@@ -106,45 +106,49 @@ defmodule Clementine.LLM.Anthropic do
   def stream(model, system, messages, tools, opts \\ []) do
     body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
     headers = build_headers()
+    parent = self()
+    ref = make_ref()
+
+    # Spawn a process to make the request and send chunks back
+    pid = spawn_link(fn -> do_stream_request(body, headers, parent, ref) end)
 
     Stream.resource(
-      fn -> init_stream(body, headers) end,
-      &next_chunk/1,
-      &cleanup_stream/1
+      fn -> {ref, pid, StreamParser.new()} end,
+      &receive_chunk/1,
+      fn _ -> :ok end
     )
   end
 
-  defp init_stream(body, headers) do
-    case Req.post(@base_url,
-           json: body,
-           headers: headers,
-           into: :self,
-           receive_timeout: 300_000
-         ) do
-      {:ok, %{status: 200} = resp} ->
-        {:streaming, resp.body, StreamParser.new()}
+  defp do_stream_request(body, headers, parent, ref) do
+    callback = fn {:data, data}, acc ->
+      send(parent, {ref, {:data, data}})
+      {:cont, acc}
+    end
+
+    result = Req.post(@base_url,
+      json: body,
+      headers: headers,
+      into: callback,
+      receive_timeout: 300_000
+    )
+
+    case result do
+      {:ok, %{status: 200}} ->
+        send(parent, {ref, :done})
 
       {:ok, %{status: status, body: body}} ->
-        {:error, {:api_error, status, body}}
+        send(parent, {ref, {:error, {:api_error, status, body}}})
 
       {:error, reason} ->
-        {:error, {:request_failed, reason}}
+        send(parent, {ref, {:error, {:request_failed, reason}}})
     end
   end
 
-  defp next_chunk({:error, reason}) do
-    {[{:error, reason}], :halt}
-  end
-
-  defp next_chunk(:halt) do
-    {:halt, :done}
-  end
-
-  defp next_chunk({:streaming, ref, parser}) do
+  defp receive_chunk({ref, pid, parser}) do
     receive do
       {^ref, {:data, data}} ->
         {events, new_parser} = StreamParser.parse(parser, data)
-        {events, {:streaming, ref, new_parser}}
+        {events, {ref, pid, new_parser}}
 
       {^ref, :done} ->
         {:halt, :done}
@@ -154,22 +158,6 @@ defmodule Clementine.LLM.Anthropic do
     after
       300_000 ->
         {[{:error, :timeout}], :halt}
-    end
-  end
-
-  defp cleanup_stream(:done), do: :ok
-  defp cleanup_stream(:halt), do: :ok
-  defp cleanup_stream({:error, _}), do: :ok
-
-  defp cleanup_stream({:streaming, ref, _parser}) do
-    flush_ref_messages(ref)
-  end
-
-  defp flush_ref_messages(ref) do
-    receive do
-      {^ref, _} -> flush_ref_messages(ref)
-    after
-      0 -> :ok
     end
   end
 
