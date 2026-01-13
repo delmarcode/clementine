@@ -231,4 +231,132 @@ defmodule Clementine.LoopTest do
       assert length(messages) == 4  # 2 initial + user + assistant
     end
   end
+
+  describe "run_stream/3" do
+    test "streams text deltas to callback" do
+      test_pid = self()
+
+      # Mock stream returns an enumerable of events
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:content_block_start, 0, :text},
+          {:text_delta, "Hello "},
+          {:text_delta, "world!"},
+          {:content_block_stop, 0},
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+          {:message_stop}
+        ]
+      end)
+
+      config = [model: :claude_sonnet, tools: []]
+
+      callback = fn event -> send(test_pid, {:stream_event, event}) end
+
+      assert {:ok, "Hello world!", _messages} = Loop.run_stream(config, "Hi", callback)
+
+      # Verify we received text deltas
+      assert_receive {:stream_event, {:text_delta, "Hello "}}
+      assert_receive {:stream_event, {:text_delta, "world!"}}
+    end
+
+    test "streams tool use events" do
+      test_pid = self()
+
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, messages, _tools, _opts ->
+        if length(messages) == 1 do
+          # First call: tool use
+          [
+            {:message_start, %{"id" => "msg_1"}},
+            {:content_block_start, 0, :tool_use},
+            {:tool_use_start, "toolu_1", "echo"},
+            {:input_json_delta, "{\"message\":"},
+            {:input_json_delta, "\"test\"}"},
+            {:content_block_stop, 0},
+            {:message_delta, %{"stop_reason" => "tool_use"}, %{}},
+            {:message_stop}
+          ]
+        else
+          # Second call: final response
+          [
+            {:message_start, %{"id" => "msg_2"}},
+            {:content_block_start, 0, :text},
+            {:text_delta, "Done!"},
+            {:content_block_stop, 0},
+            {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+            {:message_stop}
+          ]
+        end
+      end)
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_2"}},
+          {:content_block_start, 0, :text},
+          {:text_delta, "Done!"},
+          {:content_block_stop, 0},
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+          {:message_stop}
+        ]
+      end)
+
+      config = [model: :claude_sonnet, tools: [EchoTool]]
+
+      callback = fn event -> send(test_pid, {:stream_event, event}) end
+
+      assert {:ok, "Done!", _messages} = Loop.run_stream(config, "Echo test", callback)
+
+      # Verify tool use events
+      assert_receive {:stream_event, {:tool_use_start, "toolu_1", "echo"}}
+      assert_receive {:stream_event, {:input_json_delta, "{\"message\":"}}
+      assert_receive {:stream_event, {:tool_result, "toolu_1", _result}}
+      assert_receive {:stream_event, {:text_delta, "Done!"}}
+    end
+
+    test "emits loop events wrapped in :loop_event tuple" do
+      test_pid = self()
+
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:text_delta, "Hi"},
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+          {:message_stop}
+        ]
+      end)
+
+      config = [model: :claude_sonnet]
+
+      callback = fn event -> send(test_pid, {:stream_event, event}) end
+
+      {:ok, _, _} = Loop.run_stream(config, "Hello", callback)
+
+      # Loop events come wrapped
+      assert_receive {:stream_event, {:loop_event, {:loop_start, "Hello"}}}
+      assert_receive {:stream_event, {:loop_event, {:iteration_start, 1}}}
+      assert_receive {:stream_event, {:loop_event, :llm_call_start}}
+    end
+
+    test "handles max iterations in streaming mode" do
+      Clementine.LLM.MockClient
+      |> stub(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:content_block_start, 0, :tool_use},
+          {:tool_use_start, "toolu_1", "echo"},
+          {:input_json_delta, "{\"message\":\"loop\"}"},
+          {:content_block_stop, 0},
+          {:message_delta, %{"stop_reason" => "tool_use"}, %{}},
+          {:message_stop}
+        ]
+      end)
+
+      config = [model: :claude_sonnet, tools: [EchoTool], max_iterations: 2]
+
+      assert {:error, :max_iterations_reached} =
+               Loop.run_stream(config, "Loop", fn _ -> :ok end)
+    end
+  end
 end

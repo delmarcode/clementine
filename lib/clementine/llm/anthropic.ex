@@ -87,73 +87,79 @@ defmodule Clementine.LLM.Anthropic do
   @doc """
   Makes a streaming call to the Anthropic API.
 
-  Returns a Stream that emits events as they arrive.
+  Returns a Stream that emits events as they arrive. The stream is lazy -
+  events are only fetched when consumed.
+
+  ## Events
+
+  The stream emits tuples like:
+  - `{:message_start, message_data}`
+  - `{:text_delta, text}`
+  - `{:tool_use_start, id, name}`
+  - `{:input_json_delta, json_chunk}`
+  - `{:content_block_stop, index}`
+  - `{:message_delta, delta, usage}`
+  - `{:message_stop}`
+  - `{:error, reason}` on errors
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
     body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
     headers = build_headers()
+    parent = self()
+    ref = make_ref()
+
+    # Spawn a process to make the request and send chunks back
+    pid = spawn_link(fn -> do_stream_request(body, headers, parent, ref) end)
 
     Stream.resource(
-      fn -> start_stream(body, headers) end,
-      &process_stream_chunk/1,
-      &close_stream/1
+      fn -> {ref, pid, StreamParser.new()} end,
+      &receive_chunk/1,
+      fn _ -> :ok end
     )
   end
 
-  defp start_stream(body, headers) do
-    # Start a streaming request
-    case Req.post(@base_url,
-           json: body,
-           headers: headers,
-           into: :self,
-           receive_timeout: 300_000
-         ) do
-      {:ok, resp} ->
-        {resp, StreamParser.new()}
+  defp do_stream_request(body, headers, parent, ref) do
+    callback = fn {:data, data}, acc ->
+      send(parent, {ref, {:data, data}})
+      {:cont, acc}
+    end
+
+    result = Req.post(@base_url,
+      json: body,
+      headers: headers,
+      into: callback,
+      receive_timeout: 300_000
+    )
+
+    case result do
+      {:ok, %{status: 200}} ->
+        send(parent, {ref, :done})
+
+      {:ok, %{status: status, body: body}} ->
+        send(parent, {ref, {:error, {:api_error, status, body}}})
 
       {:error, reason} ->
-        {:error, reason}
+        send(parent, {ref, {:error, {:request_failed, reason}}})
     end
   end
 
-  defp process_stream_chunk({:error, reason}) do
-    {:halt, {:error, reason}}
-  end
-
-  defp process_stream_chunk({resp, parser_state}) do
-    ref = resp.body
-
+  defp receive_chunk({ref, pid, parser}) do
     receive do
       {^ref, {:data, data}} ->
-        {events, new_parser_state} = StreamParser.parse(parser_state, data)
-        {events, {resp, new_parser_state}}
+        {events, new_parser} = StreamParser.parse(parser, data)
+        {events, {ref, pid, new_parser}}
 
       {^ref, :done} ->
-        {:halt, {resp, parser_state}}
+        {:halt, :done}
 
       {^ref, {:error, reason}} ->
-        {[{:error, reason}], {:error, reason}}
+        {[{:error, reason}], :halt}
     after
       300_000 ->
-        {:halt, {:error, :timeout}}
+        {[{:error, :timeout}], :halt}
     end
   end
-
-  defp close_stream({:error, _reason}), do: :ok
-
-  defp close_stream({resp, _parser_state}) do
-    # Clean up any remaining messages
-    ref = resp.body
-
-    receive do
-      {^ref, _} -> :ok
-    after
-      0 -> :ok
-    end
-  end
-
-  defp close_stream(_), do: :ok
 
   # Build the request body
   defp build_body(model, system, messages, tools, opts) do

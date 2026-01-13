@@ -133,13 +133,77 @@ end
 # Asynchronous
 {:ok, task_id} = Clementine.run_async(agent, "Long running task")
 {:ok, :running} = Clementine.status(agent, task_id)
+```
 
-# Streaming (simplified - emits full result when done)
-Clementine.stream(agent, "Explain this code")
-|> Enum.each(fn
-  {:text, result} -> IO.puts(result)
-  {:done, _} -> :ok
-end)
+### Streaming
+
+Stream responses token-by-token as they arrive from the LLM:
+
+```elixir
+Clementine.Loop.run_stream(
+  [
+    model: :claude_sonnet,
+    system: "You have tools. Use them when asked. Be brief.",
+    tools: [Clementine.Tools.ListDir]
+  ],
+  "What files are in the current directory?",
+  fn
+    {:text_delta, text} -> IO.write(text)
+    {:tool_use_start, _id, name} -> IO.write("\n[calling #{name}...] ")
+    {:tool_result, _id, {:ok, result}} -> IO.puts("[got #{String.length(result)} chars]")
+    {:tool_result, _id, {:error, err}} -> IO.puts("[error: #{err}]")
+    _ -> :ok
+  end
+)
+```
+
+The callback receives events as they happen:
+
+| Event | Description |
+|-------|-------------|
+| `{:text_delta, text}` | A chunk of text from the model |
+| `{:tool_use_start, id, name}` | Model is calling a tool |
+| `{:input_json_delta, json}` | Tool input JSON chunk |
+| `{:tool_result, id, result}` | Tool finished executing |
+| `{:loop_event, event}` | Internal loop events |
+
+#### Streaming in Phoenix LiveView
+
+```elixir
+defmodule MyAppWeb.ChatLive do
+  use MyAppWeb, :live_view
+
+  def handle_event("submit", %{"prompt" => prompt}, socket) do
+    pid = self()
+
+    Task.start(fn ->
+      Clementine.Loop.run_stream(
+        [model: :claude_sonnet, tools: [Clementine.Tools.Bash]],
+        prompt,
+        fn
+          {:text_delta, text} -> send(pid, {:stream, text})
+          {:tool_use_start, _, name} -> send(pid, {:tool, name})
+          _ -> :ok
+        end
+      )
+      send(pid, :done)
+    end)
+
+    {:noreply, assign(socket, :streaming, true)}
+  end
+
+  def handle_info({:stream, text}, socket) do
+    {:noreply, update(socket, :response, &(&1 <> text))}
+  end
+
+  def handle_info({:tool, name}, socket) do
+    {:noreply, assign(socket, :current_tool, name)}
+  end
+
+  def handle_info(:done, socket) do
+    {:noreply, assign(socket, :streaming, false)}
+  end
+end
 ```
 
 ### Conversation Management
