@@ -8,8 +8,8 @@ defmodule Clementine.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: Clementine.Worker.start_link(arg)
-      # {Clementine.Worker, arg}
+      # Task supervisor for tool execution
+      {Task.Supervisor, name: Clementine.TaskSupervisor}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
