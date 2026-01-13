@@ -233,17 +233,146 @@ defmodule Clementine.Loop do
   @doc """
   Runs the loop with streaming output.
 
-  Similar to `run/2` but streams events back via a callback or GenStage.
+  Similar to `run/2` but streams text deltas in real-time via the callback.
+  The callback receives events like:
+
+  - `{:text_delta, text}` - Text chunk from the model
+  - `{:tool_use_start, id, name}` - Model is calling a tool
+  - `{:tool_result, id, result}` - Tool execution result
+  - `{:loop_event, event}` - Internal loop events (iteration_start, etc.)
+
   Returns the same result as `run/2`.
+
+  ## Example
+
+      Clementine.Loop.run_stream(config, "Hello", fn
+        {:text_delta, text} -> IO.write(text)
+        {:tool_use_start, _id, name} -> IO.puts("\\n[Calling \#{name}...]")
+        _ -> :ok
+      end)
+
   """
   def run_stream(config, prompt, stream_callback) when is_function(stream_callback, 1) do
-    config = Keyword.put(config, :on_event, fn event ->
-      stream_callback.({:loop_event, event})
+    state = %State{
+      model: Keyword.fetch!(config, :model),
+      system: Keyword.get(config, :system),
+      tools: Keyword.get(config, :tools, []),
+      verifiers: Keyword.get(config, :verifiers, []),
+      context: Keyword.get(config, :context, %{}),
+      max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
+      on_event: fn event -> stream_callback.({:loop_event, event}) end,
+      messages: Keyword.get(config, :messages, [])
+    }
+
+    # Add user message
+    user_message = %{role: :user, content: prompt}
+    state = %{state | messages: state.messages ++ [user_message]}
+
+    emit_event(state, {:loop_start, prompt})
+
+    iterate_streaming(state, stream_callback)
+  end
+
+  # Streaming iteration - uses LLM.stream instead of LLM.call
+  defp iterate_streaming(%State{iteration: iteration, max_iterations: max} = state, _callback)
+       when iteration >= max do
+    emit_event(state, {:loop_end, :max_iterations})
+    {:error, :max_iterations_reached}
+  end
+
+  defp iterate_streaming(%State{} = state, stream_callback) do
+    state = %{state | iteration: state.iteration + 1}
+    emit_event(state, {:iteration_start, state.iteration})
+
+    case call_llm_streaming(state, stream_callback) do
+      {:ok, response} ->
+        handle_response_streaming(state, response, stream_callback)
+
+      {:error, reason} ->
+        emit_event(state, {:loop_end, {:error, reason}})
+        {:error, reason}
+    end
+  end
+
+  # Streaming LLM call - emits text deltas as they arrive
+  defp call_llm_streaming(%State{} = state, stream_callback) do
+    alias Clementine.LLM.StreamParser.Accumulator
+
+    emit_event(state, :llm_call_start)
+
+    stream = LLM.stream(
+      state.model,
+      state.system,
+      state.messages,
+      state.tools
+    )
+
+    # Process the stream, emitting events and accumulating the response
+    result =
+      stream
+      |> Enum.reduce(Accumulator.new(), fn event, acc ->
+        # Forward relevant events to the callback
+        case event do
+          {:text_delta, _} -> stream_callback.(event)
+          {:tool_use_start, _, _} -> stream_callback.(event)
+          {:input_json_delta, _} -> stream_callback.(event)
+          {:error, reason} -> stream_callback.({:error, reason})
+          _ -> :ok
+        end
+
+        Accumulator.process(acc, event)
+      end)
+      |> Accumulator.to_response()
+
+    emit_event(state, {:llm_call_end, {:ok, result}})
+    {:ok, result}
+  rescue
+    e -> {:error, e}
+  end
+
+  # Handle response in streaming mode
+  defp handle_response_streaming(%State{} = state, response, stream_callback) do
+    # Add assistant message to history
+    assistant_message = %{role: :assistant, content: response.content}
+    state = %{state | messages: state.messages ++ [assistant_message]}
+
+    if LLM.tool_use?(response) do
+      handle_tool_use_streaming(state, response, stream_callback)
+    else
+      handle_final_response(state, response)
+    end
+  end
+
+  # Handle tool use in streaming mode
+  defp handle_tool_use_streaming(%State{} = state, response, stream_callback) do
+    tool_uses = LLM.get_tool_uses(response)
+    emit_event(state, {:tool_use, tool_uses})
+
+    # Convert tool uses to tool runner format
+    tool_calls =
+      Enum.map(tool_uses, fn t ->
+        %{id: t.id, name: t.name, input: t.input}
+      end)
+
+    # Execute tools and emit results
+    results = ToolRunner.execute(state.tools, tool_calls, state.context)
+
+    # Emit tool results to the stream callback
+    Enum.each(results, fn {id, result} ->
+      stream_callback.({:tool_result, id, result})
     end)
 
-    # For now, we use non-streaming LLM calls
-    # In a full implementation, we'd use LLM.stream and emit text deltas
-    run(config, prompt)
+    emit_event(state, {:tool_results, results})
+
+    # Format results for the conversation
+    result_content = ToolRunner.format_results(results)
+
+    # Add tool results as user message
+    tool_result_message = %{role: :user, content: result_content}
+    state = %{state | messages: state.messages ++ [tool_result_message]}
+
+    # Continue the loop
+    iterate_streaming(state, stream_callback)
   end
 
   @doc """

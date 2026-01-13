@@ -87,7 +87,20 @@ defmodule Clementine.LLM.Anthropic do
   @doc """
   Makes a streaming call to the Anthropic API.
 
-  Returns a Stream that emits events as they arrive.
+  Returns a Stream that emits events as they arrive. The stream is lazy -
+  events are only fetched when consumed.
+
+  ## Events
+
+  The stream emits tuples like:
+  - `{:message_start, message_data}`
+  - `{:text_delta, text}`
+  - `{:tool_use_start, id, name}`
+  - `{:input_json_delta, json_chunk}`
+  - `{:content_block_stop, index}`
+  - `{:message_delta, delta, usage}`
+  - `{:message_stop}`
+  - `{:error, reason}` on errors
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
@@ -95,65 +108,70 @@ defmodule Clementine.LLM.Anthropic do
     headers = build_headers()
 
     Stream.resource(
-      fn -> start_stream(body, headers) end,
-      &process_stream_chunk/1,
-      &close_stream/1
+      fn -> init_stream(body, headers) end,
+      &next_chunk/1,
+      &cleanup_stream/1
     )
   end
 
-  defp start_stream(body, headers) do
-    # Start a streaming request
+  defp init_stream(body, headers) do
     case Req.post(@base_url,
            json: body,
            headers: headers,
            into: :self,
            receive_timeout: 300_000
          ) do
-      {:ok, resp} ->
-        {resp, StreamParser.new()}
+      {:ok, %{status: 200} = resp} ->
+        {:streaming, resp.body, StreamParser.new()}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:api_error, status, body}}
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, {:request_failed, reason}}
     end
   end
 
-  defp process_stream_chunk({:error, reason}) do
-    {:halt, {:error, reason}}
+  defp next_chunk({:error, reason}) do
+    {[{:error, reason}], :halt}
   end
 
-  defp process_stream_chunk({resp, parser_state}) do
-    ref = resp.body
+  defp next_chunk(:halt) do
+    {:halt, :done}
+  end
 
+  defp next_chunk({:streaming, ref, parser}) do
     receive do
       {^ref, {:data, data}} ->
-        {events, new_parser_state} = StreamParser.parse(parser_state, data)
-        {events, {resp, new_parser_state}}
+        {events, new_parser} = StreamParser.parse(parser, data)
+        {events, {:streaming, ref, new_parser}}
 
       {^ref, :done} ->
-        {:halt, {resp, parser_state}}
+        {:halt, :done}
 
       {^ref, {:error, reason}} ->
-        {[{:error, reason}], {:error, reason}}
+        {[{:error, reason}], :halt}
     after
       300_000 ->
-        {:halt, {:error, :timeout}}
+        {[{:error, :timeout}], :halt}
     end
   end
 
-  defp close_stream({:error, _reason}), do: :ok
+  defp cleanup_stream(:done), do: :ok
+  defp cleanup_stream(:halt), do: :ok
+  defp cleanup_stream({:error, _}), do: :ok
 
-  defp close_stream({resp, _parser_state}) do
-    # Clean up any remaining messages
-    ref = resp.body
+  defp cleanup_stream({:streaming, ref, _parser}) do
+    flush_ref_messages(ref)
+  end
 
+  defp flush_ref_messages(ref) do
     receive do
-      {^ref, _} -> :ok
+      {^ref, _} -> flush_ref_messages(ref)
     after
       0 -> :ok
     end
   end
-
-  defp close_stream(_), do: :ok
 
   # Build the request body
   defp build_body(model, system, messages, tools, opts) do
