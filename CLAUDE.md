@@ -114,7 +114,9 @@ config :clementine, :models,
 1. Create `lib/clementine/tools/my_tool.ex`
 2. Use the `Clementine.Tool` macro
 3. Implement the `run/2` callback
-4. Tool results must be `{:ok, string}` or `{:error, string}`
+4. Tool results must be `{:ok, string}`, `{:ok, string, opts}`, or `{:error, string}`
+   - Use `{:ok, content, is_error: true}` for command-level failures (e.g. non-zero exit)
+   - See `docs/TOOL_AUTHORING.md` for the full result contract
 
 ### Adding a New LLM Provider
 
