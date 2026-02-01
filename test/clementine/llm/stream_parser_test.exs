@@ -270,5 +270,35 @@ defmodule Clementine.LLM.StreamParserTest do
       assert Enum.at(response.content, 0).type == :text
       assert Enum.at(response.content, 1).type == :tool_use
     end
+
+    test "captures error event" do
+      error = %{"type" => "overloaded_error", "message" => "Overloaded"}
+
+      acc =
+        Accumulator.new()
+        |> Accumulator.process({:text_delta, "partial"})
+        |> Accumulator.process({:error, error})
+
+      assert Accumulator.error?(acc)
+      assert acc.error == error
+    end
+
+    test "only captures the first error" do
+      first_error = %{"type" => "overloaded_error", "message" => "Overloaded"}
+      second_error = %{"type" => "api_error", "message" => "Server error"}
+
+      acc =
+        Accumulator.new()
+        |> Accumulator.process({:error, first_error})
+        |> Accumulator.process({:error, second_error})
+
+      assert Accumulator.error?(acc)
+      assert acc.error == first_error
+    end
+
+    test "error?/1 returns false for accumulator without error" do
+      acc = Accumulator.new()
+      refute Accumulator.error?(acc)
+    end
   end
 end

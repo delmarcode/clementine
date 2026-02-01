@@ -79,6 +79,8 @@ defmodule Clementine.LLM do
   This is useful when you want streaming behavior (e.g., for real-time display)
   but also need the final complete response.
 
+  Returns `{:error, reason}` if the stream emitted an error event.
+
   ## Example
 
       stream = Clementine.LLM.stream(:claude_sonnet, system, messages, tools)
@@ -88,14 +90,17 @@ defmodule Clementine.LLM do
   def collect_stream(stream) do
     alias Clementine.LLM.StreamParser.Accumulator
 
-    result =
+    acc =
       stream
       |> Enum.reduce(Accumulator.new(), fn event, acc ->
         Accumulator.process(acc, event)
       end)
-      |> Accumulator.to_response()
 
-    {:ok, result}
+    if Accumulator.error?(acc) do
+      {:error, acc.error}
+    else
+      {:ok, Accumulator.to_response(acc)}
+    end
   rescue
     e -> {:error, e}
   end

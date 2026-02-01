@@ -236,7 +236,8 @@ defmodule Clementine.LLM.StreamParser do
               current_tool: nil,
               current_tool_input: "",
               stop_reason: nil,
-              usage: %{}
+              usage: %{},
+              error: nil
 
     @doc "Creates a new accumulator"
     def new, do: %__MODULE__{}
@@ -278,9 +279,22 @@ defmodule Clementine.LLM.StreamParser do
       %{acc | usage: Map.merge(acc.usage, usage)}
     end
 
+    def process(%__MODULE__{error: nil} = acc, {:error, reason}) do
+      %{acc | error: reason}
+    end
+
+    def process(%__MODULE__{} = acc, {:error, _reason}) do
+      # Only capture the first error
+      acc
+    end
+
     def process(%__MODULE__{} = acc, _event) do
       acc
     end
+
+    @doc "Returns true if the accumulator has captured an error"
+    def error?(%__MODULE__{error: nil}), do: false
+    def error?(%__MODULE__{}), do: true
 
     @doc "Returns the accumulated response as a map"
     def to_response(%__MODULE__{} = acc) do

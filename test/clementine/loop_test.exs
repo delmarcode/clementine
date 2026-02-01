@@ -339,6 +339,68 @@ defmodule Clementine.LoopTest do
       assert_receive {:stream_event, {:loop_event, :llm_call_start}}
     end
 
+    test "stream error returns {:error, reason} and forwards error to callback" do
+      test_pid = self()
+
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:content_block_start, 0, :text},
+          {:text_delta, "partial"},
+          {:error, %{"type" => "overloaded_error", "message" => "Overloaded"}}
+        ]
+      end)
+
+      config = [model: :claude_sonnet, tools: []]
+
+      callback = fn event -> send(test_pid, {:stream_event, event}) end
+
+      assert {:error, %{"type" => "overloaded_error"}} =
+               Loop.run_stream(config, "Hi", callback)
+
+      # Error was forwarded to the callback
+      assert_receive {:stream_event, {:error, %{"type" => "overloaded_error"}}}
+      # Text delta before the error was also forwarded
+      assert_receive {:stream_event, {:text_delta, "partial"}}
+    end
+
+    test "stream error emits correct {:llm_call_end, {:error, ...}} loop event" do
+      test_pid = self()
+
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:error, %{"type" => "api_error", "message" => "Server error"}}
+        ]
+      end)
+
+      config = [model: :claude_sonnet, tools: []]
+
+      callback = fn event -> send(test_pid, {:stream_event, event}) end
+
+      {:error, _} = Loop.run_stream(config, "Hi", callback)
+
+      assert_receive {:stream_event, {:loop_event, {:llm_call_end, {:error, %{"type" => "api_error"}}}}}
+    end
+
+    test "stream error does not cause further iterations" do
+      Clementine.LLM.MockClient
+      |> expect(:stream, 1, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:error, %{"type" => "overloaded_error", "message" => "Overloaded"}}
+        ]
+      end)
+
+      config = [model: :claude_sonnet, tools: [EchoTool]]
+
+      assert {:error, _} = Loop.run_stream(config, "Hi", fn _ -> :ok end)
+
+      # Mox's expect with count 1 verifies no additional stream calls were made
+    end
+
     test "handles max iterations in streaming mode" do
       Clementine.LLM.MockClient
       |> stub(:stream, fn _model, _system, _messages, _tools, _opts ->
