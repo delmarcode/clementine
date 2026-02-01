@@ -11,6 +11,10 @@ defmodule ClementineTest do
       assert {:run_async, 2} in funcs
       assert {:stream, 2} in funcs
 
+      # Async result retrieval
+      assert {:await, 2} in funcs
+      assert {:await, 3} in funcs
+
       # Status
       assert {:status, 2} in funcs
 

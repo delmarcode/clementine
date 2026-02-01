@@ -120,12 +120,33 @@ defmodule Clementine do
   defdelegate run_async(agent, prompt), to: Agent
 
   @doc """
+  Awaits the result of an async task.
+
+  Blocks until the task completes or the timeout expires (default: 5000ms).
+  Returns the same `{:ok, text}` / `{:error, reason}` contract as `run/2`.
+  The task is removed from state after retrieval.
+
+  ## Example
+
+      {:ok, task_id} = Clementine.run_async(agent, "Long running task")
+      {:ok, result} = Clementine.await(agent, task_id)
+
+      # With custom timeout
+      {:ok, result} = Clementine.await(agent, task_id, 30_000)
+
+  """
+  defdelegate await(agent, task_id, timeout \\ 5000), to: Agent
+
+  @doc """
   Gets the status of an async task.
+
+  Non-blocking, read-only check. Use `await/3` to retrieve results.
 
   ## Returns
 
   - `{:ok, :running}` - Task is still running
-  - `{:ok, :completed}` - Task has finished
+  - `{:ok, :completed}` - Task function returned (result may be ok or error)
+  - `{:ok, :failed}` - Task process crashed (exception/exit)
   - `{:error, :not_found}` - Unknown task ID
 
   """
