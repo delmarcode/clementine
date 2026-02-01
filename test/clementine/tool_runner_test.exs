@@ -170,6 +170,42 @@ defmodule Clementine.ToolRunnerTest do
       assert Enum.at(formatted, 0).is_error == false
       assert Enum.at(formatted, 1).is_error == true
     end
+
+    test "formats 3-tuple with is_error: true" do
+      results = [
+        {"call_1", {:ok, "Exit code: 1\n\nfailed", is_error: true}}
+      ]
+
+      formatted = ToolRunner.format_results(results)
+
+      assert [
+               %{type: :tool_result, tool_use_id: "call_1", content: "Exit code: 1\n\nfailed", is_error: true}
+             ] = formatted
+    end
+
+    test "formats 3-tuple with is_error: false" do
+      results = [
+        {"call_1", {:ok, "some output", is_error: false}}
+      ]
+
+      formatted = ToolRunner.format_results(results)
+
+      assert [
+               %{type: :tool_result, tool_use_id: "call_1", content: "some output", is_error: false}
+             ] = formatted
+    end
+
+    test "formats 3-tuple without is_error defaults to false" do
+      results = [
+        {"call_1", {:ok, "some output", []}}
+      ]
+
+      formatted = ToolRunner.format_results(results)
+
+      assert [
+               %{type: :tool_result, tool_use_id: "call_1", content: "some output", is_error: false}
+             ] = formatted
+    end
   end
 
   describe "has_errors?/1" do
@@ -189,6 +225,24 @@ defmodule Clementine.ToolRunnerTest do
       ]
 
       assert ToolRunner.has_errors?(results)
+    end
+
+    test "returns true when 3-tuple has is_error: true" do
+      results = [
+        {"call_1", {:ok, "success"}},
+        {"call_2", {:ok, "Exit code: 1\n\nfailed", is_error: true}}
+      ]
+
+      assert ToolRunner.has_errors?(results)
+    end
+
+    test "returns false when 3-tuple has is_error: false" do
+      results = [
+        {"call_1", {:ok, "success"}},
+        {"call_2", {:ok, "output", is_error: false}}
+      ]
+
+      refute ToolRunner.has_errors?(results)
     end
   end
 
@@ -213,6 +267,20 @@ defmodule Clementine.ToolRunnerTest do
       assert length(errors) == 2
       assert {"call_2", "error 1"} in errors
       assert {"call_3", "error 2"} in errors
+    end
+
+    test "returns 3-tuple errors with is_error: true" do
+      results = [
+        {"call_1", {:ok, "success"}},
+        {"call_2", {:ok, "Exit code: 1\n\nfailed", is_error: true}},
+        {"call_3", {:error, "crash"}}
+      ]
+
+      errors = ToolRunner.get_errors(results)
+
+      assert length(errors) == 2
+      assert {"call_2", "Exit code: 1\n\nfailed"} in errors
+      assert {"call_3", "crash"} in errors
     end
   end
 end

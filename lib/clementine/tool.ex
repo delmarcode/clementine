@@ -42,7 +42,7 @@ defmodule Clementine.Tool do
           optional(atom()) => any()
         }
 
-  @type result :: {:ok, String.t()} | {:error, String.t()}
+  @type result :: {:ok, String.t()} | {:ok, String.t(), keyword()} | {:error, String.t()}
 
   @doc """
   Execute the tool with the given arguments and context.
@@ -52,6 +52,11 @@ defmodule Clementine.Tool do
 
   Returns `{:ok, result}` where result is always a string, or
   `{:error, reason}` where reason is a string description of the error.
+
+  A tool may also return `{:ok, result, opts}` where opts is a keyword list.
+  Use `is_error: true` to signal a command-level failure (e.g. non-zero exit)
+  that should be surfaced to the model as an error, while distinguishing it
+  from an invocation failure (`{:error, reason}`).
   """
   @callback run(args :: map(), context :: context()) :: result()
 

@@ -57,7 +57,8 @@ defmodule Clementine.Tools.Bash do
   end
 
   defp format_result(output, exit_code) do
-    # Return output even on failure - the model needs to see errors
-    {:ok, "Exit code: #{exit_code}\n\n#{String.trim(output)}"}
+    # Return output even on failure - the model needs to see errors.
+    # Signal is_error so the tool_result is flagged for the model.
+    {:ok, "Exit code: #{exit_code}\n\n#{String.trim(output)}", is_error: true}
   end
 end
