@@ -239,9 +239,10 @@ defmodule Clementine.Loop do
   - `{:text_delta, text}` - Text chunk from the model
   - `{:tool_use_start, id, name}` - Model is calling a tool
   - `{:tool_result, id, result}` - Tool execution result
+  - `{:error, reason}` - Streaming error from the LLM
   - `{:loop_event, event}` - Internal loop events (iteration_start, etc.)
 
-  Returns the same result as `run/2`.
+  Returns `{:ok, text, messages}` on success or `{:error, reason}` if the stream errors.
 
   ## Example
 
@@ -308,7 +309,7 @@ defmodule Clementine.Loop do
     )
 
     # Process the stream, emitting events and accumulating the response
-    result =
+    acc =
       stream
       |> Enum.reduce(Accumulator.new(), fn event, acc ->
         # Forward relevant events to the callback
@@ -322,10 +323,15 @@ defmodule Clementine.Loop do
 
         Accumulator.process(acc, event)
       end)
-      |> Accumulator.to_response()
 
-    emit_event(state, {:llm_call_end, {:ok, result}})
-    {:ok, result}
+    if Accumulator.error?(acc) do
+      emit_event(state, {:llm_call_end, {:error, acc.error}})
+      {:error, acc.error}
+    else
+      result = Accumulator.to_response(acc)
+      emit_event(state, {:llm_call_end, {:ok, result}})
+      {:ok, result}
+    end
   rescue
     e -> {:error, e}
   end

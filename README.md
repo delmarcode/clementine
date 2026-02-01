@@ -157,6 +157,9 @@ Clementine.Loop.run_stream(
 )
 ```
 
+`run_stream/3` returns `{:ok, text, messages}` on success or `{:error, reason}` if the stream errors.
+Partial text deltas may be emitted before an error occurs, so UIs should handle both streamed text and a terminal error.
+
 The callback receives events as they happen:
 
 | Event | Description |
@@ -165,6 +168,7 @@ The callback receives events as they happen:
 | `{:tool_use_start, id, name}` | Model is calling a tool |
 | `{:input_json_delta, json}` | Tool input JSON chunk |
 | `{:tool_result, id, result}` | Tool finished executing |
+| `{:error, reason}` | Streaming error from the LLM |
 | `{:loop_event, event}` | Internal loop events |
 
 #### Streaming in Phoenix LiveView
@@ -183,6 +187,7 @@ defmodule MyAppWeb.ChatLive do
         fn
           {:text_delta, text} -> send(pid, {:stream, text})
           {:tool_use_start, _, name} -> send(pid, {:tool, name})
+          {:error, reason} -> send(pid, {:error, reason})
           _ -> :ok
         end
       )
@@ -202,6 +207,10 @@ defmodule MyAppWeb.ChatLive do
 
   def handle_info(:done, socket) do
     {:noreply, assign(socket, :streaming, false)}
+  end
+
+  def handle_info({:error, reason}, socket) do
+    {:noreply, assign(socket, :streaming, false) |> assign(:error, inspect(reason))}
   end
 end
 ```
