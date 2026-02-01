@@ -102,6 +102,8 @@ defmodule Clementine.Agent do
       - `:max_iterations` - Override max iterations
       - `:context` - Initial context map
       - `:working_dir` - Working directory for tools
+      - `:history` - Initial conversation history (list of messages). Used by
+        `Clementine.Agent.fork/3` to seed the new agent with the source's history.
       """
       def start_link(opts \\ []) do
         {gen_opts, agent_opts} = Keyword.split(opts, [:name])
@@ -133,6 +135,12 @@ defmodule Clementine.Agent do
           Keyword.get(opts, :context, %{})
           |> Map.put_new(:working_dir, Keyword.get(opts, :working_dir, File.cwd!()))
 
+        history = Keyword.get(opts, :history, [])
+
+        unless is_list(history) do
+          raise ArgumentError, ":history must be a list of messages, got: #{inspect(history)}"
+        end
+
         state = %Clementine.Agent.State{
           name: @agent_name,
           model: Keyword.get(opts, :model, @agent_model || default_model),
@@ -142,7 +150,7 @@ defmodule Clementine.Agent do
           max_iterations:
             Keyword.get(opts, :max_iterations, @agent_max_iterations || default_max_iterations),
           context: context,
-          history: [],
+          history: history,
           tasks: %{}
         }
 
@@ -446,25 +454,20 @@ defmodule Clementine.Agent do
   but as a separate process with its own copy of the history.
   """
   def fork(agent, new_agent_module, opts \\ []) do
-    _history = get_history(agent)
+    history = get_history(agent)
     state = GenServer.call(agent, :get_state)
 
     fork_opts =
-      Keyword.merge(opts,
-        context: state.context,
-        model: state.model,
-        system: state.system
+      Keyword.merge(
+        [
+          context: state.context,
+          model: state.model,
+          system: state.system,
+          history: history
+        ],
+        opts
       )
 
-    case new_agent_module.start_link(fork_opts) do
-      {:ok, new_agent} ->
-        # Copy history to new agent
-        # Note: This is a simplified approach - in production you might
-        # want a more sophisticated mechanism
-        {:ok, new_agent}
-
-      error ->
-        error
-    end
+    new_agent_module.start_link(fork_opts)
   end
 end
