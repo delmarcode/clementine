@@ -41,7 +41,8 @@ defmodule Clementine.ToolRunner do
   ## Returns
 
   A list of `{tool_call_id, result}` tuples where result is
-  `{:ok, string}` or `{:error, string}`.
+  `{:ok, string}`, `{:ok, string, opts}`, or `{:error, string}`.
+  The 3-tuple form passes options through (e.g. `is_error: true`).
 
   """
   def execute(tools, tool_calls, context, opts \\ []) do
@@ -114,6 +115,9 @@ defmodule Clementine.ToolRunner do
   def format_results(results) do
     Enum.map(results, fn {id, result} ->
       case result do
+        {:ok, content, opts} when is_list(opts) ->
+          %{type: :tool_result, tool_use_id: id, content: content, is_error: Keyword.get(opts, :is_error, false)}
+
         {:ok, content} ->
           %{type: :tool_result, tool_use_id: id, content: content, is_error: false}
 
@@ -127,9 +131,7 @@ defmodule Clementine.ToolRunner do
   Checks if any tool results contain errors.
   """
   def has_errors?(results) do
-    Enum.any?(results, fn {_id, result} ->
-      match?({:error, _}, result)
-    end)
+    Enum.any?(results, fn {_id, result} -> error_result?(result) end)
   end
 
   @doc """
@@ -137,9 +139,18 @@ defmodule Clementine.ToolRunner do
   """
   def get_errors(results) do
     results
-    |> Enum.filter(fn {_id, result} -> match?({:error, _}, result) end)
-    |> Enum.map(fn {id, {:error, error}} -> {id, error} end)
+    |> Enum.filter(fn {_id, result} -> error_result?(result) end)
+    |> Enum.map(fn {id, result} ->
+      case result do
+        {:error, error} -> {id, error}
+        {:ok, content, _opts} -> {id, content}
+      end
+    end)
   end
+
+  defp error_result?({:error, _}), do: true
+  defp error_result?({:ok, _, opts}) when is_list(opts), do: Keyword.get(opts, :is_error, false)
+  defp error_result?(_), do: false
 
   # Build a map from string key names to their atom + nested schema,
   # derived from the tool's compile-time parameter definitions.
