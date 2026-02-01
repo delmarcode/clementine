@@ -87,6 +87,8 @@ end
 
 **Tool results are always strings.** The LLM consumes text. Don't make it complicated.
 
+Tools can also return `{:ok, content, is_error: true}` to signal a command-level failure (like a non-zero exit code) while still delivering the output to the model. Use `{:error, reason}` only for invocation failures (timeouts, crashes, bad args). See `docs/TOOL_AUTHORING.md` for the full guide.
+
 ### Verifiers
 
 Verifiers are optional checks that run after the model returns a final response:
