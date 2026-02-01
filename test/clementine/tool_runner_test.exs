@@ -54,6 +54,23 @@ defmodule Clementine.ToolRunnerTest do
       assert {:error, message} = result
       assert message =~ "crashed" or message =~ "failed"
     end
+
+    test "drops unknown keys from input instead of creating atoms" do
+      # Keys not in the tool's parameter schema should be silently dropped,
+      # not converted to atoms (which would be a DoS vector).
+      random_key = "unknown_key_#{System.unique_integer([:positive])}"
+      call = %{name: "echo", input: %{"message" => "hello", random_key => "injected"}}
+
+      # The tool should still execute successfully with the known key
+      assert {:ok, "Echo: hello"} = ToolRunner.execute_single(@tools, call, %{})
+
+      # Verify the random key was NOT turned into an atom
+      refute String.to_existing_atom(random_key)
+    rescue
+      ArgumentError ->
+        # Expected: the atom does not exist, confirming it was never created
+        :ok
+    end
   end
 
   describe "execute/4" do

@@ -86,8 +86,10 @@ defmodule Clementine.ToolRunner do
         {:error, "Unknown tool: #{name}"}
 
       tool ->
-        # Convert string keys to atoms for the tool
-        args = atomize_keys(input)
+        # Convert string keys to atoms using the tool's parameter schema.
+        # Only keys declared in the schema are atomized; unknown keys are dropped
+        # to avoid unbounded atom creation from untrusted LLM input.
+        args = cast_keys(input, tool.__parameters__())
 
         try do
           tool.execute(args, context)
@@ -139,30 +141,61 @@ defmodule Clementine.ToolRunner do
     |> Enum.map(fn {id, {:error, error}} -> {id, error} end)
   end
 
-  # Convert string keys to atoms
-  defp atomize_keys(map) when is_map(map) do
-    Map.new(map, fn
-      {key, value} when is_binary(key) ->
-        {String.to_existing_atom(key), atomize_keys(value)}
-
-      {key, value} when is_atom(key) ->
-        {key, atomize_keys(value)}
+  # Build a map from string key names to their atom + nested schema,
+  # derived from the tool's compile-time parameter definitions.
+  defp allowed_keys(parameters) do
+    Map.new(parameters, fn {atom_key, opts} ->
+      {Atom.to_string(atom_key), {atom_key, opts}}
     end)
-  rescue
-    ArgumentError ->
-      # If atom doesn't exist, try creating it (for dynamic keys)
-      Map.new(map, fn
-        {key, value} when is_binary(key) ->
-          {String.to_atom(key), atomize_keys(value)}
-
-        {key, value} when is_atom(key) ->
-          {key, atomize_keys(value)}
-      end)
   end
 
-  defp atomize_keys(list) when is_list(list) do
-    Enum.map(list, &atomize_keys/1)
+  # Convert string keys to atoms using the tool's parameter schema.
+  # Only keys present in the schema are converted; unknown keys are dropped.
+  # Nested :object parameters are handled recursively.
+  defp cast_keys(map, parameters) when is_map(map) and is_list(parameters) do
+    allowed = allowed_keys(parameters)
+
+    map
+    |> Enum.reduce(%{}, fn
+      {key, value}, acc when is_binary(key) ->
+        case Map.fetch(allowed, key) do
+          {:ok, {atom_key, opts}} ->
+            Map.put(acc, atom_key, cast_value(value, opts))
+
+          :error ->
+            acc
+        end
+
+      {key, value}, acc when is_atom(key) ->
+        # Already an atom key (e.g. from internal calls) — keep if in schema
+        if Keyword.has_key?(parameters, key) do
+          opts = Keyword.fetch!(parameters, key)
+          Map.put(acc, key, cast_value(value, opts))
+        else
+          acc
+        end
+    end)
   end
 
-  defp atomize_keys(value), do: value
+  defp cast_keys(map, _parameters) when is_map(map), do: map
+
+  defp cast_value(value, opts) do
+    case Keyword.get(opts, :type) do
+      :object ->
+        nested = Keyword.get(opts, :properties, [])
+        cast_keys(value, nested)
+
+      :array ->
+        items = Keyword.get(opts, :items, [])
+
+        if is_list(value) do
+          Enum.map(value, fn item -> cast_value(item, items) end)
+        else
+          value
+        end
+
+      _ ->
+        value
+    end
+  end
 end
