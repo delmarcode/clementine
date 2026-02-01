@@ -397,6 +397,102 @@ defmodule Clementine.AgentTest do
     end
   end
 
+  # A second agent module used as the fork target
+  defmodule ForkTargetAgent do
+    use Clementine.Agent,
+      name: "fork_target",
+      model: :claude_sonnet,
+      tools: [],
+      system: "You are a fork target."
+  end
+
+  describe "fork/3" do
+    test "forked agent preserves conversation history from source" do
+      Clementine.LLM.MockClient
+      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+        {:ok,
+         %{
+           content: [%{type: :text, text: "Source response"}],
+           stop_reason: "end_turn",
+           usage: %{}
+         }}
+      end)
+
+      {:ok, source} = TestAgent.start_link()
+      {:ok, _} = Clementine.Agent.run(source, "Hello source")
+
+      source_history = Clementine.Agent.get_history(source)
+      assert length(source_history) == 2
+
+      {:ok, forked} = Clementine.Agent.fork(source, ForkTargetAgent)
+
+      forked_history = Clementine.Agent.get_history(forked)
+      assert forked_history == source_history
+
+      GenServer.stop(forked)
+      GenServer.stop(source)
+    end
+
+    test "forked agent copies context, model, and system from source" do
+      {:ok, source} = TestAgent.start_link(model: :claude_opus, context: %{custom: "data"})
+
+      {:ok, forked} = Clementine.Agent.fork(source, ForkTargetAgent)
+
+      forked_state = GenServer.call(forked, :get_state)
+      assert forked_state.model == :claude_opus
+      assert forked_state.system == "You are a test assistant."
+      assert forked_state.context.custom == "data"
+
+      GenServer.stop(forked)
+      GenServer.stop(source)
+    end
+
+    test "forked agent can continue conversation using copied history" do
+      Clementine.LLM.MockClient
+      |> expect(:call, 2, fn _model, _system, messages, _tools, _opts ->
+        {:ok,
+         %{
+           content: [%{type: :text, text: "Response #{length(messages)}"}],
+           stop_reason: "end_turn",
+           usage: %{}
+         }}
+      end)
+
+      {:ok, source} = TestAgent.start_link()
+      {:ok, _} = Clementine.Agent.run(source, "First message")
+
+      {:ok, forked} = Clementine.Agent.fork(source, ForkTargetAgent)
+      {:ok, result} = Clementine.Agent.run(forked, "Second message")
+
+      # The forked agent received 2 prior messages (from source) + 1 new user message = 3
+      assert result == "Response 3"
+
+      forked_history = Clementine.Agent.get_history(forked)
+      # 2 from source + 2 from the new run = 4
+      assert length(forked_history) == 4
+
+      GenServer.stop(forked)
+      GenServer.stop(source)
+    end
+
+    test "user-supplied opts override source agent settings" do
+      {:ok, source} = TestAgent.start_link()
+
+      {:ok, forked} =
+        Clementine.Agent.fork(source, ForkTargetAgent,
+          model: :claude_haiku,
+          context: %{overridden: true}
+        )
+
+      forked_state = GenServer.call(forked, :get_state)
+      assert forked_state.model == :claude_haiku
+      assert forked_state.context.overridden == true
+
+      GenServer.stop(forked)
+      GenServer.stop(source)
+    end
+  end
+
   describe "runtime configuration" do
     test "allows overriding model at runtime" do
       {:ok, agent} = TestAgent.start_link(model: :claude_opus)
