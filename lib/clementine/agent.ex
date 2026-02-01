@@ -88,6 +88,9 @@ defmodule Clementine.Agent do
       @agent_system Keyword.get(opts, :system, "")
       @agent_max_iterations Keyword.get(opts, :max_iterations)
 
+      @task_ttl_ms :timer.minutes(30)
+      @task_cleanup_interval_ms :timer.minutes(5)
+
       @doc """
       Starts the agent with optional runtime configuration.
 
@@ -143,6 +146,7 @@ defmodule Clementine.Agent do
           tasks: %{}
         }
 
+        schedule_task_cleanup()
         {:ok, state}
       end
 
@@ -163,19 +167,16 @@ defmodule Clementine.Agent do
       @impl true
       def handle_call({:run_async, prompt}, {from_pid, _ref}, state) do
         task_id = generate_task_id()
+        config = build_loop_config(state)
 
-        # Spawn a task to run the loop
-        parent = self()
-
+        # Use async_nolink so a crash in Loop.run/2 doesn't take down the agent
         task =
-          Task.async(fn ->
-            config = build_loop_config(state)
-            result = Loop.run(config, prompt)
-            send(parent, {:task_complete, task_id, result})
-            result
+          Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
+            Loop.run(config, prompt)
           end)
 
-        tasks = Map.put(state.tasks, task_id, %{task: task, from: from_pid})
+        entry = %{task: task, from: from_pid, status: :running, waiters: []}
+        tasks = Map.put(state.tasks, task_id, entry)
         {:reply, {:ok, task_id}, %{state | tasks: tasks}}
       end
 
@@ -185,15 +186,32 @@ defmodule Clementine.Agent do
           nil ->
             {:reply, {:error, :not_found}, state}
 
-          %{task: task} = task_info ->
-            status =
-              if Process.alive?(task.pid) do
-                :running
-              else
-                :completed
-              end
-
+          %{status: status} ->
             {:reply, {:ok, status}, state}
+        end
+      end
+
+      @impl true
+      def handle_call({:await, task_id, timeout}, from, state) do
+        case Map.get(state.tasks, task_id) do
+          nil ->
+            {:reply, {:error, :not_found}, state}
+
+          %{status: :running} = entry ->
+            # Task still running — defer reply until it completes or timeout fires
+            timer_ref =
+              if timeout == :infinity,
+                do: nil,
+                else: Process.send_after(self(), {:await_timeout, task_id, from}, timeout)
+
+            waiters = [{from, timer_ref} | entry.waiters]
+            tasks = Map.put(state.tasks, task_id, %{entry | waiters: waiters})
+            {:noreply, %{state | tasks: tasks}}
+
+          %{result: result} ->
+            # Task already finished — return result and clean up
+            tasks = Map.delete(state.tasks, task_id)
+            {:reply, normalize_result(result), %{state | tasks: tasks}}
         end
       end
 
@@ -213,36 +231,88 @@ defmodule Clementine.Agent do
       end
 
       @impl true
-      def handle_info({:task_complete, task_id, result}, state) do
-        case Map.get(state.tasks, task_id) do
-          nil ->
-            {:noreply, state}
+      def handle_info({ref, result}, state) when is_reference(ref) do
+        # Successful task completion from Task.Supervisor.async_nolink
+        Process.demonitor(ref, [:flush])
 
-          %{from: from_pid} ->
-            # Update history if successful
+        case find_task_by_ref(state.tasks, ref) do
+          {task_id, task_info} ->
             state =
               case result do
                 {:ok, _text, messages} -> %{state | history: messages}
                 _ -> state
               end
 
-            tasks = Map.delete(state.tasks, task_id)
+            tasks = finish_task(state.tasks, task_id, task_info, :completed, result)
             {:noreply, %{state | tasks: tasks}}
+
+          nil ->
+            {:noreply, state}
         end
       end
 
       @impl true
-      def handle_info({ref, _result}, state) when is_reference(ref) do
-        # Task completed message - already handled
+      def handle_info({:DOWN, _ref, :process, _pid, :normal}, state) do
+        # Normal exit follows a successful {ref, result} which already
+        # handled the task. Process.demonitor(:flush) usually eats this,
+        # but it can arrive if the demonitor races. Safe to ignore.
         {:noreply, state}
       end
 
       @impl true
-      def handle_info({:DOWN, _ref, :process, _pid, _reason}, state) do
-        {:noreply, state}
+      def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+        # Abnormal exit or :shutdown — task crashed or was terminated
+        case find_task_by_ref(state.tasks, ref) do
+          {task_id, %{status: :running} = task_info} ->
+            result = {:error, {:task_crashed, reason}}
+            tasks = finish_task(state.tasks, task_id, task_info, :failed, result)
+            {:noreply, %{state | tasks: tasks}}
+
+          _ ->
+            # Task already terminal or unknown — ignore
+            {:noreply, state}
+        end
+      end
+
+      @impl true
+      def handle_info({:await_timeout, task_id, from}, state) do
+        case Map.get(state.tasks, task_id) do
+          %{waiters: waiters} = entry when is_list(waiters) ->
+            case List.keytake(waiters, from, 0) do
+              {{^from, _timer_ref}, remaining} ->
+                GenServer.reply(from, {:error, :timeout})
+                tasks = Map.put(state.tasks, task_id, %{entry | waiters: remaining})
+                {:noreply, %{state | tasks: tasks}}
+
+              nil ->
+                # Waiter already replied to (task completed before timeout fired)
+                {:noreply, state}
+            end
+
+          _ ->
+            # Task already cleaned up
+            {:noreply, state}
+        end
+      end
+
+      @impl true
+      def handle_info(:task_cleanup, state) do
+        now = System.monotonic_time(:millisecond)
+
+        tasks =
+          Map.reject(state.tasks, fn {_id, entry} ->
+            match?(%{completed_at: t} when now - t > @task_ttl_ms, entry)
+          end)
+
+        schedule_task_cleanup()
+        {:noreply, %{state | tasks: tasks}}
       end
 
       # Private helpers
+
+      defp schedule_task_cleanup do
+        Process.send_after(self(), :task_cleanup, @task_cleanup_interval_ms)
+      end
 
       defp build_loop_config(state) do
         [
@@ -259,6 +329,37 @@ defmodule Clementine.Agent do
       defp generate_task_id do
         :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
       end
+
+      defp find_task_by_ref(tasks, ref) do
+        Enum.find_value(tasks, fn
+          {task_id, %{task: %Task{ref: ^ref}} = info} -> {task_id, info}
+          _ -> nil
+        end)
+      end
+
+      # Transition a task to a terminal state, replying to any blocked waiters.
+      # If waiters exist, the task entry is removed (waiters got the result).
+      # If no waiters, the entry is kept so a later await/3 can retrieve it.
+      defp finish_task(tasks, task_id, task_info, status, result) do
+        waiters = Map.get(task_info, :waiters, [])
+        normalized = normalize_result(result)
+
+        for {from, timer_ref} <- waiters do
+          if timer_ref, do: Process.cancel_timer(timer_ref)
+          GenServer.reply(from, normalized)
+        end
+
+        if waiters == [] do
+          Map.put(tasks, task_id, %{status: status, result: result, completed_at: System.monotonic_time(:millisecond)})
+        else
+          Map.delete(tasks, task_id)
+        end
+      end
+
+      # Convert internal Loop.run/2 results to the public await/3 contract,
+      # which matches run/2: {:ok, text} | {:error, reason}
+      defp normalize_result({:ok, text, _messages}), do: {:ok, text}
+      defp normalize_result({:error, _reason} = error), do: error
     end
   end
 
@@ -281,7 +382,44 @@ defmodule Clementine.Agent do
   end
 
   @doc """
+  Awaits the result of an async task.
+
+  Blocks until the task completes or the timeout expires. Returns the same
+  contract as `run/2`. The task entry is removed from state after the result
+  is retrieved; subsequent calls return `{:error, :not_found}`.
+
+  ## Options
+
+  - `timeout` — milliseconds to wait (default: `5000`). Use `:infinity` to
+    wait indefinitely.
+
+  ## Returns
+
+  - `{:ok, text}` — task completed successfully
+  - `{:error, reason}` — task failed (LLM error, crash, etc.)
+  - `{:error, :timeout}` — task did not complete within the timeout
+  - `{:error, :not_found}` — unknown or already-consumed task_id
+  """
+  def await(agent, task_id, timeout \\ 5000)
+
+  def await(agent, task_id, :infinity) do
+    GenServer.call(agent, {:await, task_id, :infinity}, :infinity)
+  end
+
+  def await(agent, task_id, timeout) when is_integer(timeout) and timeout >= 0 do
+    GenServer.call(agent, {:await, task_id, timeout}, timeout + 5000)
+  end
+
+  @doc """
   Gets the status of an async task.
+
+  This is a non-blocking, read-only check. Use `await/3` to retrieve results.
+
+  Returns:
+  - `{:ok, :running}` — task is still in progress
+  - `{:ok, :completed}` — task function returned (result may be ok or error)
+  - `{:ok, :failed}` — task process crashed (exception/exit)
+  - `{:error, :not_found}` — unknown or already-consumed task_id
   """
   def status(agent, task_id) do
     GenServer.call(agent, {:status, task_id})
