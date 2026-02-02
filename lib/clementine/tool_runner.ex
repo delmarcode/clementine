@@ -198,7 +198,7 @@ defmodule Clementine.ToolRunner do
     case Keyword.get(opts, :type) do
       :object ->
         case Keyword.get(opts, :properties) do
-          props when is_list(props) -> cast_keys(value, props)
+          props when is_list(props) and props != [] -> cast_keys(value, props)
           _ -> value
         end
 

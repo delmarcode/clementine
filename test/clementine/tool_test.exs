@@ -322,6 +322,11 @@ defmodule Clementine.ToolTest do
       assert :ok = Tool.validate_args(params, %{config: %{anything: "goes"}})
     end
 
+    test "object: empty properties passes with string-keyed nested map" do
+      params = [data: [type: :object, required: true, properties: []]]
+      assert :ok = Tool.validate_args(params, %{data: %{"foo" => "bar"}})
+    end
+
     # Multiple errors
 
     test "multiple errors collected and joined" do

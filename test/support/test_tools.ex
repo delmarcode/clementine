@@ -110,6 +110,50 @@ defmodule Clementine.Test.Tools do
     end
   end
 
+  defmodule InspectObject do
+    @moduledoc "Reports key types of its object arg (no declared properties — passthrough)"
+    use Clementine.Tool,
+      name: "inspect_object",
+      description: "Reports key types of its object arg",
+      parameters: [
+        data: [type: :object, required: true]
+      ]
+
+    @impl true
+    def run(%{data: data}, _context) when is_map(data) do
+      cond do
+        data == %{} -> {:ok, "empty"}
+        Enum.all?(data, fn {k, _} -> is_binary(k) end) -> {:ok, "string_keys"}
+        Enum.all?(data, fn {k, _} -> is_atom(k) end) -> {:ok, "atom_keys"}
+        true -> {:ok, "mixed_keys"}
+      end
+    end
+  end
+
+  defmodule InspectDeclaredObject do
+    @moduledoc "Reports key types of declared object arg (with properties — keys atomized)"
+    use Clementine.Tool,
+      name: "inspect_declared_object",
+      description: "Reports key types of declared object arg",
+      parameters: [
+        data: [
+          type: :object,
+          required: true,
+          properties: [host: [type: :string, required: true]]
+        ]
+      ]
+
+    @impl true
+    def run(%{data: data}, _context) when is_map(data) do
+      cond do
+        data == %{} -> {:ok, "empty"}
+        Enum.all?(data, fn {k, _} -> is_binary(k) end) -> {:ok, "string_keys"}
+        Enum.all?(data, fn {k, _} -> is_atom(k) end) -> {:ok, "atom_keys"}
+        true -> {:ok, "mixed_keys"}
+      end
+    end
+  end
+
   defmodule Counter do
     @moduledoc "A stateful tool that counts invocations (uses process dictionary)"
     use Clementine.Tool,

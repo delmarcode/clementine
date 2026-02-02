@@ -5,9 +5,9 @@ defmodule Clementine.ToolRunnerTest do
   alias Clementine.ToolRunner
 
   # Import test tools
-  alias Clementine.Test.Tools.{Echo, Add, Crash, Slow, Fail, TrackedSlow}
+  alias Clementine.Test.Tools.{Echo, Add, Crash, Slow, Fail, TrackedSlow, InspectObject, InspectDeclaredObject}
 
-  @tools [Echo, Add, Crash, Slow, Fail, TrackedSlow]
+  @tools [Echo, Add, Crash, Slow, Fail, TrackedSlow, InspectObject, InspectDeclaredObject]
 
   setup do
     # The TaskSupervisor is started by the application
@@ -96,6 +96,45 @@ defmodule Clementine.ToolRunnerTest do
                  is_error: true
                }
              ] = formatted
+    end
+  end
+
+  describe "execute_single/3 object passthrough" do
+    test "object without properties preserves string-keyed data" do
+      call = %{name: "inspect_object", input: %{"data" => %{"foo" => "bar"}}}
+
+      assert {:ok, "string_keys"} = ToolRunner.execute_single(@tools, call, %{})
+    end
+
+    test "object with empty properties preserves string-keyed data" do
+      defmodule EmptyPropsObject do
+        use Clementine.Tool,
+          name: "empty_props_object",
+          description: "Object with properties: []",
+          parameters: [
+            data: [type: :object, required: true, properties: []]
+          ]
+
+        @impl true
+        def run(%{data: data}, _context) when is_map(data) do
+          cond do
+            data == %{} -> {:ok, "empty"}
+            Enum.all?(data, fn {k, _} -> is_binary(k) end) -> {:ok, "string_keys"}
+            Enum.all?(data, fn {k, _} -> is_atom(k) end) -> {:ok, "atom_keys"}
+            true -> {:ok, "mixed_keys"}
+          end
+        end
+      end
+
+      call = %{name: "empty_props_object", input: %{"data" => %{"foo" => "bar"}}}
+
+      assert {:ok, "string_keys"} = ToolRunner.execute_single([EmptyPropsObject], call, %{})
+    end
+
+    test "object with declared properties atomizes keys" do
+      call = %{name: "inspect_declared_object", input: %{"data" => %{"host" => "localhost"}}}
+
+      assert {:ok, "atom_keys"} = ToolRunner.execute_single(@tools, call, %{})
     end
   end
 
