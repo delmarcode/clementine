@@ -35,8 +35,11 @@ defmodule Clementine.ToolRunner do
 
   ## Options
 
-  - `:timeout` - Timeout per tool in milliseconds (default: 2 minutes)
-  - `:max_concurrency` - Maximum parallel tool executions (default: unlimited)
+  - `:timeout` - Timeout per tool in milliseconds (default: 2 minutes).
+    The timeout is measured from when each task is spawned, not from when
+    results are collected. With a low `:max_concurrency`, queued tasks
+    do not start their timeout until they are actually spawned.
+  - `:max_concurrency` - Maximum parallel tool executions (default: `length(tool_calls)`)
 
   ## Returns
 
@@ -47,31 +50,31 @@ defmodule Clementine.ToolRunner do
   """
   def execute(tools, tool_calls, context, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
+    max_concurrency = Keyword.get(opts, :max_concurrency, length(tool_calls))
     task_supervisor = Keyword.get(opts, :task_supervisor, Clementine.TaskSupervisor)
 
-    tool_calls
-    |> Enum.map(fn call ->
-      task =
-        Task.Supervisor.async_nolink(task_supervisor, fn ->
-          execute_single(tools, call, context)
-        end)
+    # Ensure max_concurrency is at least 1 (async_stream_nolink requires > 0)
+    max_concurrency = max(max_concurrency, 1)
 
-      {call.id, task}
-    end)
-    |> Enum.map(fn {id, task} ->
-      result =
-        case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-          {:ok, result} ->
-            result
+    task_supervisor
+    |> Task.Supervisor.async_stream_nolink(
+      tool_calls,
+      fn call -> execute_single(tools, call, context) end,
+      max_concurrency: max_concurrency,
+      timeout: timeout,
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Enum.zip(tool_calls)
+    |> Enum.map(fn
+      {{:ok, result}, call} ->
+        {call.id, result}
 
-          {:exit, reason} ->
-            {:error, "Tool crashed: #{inspect(reason)}"}
+      {{:exit, :timeout}, call} ->
+        {call.id, {:error, "Tool timed out after #{timeout}ms"}}
 
-          nil ->
-            {:error, "Tool timed out after #{timeout}ms"}
-        end
-
-      {id, result}
+      {{:exit, reason}, call} ->
+        {call.id, {:error, "Tool crashed: #{inspect(reason)}"}}
     end)
   end
 

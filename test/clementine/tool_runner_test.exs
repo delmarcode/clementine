@@ -4,9 +4,9 @@ defmodule Clementine.ToolRunnerTest do
   alias Clementine.ToolRunner
 
   # Import test tools
-  alias Clementine.Test.Tools.{Echo, Add, Crash, Slow, Fail}
+  alias Clementine.Test.Tools.{Echo, Add, Crash, Slow, Fail, TrackedSlow}
 
-  @tools [Echo, Add, Crash, Slow, Fail]
+  @tools [Echo, Add, Crash, Slow, Fail, TrackedSlow]
 
   setup do
     # The TaskSupervisor is started by the application
@@ -128,6 +128,62 @@ defmodule Clementine.ToolRunnerTest do
       ids = Enum.map(results, fn {id, _} -> id end)
 
       assert ids == ["call_1", "call_2", "call_3"]
+    end
+
+    test "max_concurrency: 1 serialises execution" do
+      tracker = start_supervised!({Agent, fn -> {0, 0} end})
+      context = %{concurrency_tracker: tracker}
+
+      calls = [
+        %{id: "call_1", name: "tracked_slow", input: %{"delay_ms" => 50}},
+        %{id: "call_2", name: "tracked_slow", input: %{"delay_ms" => 50}},
+        %{id: "call_3", name: "tracked_slow", input: %{"delay_ms" => 50}}
+      ]
+
+      results = ToolRunner.execute(@tools, calls, context, max_concurrency: 1)
+
+      assert length(results) == 3
+      assert Enum.all?(results, fn {_, result} -> match?({:ok, _}, result) end)
+
+      {_, peak} = Agent.get(tracker, & &1)
+      assert peak == 1
+    end
+
+    test "default (unlimited) concurrency runs in parallel" do
+      tracker = start_supervised!({Agent, fn -> {0, 0} end})
+      context = %{concurrency_tracker: tracker}
+
+      calls = [
+        %{id: "call_1", name: "tracked_slow", input: %{"delay_ms" => 50}},
+        %{id: "call_2", name: "tracked_slow", input: %{"delay_ms" => 50}},
+        %{id: "call_3", name: "tracked_slow", input: %{"delay_ms" => 50}}
+      ]
+
+      results = ToolRunner.execute(@tools, calls, context)
+
+      assert length(results) == 3
+      assert Enum.all?(results, fn {_, result} -> match?({:ok, _}, result) end)
+
+      {_, peak} = Agent.get(tracker, & &1)
+      assert peak > 1
+    end
+
+    test "all results returned with max_concurrency limit" do
+      calls = [
+        %{id: "call_1", name: "echo", input: %{"message" => "a"}},
+        %{id: "call_2", name: "echo", input: %{"message" => "b"}},
+        %{id: "call_3", name: "echo", input: %{"message" => "c"}},
+        %{id: "call_4", name: "echo", input: %{"message" => "d"}}
+      ]
+
+      results = ToolRunner.execute(@tools, calls, %{}, max_concurrency: 2)
+
+      assert length(results) == 4
+      result_map = Map.new(results)
+      assert {:ok, "Echo: a"} = result_map["call_1"]
+      assert {:ok, "Echo: b"} = result_map["call_2"]
+      assert {:ok, "Echo: c"} = result_map["call_3"]
+      assert {:ok, "Echo: d"} = result_map["call_4"]
     end
   end
 
