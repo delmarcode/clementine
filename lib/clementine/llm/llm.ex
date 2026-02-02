@@ -53,7 +53,7 @@ defmodule Clementine.LLM do
   - `{:message_start, message_data}` - Message metadata
   - `{:text_delta, text}` - Text content chunk
   - `{:tool_use_start, id, name}` - Start of tool use
-  - `{:input_json_delta, json_chunk}` - Tool input JSON chunk
+  - `{:input_json_delta, id, json_chunk}` - Tool input JSON chunk
   - `{:content_block_stop, index}` - End of content block
   - `{:message_delta, delta, usage}` - Message update (stop_reason)
   - `{:message_stop}` - End of message

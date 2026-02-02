@@ -272,8 +272,8 @@ defmodule Clementine.LoopTest do
             {:message_start, %{"id" => "msg_1"}},
             {:content_block_start, 0, :tool_use},
             {:tool_use_start, "toolu_1", "echo"},
-            {:input_json_delta, "{\"message\":"},
-            {:input_json_delta, "\"test\"}"},
+            {:input_json_delta, "toolu_1", "{\"message\":"},
+            {:input_json_delta, "toolu_1", "\"test\"}"},
             {:content_block_stop, 0},
             {:message_delta, %{"stop_reason" => "tool_use"}, %{}},
             {:message_stop}
@@ -309,7 +309,7 @@ defmodule Clementine.LoopTest do
 
       # Verify tool use events
       assert_receive {:stream_event, {:tool_use_start, "toolu_1", "echo"}}
-      assert_receive {:stream_event, {:input_json_delta, "{\"message\":"}}
+      assert_receive {:stream_event, {:input_json_delta, "toolu_1", "{\"message\":"}}
       assert_receive {:stream_event, {:tool_result, "toolu_1", _result}}
       assert_receive {:stream_event, {:text_delta, "Done!"}}
     end
@@ -408,7 +408,7 @@ defmodule Clementine.LoopTest do
           {:message_start, %{"id" => "msg_1"}},
           {:content_block_start, 0, :tool_use},
           {:tool_use_start, "toolu_1", "echo"},
-          {:input_json_delta, "{\"message\":\"loop\"}"},
+          {:input_json_delta, "toolu_1", "{\"message\":\"loop\"}"},
           {:content_block_stop, 0},
           {:message_delta, %{"stop_reason" => "tool_use"}, %{}},
           {:message_stop}

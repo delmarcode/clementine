@@ -168,7 +168,7 @@ The callback receives events as they happen:
 |-------|-------------|
 | `{:text_delta, text}` | A chunk of text from the model |
 | `{:tool_use_start, id, name}` | Model is calling a tool |
-| `{:input_json_delta, json}` | Tool input JSON chunk |
+| `{:input_json_delta, id, json}` | Tool input JSON chunk (includes tool use ID) |
 | `{:tool_result, id, result}` | Tool finished executing |
 | `{:error, reason}` | Streaming error from the LLM |
 | `{:loop_event, event}` | Internal loop events |

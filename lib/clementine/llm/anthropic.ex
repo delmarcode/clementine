@@ -91,7 +91,7 @@ defmodule Clementine.LLM.Anthropic do
   - `{:message_start, message_data}`
   - `{:text_delta, text}`
   - `{:tool_use_start, id, name}`
-  - `{:input_json_delta, json_chunk}`
+  - `{:input_json_delta, id, json_chunk}`
   - `{:content_block_stop, index}`
   - `{:message_delta, delta, usage}`
   - `{:message_stop}`

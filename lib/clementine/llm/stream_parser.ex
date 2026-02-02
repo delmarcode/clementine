@@ -71,19 +71,16 @@ defmodule Clementine.LLM.StreamParser do
     # Keep the last chunk if it doesn't end with \n\n (incomplete event)
     {events_data, remaining} = split_events(full_data)
 
-    events =
+    raw_events =
       events_data
       |> Enum.flat_map(&parse_event/1)
 
-    {events, %{state | buffer: remaining}}
+    {events, state} = enrich_events(raw_events, %{state | buffer: remaining})
+
+    {events, state}
   end
 
-  @doc """
-  Parses a single SSE event string into event tuples.
-
-  For use when you have complete, pre-split events.
-  """
-  def parse_event(event_str) when is_binary(event_str) do
+  defp parse_event(event_str) when is_binary(event_str) do
     event_str = String.trim(event_str)
 
     if event_str == "" do
@@ -100,6 +97,23 @@ defmodule Clementine.LLM.StreamParser do
           []
       end
     end
+  end
+
+  # Enrich raw events with tracked state (attaches tool IDs to input_json_delta)
+  defp enrich_events(events, state) do
+    Enum.map_reduce(events, state, fn
+      {:tool_use_start, id, _name} = event, state ->
+        {event, %{state | current_tool_id: id}}
+
+      {:input_json_delta, json}, state ->
+        {{:input_json_delta, state.current_tool_id, json}, state}
+
+      {:content_block_stop, _} = event, state ->
+        {event, %{state | current_tool_id: nil}}
+
+      event, state ->
+        {event, state}
+    end)
   end
 
   # Split SSE data into complete events and remaining buffer
@@ -251,7 +265,7 @@ defmodule Clementine.LLM.StreamParser do
       %{acc | current_tool: %{id: id, name: name}, current_tool_input: ""}
     end
 
-    def process(%__MODULE__{} = acc, {:input_json_delta, json}) do
+    def process(%__MODULE__{} = acc, {:input_json_delta, _id, json}) do
       %{acc | current_tool_input: acc.current_tool_input <> json}
     end
 

@@ -316,7 +316,7 @@ defmodule Clementine.Loop do
         case event do
           {:text_delta, _} -> stream_callback.(event)
           {:tool_use_start, _, _} -> stream_callback.(event)
-          {:input_json_delta, _} -> stream_callback.(event)
+          {:input_json_delta, _, _} -> stream_callback.(event)
           {:error, reason} -> stream_callback.({:error, reason})
           _ -> :ok
         end
