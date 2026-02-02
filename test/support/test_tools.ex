@@ -82,6 +82,34 @@ defmodule Clementine.Test.Tools do
     end
   end
 
+  defmodule TrackedSlow do
+    @moduledoc "A slow tool that records peak concurrency via an Agent passed in context"
+    use Clementine.Tool,
+      name: "tracked_slow",
+      description: "Slow tool that records peak concurrency",
+      parameters: [
+        delay_ms: [type: :integer, required: true, description: "Delay in ms"]
+      ]
+
+    @impl true
+    def run(%{delay_ms: delay_ms}, context) do
+      tracker = context[:concurrency_tracker]
+
+      Agent.update(tracker, fn {current, peak} ->
+        new = current + 1
+        {new, max(peak, new)}
+      end)
+
+      Process.sleep(delay_ms)
+
+      Agent.update(tracker, fn {current, peak} ->
+        {current - 1, peak}
+      end)
+
+      {:ok, "Completed after #{delay_ms}ms"}
+    end
+  end
+
   defmodule Counter do
     @moduledoc "A stateful tool that counts invocations (uses process dictionary)"
     use Clementine.Tool,

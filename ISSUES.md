@@ -49,11 +49,8 @@ Prioritized list of correctness, reliability, and maintainability issues observe
 
 ## P3 - Low
 
-### 8) `ToolRunner` docs mention `:max_concurrency` but it is not implemented
-- **Problem:** Public docs advertise `:max_concurrency` but it is ignored.
-- **Impact:** Confusing API; potential perf issues for large tool batches.
-- **Where:** `lib/clementine/tool_runner.ex:36-39`
-- **Notes / Direction:** Implement concurrency limits or update docs to reflect actual behavior.
+### 8) ~~`ToolRunner` docs mention `:max_concurrency` but it is not implemented~~ ✅ Resolved
+- **Resolution:** `execute/4` now uses `Task.Supervisor.async_stream_nolink` which natively supports `:max_concurrency`. Defaults to `length(tool_calls)` (preserving unlimited-parallelism behaviour for existing callers). Tests use a peak-concurrency tracker to deterministically verify serialisation (`peak == 1` with `max_concurrency: 1`) and parallel execution (`peak > 1` with the default).
 
 ### 9) Stream parser docs/types don’t match emitted events
 - **Problem:** Type/docs say `{:input_json_delta, id, json}`, but actual event is `{:input_json_delta, json}`. Also `current_tool_id` in parser state is unused.
@@ -67,11 +64,8 @@ Prioritized list of correctness, reliability, and maintainability issues observe
 - **Where:** `lib/clementine/tools/read_file.ex:64-71`
 - **Notes / Direction:** Clamp to valid ranges or return a friendly error when invalid.
 
-### 11) Streaming request process may leak if consumer halts early
-- **Problem:** `Stream.resource` cleanup is `:ok`, so the spawned request process may keep running after the stream consumer stops.
-- **Impact:** Wasted work; possible resource leaks.
-- **Where:** `lib/clementine/llm/anthropic.ex:115-119`
-- **Notes / Direction:** Implement cleanup to terminate the spawned process when the stream is halted.
+### 11) ~~Streaming request process may leak if consumer halts early~~ ✅ Resolved
+- **Resolution:** Fixed in PR #8 (fix/streaming-retry-policy). The streaming implementation now properly terminates spawned processes when the stream consumer halts.
 
 ## Opportunities / Major Unlocks (Lower Priority)
 
