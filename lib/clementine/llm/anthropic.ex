@@ -30,7 +30,6 @@ defmodule Clementine.LLM.Anthropic do
   alias Clementine.LLM.StreamParser
   alias Clementine.Tool
 
-  @base_url "https://api.anthropic.com/v1/messages"
   @anthropic_version "2023-06-01"
   @default_max_tokens 8192
 
@@ -51,23 +50,19 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp do_call_with_retry(body, headers, max_attempts, attempt) do
-    case Req.post(@base_url, json: body, headers: headers, receive_timeout: 120_000) do
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, parse_response(body)}
+    case Req.post(base_url(), json: body, headers: headers, receive_timeout: 120_000) do
+      {:ok, %{status: 200, body: resp_body}} ->
+        {:ok, parse_response(resp_body)}
 
-      {:ok, %{status: status, body: body}} when status in [429, 529] and attempt < max_attempts ->
-        # Rate limited or overloaded - retry with backoff
-        delay = calculate_backoff(attempt)
-        Process.sleep(delay)
+      {:ok, %{status: status}} when status in [429, 529] and attempt < max_attempts ->
+        Process.sleep(calculate_backoff(attempt))
         do_call_with_retry(body, headers, max_attempts, attempt + 1)
 
-      {:ok, %{status: status, body: body}} ->
-        {:error, {:api_error, status, body}}
+      {:ok, %{status: status, body: resp_body}} ->
+        {:error, {:api_error, status, resp_body}}
 
       {:error, _reason} when attempt < max_attempts ->
-        # Network error - retry with backoff
-        delay = calculate_backoff(attempt)
-        Process.sleep(delay)
+        Process.sleep(calculate_backoff(attempt))
         do_call_with_retry(body, headers, max_attempts, attempt + 1)
 
       {:error, reason} ->
@@ -115,17 +110,43 @@ defmodule Clementine.LLM.Anthropic do
     Stream.resource(
       fn -> {ref, pid, StreamParser.new()} end,
       &receive_chunk/1,
-      fn _ -> :ok end
+      fn
+        {_ref, pid, _parser} ->
+          Process.unlink(pid)
+          Process.exit(pid, :shutdown)
+
+        {:halting, pid} ->
+          Process.unlink(pid)
+          Process.exit(pid, :shutdown)
+
+        _ ->
+          :ok
+      end
     )
   end
 
   defp do_stream_request(body, headers, parent, ref) do
+    retry_opts = Application.get_env(:clementine, :retry, [])
+    max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
+    do_stream_request(body, headers, parent, ref, max_attempts, 1)
+  end
+
+  defp do_stream_request(body, headers, parent, ref, max_attempts, attempt) do
+    # Track whether the into callback sent any data to the parent.
+    # For 429/529 the callback fires with the error body (not real SSE),
+    # which the parser ignores, so those retries are always safe.
+    # For network errors ({:error, _}), data_sent distinguishes a
+    # pre-connection failure (safe to retry) from a mid-stream disconnect
+    # (data already emitted to the consumer — must not retry).
+    data_sent = :atomics.new(1, signed: false)
+
     callback = fn {:data, data}, acc ->
+      :atomics.put(data_sent, 1, 1)
       send(parent, {ref, {:data, data}})
       {:cont, acc}
     end
 
-    result = Req.post(@base_url,
+    result = Req.post(base_url(),
       json: body,
       headers: headers,
       into: callback,
@@ -136,8 +157,26 @@ defmodule Clementine.LLM.Anthropic do
       {:ok, %{status: 200}} ->
         send(parent, {ref, :done})
 
-      {:ok, %{status: status, body: body}} ->
-        send(parent, {ref, {:error, {:api_error, status, body}}})
+      {:ok, %{status: status}} when status in [429, 529] and attempt < max_attempts ->
+        # HTTP-level rate limit / overload. Any data that flowed through the
+        # callback was the JSON error body, not SSE events — safe to retry.
+        send(parent, {ref, :retry_reset})
+        Process.sleep(calculate_backoff(attempt))
+        do_stream_request(body, headers, parent, ref, max_attempts, attempt + 1)
+
+      {:ok, %{status: status, body: resp_body}} ->
+        send(parent, {ref, {:error, {:api_error, status, resp_body}}})
+
+      {:error, reason} when attempt < max_attempts ->
+        if :atomics.get(data_sent, 1) == 0 do
+          # No data was streamed — connection failed before any response.
+          send(parent, {ref, :retry_reset})
+          Process.sleep(calculate_backoff(attempt))
+          do_stream_request(body, headers, parent, ref, max_attempts, attempt + 1)
+        else
+          # Data already streamed to consumer — retrying would duplicate events.
+          send(parent, {ref, {:error, {:request_failed, reason}}})
+        end
 
       {:error, reason} ->
         send(parent, {ref, {:error, {:request_failed, reason}}})
@@ -150,15 +189,28 @@ defmodule Clementine.LLM.Anthropic do
         {events, new_parser} = StreamParser.parse(parser, data)
         {events, {ref, pid, new_parser}}
 
+      {^ref, :retry_reset} ->
+        {[], {ref, pid, StreamParser.new()}}
+
       {^ref, :done} ->
         {:halt, :done}
 
       {^ref, {:error, reason}} ->
-        {[{:error, reason}], :halt}
+        {[{:error, reason}], {:halting, pid}}
     after
       300_000 ->
-        {[{:error, :timeout}], :halt}
+        {[{:error, :timeout}], {:halting, pid}}
     end
+  end
+
+  # After emitting an error event, halt the stream on the next call.
+  # Keeps pid accessible so the cleanup function can terminate it.
+  defp receive_chunk({:halting, pid}) do
+    {:halt, {:halting, pid}}
+  end
+
+  defp base_url do
+    Application.get_env(:clementine, :anthropic_base_url, "https://api.anthropic.com/v1/messages")
   end
 
   # Build the request body

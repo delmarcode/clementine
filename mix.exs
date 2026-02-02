@@ -30,6 +30,7 @@ defmodule Clementine.MixProject do
       {:jason, "~> 1.4"},
       {:nimble_options, "~> 1.1"},
       {:mox, "~> 1.1", only: :test},
+      {:bypass, "~> 2.1", only: :test},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
     ]
   end
