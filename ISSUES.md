@@ -72,8 +72,16 @@ Prioritized list of correctness, reliability, and maintainability issues observe
 - **Where:** `lib/clementine/llm/message.ex`, `lib/clementine/llm/llm.ex`, `lib/clementine/loop.ex`
 - **Notes / Direction:** Use `Clementine.LLM.Message` as the internal canonical representation and convert at provider boundaries.
 
-### 13) Schema‑driven input validation for tools
-- **Problem:** Tool argument validation only checks required fields; types and enums are not enforced.
-- **Impact:** Tool implementations need defensive checks; more runtime errors.
-- **Where:** `lib/clementine/tool.ex`, `lib/clementine/tool_runner.ex`
-- **Notes / Direction:** Use `nimble_options` (already in deps) to validate and cast tool arguments from JSON input.
+### 13) ~~Schema‑driven input validation for tools~~ ✅ Resolved
+- **Resolution:** `validate_args/2` now validates types, enums, array items, and nested object properties — not just required-field presence. Custom recursive validator produces LLM-friendly error messages (e.g. `"expected count to be an integer, got: string"`, `"tags[1]"` for array items, `"config.port"` for nested objects). No type coercion; JSON values arrive correctly typed from `Jason.decode!`.
+
+### 14) `:object` parameters without `:properties` silently lose data
+- **Problem:** An `:object` parameter with no `:properties` schema passes validation (correctly — we can't validate what we don't know about), but `cast_keys/2` in `ToolRunner` drops all nested keys because none are in the (empty) allowed-keys set. The tool's `run/2` receives `%{config: %{}}` instead of the actual data. This makes it impossible to build tools that accept arbitrary/dynamic JSON payloads (form submissions, user-defined schemas, forwarded webhook bodies, etc.) without resorting to encoding the payload as a JSON string inside a `:string` parameter.
+- **Impact:** Silent data loss. A tool author who writes `config: [type: :object, required: true]` expecting a passthrough gets an empty map with no error. The only workaround (JSON-as-string) wastes LLM tokens on double-encoding and invites malformed output.
+- **Where:** `lib/clementine/tool_runner.ex:197-201` (`cast_value` for `:object`), `lib/clementine/tool_runner.ex:170-193` (`cast_keys`)
+- **Constraints:** Any fix must not reintroduce the atom-creation DoS vector from issue #1. Arbitrary keys from LLM input must stay as strings.
+- **Notes / Direction:** Add a passthrough mode for `:object` parameters. When an `:object` has no `:properties` (or an explicit opt-in flag like `passthrough: true`), `cast_value` should preserve the nested map with string keys intact instead of running it through `cast_keys`. The tool receives `%{config: %{"any_key" => "value"}}` — string keys, no atom creation, data preserved. Validation already handles this correctly (no `:properties` = no nested validation). Changes needed:
+  1. `cast_value/2` in `tool_runner.ex`: when type is `:object` and properties is `nil` or `[]`, return the map as-is instead of calling `cast_keys(value, [])`.
+  2. `param_to_json_schema/1` in `tool.ex`: when `:object` has no `:properties`, emit `{"type": "object"}` without a `"properties"` key (currently emits empty `"properties": {}` and `"required": []` which over-constrains the JSON Schema — some LLM providers interpret empty properties as "no additional properties allowed").
+  3. Consider whether `validate_object_properties` should warn or error when an `:object` with `:properties` receives string keys (indicating `cast_keys` didn't recurse, likely because the parent wasn't typed as `:object`). This would surface the "forgot `type: :object`" footgun from the review findings.
+  4. Update `docs/TOOL_AUTHORING.md` with a passthrough example and a note that passthrough objects arrive with string keys.

@@ -197,16 +197,20 @@ defmodule Clementine.ToolRunner do
   defp cast_value(value, opts) do
     case Keyword.get(opts, :type) do
       :object ->
-        nested = Keyword.get(opts, :properties, [])
-        cast_keys(value, nested)
+        case Keyword.get(opts, :properties) do
+          props when is_list(props) -> cast_keys(value, props)
+          _ -> value
+        end
 
       :array ->
-        items = Keyword.get(opts, :items, [])
+        case Keyword.get(opts, :items) do
+          items when is_list(items) and items != [] ->
+            if is_list(value),
+              do: Enum.map(value, fn item -> cast_value(item, items) end),
+              else: value
 
-        if is_list(value) do
-          Enum.map(value, fn item -> cast_value(item, items) end)
-        else
-          value
+          _ ->
+            value
         end
 
       _ ->
