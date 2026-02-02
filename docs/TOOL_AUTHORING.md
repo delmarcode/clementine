@@ -133,6 +133,29 @@ parameters: [
 ]
 ```
 
+**Passthrough objects (arbitrary JSON):**
+
+Omit `:properties` to accept arbitrary JSON objects. The nested map arrives in `run/2` with **string keys** (not atoms), preserving the original shape from the LLM without creating unbounded atoms.
+
+```elixir
+parameters: [
+  payload: [type: :object, required: true, description: "Arbitrary JSON payload"]
+]
+```
+
+In your `run/2`, pattern-match on string keys:
+
+```elixir
+@impl true
+def run(%{payload: payload}, _context) do
+  # payload is a map with string keys, e.g. %{"user" => "alice", "action" => "login"}
+  user = Map.get(payload, "user", "unknown")
+  {:ok, "Received payload from #{user}"}
+end
+```
+
+When `:properties` is declared, keys are atomized and validated as usual. Only omit `:properties` when the tool genuinely needs to accept dynamic/unknown keys.
+
 **No parameters:**
 
 ```elixir
