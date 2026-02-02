@@ -30,6 +30,8 @@ defmodule Clementine.Loop do
 
   """
 
+  alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
+  alias Clementine.LLM.Message.ToolResultMessage
   alias Clementine.{LLM, ToolRunner, Verifier}
 
   @default_max_iterations 10
@@ -58,12 +60,12 @@ defmodule Clementine.Loop do
             context: map(),
             max_iterations: pos_integer(),
             on_event: (term() -> any()) | nil,
-            messages: [map()],
+            messages: [Clementine.LLM.Message.message()],
             iteration: non_neg_integer()
           }
   end
 
-  @type result :: {:ok, String.t(), [map()]} | {:error, term()}
+  @type result :: {:ok, String.t(), [Clementine.LLM.Message.message()]} | {:error, term()}
 
   @doc """
   Runs the agentic loop with the given configuration.
@@ -101,8 +103,7 @@ defmodule Clementine.Loop do
     }
 
     # Add user message
-    user_message = %{role: :user, content: prompt}
-    state = %{state | messages: state.messages ++ [user_message]}
+    state = %{state | messages: state.messages ++ [UserMessage.new(prompt)]}
 
     emit_event(state, {:loop_start, prompt})
 
@@ -148,8 +149,7 @@ defmodule Clementine.Loop do
   # Handle LLM response
   defp handle_response(%State{} = state, response) do
     # Add assistant message to history
-    assistant_message = %{role: :assistant, content: response.content}
-    state = %{state | messages: state.messages ++ [assistant_message]}
+    state = %{state | messages: state.messages ++ [AssistantMessage.new(response.content)]}
 
     if LLM.tool_use?(response) do
       handle_tool_use(state, response)
@@ -177,8 +177,7 @@ defmodule Clementine.Loop do
     result_content = ToolRunner.format_results(results)
 
     # Add tool results as user message
-    tool_result_message = %{role: :user, content: result_content}
-    state = %{state | messages: state.messages ++ [tool_result_message]}
+    state = %{state | messages: state.messages ++ [%ToolResultMessage{content: result_content}]}
 
     # Continue the loop
     iterate(state)
@@ -212,7 +211,7 @@ defmodule Clementine.Loop do
     emit_event(state, {:verification_failed, reason})
 
     # Add retry message to conversation
-    retry_message = %{role: :user, content: "Verification failed: #{reason}\n\nPlease fix the issues and try again."}
+    retry_message = UserMessage.new("Verification failed: #{reason}\n\nPlease fix the issues and try again.")
     state = %{state | messages: state.messages ++ [retry_message]}
 
     # Continue the loop
@@ -266,8 +265,7 @@ defmodule Clementine.Loop do
     }
 
     # Add user message
-    user_message = %{role: :user, content: prompt}
-    state = %{state | messages: state.messages ++ [user_message]}
+    state = %{state | messages: state.messages ++ [UserMessage.new(prompt)]}
 
     emit_event(state, {:loop_start, prompt})
 
@@ -339,8 +337,7 @@ defmodule Clementine.Loop do
   # Handle response in streaming mode
   defp handle_response_streaming(%State{} = state, response, stream_callback) do
     # Add assistant message to history
-    assistant_message = %{role: :assistant, content: response.content}
-    state = %{state | messages: state.messages ++ [assistant_message]}
+    state = %{state | messages: state.messages ++ [AssistantMessage.new(response.content)]}
 
     if LLM.tool_use?(response) do
       handle_tool_use_streaming(state, response, stream_callback)
@@ -374,8 +371,7 @@ defmodule Clementine.Loop do
     result_content = ToolRunner.format_results(results)
 
     # Add tool results as user message
-    tool_result_message = %{role: :user, content: result_content}
-    state = %{state | messages: state.messages ++ [tool_result_message]}
+    state = %{state | messages: state.messages ++ [%ToolResultMessage{content: result_content}]}
 
     # Continue the loop
     iterate_streaming(state, stream_callback)

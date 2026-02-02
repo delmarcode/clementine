@@ -1,6 +1,8 @@
 defmodule Clementine.LLM.StreamParserTest do
   use ExUnit.Case, async: true
 
+  alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
   alias Clementine.LLM.StreamParser.Accumulator
 
@@ -347,8 +349,8 @@ defmodule Clementine.LLM.StreamParserTest do
 
       response = Accumulator.to_response(acc)
 
-      assert response.stop_reason == "end_turn"
-      assert [%{type: :text, text: "Hello World"}] = response.content
+      assert %Response{stop_reason: "end_turn"} = response
+      assert [%Content{type: :text, text: "Hello World"}] = response.content
     end
 
     test "to_response builds complete response with tool use" do
@@ -361,8 +363,8 @@ defmodule Clementine.LLM.StreamParserTest do
 
       response = Accumulator.to_response(acc)
 
-      assert response.stop_reason == "tool_use"
-      assert [%{type: :tool_use, id: "toolu_123", name: "read_file", input: %{"path" => "test.txt"}}] =
+      assert %Response{stop_reason: "tool_use"} = response
+      assert [%Content{type: :tool_use, id: "toolu_123", name: "read_file", input: %{"path" => "test.txt"}}] =
                response.content
     end
 
@@ -377,9 +379,10 @@ defmodule Clementine.LLM.StreamParserTest do
 
       response = Accumulator.to_response(acc)
 
+      assert %Response{} = response
       assert length(response.content) == 2
-      assert Enum.at(response.content, 0).type == :text
-      assert Enum.at(response.content, 1).type == :tool_use
+      assert %Content{type: :text} = Enum.at(response.content, 0)
+      assert %Content{type: :tool_use} = Enum.at(response.content, 1)
     end
 
     test "captures error event" do

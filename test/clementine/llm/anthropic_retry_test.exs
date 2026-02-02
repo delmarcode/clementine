@@ -2,6 +2,9 @@ defmodule Clementine.LLM.AnthropicRetryTest do
   use ExUnit.Case, async: false
 
   alias Clementine.LLM.Anthropic
+  alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.Message.UserMessage
+  alias Clementine.LLM.Response
 
   setup do
     bypass = Bypass.open()
@@ -41,7 +44,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         end
       end)
 
-      events = Anthropic.stream(:claude_sonnet, "system", [%{role: :user, content: "Hi"}], []) |> Enum.to_list()
+      events = Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello from retry!"}, &1))
       assert Enum.any?(events, &match?({:message_stop}, &1))
@@ -65,7 +68,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         end
       end)
 
-      events = Anthropic.stream(:claude_sonnet, "system", [%{role: :user, content: "Hi"}], []) |> Enum.to_list()
+      events = Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello after overload!"}, &1))
       assert Agent.get(counter, & &1) == 2
@@ -81,7 +84,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         Plug.Conn.resp(conn, 429, ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}))
       end)
 
-      events = Anthropic.stream(:claude_sonnet, "system", [%{role: :user, content: "Hi"}], []) |> Enum.to_list()
+      events = Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert Enum.any?(events, fn
         {:error, {:api_error, 429, _}} -> true
@@ -113,7 +116,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         Bypass.up(bypass)
       end)
 
-      events = Anthropic.stream(:claude_sonnet, "system", [%{role: :user, content: "Hi"}], []) |> Enum.to_list()
+      events = Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello after network error!"}, &1))
     end
@@ -134,8 +137,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         Bypass.up(bypass)
       end)
 
-      assert {:ok, response} = Anthropic.call(:claude_sonnet, "system", [%{role: :user, content: "Hi"}], [])
-      assert [%{type: :text, text: "Hello sync after error!"}] = response.content
+      assert {:ok, %Response{} = response} = Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+      assert [%Content{type: :text, text: "Hello sync after error!"}] = response.content
     end
   end
 
@@ -155,8 +158,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         end
       end)
 
-      assert {:ok, response} = Anthropic.call(:claude_sonnet, "system", [%{role: :user, content: "Hi"}], [])
-      assert [%{type: :text, text: "Hello sync!"}] = response.content
+      assert {:ok, %Response{} = response} = Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+      assert [%Content{type: :text, text: "Hello sync!"}] = response.content
       assert Agent.get(counter, & &1) == 2
 
       Agent.stop(counter)
@@ -170,7 +173,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         Plug.Conn.resp(conn, 429, ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}))
       end)
 
-      assert {:error, {:api_error, 429, _}} = Anthropic.call(:claude_sonnet, "system", [%{role: :user, content: "Hi"}], [])
+      assert {:error, {:api_error, 429, _}} = Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
       assert Agent.get(counter, & &1) == 3
 
       Agent.stop(counter)

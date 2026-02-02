@@ -108,6 +108,7 @@ defmodule Clementine.LLM do
   @doc """
   Checks if a response indicates the model wants to use tools.
   """
+  @spec tool_use?(Clementine.LLM.Response.t()) :: boolean()
   def tool_use?(response) do
     response.stop_reason == "tool_use" ||
       Enum.any?(response.content, &(&1.type == :tool_use))
@@ -116,6 +117,7 @@ defmodule Clementine.LLM do
   @doc """
   Extracts tool use requests from a response.
   """
+  @spec get_tool_uses(Clementine.LLM.Response.t()) :: [Clementine.LLM.Message.Content.tool_use()]
   def get_tool_uses(response) do
     response.content
     |> Enum.filter(&(&1.type == :tool_use))
@@ -124,6 +126,7 @@ defmodule Clementine.LLM do
   @doc """
   Extracts text content from a response.
   """
+  @spec get_text(Clementine.LLM.Response.t()) :: String.t()
   def get_text(response) do
     response.content
     |> Enum.filter(&(&1.type == :text))
