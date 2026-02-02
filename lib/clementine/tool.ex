@@ -149,19 +149,74 @@ defmodule Clementine.Tool do
   @valid_types [:string, :integer, :number, :boolean, :array, :object]
 
   defp validate_param_opts!(param_name, opts) do
-    case Keyword.get(opts, :type) do
-      nil ->
-        raise ArgumentError, "Parameter #{param_name} must have a :type"
+    type =
+      case Keyword.get(opts, :type) do
+        nil ->
+          raise ArgumentError, "Parameter #{param_name} must have a :type"
 
-      type when type in @valid_types ->
-        :ok
+        type when type in @valid_types ->
+          type
 
-      invalid ->
+        invalid ->
+          raise ArgumentError,
+                "Parameter #{param_name} has invalid type #{inspect(invalid)}. " <>
+                  "Valid types: #{inspect(@valid_types)}"
+      end
+
+    # Validate :items schema for array types
+    if Keyword.has_key?(opts, :items) do
+      items = Keyword.get(opts, :items)
+
+      if type != :array do
         raise ArgumentError,
-              "Parameter #{param_name} has invalid type #{inspect(invalid)}. " <>
-                "Valid types: #{inspect(@valid_types)}"
+              "Parameter #{param_name} has :items but type is #{inspect(type)}, not :array"
+      end
+
+      if items != nil and items != [] do
+        unless keyword_list?(items) do
+          raise ArgumentError,
+                "Parameter #{param_name} :items must be a keyword list, got: #{inspect(items)}"
+        end
+
+        validate_param_opts!(:"#{param_name}[]", items)
+      end
+    end
+
+    # Validate :properties schema for object types
+    if Keyword.has_key?(opts, :properties) do
+      props = Keyword.get(opts, :properties)
+
+      if type != :object do
+        raise ArgumentError,
+              "Parameter #{param_name} has :properties but type is #{inspect(type)}, not :object"
+      end
+
+      if props != nil and props != [] do
+        unless keyword_list?(props) do
+          raise ArgumentError,
+                "Parameter #{param_name} :properties must be a keyword list, got: #{inspect(props)}"
+        end
+
+        Enum.each(props, fn {prop_name, prop_opts} ->
+          unless is_atom(prop_name) do
+            raise ArgumentError,
+                  "Property name in #{param_name} must be an atom, got: #{inspect(prop_name)}"
+          end
+
+          validate_param_opts!(:"#{param_name}.#{prop_name}", prop_opts)
+        end)
+      end
     end
   end
+
+  defp keyword_list?(list) when is_list(list) do
+    Enum.all?(list, fn
+      {key, _value} when is_atom(key) -> true
+      _ -> false
+    end)
+  end
+
+  defp keyword_list?(_), do: false
 
   @doc """
   Converts parameter definitions to JSON Schema format.
@@ -194,22 +249,24 @@ defmodule Clementine.Tool do
       |> maybe_add("description", Keyword.get(opts, :description))
       |> maybe_add("enum", Keyword.get(opts, :enum))
 
-    schema =
-      case type do
-        :array ->
-          items = Keyword.get(opts, :items, [])
-          Map.put(schema, "items", param_to_json_schema(items))
+    case type do
+      :array ->
+        case Keyword.get(opts, :items) do
+          nil -> schema
+          [] -> schema
+          item_schema -> Map.put(schema, "items", param_to_json_schema(item_schema))
+        end
 
-        :object ->
-          properties = Keyword.get(opts, :properties, [])
-          nested = params_to_json_schema(properties)
-          Map.merge(schema, nested)
+      :object ->
+        case Keyword.get(opts, :properties) do
+          nil -> schema
+          [] -> schema
+          properties -> Map.merge(schema, params_to_json_schema(properties))
+        end
 
-        _ ->
-          schema
-      end
-
-    schema
+      _ ->
+        schema
+    end
   end
 
   defp type_to_json_type(:string), do: "string"
@@ -226,21 +283,141 @@ defmodule Clementine.Tool do
   Validates arguments against parameter definitions.
   """
   def validate_args(parameters, args) do
-    required_params =
+    errors =
       parameters
-      |> Enum.filter(fn {_name, opts} -> Keyword.get(opts, :required, false) end)
-      |> Enum.map(fn {name, _opts} -> name end)
+      |> Enum.flat_map(fn {name, opts} -> validate_param(to_string(name), name, opts, args) end)
 
-    missing =
-      required_params
-      |> Enum.reject(fn name -> Map.has_key?(args, name) end)
-
-    if Enum.empty?(missing) do
-      :ok
-    else
-      {:error, "Missing required parameters: #{inspect(missing)}"}
+    case errors do
+      [] -> :ok
+      errors -> {:error, Enum.join(errors, "; ")}
     end
   end
+
+  defp validate_param(path, key, opts, args) do
+    required? = Keyword.get(opts, :required, false)
+    has_key? = Map.has_key?(args, key)
+    value = Map.get(args, key)
+
+    cond do
+      required? and (!has_key? or value == nil) ->
+        ["missing required parameter: #{path}"]
+
+      not has_key? ->
+        []
+
+      value == nil ->
+        []
+
+      true ->
+        check_value(path, opts, value)
+    end
+  end
+
+  defp check_value(path, opts, value) do
+    case Keyword.fetch(opts, :type) do
+      {:ok, type} ->
+        type_errors = validate_value(path, type, opts, value)
+        if type_errors == [], do: validate_enum(path, opts, value), else: type_errors
+
+      :error ->
+        ["schema error: #{path} is missing :type"]
+    end
+  end
+
+  defp validate_value(path, :string, _opts, value) do
+    if is_binary(value), do: [], else: ["expected #{path} to be a string, got: #{type_name(value)}"]
+  end
+
+  defp validate_value(path, :integer, _opts, value) do
+    if is_integer(value), do: [], else: ["expected #{path} to be an integer, got: #{type_name(value)}"]
+  end
+
+  defp validate_value(path, :number, _opts, value) do
+    if is_number(value), do: [], else: ["expected #{path} to be a number, got: #{type_name(value)}"]
+  end
+
+  defp validate_value(path, :boolean, _opts, value) do
+    if is_boolean(value), do: [], else: ["expected #{path} to be a boolean, got: #{type_name(value)}"]
+  end
+
+  defp validate_value(path, :array, opts, value) do
+    if is_list(value),
+      do: validate_array_items(path, opts, value),
+      else: ["expected #{path} to be an array, got: #{type_name(value)}"]
+  end
+
+  defp validate_value(path, :object, opts, value) do
+    if is_map(value),
+      do: validate_object_properties(path, opts, value),
+      else: ["expected #{path} to be an object, got: #{type_name(value)}"]
+  end
+
+  defp validate_value(path, type, _opts, _value) do
+    ["schema error: #{path} has invalid type #{inspect(type)}"]
+  end
+
+  defp validate_enum(path, opts, value) do
+    case Keyword.get(opts, :enum) do
+      nil -> []
+
+      allowed ->
+        if value in allowed,
+          do: [],
+          else: ["#{path} must be one of #{inspect(allowed)}, got: #{inspect(value)}"]
+    end
+  end
+
+  defp validate_array_items(path, opts, items) do
+    case Keyword.get(opts, :items) do
+      nil -> []
+      [] -> []
+
+      item_schema ->
+        items
+        |> Enum.with_index()
+        |> Enum.flat_map(fn {item, index} ->
+          check_value("#{path}[#{index}]", item_schema, item)
+        end)
+    end
+  end
+
+  defp validate_object_properties(path, opts, map) do
+    case Keyword.get(opts, :properties) do
+      nil -> []
+      [] -> []
+
+      properties ->
+        Enum.flat_map(properties, fn {prop_name, prop_opts} ->
+          nested_path = "#{path}.#{prop_name}"
+          required? = Keyword.get(prop_opts, :required, false)
+          has_key? = Map.has_key?(map, prop_name)
+          value = Map.get(map, prop_name)
+
+          cond do
+            required? and (!has_key? or value == nil) ->
+              ["missing required parameter: #{nested_path}"]
+
+            not has_key? ->
+              []
+
+            value == nil ->
+              []
+
+            true ->
+              check_value(nested_path, prop_opts, value)
+          end
+        end)
+    end
+  end
+
+  defp type_name(value) when is_binary(value), do: "string"
+  defp type_name(value) when is_boolean(value), do: "boolean"
+  defp type_name(value) when is_integer(value), do: "integer"
+  defp type_name(value) when is_float(value), do: "float"
+  defp type_name(value) when is_list(value), do: "array"
+  defp type_name(value) when is_map(value), do: "object"
+  defp type_name(nil), do: "null"
+  defp type_name(value), do: inspect(value)
 
   @doc """
   Converts a tool module to Anthropic API format.

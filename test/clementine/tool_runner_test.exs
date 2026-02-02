@@ -74,6 +74,31 @@ defmodule Clementine.ToolRunnerTest do
     end
   end
 
+  describe "execute_single/3 input validation" do
+    test "wrong type argument returns validation error" do
+      call = %{name: "echo", input: %{"message" => 123}}
+
+      assert {:error, message} = ToolRunner.execute_single(@tools, call, %{})
+      assert message =~ "Invalid arguments"
+      assert message =~ "expected message to be a string, got: integer"
+    end
+
+    test "validation error formatted as is_error tool result" do
+      results = [{"call_1", {:error, "Invalid arguments: expected message to be a string, got: integer"}}]
+
+      formatted = ToolRunner.format_results(results)
+
+      assert [
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "call_1",
+                 content: "Error: Invalid arguments: expected message to be a string, got: integer",
+                 is_error: true
+               }
+             ] = formatted
+    end
+  end
+
   describe "execute/4" do
     test "executes multiple tools in parallel" do
       calls = [

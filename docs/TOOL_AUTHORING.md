@@ -141,6 +141,13 @@ parameters: []
 
 Parameters are validated at compile time. Invalid types or missing `:type` fields will raise `ArgumentError`.
 
+At runtime, `validate_args/2` checks types and enums in addition to required-field presence. This means tool `run/2` implementations can trust that arguments match their declared schema — no defensive type-checking needed. Validation covers:
+
+- **Types:** `:string` → `is_binary`, `:integer` → `is_integer`, `:number` → `is_number` (int or float), `:boolean` → `is_boolean`, `:array` → `is_list`, `:object` → `is_map`
+- **Enums:** value must be in the declared `:enum` list
+- **Array items:** each element validated against the `:items` schema
+- **Nested objects:** each property validated against its `:properties` schema (including required checks)
+
 ## Context
 
 The second argument to `run/2` is a context map. Available keys:
@@ -170,6 +177,21 @@ end
 ## Error Handling
 
 The `Clementine.Tool` macro wraps `run/2` in argument validation and crash protection automatically (via `execute/2`). If your tool raises, the caller gets `{:error, "Tool crashed: <message>"}`. You don't need to rescue inside `run/2` unless you want to return a more specific message.
+
+### Input Validation
+
+Arguments are validated against the parameter schema before `run/2` is called. If validation fails, the tool returns an error like:
+
+```
+Invalid arguments: expected count to be an integer, got: string
+Invalid arguments: format must be one of ["json", "csv"], got: "xml"
+Invalid arguments: missing required parameter: config.host
+Invalid arguments: expected tags[1] to be a string, got: integer
+```
+
+Multiple errors are joined with `"; "`. These errors are sent to the LLM as `is_error: true` tool results automatically — no special handling needed in your tool.
+
+### Error Messages
 
 Focus on returning clear error strings. The LLM reads these to decide what to do next:
 
