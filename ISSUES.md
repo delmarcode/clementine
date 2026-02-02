@@ -52,11 +52,8 @@ Prioritized list of correctness, reliability, and maintainability issues observe
 ### 8) ~~`ToolRunner` docs mention `:max_concurrency` but it is not implemented~~ ✅ Resolved
 - **Resolution:** `execute/4` now uses `Task.Supervisor.async_stream_nolink` which natively supports `:max_concurrency`. Defaults to `length(tool_calls)` (preserving unlimited-parallelism behaviour for existing callers). Tests use a peak-concurrency tracker to deterministically verify serialisation (`peak == 1` with `max_concurrency: 1`) and parallel execution (`peak > 1` with the default).
 
-### 9) Stream parser docs/types don’t match emitted events
-- **Problem:** Type/docs say `{:input_json_delta, id, json}`, but actual event is `{:input_json_delta, json}`. Also `current_tool_id` in parser state is unused.
-- **Impact:** Confuses downstream consumers and makes typed usage incorrect.
-- **Where:** `lib/clementine/llm/stream_parser.ex:19-46, 191-196`
-- **Notes / Direction:** Either emit the tool ID (track it) or update docs/types and remove unused state.
+### 9) ~~Stream parser docs/types don't match emitted events~~ ✅ Resolved
+- **Resolution:** Wired up `current_tool_id` in parser `State` so `parse/2` enriches raw events into self-describing `{:input_json_delta, id, json}` 3-tuples via `enrich_events/2`. Made `parse_event/1` private (`defp`) since its raw 2-tuple output is an internal detail that shouldn't leak to consumers. Updated `@type event`, `@moduledoc`, `Accumulator`, `Loop`, and all docs (`anthropic.ex`, `llm.ex`, `README.md`, design doc) to the 3-tuple contract. Added focused enrichment tests covering tool ID tracking, reset after `content_block_stop`, multiple sequential tool blocks, and cross-chunk-boundary enrichment.
 
 ### 10) ReadFile line slicing lacks range validation
 - **Problem:** Negative or inverted ranges can produce surprising outputs (e.g., start > end, negative indices).
