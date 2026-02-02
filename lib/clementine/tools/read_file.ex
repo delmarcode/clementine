@@ -18,12 +18,14 @@ defmodule Clementine.Tools.ReadFile do
       start_line: [
         type: :integer,
         required: false,
-        description: "Start reading from this line (1-indexed). If omitted, starts from the beginning."
+        description:
+          "Start reading from this line (1-indexed, must be >= 1). If omitted, starts from the beginning. Returns an error if beyond the end of the file."
       ],
       end_line: [
         type: :integer,
         required: false,
-        description: "Stop reading at this line (inclusive). If omitted, reads to the end."
+        description:
+          "Stop reading at this line (inclusive, must be >= 1 and >= start_line). If omitted or beyond the end of the file, reads to the last line."
       ]
     ]
 
@@ -31,9 +33,15 @@ defmodule Clementine.Tools.ReadFile do
   def run(args, context) do
     path = resolve_path(args.path, context)
 
+    with {:ok, content} <- read_file(path),
+         {:ok, result} <- maybe_slice_lines(content, args[:start_line], args[:end_line]) do
+      {:ok, result}
+    end
+  end
+
+  defp read_file(path) do
     case File.read(path) do
       {:ok, content} ->
-        content = maybe_slice_lines(content, args[:start_line], args[:end_line])
         {:ok, content}
 
       {:error, :enoent} ->
@@ -59,17 +67,66 @@ defmodule Clementine.Tools.ReadFile do
     end
   end
 
-  defp maybe_slice_lines(content, nil, nil), do: content
+  defp maybe_slice_lines(content, nil, nil), do: {:ok, content}
 
   defp maybe_slice_lines(content, start_line, end_line) do
-    lines = String.split(content, "\n")
-    start_idx = (start_line || 1) - 1
-    end_idx = (end_line || length(lines)) - 1
+    lines = split_lines(content)
+    line_count = length(lines)
 
-    lines
-    |> Enum.slice(start_idx..end_idx)
-    |> Enum.with_index(start_idx + 1)
-    |> Enum.map(fn {line, num} -> "#{num}: #{line}" end)
-    |> Enum.join("\n")
+    with :ok <- validate_not_empty(line_count) do
+      start_line = start_line || 1
+      end_line = end_line || line_count
+
+      with :ok <- validate_positive("start_line", start_line),
+           :ok <- validate_positive("end_line", end_line),
+           :ok <- validate_in_range(start_line, line_count),
+           :ok <- validate_order(start_line, end_line) do
+        end_line = min(end_line, line_count)
+        start_idx = start_line - 1
+        end_idx = end_line - 1
+
+        result =
+          lines
+          |> Enum.slice(start_idx..end_idx)
+          |> Enum.with_index(start_line)
+          |> Enum.map(fn {line, num} -> "#{num}: #{line}" end)
+          |> Enum.join("\n")
+
+        {:ok, result}
+      end
+    end
+  end
+
+  defp validate_positive(name, value) when value < 1,
+    do: {:error, "#{name} must be >= 1, got #{value}"}
+
+  defp validate_positive(_name, _value), do: :ok
+
+  defp validate_order(start_line, end_line) when start_line > end_line,
+    do: {:error, "start_line (#{start_line}) must be <= end_line (#{end_line})"}
+
+  defp validate_order(_start_line, _end_line), do: :ok
+
+  defp validate_not_empty(0), do: {:error, "file is empty"}
+  defp validate_not_empty(_line_count), do: :ok
+
+  defp validate_in_range(start_line, line_count) when start_line > line_count,
+    do: {:error, "start_line (#{start_line}) is beyond end of file (#{line_count} lines)"}
+
+  defp validate_in_range(_start_line, _line_count), do: :ok
+
+  # Split content into lines, dropping only the single phantom empty element
+  # that String.split/2 produces when content ends with "\n".
+  # Preserves intentional trailing blank lines (e.g., "a\n\n" → ["a", ""]).
+  defp split_lines(""), do: []
+
+  defp split_lines(content) do
+    lines = String.split(content, "\n")
+
+    if String.ends_with?(content, "\n") do
+      List.delete_at(lines, -1)
+    else
+      lines
+    end
   end
 end
