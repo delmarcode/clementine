@@ -27,6 +27,9 @@ defmodule Clementine.LLM.Anthropic do
 
   @behaviour Clementine.LLM.ClientBehaviour
 
+  alias Clementine.LLM.Message
+  alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
   alias Clementine.Tool
 
@@ -268,33 +271,8 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp format_messages(messages) do
-    Enum.map(messages, &format_message/1)
+    Enum.map(messages, &Message.to_anthropic/1)
   end
-
-  defp format_message(%{role: role, content: content}) when is_binary(content) do
-    %{"role" => to_string(role), "content" => content}
-  end
-
-  defp format_message(%{role: role, content: content}) when is_list(content) do
-    %{"role" => to_string(role), "content" => Enum.map(content, &format_content_block/1)}
-  end
-
-  defp format_message(%{"role" => _, "content" => _} = msg), do: msg
-
-  defp format_content_block(%{type: :text, text: text}) do
-    %{"type" => "text", "text" => text}
-  end
-
-  defp format_content_block(%{type: :tool_use, id: id, name: name, input: input}) do
-    %{"type" => "tool_use", "id" => id, "name" => name, "input" => input}
-  end
-
-  defp format_content_block(%{type: :tool_result, tool_use_id: id, content: content} = block) do
-    result = %{"type" => "tool_result", "tool_use_id" => id, "content" => content}
-    if Map.get(block, :is_error), do: Map.put(result, "is_error", true), else: result
-  end
-
-  defp format_content_block(%{"type" => _} = block), do: block
 
   defp format_tools(tools) do
     Enum.map(tools, fn tool ->
@@ -309,7 +287,7 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do
-    %{
+    %Response{
       content: Enum.map(content, &parse_content_block/1),
       stop_reason: stop_reason,
       usage: Map.get(body, "usage", %{})
@@ -317,10 +295,10 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp parse_content_block(%{"type" => "text", "text" => text}) do
-    %{type: :text, text: text}
+    Content.text(text)
   end
 
   defp parse_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
-    %{type: :tool_use, id: id, name: name, input: input}
+    Content.tool_use(id, name, input)
   end
 end

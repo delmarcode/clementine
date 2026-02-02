@@ -98,7 +98,15 @@ defmodule Clementine.LLM.Message do
     end
 
     def new(content) when is_list(content) do
+      validate_content!(content)
       %__MODULE__{content: content}
+    end
+
+    defp validate_content!(blocks) do
+      Enum.each(blocks, fn
+        %Content{} -> :ok
+        other -> raise ArgumentError, "expected %Content{} struct in message content, got: #{inspect(other)}"
+      end)
     end
 
     @doc "Converts to Anthropic API format"
@@ -123,7 +131,15 @@ defmodule Clementine.LLM.Message do
 
     @doc "Creates an assistant message from content blocks"
     def new(content) when is_list(content) do
+      validate_content!(content)
       %__MODULE__{content: content}
+    end
+
+    defp validate_content!(blocks) do
+      Enum.each(blocks, fn
+        %Content{} -> :ok
+        other -> raise ArgumentError, "expected %Content{} struct in message content, got: #{inspect(other)}"
+      end)
     end
 
     @doc "Creates an assistant message with just text"
@@ -170,12 +186,26 @@ defmodule Clementine.LLM.Message do
 
     defstruct role: :user, content: []
 
-    @doc "Creates a tool result message from a list of {tool_use_id, result} tuples"
+    @doc """
+    Creates a tool result message from a list of `{tool_use_id, result}` tuples.
+
+    Supports all result forms returned by `Clementine.ToolRunner.execute/4`:
+
+      * `{id, {:ok, content}}` — successful result
+      * `{id, {:ok, content, opts}}` — successful result with options (e.g. `is_error: true`)
+      * `{id, {:error, reason}}` — error result
+    """
     def new(results) when is_list(results) do
       content =
         Enum.map(results, fn
-          {id, {:ok, result}} -> Content.tool_result(id, result, false)
-          {id, {:error, error}} -> Content.tool_result(id, "Error: #{error}", true)
+          {id, {:ok, content, opts}} when is_list(opts) ->
+            Content.tool_result(id, content, Keyword.get(opts, :is_error, false))
+
+          {id, {:ok, result}} ->
+            Content.tool_result(id, result, false)
+
+          {id, {:error, error}} ->
+            Content.tool_result(id, "Error: #{error}", true)
         end)
 
       %__MODULE__{content: content}
@@ -198,13 +228,4 @@ defmodule Clementine.LLM.Message do
   def to_anthropic(%UserMessage{} = msg), do: UserMessage.to_anthropic(msg)
   def to_anthropic(%AssistantMessage{} = msg), do: AssistantMessage.to_anthropic(msg)
   def to_anthropic(%ToolResultMessage{} = msg), do: ToolResultMessage.to_anthropic(msg)
-
-  # Also handle raw maps (for backwards compatibility)
-  def to_anthropic(%{role: "user", content: content}) do
-    %{"role" => "user", "content" => content}
-  end
-
-  def to_anthropic(%{role: "assistant", content: content}) when is_list(content) do
-    %{"role" => "assistant", "content" => Enum.map(content, &Content.to_anthropic/1)}
-  end
 end

@@ -310,26 +310,29 @@ defmodule Clementine.LLM.StreamParser do
     def error?(%__MODULE__{error: nil}), do: false
     def error?(%__MODULE__{}), do: true
 
-    @doc "Returns the accumulated response as a map"
+    @doc "Returns the accumulated response as a Response struct"
     def to_response(%__MODULE__{} = acc) do
+      alias Clementine.LLM.Message.Content
+      alias Clementine.LLM.Response
+
       content =
         cond do
           acc.tool_uses != [] and acc.text != "" ->
-            [%{type: :text, text: acc.text}] ++
+            [Content.text(acc.text)] ++
               Enum.map(acc.tool_uses, fn t ->
-                %{type: :tool_use, id: t.id, name: t.name, input: t.input}
+                Content.tool_use(t.id, t.name, t.input)
               end)
 
           acc.tool_uses != [] ->
             Enum.map(acc.tool_uses, fn t ->
-              %{type: :tool_use, id: t.id, name: t.name, input: t.input}
+              Content.tool_use(t.id, t.name, t.input)
             end)
 
           true ->
-            [%{type: :text, text: acc.text}]
+            [Content.text(acc.text)]
         end
 
-      %{
+      %Response{
         content: content,
         stop_reason: acc.stop_reason,
         usage: acc.usage

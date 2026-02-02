@@ -136,10 +136,7 @@ defmodule Clementine.Agent do
           |> Map.put_new(:working_dir, Keyword.get(opts, :working_dir, File.cwd!()))
 
         history = Keyword.get(opts, :history, [])
-
-        unless is_list(history) do
-          raise ArgumentError, ":history must be a list of messages, got: #{inspect(history)}"
-        end
+        validate_history!(history)
 
         state = %Clementine.Agent.State{
           name: @agent_name,
@@ -317,6 +314,22 @@ defmodule Clementine.Agent do
       end
 
       # Private helpers
+
+      defp validate_history!(history) when is_list(history) do
+        Enum.each(history, fn
+          %Clementine.LLM.Message.UserMessage{} -> :ok
+          %Clementine.LLM.Message.AssistantMessage{} -> :ok
+          %Clementine.LLM.Message.ToolResultMessage{} -> :ok
+          other ->
+            raise ArgumentError,
+              ":history elements must be message structs " <>
+              "(UserMessage, AssistantMessage, or ToolResultMessage), got: #{inspect(other)}"
+        end)
+      end
+
+      defp validate_history!(other) do
+        raise ArgumentError, ":history must be a list of messages, got: #{inspect(other)}"
+      end
 
       defp schedule_task_cleanup do
         Process.send_after(self(), :task_cleanup, @task_cleanup_interval_ms)

@@ -20,6 +20,7 @@ defmodule Clementine.ToolRunner do
 
   """
 
+  alias Clementine.LLM.Message.Content
   alias Clementine.Tool
 
   @default_timeout :timer.minutes(2)
@@ -119,13 +120,13 @@ defmodule Clementine.ToolRunner do
     Enum.map(results, fn {id, result} ->
       case result do
         {:ok, content, opts} when is_list(opts) ->
-          %{type: :tool_result, tool_use_id: id, content: content, is_error: Keyword.get(opts, :is_error, false)}
+          Content.tool_result(id, content, Keyword.get(opts, :is_error, false))
 
         {:ok, content} ->
-          %{type: :tool_result, tool_use_id: id, content: content, is_error: false}
+          Content.tool_result(id, content, false)
 
         {:error, error} ->
-          %{type: :tool_result, tool_use_id: id, content: "Error: #{error}", is_error: true}
+          Content.tool_result(id, "Error: #{error}", true)
       end
     end)
   end

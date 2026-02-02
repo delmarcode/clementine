@@ -1,6 +1,7 @@
 defmodule Clementine.ToolRunnerTest do
   use ExUnit.Case, async: true
 
+  alias Clementine.LLM.Message.Content
   alias Clementine.ToolRunner
 
   # Import test tools
@@ -197,8 +198,8 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %{type: :tool_result, tool_use_id: "call_1", content: "success", is_error: false},
-               %{type: :tool_result, tool_use_id: "call_2", content: "also success", is_error: false}
+               %Content{type: :tool_result, tool_use_id: "call_1", content: "success", is_error: false},
+               %Content{type: :tool_result, tool_use_id: "call_2", content: "also success", is_error: false}
              ] = formatted
     end
 
@@ -210,7 +211,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %{type: :tool_result, tool_use_id: "call_1", content: "Error: something went wrong", is_error: true}
+               %Content{type: :tool_result, tool_use_id: "call_1", content: "Error: something went wrong", is_error: true}
              ] = formatted
     end
 
@@ -235,7 +236,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %{type: :tool_result, tool_use_id: "call_1", content: "Exit code: 1\n\nfailed", is_error: true}
+               %Content{type: :tool_result, tool_use_id: "call_1", content: "Exit code: 1\n\nfailed", is_error: true}
              ] = formatted
     end
 
@@ -247,7 +248,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %{type: :tool_result, tool_use_id: "call_1", content: "some output", is_error: false}
+               %Content{type: :tool_result, tool_use_id: "call_1", content: "some output", is_error: false}
              ] = formatted
     end
 
@@ -259,7 +260,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %{type: :tool_result, tool_use_id: "call_1", content: "some output", is_error: false}
+               %Content{type: :tool_result, tool_use_id: "call_1", content: "some output", is_error: false}
              ] = formatted
     end
   end

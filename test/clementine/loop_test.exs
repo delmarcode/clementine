@@ -3,6 +3,8 @@ defmodule Clementine.LoopTest do
   import Mox
 
   alias Clementine.Loop
+  alias Clementine.LLM.Message.{AssistantMessage, Content, UserMessage}
+  alias Clementine.LLM.Response
 
   # Set up Mox
   setup :verify_on_exit!
@@ -50,8 +52,8 @@ defmodule Clementine.LoopTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Hello world!"}],
+         %Response{
+           content: [Content.text("Hello world!")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -75,9 +77,9 @@ defmodule Clementine.LoopTest do
         # First call: model wants to use echo tool
         if length(messages) == 1 do
           {:ok,
-           %{
+           %Response{
              content: [
-               %{type: :tool_use, id: "toolu_1", name: "echo", input: %{"message" => "test"}}
+               Content.tool_use("toolu_1", "echo", %{"message" => "test"})
              ],
              stop_reason: "tool_use",
              usage: %{}
@@ -85,8 +87,8 @@ defmodule Clementine.LoopTest do
         else
           # Second call: model returns final text
           {:ok,
-           %{
-             content: [%{type: :text, text: "Done!"}],
+           %Response{
+             content: [Content.text("Done!")],
              stop_reason: "end_turn",
              usage: %{}
            }}
@@ -94,8 +96,8 @@ defmodule Clementine.LoopTest do
       end)
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Done!"}],
+         %Response{
+           content: [Content.text("Done!")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -118,8 +120,8 @@ defmodule Clementine.LoopTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Hello"}],
+         %Response{
+           content: [Content.text("Hello")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -140,9 +142,9 @@ defmodule Clementine.LoopTest do
       Clementine.LLM.MockClient
       |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
+         %Response{
            content: [
-             %{type: :tool_use, id: "toolu_1", name: "echo", input: %{"message" => "loop"}}
+             Content.tool_use("toolu_1", "echo", %{"message" => "loop"})
            ],
            stop_reason: "tool_use",
            usage: %{}
@@ -179,8 +181,8 @@ defmodule Clementine.LoopTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Hello"}],
+         %Response{
+           content: [Content.text("Hello")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -206,8 +208,8 @@ defmodule Clementine.LoopTest do
   describe "continue/3" do
     test "continues from existing message history" do
       initial_messages = [
-        %{role: :user, content: "Hello"},
-        %{role: :assistant, content: [%{type: :text, text: "Hi there!"}]}
+        UserMessage.new("Hello"),
+        AssistantMessage.new([Content.text("Hi there!")])
       ]
 
       Clementine.LLM.MockClient
@@ -216,8 +218,8 @@ defmodule Clementine.LoopTest do
         assert length(messages) == 3
 
         {:ok,
-         %{
-           content: [%{type: :text, text: "Continuing conversation"}],
+         %Response{
+           content: [Content.text("Continuing conversation")],
            stop_reason: "end_turn",
            usage: %{}
          }}

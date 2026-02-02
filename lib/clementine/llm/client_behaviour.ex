@@ -6,15 +6,11 @@ defmodule Clementine.LLM.ClientBehaviour do
   """
 
   @type model :: atom()
-  @type messages :: [map()]
+  @type messages :: [Clementine.LLM.Message.message()]
   @type tools :: [module()]
   @type opts :: keyword()
 
-  @type response :: %{
-          content: [map()],
-          stop_reason: String.t(),
-          usage: map()
-        }
+  @type response :: Clementine.LLM.Response.t()
 
   @callback call(model, String.t(), messages, tools, opts) ::
               {:ok, response()} | {:error, term()}

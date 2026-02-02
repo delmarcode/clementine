@@ -1,6 +1,8 @@
 defmodule Clementine.AgentTest do
   use ExUnit.Case, async: false  # Need sync for Mox global mode
   import Mox
+  alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.Response
 
   setup :set_mox_global
   setup :verify_on_exit!
@@ -49,8 +51,8 @@ defmodule Clementine.AgentTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Hello from agent!"}],
+         %Response{
+           content: [Content.text("Hello from agent!")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -67,8 +69,8 @@ defmodule Clementine.AgentTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Response 1"}],
+         %Response{
+           content: [Content.text("Response 1")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -102,8 +104,8 @@ defmodule Clementine.AgentTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Response"}],
+         %Response{
+           content: [Content.text("Response")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -128,8 +130,8 @@ defmodule Clementine.AgentTest do
         Process.sleep(10)
 
         {:ok,
-         %{
-           content: [%{type: :text, text: "Async response"}],
+         %Response{
+           content: [Content.text("Async response")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -173,13 +175,17 @@ defmodule Clementine.AgentTest do
     end
 
     test "status returns :running for in-progress task" do
+      # Use stub — we don't need to assert the mock was called; we only care
+      # that the task is still :running when we check status. expect/2 fails
+      # because GenServer.stop kills the agent before the 500ms sleep expires,
+      # and the task (async_nolink, under TaskSupervisor) may never reach the mock.
       Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(500)
 
         {:ok,
-         %{
-           content: [%{type: :text, text: "Delayed response"}],
+         %Response{
+           content: [Content.text("Delayed response")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -202,8 +208,8 @@ defmodule Clementine.AgentTest do
         Process.sleep(30)
 
         {:ok,
-         %{
-           content: [%{type: :text, text: "Awaited response"}],
+         %Response{
+           content: [Content.text("Awaited response")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -222,8 +228,8 @@ defmodule Clementine.AgentTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Fast response"}],
+         %Response{
+           content: [Content.text("Fast response")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -269,8 +275,8 @@ defmodule Clementine.AgentTest do
         Process.sleep(5_000)
 
         {:ok,
-         %{
-           content: [%{type: :text, text: "Too slow"}],
+         %Response{
+           content: [Content.text("Too slow")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -301,8 +307,8 @@ defmodule Clementine.AgentTest do
         Process.sleep(50)
 
         {:ok,
-         %{
-           content: [%{type: :text, text: "Infinite patience"}],
+         %Response{
+           content: [Content.text("Infinite patience")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -337,8 +343,8 @@ defmodule Clementine.AgentTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Forgotten result"}],
+         %Response{
+           content: [Content.text("Forgotten result")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -374,8 +380,8 @@ defmodule Clementine.AgentTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Recent result"}],
+         %Response{
+           content: [Content.text("Recent result")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -411,8 +417,8 @@ defmodule Clementine.AgentTest do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Source response"}],
+         %Response{
+           content: [Content.text("Source response")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -451,8 +457,8 @@ defmodule Clementine.AgentTest do
       Clementine.LLM.MockClient
       |> expect(:call, 2, fn _model, _system, messages, _tools, _opts ->
         {:ok,
-         %{
-           content: [%{type: :text, text: "Response #{length(messages)}"}],
+         %Response{
+           content: [Content.text("Response #{length(messages)}")],
            stop_reason: "end_turn",
            usage: %{}
          }}
@@ -510,6 +516,39 @@ defmodule Clementine.AgentTest do
       assert state.context.working_dir == "/tmp"
 
       GenServer.stop(agent)
+    end
+  end
+
+  describe "history validation" do
+    alias Clementine.LLM.Message.{AssistantMessage, Content, UserMessage}
+
+    test "accepts valid message structs in :history" do
+      history = [
+        UserMessage.new("hello"),
+        AssistantMessage.new([Content.text("hi")])
+      ]
+
+      {:ok, agent} = TestAgent.start_link(history: history)
+      assert Clementine.Agent.get_history(agent) == history
+      GenServer.stop(agent)
+    end
+
+    test "rejects plain maps in :history" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               TestAgent.start_link(history: [%{role: :user, content: "hi"}])
+
+      assert msg =~ "must be message structs"
+    end
+
+    test "rejects non-list :history" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               TestAgent.start_link(history: "not a list")
+
+      assert msg =~ "must be a list of messages"
     end
   end
 end
