@@ -29,6 +29,8 @@ defmodule Clementine.MixProject do
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
       {:nimble_options, "~> 1.1"},
+      {:telemetry, "~> 1.0"},
+      {:telemetry_metrics, "~> 1.0"},
       {:mox, "~> 1.1", only: :test},
       {:bypass, "~> 2.1", only: :test},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
