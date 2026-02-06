@@ -21,6 +21,10 @@ defmodule Clementine.Tools.ListDir do
       ]
     ]
 
+  @impl Clementine.Tool
+  def summarize(%{path: path}), do: "list_dir(#{path})"
+  def summarize(args), do: super(args)
+
   @impl true
   def run(args, context) do
     path = resolve_path(args.path, context)

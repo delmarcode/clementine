@@ -34,6 +34,14 @@ defmodule Clementine.Tools.Search do
 
   @default_max_results 100
 
+  @impl Clementine.Tool
+  def summarize(%{pattern: pattern} = args) do
+    path = Map.get(args, :path, ".")
+    "search(#{inspect(pattern)}, path=#{path})"
+  end
+
+  def summarize(args), do: super(args)
+
   @impl true
   def run(args, context) do
     search_path = resolve_path(Map.get(args, :path, "."), context)

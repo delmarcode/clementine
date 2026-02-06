@@ -21,6 +21,10 @@ defmodule Clementine.Tools.WriteFile do
       ]
     ]
 
+  @impl Clementine.Tool
+  def summarize(%{path: path}), do: "write_file(#{path})"
+  def summarize(args), do: super(args)
+
   @impl true
   def run(%{path: path, content: content}, context) do
     full_path = resolve_path(path, context)

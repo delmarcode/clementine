@@ -29,6 +29,21 @@ defmodule Clementine.Tools.ReadFile do
       ]
     ]
 
+  @impl Clementine.Tool
+  def summarize(%{path: path} = args) do
+    range =
+      case {args[:start_line], args[:end_line]} do
+        {nil, nil} -> ""
+        {s, nil} -> ":#{s}"
+        {nil, e} -> ":1-#{e}"
+        {s, e} -> ":#{s}-#{e}"
+      end
+
+    "read_file(#{path}#{range})"
+  end
+
+  def summarize(args), do: super(args)
+
   @impl true
   def run(args, context) do
     path = resolve_path(args.path, context)

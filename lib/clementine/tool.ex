@@ -61,6 +61,19 @@ defmodule Clementine.Tool do
   @callback run(args :: map(), context :: context()) :: result()
 
   @doc """
+  Returns a human-readable summary of a tool invocation for logging.
+
+  The default implementation formats as `tool_name(key=value, ...)` with
+  truncation. Override this in your tool module for a more concise summary.
+
+  ## Example
+
+      def summarize(%{path: path}), do: "read_file(\#{path})"
+
+  """
+  @callback summarize(args :: map()) :: String.t()
+
+  @doc """
   Invoked when using the tool module.
 
   ## Options
@@ -100,6 +113,16 @@ defmodule Clementine.Tool do
       Returns the tool's parameter definitions.
       """
       def __parameters__, do: @tool_parameters
+
+      @doc """
+      Returns a human-readable summary of a tool invocation for logging.
+      Override this for a more concise format.
+      """
+      def summarize(args) when is_map(args) do
+        Clementine.Tool.default_summarize(@tool_name, args)
+      end
+
+      defoverridable summarize: 1
 
       @doc """
       Executes the tool with argument validation.
@@ -418,6 +441,23 @@ defmodule Clementine.Tool do
   defp type_name(value) when is_map(value), do: "object"
   defp type_name(nil), do: "null"
   defp type_name(value), do: inspect(value)
+
+  @doc """
+  Default summarize implementation. Formats as `name(key=value, ...)`.
+  Values are truncated to 60 characters.
+  """
+  def default_summarize(name, args) when is_map(args) do
+    params =
+      args
+      |> Enum.reject(fn {k, _} -> k == :_clementine_iteration end)
+      |> Enum.map(fn {k, v} -> "#{k}=#{truncate(inspect(v), 60)}" end)
+      |> Enum.join(", ")
+
+    "#{name}(#{params})"
+  end
+
+  defp truncate(string, max) when byte_size(string) <= max, do: string
+  defp truncate(string, max), do: String.slice(string, 0, max - 1) <> "…"
 
   @doc """
   Converts a tool module to Anthropic API format.

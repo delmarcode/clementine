@@ -102,7 +102,7 @@ defmodule Clementine.Telemetry.Logger do
 
   def handle_event([:clementine, :tool, :start], _measurements, metadata, config) do
     Logger.log(config.level, fn ->
-      "[Clementine] Tool executing tool=#{metadata.tool}"
+      "[Clementine] Tool executing #{tool_summary(metadata)}"
     end)
   end
 
@@ -110,7 +110,7 @@ defmodule Clementine.Telemetry.Logger do
     duration_ms = System.convert_time_unit(measurements.duration, :native, :millisecond)
 
     Logger.log(config.level, fn ->
-      "[Clementine] Tool completed tool=#{metadata.tool} duration=#{duration_ms}ms status=#{metadata.result}"
+      "[Clementine] Tool completed #{tool_summary(metadata)} duration=#{duration_ms}ms status=#{metadata.result}"
     end)
   end
 
@@ -118,9 +118,17 @@ defmodule Clementine.Telemetry.Logger do
     duration_ms = System.convert_time_unit(measurements.duration, :native, :millisecond)
 
     Logger.log(:error, fn ->
-      "[Clementine] Tool crashed tool=#{metadata.tool} duration=#{duration_ms}ms kind=#{metadata.kind} reason=#{inspect(metadata.reason)}"
+      "[Clementine] Tool crashed #{tool_summary(metadata)} duration=#{duration_ms}ms kind=#{metadata.kind} reason=#{inspect(metadata.reason)}"
     end)
 
     _ = config
   end
+
+  defp tool_summary(%{tool_module: module, args: args}) when not is_nil(module) do
+    module.summarize(args)
+  rescue
+    _ -> Map.get(%{tool: "unknown"}, :tool, "unknown")
+  end
+
+  defp tool_summary(%{tool: name}), do: name
 end

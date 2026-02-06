@@ -24,6 +24,14 @@ defmodule Clementine.Tools.Bash do
 
   @default_timeout 60_000
 
+  @impl Clementine.Tool
+  def summarize(%{command: command}) do
+    cmd = command |> String.split("\n") |> hd() |> String.slice(0, 80)
+    "bash(#{cmd})"
+  end
+
+  def summarize(args), do: super(args)
+
   @impl true
   def run(%{command: command} = args, context) do
     working_dir = Map.get(context, :working_dir, File.cwd!())

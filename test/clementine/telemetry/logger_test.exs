@@ -86,7 +86,7 @@ defmodule Clementine.Telemetry.LoggerTest do
       assert log =~ "stop_reason=tool_use"
     end
 
-    test "tool stop logs tool name, duration, and status" do
+    test "tool stop logs tool summary with duration and status" do
       TelemetryLogger.install()
 
       log =
@@ -94,16 +94,34 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :tool, :stop],
             %{duration: System.convert_time_unit(12, :millisecond, :native)},
-            %{tool: "read_file", tool_call_id: "toolu_1", iteration: 1, result: :ok}
+            %{tool: "read_file", tool_call_id: "toolu_1", iteration: 1, result: :ok,
+              tool_module: Clementine.Tools.ReadFile, args: %{path: "lib/foo.ex"}}
           )
         end)
 
       assert log =~ "[Clementine] Tool completed"
-      assert log =~ "tool=read_file"
+      assert log =~ "read_file(lib/foo.ex)"
       assert log =~ "status=ok"
     end
 
-    test "tool exception logs tool name, kind, and reason" do
+    test "tool start logs tool summary from summarize callback" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :tool, :start],
+            %{system_time: System.system_time()},
+            %{tool: "bash", tool_call_id: "toolu_1", iteration: 1,
+              tool_module: Clementine.Tools.Bash, args: %{command: "mix test --only wip"}}
+          )
+        end)
+
+      assert log =~ "[Clementine] Tool executing"
+      assert log =~ "bash(mix test --only wip)"
+    end
+
+    test "tool exception logs tool summary with kind and reason" do
       TelemetryLogger.install()
 
       log =
@@ -111,14 +129,32 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :tool, :exception],
             %{duration: System.convert_time_unit(5, :millisecond, :native)},
-            %{tool: "bash", tool_call_id: "toolu_2", iteration: 1, kind: :error, reason: %RuntimeError{message: "boom"}}
+            %{tool: "bash", tool_call_id: "toolu_2", iteration: 1, kind: :error,
+              reason: %RuntimeError{message: "boom"},
+              tool_module: Clementine.Tools.Bash, args: %{command: "rm -rf /"}}
           )
         end)
 
       assert log =~ "[Clementine] Tool crashed"
-      assert log =~ "tool=bash"
+      assert log =~ "bash(rm -rf /)"
       assert log =~ "kind=error"
       assert log =~ "boom"
+    end
+
+    test "tool log falls back to tool name when tool_module is missing" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :tool, :start],
+            %{system_time: System.system_time()},
+            %{tool: "custom_tool", tool_call_id: "toolu_1", iteration: 1}
+          )
+        end)
+
+      assert log =~ "[Clementine] Tool executing"
+      assert log =~ "custom_tool"
     end
   end
 
