@@ -75,7 +75,11 @@ defmodule Clementine.Telemetry.LoggerTest do
         capture_log(fn ->
           :telemetry.execute(
             [:clementine, :llm, :stop],
-            %{duration: System.convert_time_unit(500, :millisecond, :native), input_tokens: 850, output_tokens: 120},
+            %{
+              duration: System.convert_time_unit(500, :millisecond, :native),
+              input_tokens: 850,
+              output_tokens: 120
+            },
             %{model: :claude_sonnet, iteration: 1, stop_reason: "tool_use", streaming: false}
           )
         end)
@@ -94,8 +98,14 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :tool, :stop],
             %{duration: System.convert_time_unit(12, :millisecond, :native)},
-            %{tool: "read_file", tool_call_id: "toolu_1", iteration: 1, result: :ok,
-              tool_module: Clementine.Tools.ReadFile, args: %{path: "lib/foo.ex"}}
+            %{
+              tool: "read_file",
+              tool_call_id: "toolu_1",
+              iteration: 1,
+              result: :ok,
+              tool_module: Clementine.Tools.ReadFile,
+              args: %{path: "lib/foo.ex"}
+            }
           )
         end)
 
@@ -112,8 +122,13 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :tool, :start],
             %{system_time: System.system_time()},
-            %{tool: "bash", tool_call_id: "toolu_1", iteration: 1,
-              tool_module: Clementine.Tools.Bash, args: %{command: "mix test --only wip"}}
+            %{
+              tool: "bash",
+              tool_call_id: "toolu_1",
+              iteration: 1,
+              tool_module: Clementine.Tools.Bash,
+              args: %{command: "mix test --only wip"}
+            }
           )
         end)
 
@@ -129,9 +144,15 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :tool, :exception],
             %{duration: System.convert_time_unit(5, :millisecond, :native)},
-            %{tool: "bash", tool_call_id: "toolu_2", iteration: 1, kind: :error,
+            %{
+              tool: "bash",
+              tool_call_id: "toolu_2",
+              iteration: 1,
+              kind: :error,
               reason: %RuntimeError{message: "boom"},
-              tool_module: Clementine.Tools.Bash, args: %{command: "rm -rf /"}}
+              tool_module: Clementine.Tools.Bash,
+              args: %{command: "rm -rf /"}
+            }
           )
         end)
 

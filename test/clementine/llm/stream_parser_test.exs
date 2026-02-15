@@ -15,10 +15,11 @@ defmodule Clementine.LLM.StreamParserTest do
 
   describe "parse/2 event parsing" do
     test "parses message_start event" do
-      events = parse_one("""
-      event: message_start
-      data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-20250514"}}
-      """)
+      events =
+        parse_one("""
+        event: message_start
+        data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-20250514"}}
+        """)
 
       assert [{:message_start, message}] = events
       assert message["id"] == "msg_123"
@@ -26,28 +27,32 @@ defmodule Clementine.LLM.StreamParserTest do
     end
 
     test "parses text content_block_start event" do
-      events = parse_one("""
-      event: content_block_start
-      data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
-      """)
+      events =
+        parse_one("""
+        event: content_block_start
+        data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+        """)
 
       assert [{:content_block_start, 0, :text}] = events
     end
 
     test "parses tool_use content_block_start event" do
-      events = parse_one("""
-      event: content_block_start
-      data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_123","name":"read_file","input":{}}}
-      """)
+      events =
+        parse_one("""
+        event: content_block_start
+        data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_123","name":"read_file","input":{}}}
+        """)
 
-      assert [{:content_block_start, 0, :tool_use}, {:tool_use_start, "toolu_123", "read_file"}] = events
+      assert [{:content_block_start, 0, :tool_use}, {:tool_use_start, "toolu_123", "read_file"}] =
+               events
     end
 
     test "parses text_delta event" do
-      events = parse_one("""
-      event: content_block_delta
-      data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
-      """)
+      events =
+        parse_one("""
+        event: content_block_delta
+        data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+        """)
 
       assert [{:text_delta, "Hello"}] = events
     end
@@ -56,30 +61,36 @@ defmodule Clementine.LLM.StreamParserTest do
       state = StreamParser.new()
 
       # First: tool_use_start sets the tool ID in state
-      tool_start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"read_file\",\"input\":{}}}\n\n"
+      tool_start =
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"read_file\",\"input\":{}}}\n\n"
+
       {_, state} = StreamParser.parse(state, tool_start)
 
       # Then: input_json_delta is enriched with that tool ID
-      json_delta = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n"
+      json_delta =
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n"
+
       {events, _state} = StreamParser.parse(state, json_delta)
 
       assert [{:input_json_delta, "toolu_123", "{\"path\":"}] = events
     end
 
     test "parses content_block_stop event" do
-      events = parse_one("""
-      event: content_block_stop
-      data: {"type":"content_block_stop","index":0}
-      """)
+      events =
+        parse_one("""
+        event: content_block_stop
+        data: {"type":"content_block_stop","index":0}
+        """)
 
       assert [{:content_block_stop, 0}] = events
     end
 
     test "parses message_delta event with stop_reason" do
-      events = parse_one("""
-      event: message_delta
-      data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":50}}
-      """)
+      events =
+        parse_one("""
+        event: message_delta
+        data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":50}}
+        """)
 
       assert [{:message_delta, delta, usage}] = events
       assert delta["stop_reason"] == "end_turn"
@@ -87,28 +98,31 @@ defmodule Clementine.LLM.StreamParserTest do
     end
 
     test "parses message_stop event" do
-      events = parse_one("""
-      event: message_stop
-      data: {"type":"message_stop"}
-      """)
+      events =
+        parse_one("""
+        event: message_stop
+        data: {"type":"message_stop"}
+        """)
 
       assert [{:message_stop}] = events
     end
 
     test "parses ping event" do
-      events = parse_one("""
-      event: ping
-      data: {"type":"ping"}
-      """)
+      events =
+        parse_one("""
+        event: ping
+        data: {"type":"ping"}
+        """)
 
       assert [{:ping}] = events
     end
 
     test "parses error event" do
-      events = parse_one("""
-      event: error
-      data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
-      """)
+      events =
+        parse_one("""
+        event: error
+        data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+        """)
 
       assert [{:error, error}] = events
       assert error["type"] == "overloaded_error"
@@ -120,10 +134,11 @@ defmodule Clementine.LLM.StreamParserTest do
     end
 
     test "returns empty list for unknown event type" do
-      events = parse_one("""
-      event: unknown_event
-      data: {"type":"unknown"}
-      """)
+      events =
+        parse_one("""
+        event: unknown_event
+        data: {"type":"unknown"}
+        """)
 
       assert events == []
     end
@@ -195,25 +210,30 @@ defmodule Clementine.LLM.StreamParserTest do
       data =
         sse_event("content_block_start", %{
           "index" => 0,
-          "content_block" => %{"type" => "tool_use", "id" => "toolu_abc", "name" => "bash", "input" => %{}}
+          "content_block" => %{
+            "type" => "tool_use",
+            "id" => "toolu_abc",
+            "name" => "bash",
+            "input" => %{}
+          }
         }) <>
-        sse_event("content_block_delta", %{
-          "index" => 0,
-          "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"cmd\":"}
-        }) <>
-        sse_event("content_block_delta", %{
-          "index" => 0,
-          "delta" => %{"type" => "input_json_delta", "partial_json" => "\"ls\"}"}
-        })
+          sse_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"cmd\":"}
+          }) <>
+          sse_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "\"ls\"}"}
+          })
 
       {events, _state} = StreamParser.parse(state, data)
 
       assert [
-        {:content_block_start, 0, :tool_use},
-        {:tool_use_start, "toolu_abc", "bash"},
-        {:input_json_delta, "toolu_abc", "{\"cmd\":"},
-        {:input_json_delta, "toolu_abc", "\"ls\"}"}
-      ] = events
+               {:content_block_start, 0, :tool_use},
+               {:tool_use_start, "toolu_abc", "bash"},
+               {:input_json_delta, "toolu_abc", "{\"cmd\":"},
+               {:input_json_delta, "toolu_abc", "\"ls\"}"}
+             ] = events
     end
 
     test "resets tool ID after content_block_stop" do
@@ -222,28 +242,35 @@ defmodule Clementine.LLM.StreamParserTest do
       data =
         sse_event("content_block_start", %{
           "index" => 0,
-          "content_block" => %{"type" => "tool_use", "id" => "toolu_1", "name" => "bash", "input" => %{}}
+          "content_block" => %{
+            "type" => "tool_use",
+            "id" => "toolu_1",
+            "name" => "bash",
+            "input" => %{}
+          }
         }) <>
-        sse_event("content_block_delta", %{
-          "index" => 0,
-          "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"cmd\":\"ls\"}"}
-        }) <>
-        sse_event("content_block_stop", %{"index" => 0})
+          sse_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"cmd\":\"ls\"}"}
+          }) <>
+          sse_event("content_block_stop", %{"index" => 0})
 
       {events, state} = StreamParser.parse(state, data)
 
       assert [
-        {:content_block_start, 0, :tool_use},
-        {:tool_use_start, "toolu_1", "bash"},
-        {:input_json_delta, "toolu_1", "{\"cmd\":\"ls\"}"},
-        {:content_block_stop, 0}
-      ] = events
+               {:content_block_start, 0, :tool_use},
+               {:tool_use_start, "toolu_1", "bash"},
+               {:input_json_delta, "toolu_1", "{\"cmd\":\"ls\"}"},
+               {:content_block_stop, 0}
+             ] = events
 
       # After stop, a new input_json_delta would get nil (no active tool)
-      delta_data = sse_event("content_block_delta", %{
-        "index" => 1,
-        "delta" => %{"type" => "input_json_delta", "partial_json" => "orphan"}
-      })
+      delta_data =
+        sse_event("content_block_delta", %{
+          "index" => 1,
+          "delta" => %{"type" => "input_json_delta", "partial_json" => "orphan"}
+        })
+
       {events2, _state} = StreamParser.parse(state, delta_data)
 
       assert [{:input_json_delta, nil, "orphan"}] = events2
@@ -256,13 +283,18 @@ defmodule Clementine.LLM.StreamParserTest do
       data1 =
         sse_event("content_block_start", %{
           "index" => 0,
-          "content_block" => %{"type" => "tool_use", "id" => "toolu_1", "name" => "read_file", "input" => %{}}
+          "content_block" => %{
+            "type" => "tool_use",
+            "id" => "toolu_1",
+            "name" => "read_file",
+            "input" => %{}
+          }
         }) <>
-        sse_event("content_block_delta", %{
-          "index" => 0,
-          "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"path\":\"a.txt\"}"}
-        }) <>
-        sse_event("content_block_stop", %{"index" => 0})
+          sse_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"path\":\"a.txt\"}"}
+          }) <>
+          sse_event("content_block_stop", %{"index" => 0})
 
       {events1, state} = StreamParser.parse(state, data1)
 
@@ -272,13 +304,18 @@ defmodule Clementine.LLM.StreamParserTest do
       data2 =
         sse_event("content_block_start", %{
           "index" => 1,
-          "content_block" => %{"type" => "tool_use", "id" => "toolu_2", "name" => "write_file", "input" => %{}}
+          "content_block" => %{
+            "type" => "tool_use",
+            "id" => "toolu_2",
+            "name" => "write_file",
+            "input" => %{}
+          }
         }) <>
-        sse_event("content_block_delta", %{
-          "index" => 1,
-          "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"path\":\"b.txt\"}"}
-        }) <>
-        sse_event("content_block_stop", %{"index" => 1})
+          sse_event("content_block_delta", %{
+            "index" => 1,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"path\":\"b.txt\"}"}
+          }) <>
+          sse_event("content_block_stop", %{"index" => 1})
 
       {events2, _state} = StreamParser.parse(state, data2)
 
@@ -289,17 +326,26 @@ defmodule Clementine.LLM.StreamParserTest do
       state = StreamParser.new()
 
       # First chunk: tool_use_start
-      chunk1 = sse_event("content_block_start", %{
-        "index" => 0,
-        "content_block" => %{"type" => "tool_use", "id" => "toolu_split", "name" => "bash", "input" => %{}}
-      })
+      chunk1 =
+        sse_event("content_block_start", %{
+          "index" => 0,
+          "content_block" => %{
+            "type" => "tool_use",
+            "id" => "toolu_split",
+            "name" => "bash",
+            "input" => %{}
+          }
+        })
+
       {_events, state} = StreamParser.parse(state, chunk1)
 
       # Second chunk: input_json_delta arrives in a separate parse call
-      chunk2 = sse_event("content_block_delta", %{
-        "index" => 0,
-        "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"cmd\":\"echo hi\"}"}
-      })
+      chunk2 =
+        sse_event("content_block_delta", %{
+          "index" => 0,
+          "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"cmd\":\"echo hi\"}"}
+        })
+
       {events, _state} = StreamParser.parse(state, chunk2)
 
       assert [{:input_json_delta, "toolu_split", "{\"cmd\":\"echo hi\"}"}] = events
@@ -335,7 +381,9 @@ defmodule Clementine.LLM.StreamParserTest do
     test "tracks stop_reason and usage" do
       acc =
         Accumulator.new()
-        |> Accumulator.process({:message_delta, %{"stop_reason" => "end_turn"}, %{"output_tokens" => 50}})
+        |> Accumulator.process(
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{"output_tokens" => 50}}
+        )
 
       assert acc.stop_reason == "end_turn"
       assert acc.usage["output_tokens"] == 50
@@ -364,7 +412,15 @@ defmodule Clementine.LLM.StreamParserTest do
       response = Accumulator.to_response(acc)
 
       assert %Response{stop_reason: "tool_use"} = response
-      assert [%Content{type: :tool_use, id: "toolu_123", name: "read_file", input: %{"path" => "test.txt"}}] =
+
+      assert [
+               %Content{
+                 type: :tool_use,
+                 id: "toolu_123",
+                 name: "read_file",
+                 input: %{"path" => "test.txt"}
+               }
+             ] =
                response.content
     end
 

@@ -40,27 +40,67 @@ defmodule Clementine.LLM.MessageTest do
   describe "ToolResultMessage.new/1" do
     test "handles {:ok, content} 2-tuple" do
       msg = ToolResultMessage.new([{"id1", {:ok, "result"}}])
-      assert [%Content{type: :tool_result, tool_use_id: "id1", content: "result", is_error: false}] = msg.content
+
+      assert [
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "id1",
+                 content: "result",
+                 is_error: false
+               }
+             ] = msg.content
     end
 
     test "handles {:error, reason}" do
       msg = ToolResultMessage.new([{"id1", {:error, "boom"}}])
-      assert [%Content{type: :tool_result, tool_use_id: "id1", content: "Error: boom", is_error: true}] = msg.content
+
+      assert [
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "id1",
+                 content: "Error: boom",
+                 is_error: true
+               }
+             ] = msg.content
     end
 
     test "handles {:ok, content, is_error: true} 3-tuple" do
       msg = ToolResultMessage.new([{"id1", {:ok, "Exit code: 1\nfailed", is_error: true}}])
-      assert [%Content{type: :tool_result, tool_use_id: "id1", content: "Exit code: 1\nfailed", is_error: true}] = msg.content
+
+      assert [
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "id1",
+                 content: "Exit code: 1\nfailed",
+                 is_error: true
+               }
+             ] = msg.content
     end
 
     test "handles {:ok, content, is_error: false} 3-tuple" do
       msg = ToolResultMessage.new([{"id1", {:ok, "output", is_error: false}}])
-      assert [%Content{type: :tool_result, tool_use_id: "id1", content: "output", is_error: false}] = msg.content
+
+      assert [
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "id1",
+                 content: "output",
+                 is_error: false
+               }
+             ] = msg.content
     end
 
     test "handles {:ok, content, []} 3-tuple defaulting is_error to false" do
       msg = ToolResultMessage.new([{"id1", {:ok, "output", []}}])
-      assert [%Content{type: :tool_result, tool_use_id: "id1", content: "output", is_error: false}] = msg.content
+
+      assert [
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "id1",
+                 content: "output",
+                 is_error: false
+               }
+             ] = msg.content
     end
 
     test "handles mixed result types" do
@@ -99,7 +139,11 @@ defmodule Clementine.LLM.MessageTest do
     test "converts ToolResultMessage" do
       msg = ToolResultMessage.new([{"id1", {:ok, "done"}}])
       api = Message.to_anthropic(msg)
-      assert %{"role" => "user", "content" => [%{"type" => "tool_result", "tool_use_id" => "id1"}]} = api
+
+      assert %{
+               "role" => "user",
+               "content" => [%{"type" => "tool_result", "tool_use_id" => "id1"}]
+             } = api
     end
   end
 end

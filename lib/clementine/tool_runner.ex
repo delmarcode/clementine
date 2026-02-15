@@ -123,7 +123,13 @@ defmodule Clementine.ToolRunner do
         tool_call_id = Map.get(call, :id)
         iteration = Map.get(context, :_clementine_iteration, 0)
 
-        telemetry_meta = %{tool: name, tool_call_id: tool_call_id, iteration: iteration, tool_module: tool, args: args}
+        telemetry_meta = %{
+          tool: name,
+          tool_call_id: tool_call_id,
+          iteration: iteration,
+          tool_module: tool,
+          args: args
+        }
 
         :telemetry.execute(
           [:clementine, :tool, :start],

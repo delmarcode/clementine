@@ -66,7 +66,8 @@ defmodule Clementine.LoopTest do
       ]
 
       assert {:ok, "Hello world!", messages} = Loop.run(config, "Hi")
-      assert length(messages) == 2  # user + assistant
+      # user + assistant
+      assert length(messages) == 2
     end
   end
 
@@ -230,7 +231,8 @@ defmodule Clementine.LoopTest do
       {:ok, result, messages} = Loop.continue(config, initial_messages, "Follow up")
 
       assert result == "Continuing conversation"
-      assert length(messages) == 4  # 2 initial + user + assistant
+      # 2 initial + user + assistant
+      assert length(messages) == 4
     end
   end
 
@@ -384,7 +386,8 @@ defmodule Clementine.LoopTest do
 
       {:error, _} = Loop.run_stream(config, "Hi", callback)
 
-      assert_receive {:stream_event, {:loop_event, {:llm_call_end, {:error, %{"type" => "api_error"}}}}}
+      assert_receive {:stream_event,
+                      {:loop_event, {:llm_call_end, {:error, %{"type" => "api_error"}}}}}
     end
 
     test "stream error does not cause further iterations" do

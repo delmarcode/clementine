@@ -317,13 +317,19 @@ defmodule Clementine.Agent do
 
       defp validate_history!(history) when is_list(history) do
         Enum.each(history, fn
-          %Clementine.LLM.Message.UserMessage{} -> :ok
-          %Clementine.LLM.Message.AssistantMessage{} -> :ok
-          %Clementine.LLM.Message.ToolResultMessage{} -> :ok
+          %Clementine.LLM.Message.UserMessage{} ->
+            :ok
+
+          %Clementine.LLM.Message.AssistantMessage{} ->
+            :ok
+
+          %Clementine.LLM.Message.ToolResultMessage{} ->
+            :ok
+
           other ->
             raise ArgumentError,
-              ":history elements must be message structs " <>
-              "(UserMessage, AssistantMessage, or ToolResultMessage), got: #{inspect(other)}"
+                  ":history elements must be message structs " <>
+                    "(UserMessage, AssistantMessage, or ToolResultMessage), got: #{inspect(other)}"
         end)
       end
 
@@ -371,7 +377,11 @@ defmodule Clementine.Agent do
         end
 
         if waiters == [] do
-          Map.put(tasks, task_id, %{status: status, result: result, completed_at: System.monotonic_time(:millisecond)})
+          Map.put(tasks, task_id, %{
+            status: status,
+            result: result,
+            completed_at: System.monotonic_time(:millisecond)
+          })
         else
           Map.delete(tasks, task_id)
         end

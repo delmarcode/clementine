@@ -77,6 +77,7 @@ defmodule Clementine.Telemetry.Logger do
   def handle_event([:clementine, :llm, :start], _measurements, metadata, config) do
     Logger.log(config.level, fn ->
       streaming = if metadata.streaming, do: " streaming=true", else: ""
+
       "[Clementine] LLM call starting iteration=#{metadata.iteration} messages=#{metadata.message_count} tools=#{metadata.tool_count}#{streaming}"
     end)
   end
@@ -86,6 +87,7 @@ defmodule Clementine.Telemetry.Logger do
 
     Logger.log(config.level, fn ->
       streaming = if metadata.streaming, do: " streaming=true", else: ""
+
       "[Clementine] LLM call completed iteration=#{metadata.iteration} duration=#{duration_ms}ms input_tokens=#{measurements.input_tokens} output_tokens=#{measurements.output_tokens} stop_reason=#{metadata.stop_reason}#{streaming}"
     end)
   end

@@ -5,7 +5,16 @@ defmodule Clementine.ToolRunnerTest do
   alias Clementine.ToolRunner
 
   # Import test tools
-  alias Clementine.Test.Tools.{Echo, Add, Crash, Slow, Fail, TrackedSlow, InspectObject, InspectDeclaredObject}
+  alias Clementine.Test.Tools.{
+    Echo,
+    Add,
+    Crash,
+    Slow,
+    Fail,
+    TrackedSlow,
+    InspectObject,
+    InspectDeclaredObject
+  }
 
   @tools [Echo, Add, Crash, Slow, Fail, TrackedSlow, InspectObject, InspectDeclaredObject]
 
@@ -84,7 +93,9 @@ defmodule Clementine.ToolRunnerTest do
     end
 
     test "validation error formatted as is_error tool result" do
-      results = [{"call_1", {:error, "Invalid arguments: expected message to be a string, got: integer"}}]
+      results = [
+        {"call_1", {:error, "Invalid arguments: expected message to be a string, got: integer"}}
+      ]
 
       formatted = ToolRunner.format_results(results)
 
@@ -92,7 +103,8 @@ defmodule Clementine.ToolRunnerTest do
                %Content{
                  type: :tool_result,
                  tool_use_id: "call_1",
-                 content: "Error: Invalid arguments: expected message to be a string, got: integer",
+                 content:
+                   "Error: Invalid arguments: expected message to be a string, got: integer",
                  is_error: true
                }
              ] = formatted
@@ -262,8 +274,18 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{type: :tool_result, tool_use_id: "call_1", content: "success", is_error: false},
-               %Content{type: :tool_result, tool_use_id: "call_2", content: "also success", is_error: false}
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "call_1",
+                 content: "success",
+                 is_error: false
+               },
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "call_2",
+                 content: "also success",
+                 is_error: false
+               }
              ] = formatted
     end
 
@@ -275,7 +297,12 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{type: :tool_result, tool_use_id: "call_1", content: "Error: something went wrong", is_error: true}
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "call_1",
+                 content: "Error: something went wrong",
+                 is_error: true
+               }
              ] = formatted
     end
 
@@ -300,7 +327,12 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{type: :tool_result, tool_use_id: "call_1", content: "Exit code: 1\n\nfailed", is_error: true}
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "call_1",
+                 content: "Exit code: 1\n\nfailed",
+                 is_error: true
+               }
              ] = formatted
     end
 
@@ -312,7 +344,12 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{type: :tool_result, tool_use_id: "call_1", content: "some output", is_error: false}
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "call_1",
+                 content: "some output",
+                 is_error: false
+               }
              ] = formatted
     end
 
@@ -324,7 +361,12 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{type: :tool_result, tool_use_id: "call_1", content: "some output", is_error: false}
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "call_1",
+                 content: "some output",
+                 is_error: false
+               }
              ] = formatted
     end
   end

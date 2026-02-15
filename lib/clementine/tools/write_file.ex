@@ -7,7 +7,8 @@ defmodule Clementine.Tools.WriteFile do
 
   use Clementine.Tool,
     name: "write_file",
-    description: "Write content to a file. Creates the file if it doesn't exist, or overwrites if it does. Creates parent directories automatically.",
+    description:
+      "Write content to a file. Creates the file if it doesn't exist, or overwrites if it does. Creates parent directories automatically.",
     parameters: [
       path: [
         type: :string,

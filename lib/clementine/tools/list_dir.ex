@@ -7,7 +7,8 @@ defmodule Clementine.Tools.ListDir do
 
   use Clementine.Tool,
     name: "list_dir",
-    description: "List the contents of a directory. Shows files and subdirectories with their types.",
+    description:
+      "List the contents of a directory. Shows files and subdirectories with their types.",
     parameters: [
       path: [
         type: :string,

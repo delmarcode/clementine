@@ -313,7 +313,9 @@ defmodule Clementine.ToolTest do
         ]
       ]
 
-      assert {:error, msg} = Tool.validate_args(params, %{config: %{host: "localhost", port: "not-int"}})
+      assert {:error, msg} =
+               Tool.validate_args(params, %{config: %{host: "localhost", port: "not-int"}})
+
       assert msg =~ "expected config.port to be an integer, got: string"
     end
 
@@ -422,98 +424,94 @@ defmodule Clementine.ToolTest do
 
     test "raises on missing parameter type" do
       assert_raise ArgumentError, ~r/must have a :type/, fn ->
-        Tool.validate_schema!("tool", "description", [param: [required: true]])
+        Tool.validate_schema!("tool", "description", param: [required: true])
       end
     end
 
     test "raises on invalid parameter type" do
       assert_raise ArgumentError, ~r/invalid type/, fn ->
-        Tool.validate_schema!("tool", "description", [param: [type: :invalid]])
+        Tool.validate_schema!("tool", "description", param: [type: :invalid])
       end
     end
 
     test "passes with valid schema" do
       assert :ok =
-               Tool.validate_schema!("tool", "description", [
+               Tool.validate_schema!("tool", "description",
                  param: [type: :string, required: true]
-               ])
+               )
     end
 
     test "raises on missing :type in nested items schema" do
       assert_raise ArgumentError, ~r/must have a :type/, fn ->
-        Tool.validate_schema!("tool", "description", [
+        Tool.validate_schema!("tool", "description",
           tags: [type: :array, items: [description: "no type"]]
-        ])
+        )
       end
     end
 
     test "raises on invalid type in nested items schema" do
       assert_raise ArgumentError, ~r/invalid type/, fn ->
-        Tool.validate_schema!("tool", "description", [
+        Tool.validate_schema!("tool", "description",
           tags: [type: :array, items: [type: :invalid]]
-        ])
+        )
       end
     end
 
     test "raises on missing :type in nested properties schema" do
       assert_raise ArgumentError, ~r/must have a :type/, fn ->
-        Tool.validate_schema!("tool", "description", [
+        Tool.validate_schema!("tool", "description",
           config: [type: :object, properties: [host: [required: true]]]
-        ])
+        )
       end
     end
 
     test "raises on :items with non-array type" do
       assert_raise ArgumentError, ~r/has :items but type is :string, not :array/, fn ->
-        Tool.validate_schema!("tool", "description", [
+        Tool.validate_schema!("tool", "description",
           name: [type: :string, items: [type: :string]]
-        ])
+        )
       end
     end
 
     test "raises on :properties with non-object type" do
       assert_raise ArgumentError, ~r/has :properties but type is :string, not :object/, fn ->
-        Tool.validate_schema!("tool", "description", [
+        Tool.validate_schema!("tool", "description",
           name: [type: :string, properties: [foo: [type: :string]]]
-        ])
+        )
       end
     end
 
     test "raises on empty :items with non-array type" do
       assert_raise ArgumentError, ~r/has :items but type is :string, not :array/, fn ->
-        Tool.validate_schema!("tool", "description", [
-          name: [type: :string, items: []]
-        ])
+        Tool.validate_schema!("tool", "description", name: [type: :string, items: []])
       end
     end
 
     test "raises on empty :properties with non-object type" do
       assert_raise ArgumentError, ~r/has :properties but type is :integer, not :object/, fn ->
-        Tool.validate_schema!("tool", "description", [
-          count: [type: :integer, properties: []]
-        ])
+        Tool.validate_schema!("tool", "description", count: [type: :integer, properties: []])
       end
     end
 
     test "raises on non-keyword-list :items" do
       assert_raise ArgumentError, ~r/:items must be a keyword list/, fn ->
-        Tool.validate_schema!("tool", "description", [
+        Tool.validate_schema!("tool", "description",
           tags: [type: :array, items: %{type: :string}]
-        ])
+        )
       end
     end
 
     test "raises on non-keyword-list :properties" do
       assert_raise ArgumentError, ~r/:properties must be a keyword list/, fn ->
-        Tool.validate_schema!("tool", "description", [
+        Tool.validate_schema!("tool", "description",
           config: [type: :object, properties: %{host: [type: :string]}]
-        ])
+        )
       end
     end
 
     test "passes with valid nested array and object schemas" do
       assert :ok =
-               Tool.validate_schema!("tool", "description", [
+               Tool.validate_schema!("tool", "description",
                  tags: [type: :array, items: [type: :string]],
                  config: [
                    type: :object,
@@ -522,7 +520,7 @@ defmodule Clementine.ToolTest do
                      port: [type: :integer]
                    ]
                  ]
-               ])
+               )
     end
   end
 

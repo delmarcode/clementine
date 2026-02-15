@@ -70,7 +70,8 @@ defmodule Clementine.VerifierTest do
     end
 
     test "returns retry for failing verifier" do
-      assert {:retry, "Verification failed"} = Verifier.safe_verify(FailingVerifier, "result", %{})
+      assert {:retry, "Verification failed"} =
+               Verifier.safe_verify(FailingVerifier, "result", %{})
     end
 
     test "catches crashes and returns retry" do

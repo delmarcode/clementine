@@ -348,19 +348,27 @@ defmodule Clementine.Tool do
   end
 
   defp validate_value(path, :string, _opts, value) do
-    if is_binary(value), do: [], else: ["expected #{path} to be a string, got: #{type_name(value)}"]
+    if is_binary(value),
+      do: [],
+      else: ["expected #{path} to be a string, got: #{type_name(value)}"]
   end
 
   defp validate_value(path, :integer, _opts, value) do
-    if is_integer(value), do: [], else: ["expected #{path} to be an integer, got: #{type_name(value)}"]
+    if is_integer(value),
+      do: [],
+      else: ["expected #{path} to be an integer, got: #{type_name(value)}"]
   end
 
   defp validate_value(path, :number, _opts, value) do
-    if is_number(value), do: [], else: ["expected #{path} to be a number, got: #{type_name(value)}"]
+    if is_number(value),
+      do: [],
+      else: ["expected #{path} to be a number, got: #{type_name(value)}"]
   end
 
   defp validate_value(path, :boolean, _opts, value) do
-    if is_boolean(value), do: [], else: ["expected #{path} to be a boolean, got: #{type_name(value)}"]
+    if is_boolean(value),
+      do: [],
+      else: ["expected #{path} to be a boolean, got: #{type_name(value)}"]
   end
 
   defp validate_value(path, :array, opts, value) do
@@ -381,7 +389,8 @@ defmodule Clementine.Tool do
 
   defp validate_enum(path, opts, value) do
     case Keyword.get(opts, :enum) do
-      nil -> []
+      nil ->
+        []
 
       allowed ->
         if value in allowed,
@@ -392,8 +401,11 @@ defmodule Clementine.Tool do
 
   defp validate_array_items(path, opts, items) do
     case Keyword.get(opts, :items) do
-      nil -> []
-      [] -> []
+      nil ->
+        []
+
+      [] ->
+        []
 
       item_schema ->
         items
@@ -406,8 +418,11 @@ defmodule Clementine.Tool do
 
   defp validate_object_properties(path, opts, map) do
     case Keyword.get(opts, :properties) do
-      nil -> []
-      [] -> []
+      nil ->
+        []
+
+      [] ->
+        []
 
       properties ->
         Enum.flat_map(properties, fn {prop_name, prop_opts} ->

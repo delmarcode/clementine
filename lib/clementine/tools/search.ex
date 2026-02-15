@@ -8,7 +8,8 @@ defmodule Clementine.Tools.Search do
 
   use Clementine.Tool,
     name: "search",
-    description: "Search for a pattern in files. Returns matching lines with file names and line numbers. Supports regular expressions.",
+    description:
+      "Search for a pattern in files. Returns matching lines with file names and line numbers. Supports regular expressions.",
     parameters: [
       pattern: [
         type: :string,

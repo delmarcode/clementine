@@ -40,7 +40,12 @@ defmodule Clementine.LLM.Message do
     @doc "Creates a tool result content block"
     def tool_result(tool_use_id, content, is_error \\ false)
         when is_binary(tool_use_id) and is_binary(content) and is_boolean(is_error) do
-      %__MODULE__{type: :tool_result, tool_use_id: tool_use_id, content: content, is_error: is_error}
+      %__MODULE__{
+        type: :tool_result,
+        tool_use_id: tool_use_id,
+        content: content,
+        is_error: is_error
+      }
     end
 
     @doc "Converts content to Anthropic API format"
@@ -71,11 +76,13 @@ defmodule Clementine.LLM.Message do
       tool_use(id, name, input)
     end
 
-    def from_anthropic(%{
-          "type" => "tool_result",
-          "tool_use_id" => id,
-          "content" => content
-        } = data) do
+    def from_anthropic(
+          %{
+            "type" => "tool_result",
+            "tool_use_id" => id,
+            "content" => content
+          } = data
+        ) do
       tool_result(id, content, Map.get(data, "is_error", false))
     end
   end
@@ -104,8 +111,12 @@ defmodule Clementine.LLM.Message do
 
     defp validate_content!(blocks) do
       Enum.each(blocks, fn
-        %Content{} -> :ok
-        other -> raise ArgumentError, "expected %Content{} struct in message content, got: #{inspect(other)}"
+        %Content{} ->
+          :ok
+
+        other ->
+          raise ArgumentError,
+                "expected %Content{} struct in message content, got: #{inspect(other)}"
       end)
     end
 
@@ -137,8 +148,12 @@ defmodule Clementine.LLM.Message do
 
     defp validate_content!(blocks) do
       Enum.each(blocks, fn
-        %Content{} -> :ok
-        other -> raise ArgumentError, "expected %Content{} struct in message content, got: #{inspect(other)}"
+        %Content{} ->
+          :ok
+
+        other ->
+          raise ArgumentError,
+                "expected %Content{} struct in message content, got: #{inspect(other)}"
       end)
     end
 

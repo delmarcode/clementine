@@ -118,7 +118,12 @@ defmodule Clementine.Test.Fixtures do
       sse_event("content_block_start", %{
         "type" => "content_block_start",
         "index" => 0,
-        "content_block" => %{"type" => "tool_use", "id" => tool_id, "name" => tool_name, "input" => %{}}
+        "content_block" => %{
+          "type" => "tool_use",
+          "id" => tool_id,
+          "name" => tool_name,
+          "input" => %{}
+        }
       })
     ]
 

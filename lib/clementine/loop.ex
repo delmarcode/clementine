@@ -146,7 +146,10 @@ defmodule Clementine.Loop do
 
         :telemetry.execute(
           [:clementine, :loop, :exception],
-          %{duration: System.monotonic_time() - state.loop_start_time, iterations: state.iteration},
+          %{
+            duration: System.monotonic_time() - state.loop_start_time,
+            iterations: state.iteration
+          },
           %{model: state.model, kind: :error, reason: reason}
         )
 
@@ -172,12 +175,13 @@ defmodule Clementine.Loop do
       }
     )
 
-    result = LLM.call(
-      state.model,
-      state.system,
-      state.messages,
-      state.tools
-    )
+    result =
+      LLM.call(
+        state.model,
+        state.system,
+        state.messages,
+        state.tools
+      )
 
     llm_duration = System.monotonic_time() - llm_start
 
@@ -190,14 +194,25 @@ defmodule Clementine.Loop do
             input_tokens: get_in(response.usage, ["input_tokens"]) || 0,
             output_tokens: get_in(response.usage, ["output_tokens"]) || 0
           },
-          %{model: state.model, iteration: state.iteration, stop_reason: response.stop_reason, streaming: false}
+          %{
+            model: state.model,
+            iteration: state.iteration,
+            stop_reason: response.stop_reason,
+            streaming: false
+          }
         )
 
       {:error, reason} ->
         :telemetry.execute(
           [:clementine, :llm, :exception],
           %{duration: llm_duration},
-          %{model: state.model, iteration: state.iteration, kind: :error, reason: reason, streaming: false}
+          %{
+            model: state.model,
+            iteration: state.iteration,
+            kind: :error,
+            reason: reason,
+            streaming: false
+          }
         )
     end
 
@@ -255,7 +270,10 @@ defmodule Clementine.Loop do
 
         :telemetry.execute(
           [:clementine, :loop, :stop],
-          %{duration: System.monotonic_time() - state.loop_start_time, iterations: state.iteration},
+          %{
+            duration: System.monotonic_time() - state.loop_start_time,
+            iterations: state.iteration
+          },
           %{model: state.model, status: :success}
         )
 
@@ -278,7 +296,9 @@ defmodule Clementine.Loop do
     emit_event(state, {:verification_failed, reason})
 
     # Add retry message to conversation
-    retry_message = UserMessage.new("Verification failed: #{reason}\n\nPlease fix the issues and try again.")
+    retry_message =
+      UserMessage.new("Verification failed: #{reason}\n\nPlease fix the issues and try again.")
+
     state = %{state | messages: state.messages ++ [retry_message]}
 
     # Continue the loop
@@ -373,7 +393,10 @@ defmodule Clementine.Loop do
 
         :telemetry.execute(
           [:clementine, :loop, :exception],
-          %{duration: System.monotonic_time() - state.loop_start_time, iterations: state.iteration},
+          %{
+            duration: System.monotonic_time() - state.loop_start_time,
+            iterations: state.iteration
+          },
           %{model: state.model, kind: :error, reason: reason}
         )
 
@@ -405,12 +428,13 @@ defmodule Clementine.Loop do
   defp do_call_llm_streaming(%State{} = state, stream_callback, llm_start) do
     alias Clementine.LLM.StreamParser.Accumulator
 
-    stream = LLM.stream(
-      state.model,
-      state.system,
-      state.messages,
-      state.tools
-    )
+    stream =
+      LLM.stream(
+        state.model,
+        state.system,
+        state.messages,
+        state.tools
+      )
 
     # Process the stream, emitting events and accumulating the response
     acc =
@@ -436,7 +460,13 @@ defmodule Clementine.Loop do
       :telemetry.execute(
         [:clementine, :llm, :exception],
         %{duration: llm_duration},
-        %{model: state.model, iteration: state.iteration, kind: :error, reason: acc.error, streaming: true}
+        %{
+          model: state.model,
+          iteration: state.iteration,
+          kind: :error,
+          reason: acc.error,
+          streaming: true
+        }
       )
 
       {:error, acc.error}
@@ -451,7 +481,12 @@ defmodule Clementine.Loop do
           input_tokens: get_in(result.usage, ["input_tokens"]) || 0,
           output_tokens: get_in(result.usage, ["output_tokens"]) || 0
         },
-        %{model: state.model, iteration: state.iteration, stop_reason: result.stop_reason, streaming: true}
+        %{
+          model: state.model,
+          iteration: state.iteration,
+          stop_reason: result.stop_reason,
+          streaming: true
+        }
       )
 
       {:ok, result}
@@ -463,7 +498,13 @@ defmodule Clementine.Loop do
       :telemetry.execute(
         [:clementine, :llm, :exception],
         %{duration: llm_duration},
-        %{model: state.model, iteration: state.iteration, kind: :error, reason: e, streaming: true}
+        %{
+          model: state.model,
+          iteration: state.iteration,
+          kind: :error,
+          reason: e,
+          streaming: true
+        }
       )
 
       {:error, e}

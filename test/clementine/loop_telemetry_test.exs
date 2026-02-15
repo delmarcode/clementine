@@ -66,17 +66,25 @@ defmodule Clementine.LoopTelemetryTest do
       assert {:ok, "Hello!", _messages} = Loop.run(config, "Hi")
 
       # Loop start
-      assert_receive {:telemetry, [:clementine, :loop, :start], %{system_time: _}, %{model: :claude_sonnet, tool_count: 0, max_iterations: 10}}
+      assert_receive {:telemetry, [:clementine, :loop, :start], %{system_time: _},
+                      %{model: :claude_sonnet, tool_count: 0, max_iterations: 10}}
 
       # LLM start
-      assert_receive {:telemetry, [:clementine, :llm, :start], %{system_time: _}, %{model: :claude_sonnet, iteration: 1, streaming: false}}
+      assert_receive {:telemetry, [:clementine, :llm, :start], %{system_time: _},
+                      %{model: :claude_sonnet, iteration: 1, streaming: false}}
 
       # LLM stop with token counts
-      assert_receive {:telemetry, [:clementine, :llm, :stop], %{duration: duration, input_tokens: 100, output_tokens: 50}, %{model: :claude_sonnet, stop_reason: "end_turn", streaming: false}}
+      assert_receive {:telemetry, [:clementine, :llm, :stop],
+                      %{duration: duration, input_tokens: 100, output_tokens: 50},
+                      %{model: :claude_sonnet, stop_reason: "end_turn", streaming: false}}
+
       assert is_integer(duration) and duration >= 0
 
       # Loop stop
-      assert_receive {:telemetry, [:clementine, :loop, :stop], %{duration: loop_duration, iterations: 1}, %{model: :claude_sonnet, status: :success}}
+      assert_receive {:telemetry, [:clementine, :loop, :stop],
+                      %{duration: loop_duration, iterations: 1},
+                      %{model: :claude_sonnet, status: :success}}
+
       assert is_integer(loop_duration) and loop_duration >= 0
     end
   end
@@ -115,10 +123,13 @@ defmodule Clementine.LoopTelemetryTest do
       assert {:ok, "Done!", _} = Loop.run(config, "Echo test")
 
       # Tool start
-      assert_receive {:telemetry, [:clementine, :tool, :start], %{system_time: _}, %{tool: "echo", tool_call_id: "toolu_1", iteration: 1}}
+      assert_receive {:telemetry, [:clementine, :tool, :start], %{system_time: _},
+                      %{tool: "echo", tool_call_id: "toolu_1", iteration: 1}}
 
       # Tool stop
-      assert_receive {:telemetry, [:clementine, :tool, :stop], %{duration: tool_duration}, %{tool: "echo", tool_call_id: "toolu_1", result: :ok}}
+      assert_receive {:telemetry, [:clementine, :tool, :stop], %{duration: tool_duration},
+                      %{tool: "echo", tool_call_id: "toolu_1", result: :ok}}
+
       assert is_integer(tool_duration) and tool_duration >= 0
 
       # Two LLM calls
@@ -143,7 +154,8 @@ defmodule Clementine.LoopTelemetryTest do
 
       assert {:error, :max_iterations_reached} = Loop.run(config, "Loop forever")
 
-      assert_receive {:telemetry, [:clementine, :loop, :stop], %{duration: _, iterations: 2}, %{status: :max_iterations}}
+      assert_receive {:telemetry, [:clementine, :loop, :stop], %{duration: _, iterations: 2},
+                      %{status: :max_iterations}}
     end
   end
 
@@ -159,10 +171,17 @@ defmodule Clementine.LoopTelemetryTest do
       assert {:error, {:api_error, 500, _}} = Loop.run(config, "Hi")
 
       # LLM exception
-      assert_receive {:telemetry, [:clementine, :llm, :exception], %{duration: _}, %{model: :claude_sonnet, kind: :error, reason: {:api_error, 500, "Internal server error"}, streaming: false}}
+      assert_receive {:telemetry, [:clementine, :llm, :exception], %{duration: _},
+                      %{
+                        model: :claude_sonnet,
+                        kind: :error,
+                        reason: {:api_error, 500, "Internal server error"},
+                        streaming: false
+                      }}
 
       # Loop exception
-      assert_receive {:telemetry, [:clementine, :loop, :exception], %{duration: _, iterations: 1}, %{model: :claude_sonnet, kind: :error}}
+      assert_receive {:telemetry, [:clementine, :loop, :exception], %{duration: _, iterations: 1},
+                      %{model: :claude_sonnet, kind: :error}}
     end
   end
 
@@ -203,7 +222,8 @@ defmodule Clementine.LoopTelemetryTest do
 
       assert {:error, _} = Loop.run_stream(config, "Hi", fn _ -> :ok end)
 
-      assert_receive {:telemetry, [:clementine, :llm, :exception], %{duration: _}, %{streaming: true, kind: :error}}
+      assert_receive {:telemetry, [:clementine, :llm, :exception], %{duration: _},
+                      %{streaming: true, kind: :error}}
     end
 
     test "streaming tool use emits tool telemetry" do
@@ -290,7 +310,8 @@ defmodule Clementine.LoopTelemetryTest do
 
       {:ok, _, _} = Loop.run(config, "Hi")
 
-      assert_receive {:telemetry, [:clementine, :llm, :stop], %{input_tokens: 850, output_tokens: 120}, _}
+      assert_receive {:telemetry, [:clementine, :llm, :stop],
+                      %{input_tokens: 850, output_tokens: 120}, _}
     end
 
     test "defaults to 0 when usage is empty" do
@@ -308,7 +329,8 @@ defmodule Clementine.LoopTelemetryTest do
 
       {:ok, _, _} = Loop.run(config, "Hi")
 
-      assert_receive {:telemetry, [:clementine, :llm, :stop], %{input_tokens: 0, output_tokens: 0}, _}
+      assert_receive {:telemetry, [:clementine, :llm, :stop],
+                      %{input_tokens: 0, output_tokens: 0}, _}
     end
   end
 end
