@@ -7,6 +7,7 @@ defmodule Clementine.LLM.OpenAI do
 
   @behaviour Clementine.LLM.ClientBehaviour
 
+  alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
   alias Clementine.LLM.OpenAIStreamParser
   alias Clementine.LLM.Response
@@ -161,8 +162,8 @@ defmodule Clementine.LLM.OpenAI do
   end
 
   defp build_body(model, system, messages, tools, opts) do
-    model_config = get_model_config(model)
-    model_id = Keyword.fetch!(model_config, :model)
+    resolved = resolve_model(model)
+    model_id = resolved.id
 
     max_output_tokens =
       Keyword.get(
@@ -172,9 +173,9 @@ defmodule Clementine.LLM.OpenAI do
           opts,
           :max_tokens,
           Keyword.get(
-            model_config,
+            resolved.defaults,
             :max_output_tokens,
-            Keyword.get(model_config, :max_tokens, @default_max_output_tokens)
+            Keyword.get(resolved.defaults, :max_tokens, @default_max_output_tokens)
           )
         )
       )
@@ -224,22 +225,14 @@ defmodule Clementine.LLM.OpenAI do
   defp resolve_api_key(key) when is_binary(key), do: key
   defp resolve_api_key(_), do: nil
 
-  defp get_model_config(model) when is_atom(model) do
-    models = Application.get_env(:clementine, :models, [])
+  defp resolve_model(model_ref) do
+    resolved = ModelRegistry.resolve!(model_ref)
 
-    case Keyword.get(models, model) do
-      nil ->
-        raise "Unknown model: #{inspect(model)}. Configure it in :clementine, :models"
-
-      config ->
-        case Keyword.get(config, :provider) do
-          :openai ->
-            config
-
-          other ->
-            raise "Model #{inspect(model)} is configured for provider #{inspect(other)}, not :openai"
-        end
+    if resolved.provider != :openai do
+      raise "Model #{inspect(model_ref)} is configured for provider #{inspect(resolved.provider)}, not :openai"
     end
+
+    resolved
   end
 
   defp format_messages(messages) do

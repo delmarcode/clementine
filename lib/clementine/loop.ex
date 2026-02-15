@@ -54,7 +54,7 @@ defmodule Clementine.Loop do
     ]
 
     @type t :: %__MODULE__{
-            model: atom(),
+            model: Clementine.LLM.ModelRegistry.model_ref(),
             system: String.t() | nil,
             tools: [module()],
             verifiers: [module()],
@@ -75,7 +75,7 @@ defmodule Clementine.Loop do
   ## Parameters
 
   - `config` - Keyword list with:
-    - `:model` - The model atom (required)
+    - `:model` - Model reference (required): alias atom (e.g. `:claude_sonnet`) or `{provider, id}` tuple
     - `:system` - System prompt
     - `:tools` - List of tool modules
     - `:verifiers` - List of verifier modules

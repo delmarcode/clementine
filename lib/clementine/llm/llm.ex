@@ -21,7 +21,7 @@ defmodule Clementine.LLM do
 
   ## Parameters
 
-  - `model` - The model atom (e.g., `:claude_sonnet`)
+  - `model` - Model reference: alias atom (e.g., `:claude_sonnet`) or `{provider, id}` tuple
   - `system` - The system prompt (can be nil or empty string)
   - `messages` - List of conversation messages
   - `tools` - List of tool modules (can be empty)

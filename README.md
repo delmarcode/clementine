@@ -260,24 +260,30 @@ config :clementine,
 config :clementine, :models,
   claude_sonnet: [
     provider: :anthropic,
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 8192
+    id: "claude-sonnet-4-20250514",
+    defaults: [max_tokens: 8192]
   ],
   claude_opus: [
     provider: :anthropic,
-    model: "claude-opus-4-20250514",
-    max_tokens: 8192
+    id: "claude-opus-4-20250514",
+    defaults: [max_tokens: 8192]
   ],
   gpt_5: [
     provider: :openai,
-    model: "gpt-5",
-    max_output_tokens: 4096
+    id: "gpt-5",
+    defaults: [max_output_tokens: 4096]
   ],
   gpt_5_codex: [
     provider: :openai,
-    model: "gpt-5-codex",
-    max_output_tokens: 4096
+    id: "gpt-5-codex",
+    defaults: [max_output_tokens: 4096]
   ]
+```
+
+You can also bypass aliases and pass provider model IDs directly:
+
+```elixir
+{:ok, result} = Clementine.Loop.run([model: {:openai, "gpt-5"}, tools: []], "Hi")
 ```
 
 ## Why Clementine?

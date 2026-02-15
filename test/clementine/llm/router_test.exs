@@ -31,7 +31,7 @@ defmodule Clementine.LLM.RouterTest do
   end
 
   test "routes call/5 to the configured provider client" do
-    Application.put_env(:clementine, :models, gpt_test: [provider: :openai, model: "gpt-5"])
+    Application.put_env(:clementine, :models, gpt_test: [provider: :openai, id: "gpt-5"])
     Application.put_env(:clementine, :llm_provider_clients, openai: Clementine.LLM.MockClient)
 
     Clementine.LLM.MockClient
@@ -44,7 +44,7 @@ defmodule Clementine.LLM.RouterTest do
 
   test "routes stream/5 to the configured provider client" do
     Application.put_env(:clementine, :models,
-      claude_test: [provider: :anthropic, model: "claude-test"]
+      claude_test: [provider: :anthropic, id: "claude-test"]
     )
 
     Application.put_env(:clementine, :llm_provider_clients, anthropic: Clementine.LLM.MockClient)
@@ -56,5 +56,17 @@ defmodule Clementine.LLM.RouterTest do
 
     events = Router.stream(:claude_test, "sys", [UserMessage.new("hi")], []) |> Enum.to_list()
     assert events == [{:text_delta, "ok"}]
+  end
+
+  test "routes direct provider tuple model references" do
+    Application.put_env(:clementine, :llm_provider_clients, openai: Clementine.LLM.MockClient)
+
+    Clementine.LLM.MockClient
+    |> expect(:call, fn {:openai, "gpt-5"}, "sys", [%UserMessage{}], [], [] ->
+      {:ok, %Response{}}
+    end)
+
+    assert {:ok, %Response{}} =
+             Router.call({:openai, "gpt-5"}, "sys", [UserMessage.new("hi")], [])
   end
 end

@@ -5,7 +5,7 @@ defmodule Clementine.LLM.ClientBehaviour do
   This behaviour allows for mocking the LLM client in tests.
   """
 
-  @type model :: atom()
+  @type model :: Clementine.LLM.ModelRegistry.model_ref()
   @type messages :: [Clementine.LLM.Message.message()]
   @type tools :: [module()]
   @type opts :: keyword()

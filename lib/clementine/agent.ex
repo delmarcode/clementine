@@ -71,7 +71,7 @@ defmodule Clementine.Agent do
   ## Options
 
   - `:name` - Required. The agent's name.
-  - `:model` - LLM model atom (default: from config)
+  - `:model` - LLM model reference (default: from config)
   - `:tools` - List of tool modules
   - `:verifiers` - List of verifier modules
   - `:system` - System prompt

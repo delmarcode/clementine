@@ -51,6 +51,25 @@ defmodule Clementine.Telemetry.LoggerTest do
       assert log =~ "max_iterations=30"
     end
 
+    test "loop start logs tuple model refs without crashing" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :loop, :start],
+            %{system_time: System.system_time()},
+            %{model: {:openai, "gpt-5"}, tool_count: 0, max_iterations: 10}
+          )
+        end)
+
+      assert log =~ "[Clementine] Loop started"
+      assert log =~ ~s(model={:openai, "gpt-5"})
+
+      handlers = :telemetry.list_handlers([:clementine, :loop, :start])
+      assert Enum.any?(handlers, fn h -> h.id == "clementine-logger" end)
+    end
+
     test "loop stop logs status, duration, and iterations" do
       TelemetryLogger.install()
 

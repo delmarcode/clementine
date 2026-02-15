@@ -15,28 +15,28 @@ config :clementine,
 config :clementine, :models,
   claude_sonnet: [
     provider: :anthropic,
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 8192
+    id: "claude-sonnet-4-20250514",
+    defaults: [max_tokens: 8192]
   ],
   claude_haiku: [
     provider: :anthropic,
-    model: "claude-haiku-4-5-20250514",
-    max_tokens: 4096
+    id: "claude-haiku-4-5-20250514",
+    defaults: [max_tokens: 4096]
   ],
   claude_opus: [
     provider: :anthropic,
-    model: "claude-opus-4-20250514",
-    max_tokens: 8192
+    id: "claude-opus-4-20250514",
+    defaults: [max_tokens: 8192]
   ],
   gpt_5: [
     provider: :openai,
-    model: "gpt-5",
-    max_output_tokens: 4096
+    id: "gpt-5",
+    defaults: [max_output_tokens: 4096]
   ],
   gpt_5_codex: [
     provider: :openai,
-    model: "gpt-5-codex",
-    max_output_tokens: 4096
+    id: "gpt-5-codex",
+    defaults: [max_output_tokens: 4096]
   ]
 
 import_config "#{config_env()}.exs"

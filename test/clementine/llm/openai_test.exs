@@ -24,7 +24,7 @@ defmodule Clementine.LLM.OpenAITest do
     Application.put_env(:clementine, :openai_api_key, "test-openai-key")
 
     Application.put_env(:clementine, :models,
-      gpt_test: [provider: :openai, model: "gpt-5", max_output_tokens: 1024]
+      gpt_test: [provider: :openai, id: "gpt-5", defaults: [max_output_tokens: 1024]]
     )
 
     Application.put_env(:clementine, :retry, max_attempts: 3, base_delay: 0, max_delay: 0)
@@ -71,6 +71,35 @@ defmodule Clementine.LLM.OpenAITest do
     assert [%Content{type: :text, text: "Hello from OpenAI"}] = response.content
     assert response.stop_reason == "end_turn"
     assert response.usage["output_tokens"] == 4
+  end
+
+  test "call/5 supports direct tuple model references", %{bypass: bypass} do
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+
+      assert request["model"] == "gpt-5"
+
+      response = %{
+        "id" => "resp_direct",
+        "output" => [
+          %{
+            "type" => "message",
+            "id" => "msg_1",
+            "role" => "assistant",
+            "content" => [%{"type" => "output_text", "text" => "Direct model ref"}]
+          }
+        ],
+        "usage" => %{"input_tokens" => 12, "output_tokens" => 4}
+      }
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, Jason.encode!(response))
+    end)
+
+    assert {:ok, %Response{content: [%Content{text: "Direct model ref"}]}} =
+             OpenAI.call({:openai, "gpt-5"}, "system", [UserMessage.new("Hi")], [])
   end
 
   test "call/5 parses tool calls", %{bypass: bypass} do

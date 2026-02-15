@@ -7,6 +7,9 @@ defmodule Clementine.Application do
 
   @impl true
   def start(_type, _args) do
+    # Fail fast on invalid model configuration.
+    Clementine.LLM.ModelRegistry.validate_config!()
+
     children = [
       # Task supervisor for tool execution
       {Task.Supervisor, name: Clementine.TaskSupervisor}

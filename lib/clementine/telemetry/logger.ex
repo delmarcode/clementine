@@ -52,7 +52,7 @@ defmodule Clementine.Telemetry.Logger do
   @doc false
   def handle_event([:clementine, :loop, :start], _measurements, metadata, config) do
     Logger.log(config.level, fn ->
-      "[Clementine] Loop started model=#{metadata.model} tools=#{metadata.tool_count} max_iterations=#{metadata.max_iterations}"
+      "[Clementine] Loop started model=#{format_model(metadata.model)} tools=#{metadata.tool_count} max_iterations=#{metadata.max_iterations}"
     end)
   end
 
@@ -133,4 +133,7 @@ defmodule Clementine.Telemetry.Logger do
   end
 
   defp tool_summary(%{tool: name}), do: name
+
+  defp format_model(model) when is_atom(model), do: Atom.to_string(model)
+  defp format_model(model), do: inspect(model)
 end

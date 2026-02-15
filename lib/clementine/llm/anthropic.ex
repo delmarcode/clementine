@@ -19,14 +19,15 @@ defmodule Clementine.LLM.Anthropic do
       config :clementine, :models,
         claude_sonnet: [
           provider: :anthropic,
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 8192
+          id: "claude-sonnet-4-20250514",
+          defaults: [max_tokens: 8192]
         ]
 
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
 
+  alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Message
   alias Clementine.LLM.Message.Content
   alias Clementine.LLM.Response
@@ -219,11 +220,15 @@ defmodule Clementine.LLM.Anthropic do
 
   # Build the request body
   defp build_body(model, system, messages, tools, opts) do
-    model_config = get_model_config(model)
-    model_id = Keyword.fetch!(model_config, :model)
+    resolved = resolve_model(model)
+    model_id = resolved.id
 
     max_tokens =
-      Keyword.get(opts, :max_tokens, Keyword.get(model_config, :max_tokens, @default_max_tokens))
+      Keyword.get(
+        opts,
+        :max_tokens,
+        Keyword.get(resolved.defaults, :max_tokens, @default_max_tokens)
+      )
 
     body = %{
       "model" => model_id,
@@ -272,22 +277,14 @@ defmodule Clementine.LLM.Anthropic do
   defp resolve_api_key(key) when is_binary(key), do: key
   defp resolve_api_key(_), do: nil
 
-  defp get_model_config(model) when is_atom(model) do
-    models = Application.get_env(:clementine, :models, %{})
+  defp resolve_model(model_ref) do
+    resolved = ModelRegistry.resolve!(model_ref)
 
-    case Keyword.get(models, model) do
-      nil ->
-        raise "Unknown model: #{inspect(model)}. Configure it in :clementine, :models"
-
-      config ->
-        case Keyword.get(config, :provider) do
-          :anthropic ->
-            config
-
-          other ->
-            raise "Model #{inspect(model)} is configured for provider #{inspect(other)}, not :anthropic"
-        end
+    if resolved.provider != :anthropic do
+      raise "Model #{inspect(model_ref)} is configured for provider #{inspect(resolved.provider)}, not :anthropic"
     end
+
+    resolved
   end
 
   defp format_messages(messages) do

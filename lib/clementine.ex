@@ -82,13 +82,13 @@ defmodule Clementine do
       config :clementine, :models,
         claude_sonnet: [
           provider: :anthropic,
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 8192
+          id: "claude-sonnet-4-20250514",
+          defaults: [max_tokens: 8192]
         ],
         gpt_5: [
           provider: :openai,
-          model: "gpt-5",
-          max_output_tokens: 4096
+          id: "gpt-5",
+          defaults: [max_output_tokens: 4096]
         ]
 
   """

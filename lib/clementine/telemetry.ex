@@ -12,21 +12,21 @@ defmodule Clementine.Telemetry do
   Emitted when the agentic loop begins.
 
   - Measurements: `%{system_time: integer}`
-  - Metadata: `%{model: atom, max_iterations: integer, tool_count: integer}`
+  - Metadata: `%{model: model_ref, max_iterations: integer, tool_count: integer}`
 
   ### `[:clementine, :loop, :stop]`
 
   Emitted when the loop ends successfully or hits max iterations.
 
   - Measurements: `%{duration: native_time, iterations: integer}`
-  - Metadata: `%{model: atom, status: :success | :max_iterations}`
+  - Metadata: `%{model: model_ref, status: :success | :max_iterations}`
 
   ### `[:clementine, :loop, :exception]`
 
   Emitted when the loop ends with an error.
 
   - Measurements: `%{duration: native_time, iterations: integer}`
-  - Metadata: `%{model: atom, kind: :error, reason: term}`
+  - Metadata: `%{model: model_ref, kind: :error, reason: term}`
 
   ## LLM Events
 
@@ -35,21 +35,21 @@ defmodule Clementine.Telemetry do
   Emitted before calling the LLM API.
 
   - Measurements: `%{system_time: integer}`
-  - Metadata: `%{model: atom, iteration: integer, message_count: integer, tool_count: integer, streaming: boolean}`
+  - Metadata: `%{model: model_ref, iteration: integer, message_count: integer, tool_count: integer, streaming: boolean}`
 
   ### `[:clementine, :llm, :stop]`
 
   Emitted when the LLM call completes successfully.
 
   - Measurements: `%{duration: native_time, input_tokens: integer, output_tokens: integer}`
-  - Metadata: `%{model: atom, iteration: integer, stop_reason: String.t(), streaming: boolean}`
+  - Metadata: `%{model: model_ref, iteration: integer, stop_reason: String.t(), streaming: boolean}`
 
   ### `[:clementine, :llm, :exception]`
 
   Emitted when the LLM call fails.
 
   - Measurements: `%{duration: native_time}`
-  - Metadata: `%{model: atom, iteration: integer, kind: :error, reason: term, streaming: boolean}`
+  - Metadata: `%{model: model_ref, iteration: integer, kind: :error, reason: term, streaming: boolean}`
 
   ## Tool Events
 
