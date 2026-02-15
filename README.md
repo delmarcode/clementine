@@ -28,12 +28,13 @@ end
 
 ## Quick Start
 
-### 1. Configure your API key
+### 1. Configure your API key(s)
 
 ```elixir
 # config/config.exs
 config :clementine,
-  api_key: {:system, "ANTHROPIC_API_KEY"}
+  anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
+  openai_api_key: {:system, "OPENAI_API_KEY"}
 ```
 
 ### 2. Define an agent
@@ -245,7 +246,8 @@ Clementine.clear_history(agent)
 ```elixir
 # config/config.exs
 config :clementine,
-  api_key: {:system, "ANTHROPIC_API_KEY"},
+  anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
+  openai_api_key: {:system, "OPENAI_API_KEY"},
   default_model: :claude_sonnet,
   max_iterations: 10,
   timeout: :timer.minutes(5),
@@ -265,6 +267,16 @@ config :clementine, :models,
     provider: :anthropic,
     model: "claude-opus-4-20250514",
     max_tokens: 8192
+  ],
+  gpt_5: [
+    provider: :openai,
+    model: "gpt-5",
+    max_output_tokens: 4096
+  ],
+  gpt_5_codex: [
+    provider: :openai,
+    model: "gpt-5-codex",
+    max_output_tokens: 4096
   ]
 ```
 

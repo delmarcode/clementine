@@ -136,6 +136,6 @@ defmodule Clementine.LLM do
 
   # Get the configured LLM client (allows for mocking in tests)
   defp get_client do
-    Application.get_env(:clementine, :llm_client, Clementine.LLM.Anthropic)
+    Application.get_env(:clementine, :llm_client, Clementine.LLM.Router)
   end
 end
