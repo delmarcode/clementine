@@ -8,7 +8,8 @@ defmodule Clementine.Tools.Search do
 
   use Clementine.Tool,
     name: "search",
-    description: "Search for a pattern in files. Returns matching lines with file names and line numbers. Supports regular expressions.",
+    description:
+      "Search for a pattern in files. Returns matching lines with file names and line numbers. Supports regular expressions.",
     parameters: [
       pattern: [
         type: :string,
@@ -33,6 +34,14 @@ defmodule Clementine.Tools.Search do
     ]
 
   @default_max_results 100
+
+  @impl Clementine.Tool
+  def summarize(%{pattern: pattern} = args) do
+    path = Map.get(args, :path, ".")
+    "search(#{inspect(pattern)}, path=#{path})"
+  end
+
+  def summarize(args), do: super(args)
 
   @impl true
   def run(args, context) do

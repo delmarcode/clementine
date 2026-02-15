@@ -7,7 +7,8 @@ defmodule Clementine.Tools.ListDir do
 
   use Clementine.Tool,
     name: "list_dir",
-    description: "List the contents of a directory. Shows files and subdirectories with their types.",
+    description:
+      "List the contents of a directory. Shows files and subdirectories with their types.",
     parameters: [
       path: [
         type: :string,
@@ -20,6 +21,10 @@ defmodule Clementine.Tools.ListDir do
         description: "Whether to show hidden files (starting with dot). Default: false"
       ]
     ]
+
+  @impl Clementine.Tool
+  def summarize(%{path: path}), do: "list_dir(#{path})"
+  def summarize(args), do: super(args)
 
   @impl true
   def run(args, context) do

@@ -21,7 +21,7 @@ defmodule Clementine.LLM do
 
   ## Parameters
 
-  - `model` - The model atom (e.g., `:claude_sonnet`)
+  - `model` - Model reference: alias atom (e.g., `:claude_sonnet`) or `{provider, id}` tuple
   - `system` - The system prompt (can be nil or empty string)
   - `messages` - List of conversation messages
   - `tools` - List of tool modules (can be empty)
@@ -136,6 +136,6 @@ defmodule Clementine.LLM do
 
   # Get the configured LLM client (allows for mocking in tests)
   defp get_client do
-    Application.get_env(:clementine, :llm_client, Clementine.LLM.Anthropic)
+    Application.get_env(:clementine, :llm_client, Clementine.LLM.Router)
   end
 end

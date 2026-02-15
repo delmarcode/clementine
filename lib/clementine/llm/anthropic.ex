@@ -10,7 +10,7 @@ defmodule Clementine.LLM.Anthropic do
   Configure the API key in your config:
 
       config :clementine,
-        api_key: {:system, "ANTHROPIC_API_KEY"}  # or a literal string
+        anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}  # or a literal string
 
   ## Models
 
@@ -19,14 +19,15 @@ defmodule Clementine.LLM.Anthropic do
       config :clementine, :models,
         claude_sonnet: [
           provider: :anthropic,
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 8192
+          id: "claude-sonnet-4-20250514",
+          defaults: [max_tokens: 8192]
         ]
 
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
 
+  alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Message
   alias Clementine.LLM.Message.Content
   alias Clementine.LLM.Response
@@ -78,7 +79,7 @@ defmodule Clementine.LLM.Anthropic do
     base_delay = Keyword.get(retry_opts, :base_delay, 1000)
     max_delay = Keyword.get(retry_opts, :max_delay, 30_000)
 
-    delay = base_delay * :math.pow(2, attempt - 1) |> round()
+    delay = (base_delay * :math.pow(2, attempt - 1)) |> round()
     min(delay, max_delay)
   end
 
@@ -149,12 +150,13 @@ defmodule Clementine.LLM.Anthropic do
       {:cont, acc}
     end
 
-    result = Req.post(base_url(),
-      json: body,
-      headers: headers,
-      into: callback,
-      receive_timeout: 300_000
-    )
+    result =
+      Req.post(base_url(),
+        json: body,
+        headers: headers,
+        into: callback,
+        receive_timeout: 300_000
+      )
 
     case result do
       {:ok, %{status: 200}} ->
@@ -218,9 +220,15 @@ defmodule Clementine.LLM.Anthropic do
 
   # Build the request body
   defp build_body(model, system, messages, tools, opts) do
-    model_config = get_model_config(model)
-    model_id = Keyword.fetch!(model_config, :model)
-    max_tokens = Keyword.get(opts, :max_tokens, Keyword.get(model_config, :max_tokens, @default_max_tokens))
+    resolved = resolve_model(model)
+    model_id = resolved.id
+
+    max_tokens =
+      Keyword.get(
+        opts,
+        :max_tokens,
+        Keyword.get(resolved.defaults, :max_tokens, @default_max_tokens)
+      )
 
     body = %{
       "model" => model_id,
@@ -254,20 +262,29 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp get_api_key do
-    case Application.get_env(:clementine, :api_key) do
-      {:system, env_var} -> System.get_env(env_var) || raise "Missing #{env_var} environment variable"
-      key when is_binary(key) -> key
-      nil -> raise "Missing :api_key configuration for :clementine"
+    key = resolve_api_key(Application.get_env(:clementine, :anthropic_api_key))
+
+    case key do
+      key when is_binary(key) and key != "" ->
+        key
+
+      _ ->
+        raise "Missing :anthropic_api_key configuration for :clementine"
     end
   end
 
-  defp get_model_config(model) when is_atom(model) do
-    models = Application.get_env(:clementine, :models, %{})
+  defp resolve_api_key({:system, env_var}) when is_binary(env_var), do: System.get_env(env_var)
+  defp resolve_api_key(key) when is_binary(key), do: key
+  defp resolve_api_key(_), do: nil
 
-    case Keyword.get(models, model) do
-      nil -> raise "Unknown model: #{inspect(model)}. Configure it in :clementine, :models"
-      config -> config
+  defp resolve_model(model_ref) do
+    resolved = ModelRegistry.resolve!(model_ref)
+
+    if resolved.provider != :anthropic do
+      raise "Model #{inspect(model_ref)} is configured for provider #{inspect(resolved.provider)}, not :anthropic"
     end
+
+    resolved
   end
 
   defp format_messages(messages) do

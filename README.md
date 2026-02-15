@@ -28,12 +28,13 @@ end
 
 ## Quick Start
 
-### 1. Configure your API key
+### 1. Configure your API key(s)
 
 ```elixir
 # config/config.exs
 config :clementine,
-  api_key: {:system, "ANTHROPIC_API_KEY"}
+  anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
+  openai_api_key: {:system, "OPENAI_API_KEY"}
 ```
 
 ### 2. Define an agent
@@ -245,7 +246,8 @@ Clementine.clear_history(agent)
 ```elixir
 # config/config.exs
 config :clementine,
-  api_key: {:system, "ANTHROPIC_API_KEY"},
+  anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
+  openai_api_key: {:system, "OPENAI_API_KEY"},
   default_model: :claude_sonnet,
   max_iterations: 10,
   timeout: :timer.minutes(5),
@@ -258,14 +260,30 @@ config :clementine,
 config :clementine, :models,
   claude_sonnet: [
     provider: :anthropic,
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 8192
+    id: "claude-sonnet-4-20250514",
+    defaults: [max_tokens: 8192]
   ],
   claude_opus: [
     provider: :anthropic,
-    model: "claude-opus-4-20250514",
-    max_tokens: 8192
+    id: "claude-opus-4-20250514",
+    defaults: [max_tokens: 8192]
+  ],
+  gpt_5: [
+    provider: :openai,
+    id: "gpt-5",
+    defaults: [max_output_tokens: 4096]
+  ],
+  gpt_5_codex: [
+    provider: :openai,
+    id: "gpt-5-codex",
+    defaults: [max_output_tokens: 4096]
   ]
+```
+
+You can also bypass aliases and pass provider model IDs directly:
+
+```elixir
+{:ok, result} = Clementine.Loop.run([model: {:openai, "gpt-5"}, tools: []], "Hi")
 ```
 
 ## Why Clementine?

@@ -7,7 +7,8 @@ defmodule Clementine.Tools.WriteFile do
 
   use Clementine.Tool,
     name: "write_file",
-    description: "Write content to a file. Creates the file if it doesn't exist, or overwrites if it does. Creates parent directories automatically.",
+    description:
+      "Write content to a file. Creates the file if it doesn't exist, or overwrites if it does. Creates parent directories automatically.",
     parameters: [
       path: [
         type: :string,
@@ -20,6 +21,10 @@ defmodule Clementine.Tools.WriteFile do
         description: "The content to write to the file"
       ]
     ]
+
+  @impl Clementine.Tool
+  def summarize(%{path: path}), do: "write_file(#{path})"
+  def summarize(args), do: super(args)
 
   @impl true
   def run(%{path: path, content: content}, context) do

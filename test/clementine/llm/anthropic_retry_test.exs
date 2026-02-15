@@ -12,7 +12,12 @@ defmodule Clementine.LLM.AnthropicRetryTest do
     prev_url = Application.get_env(:clementine, :anthropic_base_url)
     prev_retry = Application.get_env(:clementine, :retry)
 
-    Application.put_env(:clementine, :anthropic_base_url, "http://localhost:#{bypass.port}/v1/messages")
+    Application.put_env(
+      :clementine,
+      :anthropic_base_url,
+      "http://localhost:#{bypass.port}/v1/messages"
+    )
+
     Application.put_env(:clementine, :retry, max_attempts: 3, base_delay: 0, max_delay: 0)
 
     on_exit(fn ->
@@ -36,7 +41,11 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         call_num = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
 
         if call_num == 1 do
-          Plug.Conn.resp(conn, 429, ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}))
+          Plug.Conn.resp(
+            conn,
+            429,
+            ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}})
+          )
         else
           conn
           |> Plug.Conn.put_resp_content_type("text/event-stream")
@@ -44,7 +53,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         end
       end)
 
-      events = Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+      events =
+        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello from retry!"}, &1))
       assert Enum.any?(events, &match?({:message_stop}, &1))
@@ -60,7 +70,11 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         call_num = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
 
         if call_num == 1 do
-          Plug.Conn.resp(conn, 529, ~s({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}))
+          Plug.Conn.resp(
+            conn,
+            529,
+            ~s({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})
+          )
         else
           conn
           |> Plug.Conn.put_resp_content_type("text/event-stream")
@@ -68,7 +82,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         end
       end)
 
-      events = Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+      events =
+        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello after overload!"}, &1))
       assert Agent.get(counter, & &1) == 2
@@ -81,15 +96,21 @@ defmodule Clementine.LLM.AnthropicRetryTest do
 
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         Agent.update(counter, fn n -> n + 1 end)
-        Plug.Conn.resp(conn, 429, ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}))
+
+        Plug.Conn.resp(
+          conn,
+          429,
+          ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}})
+        )
       end)
 
-      events = Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+      events =
+        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert Enum.any?(events, fn
-        {:error, {:api_error, 429, _}} -> true
-        _ -> false
-      end)
+               {:error, {:api_error, 429, _}} -> true
+               _ -> false
+             end)
 
       # max_attempts is 3
       assert Agent.get(counter, & &1) == 3
@@ -116,7 +137,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         Bypass.up(bypass)
       end)
 
-      events = Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+      events =
+        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello after network error!"}, &1))
     end
@@ -137,7 +159,9 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         Bypass.up(bypass)
       end)
 
-      assert {:ok, %Response{} = response} = Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+      assert {:ok, %Response{} = response} =
+               Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+
       assert [%Content{type: :text, text: "Hello sync after error!"}] = response.content
     end
   end
@@ -150,7 +174,11 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         call_num = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
 
         if call_num == 1 do
-          Plug.Conn.resp(conn, 429, ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}))
+          Plug.Conn.resp(
+            conn,
+            429,
+            ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}})
+          )
         else
           conn
           |> Plug.Conn.put_resp_content_type("application/json")
@@ -158,7 +186,9 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         end
       end)
 
-      assert {:ok, %Response{} = response} = Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+      assert {:ok, %Response{} = response} =
+               Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+
       assert [%Content{type: :text, text: "Hello sync!"}] = response.content
       assert Agent.get(counter, & &1) == 2
 
@@ -170,10 +200,17 @@ defmodule Clementine.LLM.AnthropicRetryTest do
 
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         Agent.update(counter, fn n -> n + 1 end)
-        Plug.Conn.resp(conn, 429, ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}))
+
+        Plug.Conn.resp(
+          conn,
+          429,
+          ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}})
+        )
       end)
 
-      assert {:error, {:api_error, 429, _}} = Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+      assert {:error, {:api_error, 429, _}} =
+               Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+
       assert Agent.get(counter, & &1) == 3
 
       Agent.stop(counter)
@@ -182,14 +219,17 @@ defmodule Clementine.LLM.AnthropicRetryTest do
 
   # Minimal SSE body that produces a text_delta and message_stop
   defp sse_success_body(text) do
-    Enum.join([
-      "event: message_start\ndata: #{Jason.encode!(%{"type" => "message_start", "message" => %{"id" => "msg_test", "type" => "message", "role" => "assistant", "content" => [], "model" => "claude-sonnet-4-20250514", "stop_reason" => nil, "stop_sequence" => nil, "usage" => %{"input_tokens" => 10, "output_tokens" => 1}}})}\n",
-      "event: content_block_start\ndata: #{Jason.encode!(%{"type" => "content_block_start", "index" => 0, "content_block" => %{"type" => "text", "text" => ""}})}\n",
-      "event: content_block_delta\ndata: #{Jason.encode!(%{"type" => "content_block_delta", "index" => 0, "delta" => %{"type" => "text_delta", "text" => text}})}\n",
-      "event: content_block_stop\ndata: #{Jason.encode!(%{"type" => "content_block_stop", "index" => 0})}\n",
-      "event: message_delta\ndata: #{Jason.encode!(%{"type" => "message_delta", "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil}, "usage" => %{"output_tokens" => 5}})}\n",
-      "event: message_stop\ndata: #{Jason.encode!(%{"type" => "message_stop"})}\n"
-    ], "\n") <> "\n"
+    Enum.join(
+      [
+        "event: message_start\ndata: #{Jason.encode!(%{"type" => "message_start", "message" => %{"id" => "msg_test", "type" => "message", "role" => "assistant", "content" => [], "model" => "claude-sonnet-4-20250514", "stop_reason" => nil, "stop_sequence" => nil, "usage" => %{"input_tokens" => 10, "output_tokens" => 1}}})}\n",
+        "event: content_block_start\ndata: #{Jason.encode!(%{"type" => "content_block_start", "index" => 0, "content_block" => %{"type" => "text", "text" => ""}})}\n",
+        "event: content_block_delta\ndata: #{Jason.encode!(%{"type" => "content_block_delta", "index" => 0, "delta" => %{"type" => "text_delta", "text" => text}})}\n",
+        "event: content_block_stop\ndata: #{Jason.encode!(%{"type" => "content_block_stop", "index" => 0})}\n",
+        "event: message_delta\ndata: #{Jason.encode!(%{"type" => "message_delta", "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil}, "usage" => %{"output_tokens" => 5}})}\n",
+        "event: message_stop\ndata: #{Jason.encode!(%{"type" => "message_stop"})}\n"
+      ],
+      "\n"
+    ) <> "\n"
   end
 
   defp sync_success_body(text) do

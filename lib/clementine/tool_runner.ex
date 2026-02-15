@@ -72,9 +72,35 @@ defmodule Clementine.ToolRunner do
         {call.id, result}
 
       {{:exit, :timeout}, call} ->
+        timeout_native = System.convert_time_unit(timeout, :millisecond, :native)
+
+        :telemetry.execute(
+          [:clementine, :tool, :exception],
+          %{duration: timeout_native},
+          %{
+            tool: call.name,
+            tool_call_id: call.id,
+            iteration: Map.get(context, :_clementine_iteration, 0),
+            kind: :exit,
+            reason: :timeout
+          }
+        )
+
         {call.id, {:error, "Tool timed out after #{timeout}ms"}}
 
       {{:exit, reason}, call} ->
+        :telemetry.execute(
+          [:clementine, :tool, :exception],
+          %{duration: 0},
+          %{
+            tool: call.name,
+            tool_call_id: call.id,
+            iteration: Map.get(context, :_clementine_iteration, 0),
+            kind: :exit,
+            reason: reason
+          }
+        )
+
         {call.id, {:error, "Tool crashed: #{inspect(reason)}"}}
     end)
   end
@@ -85,7 +111,7 @@ defmodule Clementine.ToolRunner do
   This is useful when you want to run tools one at a time
   or when you're already in a supervised context.
   """
-  def execute_single(tools, %{name: name, input: input} = _call, context) do
+  def execute_single(tools, %{name: name, input: input} = call, context) do
     case Tool.find_by_name(tools, name) do
       nil ->
         {:error, "Unknown tool: #{name}"}
@@ -96,20 +122,72 @@ defmodule Clementine.ToolRunner do
         # to avoid unbounded atom creation from untrusted LLM input.
         args = cast_keys(input, tool.__parameters__())
 
+        tool_call_id = Map.get(call, :id)
+        iteration = Map.get(context, :_clementine_iteration, 0)
+
+        telemetry_meta = %{
+          tool: name,
+          tool_call_id: tool_call_id,
+          iteration: iteration,
+          tool_module: tool,
+          args: args
+        }
+
+        :telemetry.execute(
+          [:clementine, :tool, :start],
+          %{system_time: System.system_time()},
+          telemetry_meta
+        )
+
+        tool_start = System.monotonic_time()
+
         try do
-          tool.execute(args, context)
+          result = tool.execute(args, context)
+
+          :telemetry.execute(
+            [:clementine, :tool, :stop],
+            %{duration: System.monotonic_time() - tool_start},
+            Map.put(telemetry_meta, :result, tool_result_status(result))
+          )
+
+          result
         rescue
           e ->
+            :telemetry.execute(
+              [:clementine, :tool, :exception],
+              %{duration: System.monotonic_time() - tool_start},
+              Map.merge(telemetry_meta, %{kind: :error, reason: e})
+            )
+
             {:error, "Tool execution failed: #{Exception.message(e)}"}
         catch
           :exit, reason ->
+            :telemetry.execute(
+              [:clementine, :tool, :exception],
+              %{duration: System.monotonic_time() - tool_start},
+              Map.merge(telemetry_meta, %{kind: :exit, reason: reason})
+            )
+
             {:error, "Tool exited: #{inspect(reason)}"}
 
           kind, reason ->
+            :telemetry.execute(
+              [:clementine, :tool, :exception],
+              %{duration: System.monotonic_time() - tool_start},
+              Map.merge(telemetry_meta, %{kind: kind, reason: reason})
+            )
+
             {:error, "Tool error (#{kind}): #{inspect(reason)}"}
         end
     end
   end
+
+  defp tool_result_status({:ok, _, opts}) when is_list(opts) do
+    if Keyword.get(opts, :is_error, false), do: :error, else: :ok
+  end
+
+  defp tool_result_status({:ok, _}), do: :ok
+  defp tool_result_status({:error, _}), do: :error
 
   @doc """
   Formats tool results for inclusion in the conversation.

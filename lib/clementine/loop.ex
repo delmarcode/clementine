@@ -48,18 +48,20 @@ defmodule Clementine.Loop do
       :context,
       :max_iterations,
       :on_event,
+      :loop_start_time,
       messages: [],
       iteration: 0
     ]
 
     @type t :: %__MODULE__{
-            model: atom(),
+            model: Clementine.LLM.ModelRegistry.model_ref(),
             system: String.t() | nil,
             tools: [module()],
             verifiers: [module()],
             context: map(),
             max_iterations: pos_integer(),
             on_event: (term() -> any()) | nil,
+            loop_start_time: integer() | nil,
             messages: [Clementine.LLM.Message.message()],
             iteration: non_neg_integer()
           }
@@ -73,7 +75,7 @@ defmodule Clementine.Loop do
   ## Parameters
 
   - `config` - Keyword list with:
-    - `:model` - The model atom (required)
+    - `:model` - Model reference (required): alias atom (e.g. `:claude_sonnet`) or `{provider, id}` tuple
     - `:system` - System prompt
     - `:tools` - List of tool modules
     - `:verifiers` - List of verifier modules
@@ -99,13 +101,20 @@ defmodule Clementine.Loop do
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       on_event: Keyword.get(config, :on_event),
-      messages: Keyword.get(config, :messages, [])
+      messages: Keyword.get(config, :messages, []),
+      loop_start_time: System.monotonic_time()
     }
 
     # Add user message
     state = %{state | messages: state.messages ++ [UserMessage.new(prompt)]}
 
     emit_event(state, {:loop_start, prompt})
+
+    :telemetry.execute(
+      [:clementine, :loop, :start],
+      %{system_time: System.system_time()},
+      %{model: state.model, max_iterations: state.max_iterations, tool_count: length(state.tools)}
+    )
 
     iterate(state)
   end
@@ -114,6 +123,13 @@ defmodule Clementine.Loop do
   defp iterate(%State{iteration: iteration, max_iterations: max} = state)
        when iteration >= max do
     emit_event(state, {:loop_end, :max_iterations})
+
+    :telemetry.execute(
+      [:clementine, :loop, :stop],
+      %{duration: System.monotonic_time() - state.loop_start_time, iterations: state.iteration},
+      %{model: state.model, status: :max_iterations}
+    )
+
     {:error, :max_iterations_reached}
   end
 
@@ -127,6 +143,16 @@ defmodule Clementine.Loop do
 
       {:error, reason} ->
         emit_event(state, {:loop_end, {:error, reason}})
+
+        :telemetry.execute(
+          [:clementine, :loop, :exception],
+          %{
+            duration: System.monotonic_time() - state.loop_start_time,
+            iterations: state.iteration
+          },
+          %{model: state.model, kind: :error, reason: reason}
+        )
+
         {:error, reason}
     end
   end
@@ -135,12 +161,60 @@ defmodule Clementine.Loop do
   defp call_llm(%State{} = state) do
     emit_event(state, :llm_call_start)
 
-    result = LLM.call(
-      state.model,
-      state.system,
-      state.messages,
-      state.tools
+    llm_start = System.monotonic_time()
+
+    :telemetry.execute(
+      [:clementine, :llm, :start],
+      %{system_time: System.system_time()},
+      %{
+        model: state.model,
+        iteration: state.iteration,
+        message_count: length(state.messages),
+        tool_count: length(state.tools),
+        streaming: false
+      }
     )
+
+    result =
+      LLM.call(
+        state.model,
+        state.system,
+        state.messages,
+        state.tools
+      )
+
+    llm_duration = System.monotonic_time() - llm_start
+
+    case result do
+      {:ok, response} ->
+        :telemetry.execute(
+          [:clementine, :llm, :stop],
+          %{
+            duration: llm_duration,
+            input_tokens: get_in(response.usage, ["input_tokens"]) || 0,
+            output_tokens: get_in(response.usage, ["output_tokens"]) || 0
+          },
+          %{
+            model: state.model,
+            iteration: state.iteration,
+            stop_reason: response.stop_reason,
+            streaming: false
+          }
+        )
+
+      {:error, reason} ->
+        :telemetry.execute(
+          [:clementine, :llm, :exception],
+          %{duration: llm_duration},
+          %{
+            model: state.model,
+            iteration: state.iteration,
+            kind: :error,
+            reason: reason,
+            streaming: false
+          }
+        )
+    end
 
     emit_event(state, {:llm_call_end, result})
     result
@@ -169,8 +243,9 @@ defmodule Clementine.Loop do
         %{id: t.id, name: t.name, input: t.input}
       end)
 
-    # Execute tools
-    results = ToolRunner.execute(state.tools, tool_calls, state.context)
+    # Execute tools (per-tool telemetry is emitted by ToolRunner)
+    context = Map.put(state.context, :_clementine_iteration, state.iteration)
+    results = ToolRunner.execute(state.tools, tool_calls, context)
     emit_event(state, {:tool_results, results})
 
     # Format results for the conversation
@@ -192,6 +267,16 @@ defmodule Clementine.Loop do
     case run_verifiers(state, text) do
       :ok ->
         emit_event(state, {:loop_end, :success})
+
+        :telemetry.execute(
+          [:clementine, :loop, :stop],
+          %{
+            duration: System.monotonic_time() - state.loop_start_time,
+            iterations: state.iteration
+          },
+          %{model: state.model, status: :success}
+        )
+
         {:ok, text, state.messages}
 
       {:retry, reason} ->
@@ -211,7 +296,9 @@ defmodule Clementine.Loop do
     emit_event(state, {:verification_failed, reason})
 
     # Add retry message to conversation
-    retry_message = UserMessage.new("Verification failed: #{reason}\n\nPlease fix the issues and try again.")
+    retry_message =
+      UserMessage.new("Verification failed: #{reason}\n\nPlease fix the issues and try again.")
+
     state = %{state | messages: state.messages ++ [retry_message]}
 
     # Continue the loop
@@ -261,13 +348,20 @@ defmodule Clementine.Loop do
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       on_event: fn event -> stream_callback.({:loop_event, event}) end,
-      messages: Keyword.get(config, :messages, [])
+      messages: Keyword.get(config, :messages, []),
+      loop_start_time: System.monotonic_time()
     }
 
     # Add user message
     state = %{state | messages: state.messages ++ [UserMessage.new(prompt)]}
 
     emit_event(state, {:loop_start, prompt})
+
+    :telemetry.execute(
+      [:clementine, :loop, :start],
+      %{system_time: System.system_time()},
+      %{model: state.model, max_iterations: state.max_iterations, tool_count: length(state.tools)}
+    )
 
     iterate_streaming(state, stream_callback)
   end
@@ -276,6 +370,13 @@ defmodule Clementine.Loop do
   defp iterate_streaming(%State{iteration: iteration, max_iterations: max} = state, _callback)
        when iteration >= max do
     emit_event(state, {:loop_end, :max_iterations})
+
+    :telemetry.execute(
+      [:clementine, :loop, :stop],
+      %{duration: System.monotonic_time() - state.loop_start_time, iterations: state.iteration},
+      %{model: state.model, status: :max_iterations}
+    )
+
     {:error, :max_iterations_reached}
   end
 
@@ -289,22 +390,51 @@ defmodule Clementine.Loop do
 
       {:error, reason} ->
         emit_event(state, {:loop_end, {:error, reason}})
+
+        :telemetry.execute(
+          [:clementine, :loop, :exception],
+          %{
+            duration: System.monotonic_time() - state.loop_start_time,
+            iterations: state.iteration
+          },
+          %{model: state.model, kind: :error, reason: reason}
+        )
+
         {:error, reason}
     end
   end
 
   # Streaming LLM call - emits text deltas as they arrive
   defp call_llm_streaming(%State{} = state, stream_callback) do
-    alias Clementine.LLM.StreamParser.Accumulator
-
     emit_event(state, :llm_call_start)
 
-    stream = LLM.stream(
-      state.model,
-      state.system,
-      state.messages,
-      state.tools
+    llm_start = System.monotonic_time()
+
+    :telemetry.execute(
+      [:clementine, :llm, :start],
+      %{system_time: System.system_time()},
+      %{
+        model: state.model,
+        iteration: state.iteration,
+        message_count: length(state.messages),
+        tool_count: length(state.tools),
+        streaming: true
+      }
     )
+
+    do_call_llm_streaming(state, stream_callback, llm_start)
+  end
+
+  defp do_call_llm_streaming(%State{} = state, stream_callback, llm_start) do
+    alias Clementine.LLM.StreamParser.Accumulator
+
+    stream =
+      LLM.stream(
+        state.model,
+        state.system,
+        state.messages,
+        state.tools
+      )
 
     # Process the stream, emitting events and accumulating the response
     acc =
@@ -322,16 +452,62 @@ defmodule Clementine.Loop do
         Accumulator.process(acc, event)
       end)
 
+    llm_duration = System.monotonic_time() - llm_start
+
     if Accumulator.error?(acc) do
       emit_event(state, {:llm_call_end, {:error, acc.error}})
+
+      :telemetry.execute(
+        [:clementine, :llm, :exception],
+        %{duration: llm_duration},
+        %{
+          model: state.model,
+          iteration: state.iteration,
+          kind: :error,
+          reason: acc.error,
+          streaming: true
+        }
+      )
+
       {:error, acc.error}
     else
       result = Accumulator.to_response(acc)
       emit_event(state, {:llm_call_end, {:ok, result}})
+
+      :telemetry.execute(
+        [:clementine, :llm, :stop],
+        %{
+          duration: llm_duration,
+          input_tokens: get_in(result.usage, ["input_tokens"]) || 0,
+          output_tokens: get_in(result.usage, ["output_tokens"]) || 0
+        },
+        %{
+          model: state.model,
+          iteration: state.iteration,
+          stop_reason: result.stop_reason,
+          streaming: true
+        }
+      )
+
       {:ok, result}
     end
   rescue
-    e -> {:error, e}
+    e ->
+      llm_duration = System.monotonic_time() - llm_start
+
+      :telemetry.execute(
+        [:clementine, :llm, :exception],
+        %{duration: llm_duration},
+        %{
+          model: state.model,
+          iteration: state.iteration,
+          kind: :error,
+          reason: e,
+          streaming: true
+        }
+      )
+
+      {:error, e}
   end
 
   # Handle response in streaming mode
@@ -357,8 +533,9 @@ defmodule Clementine.Loop do
         %{id: t.id, name: t.name, input: t.input}
       end)
 
-    # Execute tools and emit results
-    results = ToolRunner.execute(state.tools, tool_calls, state.context)
+    # Execute tools (per-tool telemetry is emitted by ToolRunner)
+    context = Map.put(state.context, :_clementine_iteration, state.iteration)
+    results = ToolRunner.execute(state.tools, tool_calls, context)
 
     # Emit tool results to the stream callback
     Enum.each(results, fn {id, result} ->

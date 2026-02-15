@@ -74,15 +74,21 @@ defmodule Clementine do
 
       # config/config.exs
       config :clementine,
-        api_key: {:system, "ANTHROPIC_API_KEY"},
+        anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
+        openai_api_key: {:system, "OPENAI_API_KEY"},
         default_model: :claude_sonnet,
         max_iterations: 10
 
       config :clementine, :models,
         claude_sonnet: [
           provider: :anthropic,
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 8192
+          id: "claude-sonnet-4-20250514",
+          defaults: [max_tokens: 8192]
+        ],
+        gpt_5: [
+          provider: :openai,
+          id: "gpt-5",
+          defaults: [max_output_tokens: 4096]
         ]
 
   """

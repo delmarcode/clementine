@@ -8,7 +8,8 @@ defmodule Clementine.Tools.Bash do
 
   use Clementine.Tool,
     name: "bash",
-    description: "Execute a shell command. Runs in bash with a timeout. Use for running tests, builds, git operations, and other system commands.",
+    description:
+      "Execute a shell command. Runs in bash with a timeout. Use for running tests, builds, git operations, and other system commands.",
     parameters: [
       command: [
         type: :string,
@@ -23,6 +24,14 @@ defmodule Clementine.Tools.Bash do
     ]
 
   @default_timeout 60_000
+
+  @impl Clementine.Tool
+  def summarize(%{command: command}) do
+    cmd = command |> String.split("\n") |> hd() |> String.slice(0, 80)
+    "bash(#{cmd})"
+  end
+
+  def summarize(args), do: super(args)
 
   @impl true
   def run(%{command: command} = args, context) do

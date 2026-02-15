@@ -1,5 +1,6 @@
 defmodule Clementine.AgentTest do
-  use ExUnit.Case, async: false  # Need sync for Mox global mode
+  # Need sync for Mox global mode
+  use ExUnit.Case, async: false
   import Mox
   alias Clementine.LLM.Message.Content
   alias Clementine.LLM.Response
@@ -81,7 +82,8 @@ defmodule Clementine.AgentTest do
       {:ok, _} = Clementine.Agent.run(agent, "First message")
       history = Clementine.Agent.get_history(agent)
 
-      assert length(history) == 2  # user + assistant
+      # user + assistant
+      assert length(history) == 2
       assert Enum.at(history, 0).role == :user
       assert Enum.at(history, 1).role == :assistant
 
@@ -360,7 +362,12 @@ defmodule Clementine.AgentTest do
       # Backdate the completed_at timestamp so the sweep will evict it
       state = GenServer.call(agent, :get_state)
       old_entry = Map.get(state.tasks, task_id)
-      backdated = %{old_entry | completed_at: System.monotonic_time(:millisecond) - :timer.minutes(60)}
+
+      backdated = %{
+        old_entry
+        | completed_at: System.monotonic_time(:millisecond) - :timer.minutes(60)
+      }
+
       new_tasks = Map.put(state.tasks, task_id, backdated)
       # We can't set state directly, so trigger cleanup by sending the message
       # after updating via :sys.replace_state

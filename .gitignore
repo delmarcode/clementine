@@ -22,3 +22,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 clementine-*.tar
 
+# Private exploration/design documents
+/private/
+

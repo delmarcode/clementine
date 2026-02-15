@@ -269,7 +269,10 @@ defmodule Clementine.LLM.StreamParser do
       %{acc | current_tool_input: acc.current_tool_input <> json}
     end
 
-    def process(%__MODULE__{current_tool: tool, current_tool_input: input} = acc, {:content_block_stop, _})
+    def process(
+          %__MODULE__{current_tool: tool, current_tool_input: input} = acc,
+          {:content_block_stop, _}
+        )
         when tool != nil do
       parsed_input =
         case Jason.decode(input) do
