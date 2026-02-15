@@ -72,9 +72,11 @@ defmodule Clementine.ToolRunner do
         {call.id, result}
 
       {{:exit, :timeout}, call} ->
+        timeout_native = System.convert_time_unit(timeout, :millisecond, :native)
+
         :telemetry.execute(
           [:clementine, :tool, :exception],
-          %{duration: timeout * 1_000_000},
+          %{duration: timeout_native},
           %{
             tool: call.name,
             tool_call_id: call.id,

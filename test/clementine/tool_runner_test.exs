@@ -177,6 +177,35 @@ defmodule Clementine.ToolRunnerTest do
       assert message =~ "timed out"
     end
 
+    test "timeout telemetry duration is emitted in native units" do
+      handler_id = "tool-timeout-test-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:clementine, :tool, :exception],
+        fn _event, measurements, metadata, _config ->
+          send(parent, {:tool_exception, measurements, metadata})
+        end,
+        %{}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      timeout_ms = 50
+
+      calls = [
+        %{id: "call_1", name: "slow", input: %{"delay_ms" => 5000}}
+      ]
+
+      _ = ToolRunner.execute(@tools, calls, %{}, timeout: timeout_ms)
+
+      expected_duration = System.convert_time_unit(timeout_ms, :millisecond, :native)
+
+      assert_receive {:tool_exception, %{duration: ^expected_duration},
+                      %{tool_call_id: "call_1", reason: :timeout}}
+    end
+
     test "isolates tool crashes" do
       calls = [
         %{id: "call_1", name: "crash", input: %{}},

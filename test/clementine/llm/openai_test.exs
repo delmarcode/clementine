@@ -209,6 +209,35 @@ defmodule Clementine.LLM.OpenAITest do
            ] = response.content
   end
 
+  test "stream/5 replays unfinished parallel function calls correctly", %{bypass: bypass} do
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      conn
+      |> Plug.Conn.put_resp_content_type("text/event-stream")
+      |> Plug.Conn.resp(200, parallel_unfinished_tool_calls_sse())
+    end)
+
+    assert {:ok, %Response{} = response} =
+             OpenAI.stream(:gpt_test, "system", [UserMessage.new("parallel tools")], [])
+             |> LLM.collect_stream()
+
+    assert [
+             %Content{
+               type: :tool_use,
+               id: "call_1",
+               name: "search",
+               input: %{"query" => "elixir"}
+             },
+             %Content{
+               type: :tool_use,
+               id: "call_2",
+               name: "read_file",
+               input: %{"path" => "README.md"}
+             }
+           ] = response.content
+
+    assert response.stop_reason == "tool_use"
+  end
+
   test "call/5 retries on 429 and succeeds", %{bypass: bypass} do
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
@@ -372,6 +401,59 @@ defmodule Clementine.LLM.OpenAITest do
               "call_id" => call_id,
               "name" => tool_name,
               "arguments" => arguments_json
+            }
+          ],
+          "usage" => %{"input_tokens" => 11, "output_tokens" => 4}
+        }
+      })
+    ]
+
+    Enum.join(events, "\n\n") <> "\n\n"
+  end
+
+  defp parallel_unfinished_tool_calls_sse do
+    events = [
+      sse("response.output_item.added", %{
+        "type" => "response.output_item.added",
+        "output_index" => 0,
+        "item" => %{
+          "type" => "function_call",
+          "id" => "fc_1",
+          "call_id" => "call_1",
+          "name" => "search",
+          "arguments" => ""
+        }
+      }),
+      sse("response.output_item.added", %{
+        "type" => "response.output_item.added",
+        "output_index" => 1,
+        "item" => %{
+          "type" => "function_call",
+          "id" => "fc_2",
+          "call_id" => "call_2",
+          "name" => "read_file",
+          "arguments" => ""
+        }
+      }),
+      sse("response.completed", %{
+        "type" => "response.completed",
+        "response" => %{
+          "id" => "resp_parallel",
+          "status" => "completed",
+          "output" => [
+            %{
+              "type" => "function_call",
+              "id" => "fc_1",
+              "call_id" => "call_1",
+              "name" => "search",
+              "arguments" => ~s({"query":"elixir"})
+            },
+            %{
+              "type" => "function_call",
+              "id" => "fc_2",
+              "call_id" => "call_2",
+              "name" => "read_file",
+              "arguments" => ~s({"path":"README.md"})
             }
           ],
           "usage" => %{"input_tokens" => 11, "output_tokens" => 4}

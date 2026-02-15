@@ -251,7 +251,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
         if MapSet.member?(state.closed_calls, call_id) do
           {events, state}
         else
-          {new_events, state} = process_output_item(item, index, state, :done)
+          {new_events, state} = replay_unfinished_tool_call(item, index, state)
           {events ++ new_events, state}
         end
 
@@ -261,4 +261,37 @@ defmodule Clementine.LLM.OpenAIStreamParser do
   end
 
   defp ensure_completed_tool_events(_response, state), do: {[], state}
+
+  # Reconstruct unfinished function calls from response.completed payload.
+  # Emit a full synthetic sequence per call to keep accumulator state coherent
+  # even when multiple calls were open concurrently.
+  defp replay_unfinished_tool_call(item, output_index, state) do
+    item_id = Map.get(item, "id")
+    call_id = Map.get(item, "call_id") || item_id || "tool_call_#{output_index}"
+    name = Map.get(item, "name", "unknown")
+    arguments = Map.get(item, "arguments", "")
+
+    state =
+      if is_binary(item_id) do
+        %{state | item_call_ids: Map.put(state.item_call_ids, item_id, call_id)}
+      else
+        state
+      end
+
+    events =
+      [{:tool_use_start, call_id, name}] ++
+        if(arguments == "", do: [], else: [{:input_json_delta, call_id, arguments}]) ++
+        [{:content_block_stop, output_index}]
+
+    state = %{state | started_calls: MapSet.put(state.started_calls, call_id)}
+
+    state =
+      if arguments == "" do
+        state
+      else
+        %{state | calls_with_arg_deltas: MapSet.put(state.calls_with_arg_deltas, call_id)}
+      end
+
+    {events, %{state | closed_calls: MapSet.put(state.closed_calls, call_id)}}
+  end
 end
