@@ -1,7 +1,7 @@
 defmodule Clementine.ToolTest do
   use ExUnit.Case, async: true
 
-  alias Clementine.Tool
+  alias Clementine.{Tool, ToolResult}
 
   describe "params_to_json_schema/1" do
     test "converts simple string parameter" do
@@ -559,7 +559,8 @@ defmodule Clementine.ToolTest do
     end
 
     test "execute/2 runs the tool" do
-      assert {:ok, "Processed: hello"} = TestTool.execute(%{input: "hello"})
+      assert {:ok, %ToolResult{content: "Processed: hello", is_error: false}} =
+               TestTool.execute(%{input: "hello"})
     end
 
     test "execute/2 validates required arguments" do

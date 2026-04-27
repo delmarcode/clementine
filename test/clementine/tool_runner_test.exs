@@ -2,6 +2,7 @@ defmodule Clementine.ToolRunnerTest do
   use ExUnit.Case, async: true
 
   alias Clementine.LLM.Message.Content
+  alias Clementine.ToolResult
   alias Clementine.ToolRunner
 
   # Import test tools
@@ -29,7 +30,7 @@ defmodule Clementine.ToolRunnerTest do
 
       result = ToolRunner.execute_single(@tools, call, %{})
 
-      assert {:ok, "Echo: hello"} = result
+      assert {:ok, %ToolResult{content: "Echo: hello", is_error: false}} = result
     end
 
     test "executes a tool with numeric args" do
@@ -37,7 +38,7 @@ defmodule Clementine.ToolRunnerTest do
 
       result = ToolRunner.execute_single(@tools, call, %{})
 
-      assert {:ok, "8"} = result
+      assert {:ok, %ToolResult{content: "8", is_error: false}} = result
     end
 
     test "returns error for unknown tool" do
@@ -72,7 +73,8 @@ defmodule Clementine.ToolRunnerTest do
       call = %{name: "echo", input: %{"message" => "hello", random_key => "injected"}}
 
       # The tool should still execute successfully with the known key
-      assert {:ok, "Echo: hello"} = ToolRunner.execute_single(@tools, call, %{})
+      assert {:ok, %ToolResult{content: "Echo: hello", is_error: false}} =
+               ToolRunner.execute_single(@tools, call, %{})
 
       # Verify the random key was NOT turned into an atom
       refute String.to_existing_atom(random_key)
@@ -90,6 +92,24 @@ defmodule Clementine.ToolRunnerTest do
       assert {:error, message} = ToolRunner.execute_single(@tools, call, %{})
       assert message =~ "Invalid arguments"
       assert message =~ "expected message to be a string, got: integer"
+    end
+
+    test "invalid non-string tool content becomes an invocation error" do
+      defmodule NonStringResult do
+        use Clementine.Tool,
+          name: "non_string_result",
+          description: "Returns an invalid success shape",
+          parameters: []
+
+        @impl true
+        def run(_args, _context), do: {:ok, %{content: "not valid"}}
+      end
+
+      call = %{name: "non_string_result", input: %{}}
+
+      assert {:error, message} = ToolRunner.execute_single([NonStringResult], call, %{})
+      assert message =~ "Invalid tool result"
+      assert message =~ "content to be a string"
     end
 
     test "validation error formatted as is_error tool result" do
@@ -115,7 +135,8 @@ defmodule Clementine.ToolRunnerTest do
     test "object without properties preserves string-keyed data" do
       call = %{name: "inspect_object", input: %{"data" => %{"foo" => "bar"}}}
 
-      assert {:ok, "string_keys"} = ToolRunner.execute_single(@tools, call, %{})
+      assert {:ok, %ToolResult{content: "string_keys", is_error: false}} =
+               ToolRunner.execute_single(@tools, call, %{})
     end
 
     test "object with empty properties preserves string-keyed data" do
@@ -140,13 +161,15 @@ defmodule Clementine.ToolRunnerTest do
 
       call = %{name: "empty_props_object", input: %{"data" => %{"foo" => "bar"}}}
 
-      assert {:ok, "string_keys"} = ToolRunner.execute_single([EmptyPropsObject], call, %{})
+      assert {:ok, %ToolResult{content: "string_keys", is_error: false}} =
+               ToolRunner.execute_single([EmptyPropsObject], call, %{})
     end
 
     test "object with declared properties atomizes keys" do
       call = %{name: "inspect_declared_object", input: %{"data" => %{"host" => "localhost"}}}
 
-      assert {:ok, "atom_keys"} = ToolRunner.execute_single(@tools, call, %{})
+      assert {:ok, %ToolResult{content: "atom_keys", is_error: false}} =
+               ToolRunner.execute_single(@tools, call, %{})
     end
   end
 
@@ -162,8 +185,8 @@ defmodule Clementine.ToolRunnerTest do
       assert length(results) == 2
 
       result_map = Map.new(results)
-      assert {:ok, "Echo: first"} = result_map["call_1"]
-      assert {:ok, "Echo: second"} = result_map["call_2"]
+      assert {:ok, %ToolResult{content: "Echo: first", is_error: false}} = result_map["call_1"]
+      assert {:ok, %ToolResult{content: "Echo: second", is_error: false}} = result_map["call_2"]
     end
 
     test "handles timeout" do
@@ -220,7 +243,7 @@ defmodule Clementine.ToolRunnerTest do
       assert {:error, _} = result_map["call_1"]
 
       # Echo tool should succeed despite the crash
-      assert {:ok, "Echo: hello"} = result_map["call_2"]
+      assert {:ok, %ToolResult{content: "Echo: hello", is_error: false}} = result_map["call_2"]
     end
 
     test "preserves order of results" do
@@ -249,7 +272,7 @@ defmodule Clementine.ToolRunnerTest do
       results = ToolRunner.execute(@tools, calls, context, max_concurrency: 1)
 
       assert length(results) == 3
-      assert Enum.all?(results, fn {_, result} -> match?({:ok, _}, result) end)
+      assert Enum.all?(results, fn {_, result} -> match?({:ok, %ToolResult{}}, result) end)
 
       {_, peak} = Agent.get(tracker, & &1)
       assert peak == 1
@@ -268,7 +291,7 @@ defmodule Clementine.ToolRunnerTest do
       results = ToolRunner.execute(@tools, calls, context)
 
       assert length(results) == 3
-      assert Enum.all?(results, fn {_, result} -> match?({:ok, _}, result) end)
+      assert Enum.all?(results, fn {_, result} -> match?({:ok, %ToolResult{}}, result) end)
 
       {_, peak} = Agent.get(tracker, & &1)
       assert peak > 1
@@ -286,10 +309,10 @@ defmodule Clementine.ToolRunnerTest do
 
       assert length(results) == 4
       result_map = Map.new(results)
-      assert {:ok, "Echo: a"} = result_map["call_1"]
-      assert {:ok, "Echo: b"} = result_map["call_2"]
-      assert {:ok, "Echo: c"} = result_map["call_3"]
-      assert {:ok, "Echo: d"} = result_map["call_4"]
+      assert {:ok, %ToolResult{content: "Echo: a", is_error: false}} = result_map["call_1"]
+      assert {:ok, %ToolResult{content: "Echo: b", is_error: false}} = result_map["call_2"]
+      assert {:ok, %ToolResult{content: "Echo: c", is_error: false}} = result_map["call_3"]
+      assert {:ok, %ToolResult{content: "Echo: d", is_error: false}} = result_map["call_4"]
     end
   end
 
@@ -330,6 +353,19 @@ defmodule Clementine.ToolRunnerTest do
                  type: :tool_result,
                  tool_use_id: "call_1",
                  content: "Error: something went wrong",
+                 is_error: true
+               }
+             ] = formatted
+    end
+
+    test "invalid raw results are formatted as invocation errors" do
+      formatted = ToolRunner.format_results([{"call_1", {:ok, %{not: "binary"}}}])
+
+      assert [
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "call_1",
+                 content: "Error: Invalid tool result: " <> _,
                  is_error: true
                }
              ] = formatted

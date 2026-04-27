@@ -16,12 +16,14 @@ defmodule Clementine.ToolRunner do
       ]
 
       results = Clementine.ToolRunner.execute(tools, tool_calls, context)
-      # => [{"toolu_1", {:ok, "file contents"}}, {"toolu_2", {:ok, "foo.ex\\nbar.ex"}}]
+      # => [{"toolu_1", {:ok, %Clementine.ToolResult{content: "file contents", is_error: false}}},
+      #     {"toolu_2", {:ok, %Clementine.ToolResult{content: "foo.ex\\nbar.ex", is_error: false}}}]
 
   """
 
   alias Clementine.LLM.Message.Content
   alias Clementine.Tool
+  alias Clementine.ToolResult
 
   @default_timeout :timer.minutes(2)
 
@@ -45,8 +47,7 @@ defmodule Clementine.ToolRunner do
   ## Returns
 
   A list of `{tool_call_id, result}` tuples where result is
-  `{:ok, string}`, `{:ok, string, opts}`, or `{:error, string}`.
-  The 3-tuple form passes options through (e.g. `is_error: true`).
+  `{:ok, %Clementine.ToolResult{}}` or `{:error, string}`.
 
   """
   def execute(tools, tool_calls, context, opts \\ []) do
@@ -142,7 +143,10 @@ defmodule Clementine.ToolRunner do
         tool_start = System.monotonic_time()
 
         try do
-          result = tool.execute(args, context)
+          result =
+            tool
+            |> apply(:execute, [args, context])
+            |> ToolResult.normalize()
 
           :telemetry.execute(
             [:clementine, :tool, :stop],
@@ -182,12 +186,10 @@ defmodule Clementine.ToolRunner do
     end
   end
 
-  defp tool_result_status({:ok, _, opts}) when is_list(opts) do
-    if Keyword.get(opts, :is_error, false), do: :error, else: :ok
+  defp tool_result_status(result) do
+    normalized = ToolResult.normalize(result)
+    if ToolResult.error?(normalized), do: :error, else: :ok
   end
-
-  defp tool_result_status({:ok, _}), do: :ok
-  defp tool_result_status({:error, _}), do: :error
 
   @doc """
   Formats tool results for inclusion in the conversation.
@@ -196,16 +198,8 @@ defmodule Clementine.ToolRunner do
   """
   def format_results(results) do
     Enum.map(results, fn {id, result} ->
-      case result do
-        {:ok, content, opts} when is_list(opts) ->
-          Content.tool_result(id, content, Keyword.get(opts, :is_error, false))
-
-        {:ok, content} ->
-          Content.tool_result(id, content, false)
-
-        {:error, error} ->
-          Content.tool_result(id, "Error: #{error}", true)
-      end
+      normalized = ToolResult.normalize(result)
+      Content.tool_result(id, ToolResult.content(normalized), ToolResult.error?(normalized))
     end)
   end
 
@@ -221,18 +215,18 @@ defmodule Clementine.ToolRunner do
   """
   def get_errors(results) do
     results
-    |> Enum.filter(fn {_id, result} -> error_result?(result) end)
+    |> Enum.map(fn {id, result} -> {id, ToolResult.normalize(result)} end)
+    |> Enum.filter(fn {_id, result} -> ToolResult.error?(result) end)
     |> Enum.map(fn {id, result} ->
-      case result do
-        {:error, error} -> {id, error}
-        {:ok, content, _opts} -> {id, content}
-      end
+      {id, ToolResult.error_value(result)}
     end)
   end
 
-  defp error_result?({:error, _}), do: true
-  defp error_result?({:ok, _, opts}) when is_list(opts), do: Keyword.get(opts, :is_error, false)
-  defp error_result?(_), do: false
+  defp error_result?(result) do
+    result
+    |> ToolResult.normalize()
+    |> ToolResult.error?()
+  end
 
   # Build a map from string key names to their atom + nested schema,
   # derived from the tool's compile-time parameter definitions.

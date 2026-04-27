@@ -243,7 +243,8 @@ defmodule Clementine do
 
   ## Example
 
-      {:ok, content} = Clementine.Tool.run(MyApp.Tools.ReadFile, %{path: "README.md"})
+      {:ok, %Clementine.ToolResult{content: content, is_error: false}} =
+        Clementine.tool_run(MyApp.Tools.ReadFile, %{path: "README.md"})
 
   """
   def tool_run(tool_module, args, context \\ %{}) do
