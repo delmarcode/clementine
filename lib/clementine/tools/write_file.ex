@@ -28,17 +28,18 @@ defmodule Clementine.Tools.WriteFile do
 
   @impl true
   def run(%{path: path, content: content}, context) do
-    full_path = resolve_path(path, context)
+    with :ok <- Clementine.ToolContext.require_capability(context, :write),
+         {:ok, full_path} <- Clementine.ToolContext.resolve_path(path, context) do
+      # Ensure parent directory exists
+      parent_dir = Path.dirname(full_path)
 
-    # Ensure parent directory exists
-    parent_dir = Path.dirname(full_path)
+      case File.mkdir_p(parent_dir) do
+        :ok ->
+          write_file(full_path, content)
 
-    case File.mkdir_p(parent_dir) do
-      :ok ->
-        write_file(full_path, content)
-
-      {:error, reason} ->
-        {:error, "Failed to create directory #{parent_dir}: #{inspect(reason)}"}
+        {:error, reason} ->
+          {:error, "Failed to create directory #{parent_dir}: #{inspect(reason)}"}
+      end
     end
   end
 
@@ -55,15 +56,6 @@ defmodule Clementine.Tools.WriteFile do
 
       {:error, reason} ->
         {:error, "Failed to write file: #{inspect(reason)}"}
-    end
-  end
-
-  defp resolve_path(path, context) do
-    if Path.type(path) == :absolute do
-      path
-    else
-      working_dir = Map.get(context, :working_dir, File.cwd!())
-      Path.join(working_dir, path)
     end
   end
 end

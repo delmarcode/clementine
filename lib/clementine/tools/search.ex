@@ -45,27 +45,21 @@ defmodule Clementine.Tools.Search do
 
   @impl true
   def run(args, context) do
-    search_path = resolve_path(Map.get(args, :path, "."), context)
-    pattern = args.pattern
-    file_pattern = Map.get(args, :file_pattern, "**/*")
-    max_results = Map.get(args, :max_results, @default_max_results)
+    with :ok <- Clementine.ToolContext.require_capability(context, :read),
+         {:ok, search_path} <-
+           Clementine.ToolContext.resolve_path(Map.get(args, :path, "."), context) do
+      pattern = args.pattern
+      file_pattern = Map.get(args, :file_pattern, "**/*")
+      max_results = Map.get(args, :max_results, @default_max_results)
 
-    case compile_regex(pattern) do
-      {:ok, regex} ->
-        results = search_files(search_path, regex, file_pattern, max_results)
-        format_results(results, pattern)
+      case compile_regex(pattern) do
+        {:ok, regex} ->
+          results = search_files(search_path, regex, file_pattern, max_results)
+          format_results(results, pattern)
 
-      {:error, reason} ->
-        {:error, "Invalid regex pattern: #{reason}"}
-    end
-  end
-
-  defp resolve_path(path, context) do
-    if Path.type(path) == :absolute do
-      path
-    else
-      working_dir = Map.get(context, :working_dir, File.cwd!())
-      Path.join(working_dir, path)
+        {:error, reason} ->
+          {:error, "Invalid regex pattern: #{reason}"}
+      end
     end
   end
 

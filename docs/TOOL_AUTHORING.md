@@ -178,22 +178,43 @@ The second argument to `run/2` is a context map. Available keys:
 | Key | Type | Description |
 |---|---|---|
 | `:working_dir` | string | Working directory for the agent (resolve relative paths against this) |
+| `:workspace_root` | string | Optional stricter root for built-in filesystem and shell tools |
+| `:capabilities` | map | Explicit built-in tool capabilities, e.g. `%{read: true, write: false, shell: false}` |
 | `:agent_pid` | pid | PID of the agent GenServer |
 
 You can pass additional context keys when starting the agent or calling `ToolRunner.execute/4` directly.
 
-### Resolving paths
+### Built-in tool capabilities
 
-Follow the pattern used by the built-in tools:
+Built-in filesystem and shell tools fail closed unless the relevant capability is
+explicitly enabled:
 
 ```elixir
-defp resolve_path(path, context) do
-  if Path.type(path) == :absolute do
-    path
-  else
-    working_dir = Map.get(context, :working_dir, File.cwd!())
-    Path.join(working_dir, path)
-  end
+context = %{
+  working_dir: "/repo",
+  capabilities: %{read: true, write: true, shell: false}
+}
+```
+
+- `:read` enables `ReadFile`, `ListDir`, and `Search`
+- `:write` enables `WriteFile`
+- `:shell` enables `Bash`
+
+Filesystem paths are expanded under `:workspace_root` when present, otherwise
+under `:working_dir`. Absolute paths are accepted only if they remain inside
+that root after expansion and symlink resolution; parent traversal or symlink
+escape outside the root returns an error.
+
+### Resolving paths
+
+Custom filesystem tools should use `Clementine.ToolContext.resolve_path/2`
+instead of open-coded `Path.join/2` logic:
+
+```elixir
+with :ok <- Clementine.ToolContext.require_capability(context, :read),
+     {:ok, path} <- Clementine.ToolContext.resolve_path(args.path, context),
+     {:ok, content} <- File.read(path) do
+  {:ok, content}
 end
 ```
 

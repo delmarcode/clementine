@@ -46,9 +46,9 @@ defmodule Clementine.Tools.ReadFile do
 
   @impl true
   def run(args, context) do
-    path = resolve_path(args.path, context)
-
-    with {:ok, content} <- read_file(path),
+    with :ok <- Clementine.ToolContext.require_capability(context, :read),
+         {:ok, path} <- Clementine.ToolContext.resolve_path(args.path, context),
+         {:ok, content} <- read_file(path),
          {:ok, result} <- maybe_slice_lines(content, args[:start_line], args[:end_line]) do
       {:ok, result}
     end
@@ -70,15 +70,6 @@ defmodule Clementine.Tools.ReadFile do
 
       {:error, reason} ->
         {:error, "Failed to read file: #{inspect(reason)}"}
-    end
-  end
-
-  defp resolve_path(path, context) do
-    if Path.type(path) == :absolute do
-      path
-    else
-      working_dir = Map.get(context, :working_dir, File.cwd!())
-      Path.join(working_dir, path)
     end
   end
 
