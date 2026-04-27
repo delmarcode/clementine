@@ -1,7 +1,7 @@
 defmodule Clementine.LLM.MessageTest do
   use ExUnit.Case, async: true
 
-  alias Clementine.LLM.Message
+  alias Clementine.LLM.Anthropic.Messages
   alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
 
   describe "UserMessage.new/1" do
@@ -131,32 +131,50 @@ defmodule Clementine.LLM.MessageTest do
     end
   end
 
-  describe "Message.to_anthropic/1" do
+  describe "Anthropic.Messages.encode/1" do
     test "converts UserMessage with string content" do
       assert %{"role" => "user", "content" => "hi"} =
-               Message.to_anthropic(UserMessage.new("hi"))
+               Messages.encode(UserMessage.new("hi"))
     end
 
     test "converts UserMessage with Content list" do
       msg = UserMessage.new([Content.tool_result("id1", "result", false)])
-      api = Message.to_anthropic(msg)
+      api = Messages.encode(msg)
       assert %{"role" => "user", "content" => [%{"type" => "tool_result"}]} = api
     end
 
     test "converts AssistantMessage" do
       msg = AssistantMessage.new([Content.text("hello")])
-      api = Message.to_anthropic(msg)
+      api = Messages.encode(msg)
       assert %{"role" => "assistant", "content" => [%{"type" => "text", "text" => "hello"}]} = api
     end
 
     test "converts ToolResultMessage" do
       msg = ToolResultMessage.new([{"id1", {:ok, "done"}}])
-      api = Message.to_anthropic(msg)
+      api = Messages.encode(msg)
 
       assert %{
                "role" => "user",
                "content" => [%{"type" => "tool_result", "tool_use_id" => "id1"}]
              } = api
+    end
+
+    test "decodes assistant messages" do
+      msg =
+        Messages.decode_assistant(%{
+          "role" => "assistant",
+          "content" => [
+            %{"type" => "text", "text" => "hello"},
+            %{"type" => "tool_use", "id" => "id1", "name" => "search", "input" => %{}}
+          ]
+        })
+
+      assert %AssistantMessage{
+               content: [
+                 %Content{type: :text, text: "hello"},
+                 %Content{type: :tool_use, id: "id1", name: "search"}
+               ]
+             } = msg
     end
   end
 end

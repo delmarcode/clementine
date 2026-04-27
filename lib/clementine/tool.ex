@@ -103,7 +103,7 @@ defmodule Clementine.Tool do
       Clementine.Tool.validate_schema!(@tool_name, @tool_description, @tool_parameters)
 
       @doc """
-      Returns the tool's schema as a map suitable for the Anthropic API.
+      Returns the tool's provider-neutral schema.
       """
       def __schema__ do
         %{
@@ -486,9 +486,9 @@ defmodule Clementine.Tool do
   defp truncate(string, max), do: String.slice(string, 0, max - 1) <> "…"
 
   @doc """
-  Converts a tool module to Anthropic API format.
+  Returns a tool module's provider-neutral schema.
   """
-  def to_anthropic_format(tool_module) when is_atom(tool_module) do
+  def to_schema(tool_module) when is_atom(tool_module) do
     tool_module.__schema__()
   end
 

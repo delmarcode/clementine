@@ -8,10 +8,9 @@ defmodule Clementine.LLM.OpenAI do
   @behaviour Clementine.LLM.ClientBehaviour
 
   alias Clementine.LLM.ModelRegistry
-  alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
+  alias Clementine.LLM.OpenAI.{Messages, Tools}
   alias Clementine.LLM.OpenAIStreamParser
   alias Clementine.LLM.Response
-  alias Clementine.Tool
 
   @default_max_output_tokens 8192
   @retriable_statuses [429, 500, 502, 503, 504]
@@ -236,87 +235,15 @@ defmodule Clementine.LLM.OpenAI do
   end
 
   defp format_messages(messages) do
-    messages
-    |> Enum.flat_map(&format_message/1)
-  end
-
-  defp format_message(%UserMessage{content: content}) when is_binary(content) do
-    [%{"type" => "message", "role" => "user", "content" => content}]
-  end
-
-  defp format_message(%UserMessage{content: content}) when is_list(content) do
-    format_content_blocks("user", content)
-  end
-
-  defp format_message(%AssistantMessage{content: content}) when is_list(content) do
-    format_content_blocks("assistant", content)
-  end
-
-  defp format_message(%ToolResultMessage{content: content}) do
-    Enum.map(content, &tool_result_to_openai/1)
-  end
-
-  defp format_content_blocks(role, blocks) do
-    {items, text_buffer} =
-      Enum.reduce(blocks, {[], []}, fn
-        %Content{type: :text, text: text}, {items, text_buffer} ->
-          {items, [text | text_buffer]}
-
-        %Content{type: :tool_use} = block, {items, text_buffer} ->
-          items = flush_text_message(role, text_buffer, items)
-          {[tool_use_to_openai(block) | items], []}
-
-        %Content{type: :tool_result} = block, {items, text_buffer} ->
-          items = flush_text_message(role, text_buffer, items)
-          {[tool_result_to_openai(block) | items], []}
-      end)
-
-    items
-    |> then(&flush_text_message(role, text_buffer, &1))
-    |> Enum.reverse()
-  end
-
-  defp flush_text_message(_role, [], items), do: items
-
-  defp flush_text_message(role, text_buffer, items) do
-    text = text_buffer |> Enum.reverse() |> Enum.join("")
-    [%{"type" => "message", "role" => role, "content" => text} | items]
-  end
-
-  defp tool_use_to_openai(%Content{type: :tool_use, id: id, name: name, input: input}) do
-    %{
-      "type" => "function_call",
-      "call_id" => id,
-      "name" => name,
-      "arguments" => Jason.encode!(input)
-    }
-  end
-
-  defp tool_result_to_openai(%Content{type: :tool_result, tool_use_id: id, content: content}) do
-    %{
-      "type" => "function_call_output",
-      "call_id" => id,
-      "output" => content
-    }
+    Messages.encode_all(messages)
   end
 
   defp format_tools(tools) do
-    Enum.map(tools, fn tool ->
-      schema = Tool.to_anthropic_format(tool)
-
-      %{
-        "type" => "function",
-        "name" => schema.name,
-        "description" => schema.description,
-        "parameters" => schema.input_schema
-      }
-    end)
+    Tools.encode_all(tools)
   end
 
   defp parse_response(%{"output" => output} = body) when is_list(output) do
-    content =
-      output
-      |> Enum.flat_map(&parse_output_item/1)
+    content = Messages.decode_output_items(output)
 
     stop_reason =
       if Enum.any?(content, &(&1.type == :tool_use)) do
@@ -339,28 +266,4 @@ defmodule Clementine.LLM.OpenAI do
       usage: Map.get(body, "usage", %{}) || %{}
     }
   end
-
-  defp parse_output_item(%{"type" => "message", "content" => content}) when is_list(content) do
-    content
-    |> Enum.flat_map(fn
-      %{"type" => "output_text", "text" => text} when is_binary(text) -> [Content.text(text)]
-      _ -> []
-    end)
-  end
-
-  defp parse_output_item(%{"type" => "function_call"} = item) do
-    call_id = Map.get(item, "call_id") || Map.get(item, "id") || "tool_call"
-    name = Map.get(item, "name", "unknown")
-    arguments = Map.get(item, "arguments", "{}")
-
-    input =
-      case Jason.decode(arguments) do
-        {:ok, parsed} when is_map(parsed) -> parsed
-        _ -> %{}
-      end
-
-    [Content.tool_use(call_id, name, input)]
-  end
-
-  defp parse_output_item(_item), do: []
 end

@@ -624,10 +624,10 @@ defmodule Clementine.ToolTest do
     end
   end
 
-  describe "to_anthropic_format/1" do
-    defmodule AnthropicTool do
+  describe "to_schema/1" do
+    defmodule SchemaTool do
       use Clementine.Tool,
-        name: "anthropic_test",
+        name: "schema_test",
         description: "Test for API format",
         parameters: [
           path: [type: :string, required: true, description: "File path"]
@@ -637,10 +637,10 @@ defmodule Clementine.ToolTest do
       def run(_, _), do: {:ok, "ok"}
     end
 
-    test "returns schema in Anthropic format" do
-      schema = Tool.to_anthropic_format(AnthropicTool)
+    test "returns provider-neutral tool schema" do
+      schema = Tool.to_schema(SchemaTool)
 
-      assert schema.name == "anthropic_test"
+      assert schema.name == "schema_test"
       assert schema.description == "Test for API format"
       assert is_map(schema.input_schema)
     end
