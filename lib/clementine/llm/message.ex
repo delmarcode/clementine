@@ -7,46 +7,66 @@ defmodule Clementine.LLM.Message do
   """
 
   defmodule Content do
-    @moduledoc "Represents a content block in a message"
+    @moduledoc "Message content variants."
 
-    @type text :: %__MODULE__{type: :text, text: String.t()}
-    @type tool_use :: %__MODULE__{
-            type: :tool_use,
-            id: String.t(),
-            name: String.t(),
-            input: map()
-          }
-    @type tool_result :: %__MODULE__{
-            type: :tool_result,
-            tool_use_id: String.t(),
-            content: String.t(),
-            is_error: boolean()
-          }
+    defmodule Text do
+      @moduledoc "Text content block."
+      @enforce_keys [:text]
+      defstruct [:text]
 
+      @type t :: %__MODULE__{text: String.t()}
+    end
+
+    defmodule ToolUse do
+      @moduledoc "Tool-use content block."
+      @enforce_keys [:id, :name, :input]
+      defstruct [:id, :name, :input]
+
+      @type t :: %__MODULE__{
+              id: String.t(),
+              name: String.t(),
+              input: map()
+            }
+    end
+
+    defmodule ToolResult do
+      @moduledoc "Tool-result content block."
+      @enforce_keys [:tool_use_id, :content, :is_error]
+      defstruct [:tool_use_id, :content, :is_error]
+
+      @type t :: %__MODULE__{
+              tool_use_id: String.t(),
+              content: String.t(),
+              is_error: boolean()
+            }
+    end
+
+    @type text :: Text.t()
+    @type tool_use :: ToolUse.t()
+    @type tool_result :: ToolResult.t()
     @type t :: text() | tool_use() | tool_result()
-
-    defstruct [:type, :text, :id, :name, :input, :tool_use_id, :content, :is_error]
 
     @doc "Creates a text content block"
     def text(text) when is_binary(text) do
-      %__MODULE__{type: :text, text: text}
+      %Text{text: text}
     end
 
     @doc "Creates a tool use content block"
     def tool_use(id, name, input) when is_binary(id) and is_binary(name) and is_map(input) do
-      %__MODULE__{type: :tool_use, id: id, name: name, input: input}
+      %ToolUse{id: id, name: name, input: input}
     end
 
     @doc "Creates a tool result content block"
     def tool_result(tool_use_id, content, is_error \\ false)
         when is_binary(tool_use_id) and is_binary(content) and is_boolean(is_error) do
-      %__MODULE__{
-        type: :tool_result,
-        tool_use_id: tool_use_id,
-        content: content,
-        is_error: is_error
-      }
+      %ToolResult{tool_use_id: tool_use_id, content: content, is_error: is_error}
     end
+
+    @doc "Checks whether a struct is a known message content variant."
+    def valid?(%Text{}), do: true
+    def valid?(%ToolUse{}), do: true
+    def valid?(%ToolResult{}), do: true
+    def valid?(_other), do: false
   end
 
   defmodule UserMessage do
@@ -72,13 +92,10 @@ defmodule Clementine.LLM.Message do
     end
 
     defp validate_content!(blocks) do
-      Enum.each(blocks, fn
-        %Content{} ->
-          :ok
-
-        other ->
-          raise ArgumentError,
-                "expected %Content{} struct in message content, got: #{inspect(other)}"
+      Enum.each(blocks, fn block ->
+        unless Content.valid?(block) do
+          raise ArgumentError, "expected message content variant, got: #{inspect(block)}"
+        end
       end)
     end
   end
@@ -100,13 +117,10 @@ defmodule Clementine.LLM.Message do
     end
 
     defp validate_content!(blocks) do
-      Enum.each(blocks, fn
-        %Content{} ->
-          :ok
-
-        other ->
-          raise ArgumentError,
-                "expected %Content{} struct in message content, got: #{inspect(other)}"
+      Enum.each(blocks, fn block ->
+        unless Content.valid?(block) do
+          raise ArgumentError, "expected message content variant, got: #{inspect(block)}"
+        end
       end)
     end
 
@@ -118,19 +132,19 @@ defmodule Clementine.LLM.Message do
     @doc "Extracts text content from the message"
     def get_text(%__MODULE__{content: content}) do
       content
-      |> Enum.filter(&(&1.type == :text))
+      |> Enum.filter(&match?(%Content.Text{}, &1))
       |> Enum.map(& &1.text)
       |> Enum.join("")
     end
 
     @doc "Extracts tool use blocks from the message"
     def get_tool_uses(%__MODULE__{content: content}) do
-      Enum.filter(content, &(&1.type == :tool_use))
+      Enum.filter(content, &match?(%Content.ToolUse{}, &1))
     end
 
     @doc "Checks if the message contains tool uses"
     def has_tool_use?(%__MODULE__{content: content}) do
-      Enum.any?(content, &(&1.type == :tool_use))
+      Enum.any?(content, &match?(%Content.ToolUse{}, &1))
     end
   end
 

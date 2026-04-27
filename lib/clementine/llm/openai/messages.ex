@@ -30,14 +30,14 @@ defmodule Clementine.LLM.OpenAI.Messages do
   defp encode_content_blocks(role, blocks) do
     {items, text_buffer} =
       Enum.reduce(blocks, {[], []}, fn
-        %Content{type: :text, text: text}, {items, text_buffer} ->
+        %Content.Text{text: text}, {items, text_buffer} ->
           {items, [text | text_buffer]}
 
-        %Content{type: :tool_use} = block, {items, text_buffer} ->
+        %Content.ToolUse{} = block, {items, text_buffer} ->
           items = flush_text_message(role, text_buffer, items)
           {[tool_use_to_openai(block) | items], []}
 
-        %Content{type: :tool_result} = block, {items, text_buffer} ->
+        %Content.ToolResult{} = block, {items, text_buffer} ->
           items = flush_text_message(role, text_buffer, items)
           {[tool_result_to_openai(block) | items], []}
       end)
@@ -54,7 +54,7 @@ defmodule Clementine.LLM.OpenAI.Messages do
     [%{"type" => "message", "role" => role, "content" => text} | items]
   end
 
-  defp tool_use_to_openai(%Content{type: :tool_use, id: id, name: name, input: input}) do
+  defp tool_use_to_openai(%Content.ToolUse{id: id, name: name, input: input}) do
     %{
       "type" => "function_call",
       "call_id" => id,
@@ -63,7 +63,7 @@ defmodule Clementine.LLM.OpenAI.Messages do
     }
   end
 
-  defp tool_result_to_openai(%Content{type: :tool_result, tool_use_id: id, content: content}) do
+  defp tool_result_to_openai(%Content.ToolResult{tool_use_id: id, content: content}) do
     %{
       "type" => "function_call_output",
       "call_id" => id,

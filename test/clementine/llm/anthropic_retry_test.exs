@@ -162,7 +162,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       assert {:ok, %Response{} = response} =
                Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
 
-      assert [%Content{type: :text, text: "Hello sync after error!"}] = response.content
+      assert [%Content.Text{text: "Hello sync after error!"}] = response.content
     end
   end
 
@@ -189,7 +189,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       assert {:ok, %Response{} = response} =
                Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
 
-      assert [%Content{type: :text, text: "Hello sync!"}] = response.content
+      assert [%Content.Text{text: "Hello sync!"}] = response.content
       assert Agent.get(counter, & &1) == 2
 
       Agent.stop(counter)

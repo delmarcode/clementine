@@ -68,7 +68,7 @@ defmodule Clementine.LLM.OpenAITest do
     assert {:ok, %Response{} = response} =
              OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [])
 
-    assert [%Content{type: :text, text: "Hello from OpenAI"}] = response.content
+    assert [%Content.Text{text: "Hello from OpenAI"}] = response.content
     assert response.stop_reason == "end_turn"
     assert response.usage["output_tokens"] == 4
   end
@@ -98,7 +98,7 @@ defmodule Clementine.LLM.OpenAITest do
       |> Plug.Conn.resp(200, Jason.encode!(response))
     end)
 
-    assert {:ok, %Response{content: [%Content{text: "Direct model ref"}]}} =
+    assert {:ok, %Response{content: [%Content.Text{text: "Direct model ref"}]}} =
              OpenAI.call({:openai, "gpt-5"}, "system", [UserMessage.new("Hi")], [])
   end
 
@@ -127,8 +127,7 @@ defmodule Clementine.LLM.OpenAITest do
              OpenAI.call(:gpt_test, "system", [UserMessage.new("Find docs")], [])
 
     assert [
-             %Content{
-               type: :tool_use,
+             %Content.ToolUse{
                id: "call_1",
                name: "search",
                input: %{"query" => "elixir"}
@@ -154,7 +153,7 @@ defmodule Clementine.LLM.OpenAITest do
              OpenAI.stream(:gpt_test, "system", [UserMessage.new("Hi")], [])
              |> LLM.collect_stream()
 
-    assert [%Content{type: :text, text: "Hello stream"}] = response.content
+    assert [%Content.Text{text: "Hello stream"}] = response.content
   end
 
   test "stream/5 emits tool use events and can be collected", %{bypass: bypass} do
@@ -169,8 +168,7 @@ defmodule Clementine.LLM.OpenAITest do
              |> LLM.collect_stream()
 
     assert [
-             %Content{
-               type: :tool_use,
+             %Content.ToolUse{
                id: "call_abc",
                name: "search",
                input: %{"query" => "phoenix"}
@@ -200,8 +198,7 @@ defmodule Clementine.LLM.OpenAITest do
              |> LLM.collect_stream()
 
     assert [
-             %Content{
-               type: :tool_use,
+             %Content.ToolUse{
                id: "call_done_only",
                name: "search",
                input: %{"query" => "elixir docs"}
@@ -221,14 +218,12 @@ defmodule Clementine.LLM.OpenAITest do
              |> LLM.collect_stream()
 
     assert [
-             %Content{
-               type: :tool_use,
+             %Content.ToolUse{
                id: "call_1",
                name: "search",
                input: %{"query" => "elixir"}
              },
-             %Content{
-               type: :tool_use,
+             %Content.ToolUse{
                id: "call_2",
                name: "read_file",
                input: %{"path" => "README.md"}
@@ -269,7 +264,7 @@ defmodule Clementine.LLM.OpenAITest do
       end
     end)
 
-    assert {:ok, %Response{content: [%Content{text: "Recovered"}]}} =
+    assert {:ok, %Response{content: [%Content.Text{text: "Recovered"}]}} =
              OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [])
 
     assert Agent.get(counter, & &1) == 2

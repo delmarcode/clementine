@@ -398,7 +398,7 @@ defmodule Clementine.LLM.StreamParserTest do
       response = Accumulator.to_response(acc)
 
       assert %Response{stop_reason: "end_turn"} = response
-      assert [%Content{type: :text, text: "Hello World"}] = response.content
+      assert [%Content.Text{text: "Hello World"}] = response.content
     end
 
     test "to_response builds complete response with tool use" do
@@ -414,8 +414,7 @@ defmodule Clementine.LLM.StreamParserTest do
       assert %Response{stop_reason: "tool_use"} = response
 
       assert [
-               %Content{
-                 type: :tool_use,
+               %Content.ToolUse{
                  id: "toolu_123",
                  name: "read_file",
                  input: %{"path" => "test.txt"}
@@ -437,8 +436,8 @@ defmodule Clementine.LLM.StreamParserTest do
 
       assert %Response{} = response
       assert length(response.content) == 2
-      assert %Content{type: :text} = Enum.at(response.content, 0)
-      assert %Content{type: :tool_use} = Enum.at(response.content, 1)
+      assert %Content.Text{} = Enum.at(response.content, 0)
+      assert %Content.ToolUse{} = Enum.at(response.content, 1)
     end
 
     test "captures error event" do
