@@ -103,7 +103,7 @@ context: %{
 }
 ```
 
-Filesystem paths are scoped to the agent's `:working_dir` or `:workspace_root`; attempts to escape that root return an error.
+Filesystem paths are scoped to the agent's `:working_dir` or `:workspace_root`; parent traversal and symlink escapes outside that root return an error.
 
 ### Verifiers
 

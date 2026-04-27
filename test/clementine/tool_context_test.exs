@@ -45,5 +45,27 @@ defmodule Clementine.ToolContextTest do
 
       assert {:ok, ^nested} = ToolContext.resolve_path(nested, %{workspace_root: @root})
     end
+
+    test "allows children when workspace root is filesystem root" do
+      assert {:ok, "/etc/hosts"} = ToolContext.resolve_path("/etc/hosts", %{workspace_root: "/"})
+    end
+
+    test "rejects paths that escape through symlinks" do
+      root = Path.join(@root, "symlink_escape")
+      outside = Path.join(@root, "outside")
+      File.rm_rf!(root)
+      File.rm_rf!(outside)
+      File.mkdir_p!(root)
+      File.mkdir_p!(outside)
+      File.write!(Path.join(outside, "secret.txt"), "secret")
+
+      link = Path.join(root, "link")
+      File.ln_s!(outside, link)
+
+      assert {:error, msg} =
+               ToolContext.resolve_path("link/secret.txt", %{workspace_root: root})
+
+      assert msg =~ "escapes workspace root"
+    end
   end
 end

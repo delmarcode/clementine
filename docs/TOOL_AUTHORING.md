@@ -202,7 +202,8 @@ context = %{
 
 Filesystem paths are expanded under `:workspace_root` when present, otherwise
 under `:working_dir`. Absolute paths are accepted only if they remain inside
-that root after expansion; parent traversal outside the root returns an error.
+that root after expansion and symlink resolution; parent traversal or symlink
+escape outside the root returns an error.
 
 ### Resolving paths
 
