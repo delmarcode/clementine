@@ -106,6 +106,7 @@ defmodule Clementine do
   ## Returns
 
   - `{:ok, result}` - The agent's text response
+  - `{:error, {:agent_busy, task_ids}}` - If an async run is already active
   - `{:error, reason}` - If something went wrong
 
   """
@@ -115,6 +116,8 @@ defmodule Clementine do
   Runs a prompt on an agent asynchronously.
 
   Returns immediately with a task ID. Use `await/3` to get the result.
+  Returns `{:error, {:agent_busy, task_ids}}` if another run is already active
+  for the conversational agent.
 
   ## Example
 
@@ -169,6 +172,7 @@ defmodule Clementine do
   Clears the conversation history.
 
   This starts a fresh conversation.
+  Returns `{:error, {:agent_busy, task_ids}}` if an async run is active.
   """
   defdelegate clear_history(agent), to: Agent
 

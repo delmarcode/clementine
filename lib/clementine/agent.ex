@@ -156,33 +156,45 @@ defmodule Clementine.Agent do
       end
 
       @impl true
-      def handle_call({:run, prompt}, from, state) do
-        # Run synchronously
-        config = build_loop_config(state)
+      def handle_call({:run, prompt}, _from, state) do
+        case running_task_ids(state) do
+          [] ->
+            # Run synchronously
+            config = build_loop_config(state)
 
-        case Loop.run(config, prompt) do
-          {:ok, result, messages} ->
-            {:reply, {:ok, result}, %{state | history: messages}}
+            case Loop.run(config, prompt) do
+              {:ok, result, messages} ->
+                {:reply, {:ok, result}, %{state | history: messages}}
 
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
+              {:error, reason} ->
+                {:reply, {:error, reason}, state}
+            end
+
+          task_ids ->
+            {:reply, {:error, {:agent_busy, task_ids}}, state}
         end
       end
 
       @impl true
       def handle_call({:run_async, prompt}, {from_pid, _ref}, state) do
-        task_id = generate_task_id()
-        config = build_loop_config(state)
+        case running_task_ids(state) do
+          [] ->
+            task_id = generate_task_id()
+            config = build_loop_config(state)
 
-        # Use async_nolink so a crash in Loop.run/2 doesn't take down the agent
-        task =
-          Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
-            Loop.run(config, prompt)
-          end)
+            # Use async_nolink so a crash in Loop.run/2 doesn't take down the agent
+            task =
+              Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
+                Loop.run(config, prompt)
+              end)
 
-        entry = %{task: task, from: from_pid, status: :running, waiters: []}
-        tasks = Map.put(state.tasks, task_id, entry)
-        {:reply, {:ok, task_id}, %{state | tasks: tasks}}
+            entry = %{task: task, from: from_pid, status: :running, waiters: []}
+            tasks = Map.put(state.tasks, task_id, entry)
+            {:reply, {:ok, task_id}, %{state | tasks: tasks}}
+
+          task_ids ->
+            {:reply, {:error, {:agent_busy, task_ids}}, state}
+        end
       end
 
       @impl true
@@ -227,7 +239,10 @@ defmodule Clementine.Agent do
 
       @impl true
       def handle_call(:clear_history, _from, state) do
-        {:reply, :ok, %{state | history: []}}
+        case running_task_ids(state) do
+          [] -> {:reply, :ok, %{state | history: []}}
+          task_ids -> {:reply, {:error, {:agent_busy, task_ids}}, state}
+        end
       end
 
       @impl true
@@ -364,6 +379,15 @@ defmodule Clementine.Agent do
         end)
       end
 
+      defp running_task_ids(%{tasks: tasks}) do
+        tasks
+        |> Enum.flat_map(fn
+          {task_id, %{status: :running}} -> [task_id]
+          _ -> []
+        end)
+        |> Enum.sort()
+      end
+
       # Transition a task to a terminal state, replying to any blocked waiters.
       # If waiters exist, the task entry is removed (waiters got the result).
       # If no waiters, the entry is kept so a later await/3 can retrieve it.
@@ -398,6 +422,9 @@ defmodule Clementine.Agent do
 
   @doc """
   Runs a prompt synchronously on an agent.
+
+  Returns `{:error, {:agent_busy, task_ids}}` if an async run is already
+  active for this conversational agent.
   """
   def run(agent, prompt) when is_binary(prompt) do
     GenServer.call(agent, {:run, prompt}, :infinity)
@@ -407,6 +434,7 @@ defmodule Clementine.Agent do
   Runs a prompt asynchronously on an agent.
 
   Returns `{:ok, task_id}` immediately. Use `await/3` to get the result.
+  Returns `{:error, {:agent_busy, task_ids}}` if another run is active.
   """
   def run_async(agent, prompt) when is_binary(prompt) do
     GenServer.call(agent, {:run_async, prompt})
@@ -465,6 +493,8 @@ defmodule Clementine.Agent do
 
   @doc """
   Clears the conversation history.
+
+  Returns `{:error, {:agent_busy, task_ids}}` if an async run is active.
   """
   def clear_history(agent) do
     GenServer.call(agent, :clear_history)
