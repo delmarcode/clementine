@@ -20,6 +20,13 @@ defmodule Clementine.ToolResultTest do
       assert {:ok, ^result} = ToolResult.normalize(result)
     end
 
+    test "rejects existing structs with invalid metadata" do
+      result = %ToolResult{content: "done", is_error: false, metadata: ["not_keyword"]}
+
+      assert {:error, message} = ToolResult.normalize(result)
+      assert message =~ "metadata to be a keyword list"
+    end
+
     test "normalizes error tuples" do
       assert {:error, "bad args"} = ToolResult.normalize({:error, "bad args"})
     end
@@ -38,11 +45,19 @@ defmodule Clementine.ToolResultTest do
       assert message =~ "error reason to be a string"
     end
 
-    test "rejects unknown success options" do
-      assert {:error, message} = ToolResult.normalize({:ok, "done", hidden: true})
+    test "preserves success metadata options" do
+      assert {:ok,
+              %ToolResult{
+                content: "done",
+                is_error: false,
+                metadata: [hidden: true, source: "cache"]
+              }} =
+               ToolResult.normalize({:ok, "done", hidden: true, source: "cache"})
+    end
 
-      assert message =~ "Invalid tool result"
-      assert message =~ "unknown successful tool option"
+    test "keeps is_error out of metadata" do
+      assert {:ok, %ToolResult{metadata: [duration_ms: 12]}} =
+               ToolResult.normalize({:ok, "done", duration_ms: 12, is_error: true})
     end
 
     test "rejects non-boolean is_error options" do

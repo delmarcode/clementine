@@ -9,11 +9,12 @@ defmodule Clementine.ToolResult do
   """
 
   @enforce_keys [:content, :is_error]
-  defstruct [:content, :is_error]
+  defstruct [:content, :is_error, metadata: []]
 
   @type t :: %__MODULE__{
           content: String.t(),
-          is_error: boolean()
+          is_error: boolean(),
+          metadata: keyword()
         }
 
   @type normalized :: {:ok, t()} | {:error, String.t()}
@@ -85,17 +86,34 @@ defmodule Clementine.ToolResult do
   def error_value({:ok, %__MODULE__{is_error: false}}), do: nil
   def error_value({:error, reason}), do: reason
 
-  defp validate_struct(%__MODULE__{content: content, is_error: is_error} = result)
+  @doc """
+  Returns callback metadata options that do not affect message formatting.
+  """
+  @spec metadata(normalized()) :: keyword()
+  def metadata({:ok, %__MODULE__{metadata: metadata}}), do: metadata
+  def metadata({:error, _reason}), do: []
+
+  defp validate_struct(
+         %__MODULE__{content: content, is_error: is_error, metadata: metadata} = result
+       )
        when is_binary(content) and is_boolean(is_error) do
-    {:ok, result}
+    if Keyword.keyword?(metadata) do
+      {:ok, result}
+    else
+      invalid("expected metadata to be a keyword list, got: #{type_name(metadata)}")
+    end
   end
 
   defp validate_struct(%__MODULE__{content: content}) when not is_binary(content) do
     invalid("expected successful tool content to be a string, got: #{type_name(content)}")
   end
 
-  defp validate_struct(%__MODULE__{is_error: is_error}) do
+  defp validate_struct(%__MODULE__{is_error: is_error}) when not is_boolean(is_error) do
     invalid("expected :is_error to be a boolean, got: #{type_name(is_error)}")
+  end
+
+  defp validate_struct(%__MODULE__{} = result) do
+    {:ok, result}
   end
 
   defp normalize_success_opts(content, opts) do
@@ -103,22 +121,17 @@ defmodule Clementine.ToolResult do
       not Keyword.keyword?(opts) ->
         invalid("expected successful tool options to be a keyword list, got: #{type_name(opts)}")
 
-      unknown_opts(opts) != [] ->
-        invalid("unknown successful tool option(s): #{inspect(unknown_opts(opts))}")
-
       not is_boolean(Keyword.get(opts, :is_error, false)) ->
         invalid("expected :is_error option to be a boolean")
 
       true ->
-        {:ok, %__MODULE__{content: content, is_error: Keyword.get(opts, :is_error, false)}}
+        {:ok,
+         %__MODULE__{
+           content: content,
+           is_error: Keyword.get(opts, :is_error, false),
+           metadata: Keyword.delete(opts, :is_error)
+         }}
     end
-  end
-
-  defp unknown_opts(opts) do
-    opts
-    |> Keyword.keys()
-    |> Enum.uniq()
-    |> Kernel.--([:is_error])
   end
 
   defp invalid(reason), do: {:error, "Invalid tool result: #{reason}"}

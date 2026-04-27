@@ -54,6 +54,9 @@ successful results to `{:ok, %Clementine.ToolResult{}}` before telemetry, stream
 events, or message formatting see them. Malformed callback returns become
 `{:error, "Invalid tool result: ..."}` invocation failures.
 
+Success options other than `:is_error` are preserved as
+`ToolResult.metadata`; they do not affect LLM message formatting.
+
 ### When to use each form
 
 **`{:ok, content}`** — the tool ran and produced a normal result.
