@@ -45,20 +45,15 @@ defmodule Clementine.LLM.Anthropic.Messages do
     Content.tool_result(id, content, Map.get(data, "is_error", false))
   end
 
-  defp encode_content(%Content{type: :text, text: text}) do
+  defp encode_content(%Content.Text{text: text}) do
     %{"type" => "text", "text" => text}
   end
 
-  defp encode_content(%Content{type: :tool_use, id: id, name: name, input: input}) do
+  defp encode_content(%Content.ToolUse{id: id, name: name, input: input}) do
     %{"type" => "tool_use", "id" => id, "name" => name, "input" => input}
   end
 
-  defp encode_content(%Content{
-         type: :tool_result,
-         tool_use_id: id,
-         content: content,
-         is_error: is_error
-       }) do
+  defp encode_content(%Content.ToolResult{tool_use_id: id, content: content, is_error: is_error}) do
     base = %{"type" => "tool_result", "tool_use_id" => id, "content" => content}
     if is_error, do: Map.put(base, "is_error", true), else: base
   end

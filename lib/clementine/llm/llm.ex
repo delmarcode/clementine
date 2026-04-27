@@ -16,6 +16,8 @@ defmodule Clementine.LLM do
 
   """
 
+  alias Clementine.LLM.Message.Content
+
   @doc """
   Makes a synchronous LLM call.
 
@@ -128,16 +130,16 @@ defmodule Clementine.LLM do
   @spec tool_use?(Clementine.LLM.Response.t()) :: boolean()
   def tool_use?(response) do
     response.stop_reason == "tool_use" ||
-      Enum.any?(response.content, &(&1.type == :tool_use))
+      Enum.any?(response.content, &match?(%Content.ToolUse{}, &1))
   end
 
   @doc """
   Extracts tool use requests from a response.
   """
-  @spec get_tool_uses(Clementine.LLM.Response.t()) :: [Clementine.LLM.Message.Content.tool_use()]
+  @spec get_tool_uses(Clementine.LLM.Response.t()) :: [Content.ToolUse.t()]
   def get_tool_uses(response) do
     response.content
-    |> Enum.filter(&(&1.type == :tool_use))
+    |> Enum.filter(&match?(%Content.ToolUse{}, &1))
   end
 
   @doc """
@@ -146,7 +148,7 @@ defmodule Clementine.LLM do
   @spec get_text(Clementine.LLM.Response.t()) :: String.t()
   def get_text(response) do
     response.content
-    |> Enum.filter(&(&1.type == :text))
+    |> Enum.filter(&match?(%Content.Text{}, &1))
     |> Enum.map(& &1.text)
     |> Enum.join("")
   end

@@ -16,22 +16,22 @@ defmodule Clementine.LLM.MessageTest do
       assert %UserMessage{role: :user, content: ^content} = msg
     end
 
-    test "raises on non-Content elements in list" do
-      assert_raise ArgumentError, ~r/expected %Content{} struct/, fn ->
+    test "raises on non-content variants in list" do
+      assert_raise ArgumentError, ~r/expected message content variant/, fn ->
         UserMessage.new([%{type: :text, text: "bad"}])
       end
     end
   end
 
   describe "AssistantMessage.new/1" do
-    test "creates from list of Content structs" do
+    test "creates from list of content variants" do
       content = [Content.text("hi"), Content.tool_use("id1", "tool", %{})]
       msg = AssistantMessage.new(content)
       assert %AssistantMessage{role: :assistant, content: ^content} = msg
     end
 
-    test "raises on non-Content elements in list" do
-      assert_raise ArgumentError, ~r/expected %Content{} struct/, fn ->
+    test "raises on non-content variants in list" do
+      assert_raise ArgumentError, ~r/expected message content variant/, fn ->
         AssistantMessage.new([%{type: :text, text: "bad"}])
       end
     end
@@ -42,8 +42,7 @@ defmodule Clementine.LLM.MessageTest do
       msg = ToolResultMessage.new([{"id1", {:ok, "result"}}])
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "id1",
                  content: "result",
                  is_error: false
@@ -55,8 +54,7 @@ defmodule Clementine.LLM.MessageTest do
       msg = ToolResultMessage.new([{"id1", {:error, "boom"}}])
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "id1",
                  content: "Error: boom",
                  is_error: true
@@ -68,8 +66,7 @@ defmodule Clementine.LLM.MessageTest do
       msg = ToolResultMessage.new([{"id1", {:ok, "Exit code: 1\nfailed", is_error: true}}])
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "id1",
                  content: "Exit code: 1\nfailed",
                  is_error: true
@@ -81,8 +78,7 @@ defmodule Clementine.LLM.MessageTest do
       msg = ToolResultMessage.new([{"id1", {:ok, "output", is_error: false}}])
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "id1",
                  content: "output",
                  is_error: false
@@ -94,8 +90,7 @@ defmodule Clementine.LLM.MessageTest do
       msg = ToolResultMessage.new([{"id1", {:ok, "output", []}}])
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "id1",
                  content: "output",
                  is_error: false
@@ -107,8 +102,7 @@ defmodule Clementine.LLM.MessageTest do
       msg = ToolResultMessage.new([{"id1", {:ok, %{not: "binary"}}}])
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "id1",
                  content: "Error: Invalid tool result: " <> _,
                  is_error: true
@@ -171,8 +165,8 @@ defmodule Clementine.LLM.MessageTest do
 
       assert %AssistantMessage{
                content: [
-                 %Content{type: :text, text: "hello"},
-                 %Content{type: :tool_use, id: "id1", name: "search"}
+                 %Content.Text{text: "hello"},
+                 %Content.ToolUse{id: "id1", name: "search"}
                ]
              } = msg
     end

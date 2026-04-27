@@ -120,8 +120,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "call_1",
                  content:
                    "Error: Invalid arguments: expected message to be a string, got: integer",
@@ -326,14 +325,12 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "call_1",
                  content: "success",
                  is_error: false
                },
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "call_2",
                  content: "also success",
                  is_error: false
@@ -349,8 +346,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "call_1",
                  content: "Error: something went wrong",
                  is_error: true
@@ -362,8 +358,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results([{"call_1", {:ok, %{not: "binary"}}}])
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "call_1",
                  content: "Error: Invalid tool result: " <> _,
                  is_error: true
@@ -392,8 +387,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "call_1",
                  content: "Exit code: 1\n\nfailed",
                  is_error: true
@@ -409,8 +403,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "call_1",
                  content: "some output",
                  is_error: false
@@ -426,8 +419,7 @@ defmodule Clementine.ToolRunnerTest do
       formatted = ToolRunner.format_results(results)
 
       assert [
-               %Content{
-                 type: :tool_result,
+               %Content.ToolResult{
                  tool_use_id: "call_1",
                  content: "some output",
                  is_error: false

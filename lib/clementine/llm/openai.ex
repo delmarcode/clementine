@@ -8,6 +8,7 @@ defmodule Clementine.LLM.OpenAI do
   @behaviour Clementine.LLM.ClientBehaviour
 
   alias Clementine.LLM.ModelRegistry
+  alias Clementine.LLM.Message.Content
   alias Clementine.LLM.OpenAI.{Messages, Tools}
   alias Clementine.LLM.OpenAIStreamParser
   alias Clementine.LLM.Response
@@ -246,7 +247,7 @@ defmodule Clementine.LLM.OpenAI do
     content = Messages.decode_output_items(output)
 
     stop_reason =
-      if Enum.any?(content, &(&1.type == :tool_use)) do
+      if Enum.any?(content, &match?(%Content.ToolUse{}, &1)) do
         "tool_use"
       else
         "end_turn"

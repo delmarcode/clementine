@@ -79,10 +79,14 @@ Success options other than `:is_error` are preserved as
 
 ### How results flow to the LLM
 
-`ToolRunner.format_results/1` converts result tuples into tool_result maps:
+`ToolRunner.format_results/1` converts result tuples into explicit tool-result content variants:
 
 ```elixir
-%{type: :tool_result, tool_use_id: id, content: content, is_error: true | false}
+%Clementine.LLM.Message.Content.ToolResult{
+  tool_use_id: id,
+  content: content,
+  is_error: true | false
+}
 ```
 
 `ToolRunner.has_errors?/1` and `get_errors/1` treat both `{:error, _}` and `{:ok, _, is_error: true}` as errors. This means downstream code that checks for failures (retry logic, verifiers, event callbacks) will see command-level failures.
