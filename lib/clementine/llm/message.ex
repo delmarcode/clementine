@@ -47,44 +47,6 @@ defmodule Clementine.LLM.Message do
         is_error: is_error
       }
     end
-
-    @doc "Converts content to Anthropic API format"
-    def to_anthropic(%__MODULE__{type: :text, text: text}) do
-      %{"type" => "text", "text" => text}
-    end
-
-    def to_anthropic(%__MODULE__{type: :tool_use, id: id, name: name, input: input}) do
-      %{"type" => "tool_use", "id" => id, "name" => name, "input" => input}
-    end
-
-    def to_anthropic(%__MODULE__{
-          type: :tool_result,
-          tool_use_id: id,
-          content: content,
-          is_error: is_error
-        }) do
-      base = %{"type" => "tool_result", "tool_use_id" => id, "content" => content}
-      if is_error, do: Map.put(base, "is_error", true), else: base
-    end
-
-    @doc "Parses content from Anthropic API format"
-    def from_anthropic(%{"type" => "text", "text" => text}) do
-      text(text)
-    end
-
-    def from_anthropic(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
-      tool_use(id, name, input)
-    end
-
-    def from_anthropic(
-          %{
-            "type" => "tool_result",
-            "tool_use_id" => id,
-            "content" => content
-          } = data
-        ) do
-      tool_result(id, content, Map.get(data, "is_error", false))
-    end
   end
 
   defmodule UserMessage do
@@ -119,15 +81,6 @@ defmodule Clementine.LLM.Message do
                 "expected %Content{} struct in message content, got: #{inspect(other)}"
       end)
     end
-
-    @doc "Converts to Anthropic API format"
-    def to_anthropic(%__MODULE__{content: content}) when is_binary(content) do
-      %{"role" => "user", "content" => content}
-    end
-
-    def to_anthropic(%__MODULE__{content: content}) when is_list(content) do
-      %{"role" => "user", "content" => Enum.map(content, &Content.to_anthropic/1)}
-    end
   end
 
   defmodule AssistantMessage do
@@ -160,16 +113,6 @@ defmodule Clementine.LLM.Message do
     @doc "Creates an assistant message with just text"
     def text(text) when is_binary(text) do
       %__MODULE__{content: [Content.text(text)]}
-    end
-
-    @doc "Converts to Anthropic API format"
-    def to_anthropic(%__MODULE__{content: content}) do
-      %{"role" => "assistant", "content" => Enum.map(content, &Content.to_anthropic/1)}
-    end
-
-    @doc "Parses from Anthropic API format"
-    def from_anthropic(%{"role" => "assistant", "content" => content}) when is_list(content) do
-      %__MODULE__{content: Enum.map(content, &Content.from_anthropic/1)}
     end
 
     @doc "Extracts text content from the message"
@@ -225,22 +168,10 @@ defmodule Clementine.LLM.Message do
 
       %__MODULE__{content: content}
     end
-
-    @doc "Converts to Anthropic API format"
-    def to_anthropic(%__MODULE__{content: content}) do
-      %{"role" => "user", "content" => Enum.map(content, &Content.to_anthropic/1)}
-    end
   end
 
   @type message ::
           UserMessage.t()
           | AssistantMessage.t()
           | ToolResultMessage.t()
-
-  @doc """
-  Converts any message type to Anthropic API format.
-  """
-  def to_anthropic(%UserMessage{} = msg), do: UserMessage.to_anthropic(msg)
-  def to_anthropic(%AssistantMessage{} = msg), do: AssistantMessage.to_anthropic(msg)
-  def to_anthropic(%ToolResultMessage{} = msg), do: ToolResultMessage.to_anthropic(msg)
 end

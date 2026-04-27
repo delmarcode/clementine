@@ -28,11 +28,9 @@ defmodule Clementine.LLM.Anthropic do
   @behaviour Clementine.LLM.ClientBehaviour
 
   alias Clementine.LLM.ModelRegistry
-  alias Clementine.LLM.Message
-  alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.Anthropic.{Messages, Tools}
   alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
-  alias Clementine.Tool
 
   @anthropic_version "2023-06-01"
   @default_max_tokens 8192
@@ -288,19 +286,11 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp format_messages(messages) do
-    Enum.map(messages, &Message.to_anthropic/1)
+    Messages.encode_all(messages)
   end
 
   defp format_tools(tools) do
-    Enum.map(tools, fn tool ->
-      schema = Tool.to_anthropic_format(tool)
-
-      %{
-        "name" => schema.name,
-        "description" => schema.description,
-        "input_schema" => schema.input_schema
-      }
-    end)
+    Tools.encode_all(tools)
   end
 
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do
@@ -312,10 +302,10 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp parse_content_block(%{"type" => "text", "text" => text}) do
-    Content.text(text)
+    Messages.decode_content(%{"type" => "text", "text" => text})
   end
 
-  defp parse_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
-    Content.tool_use(id, name, input)
+  defp parse_content_block(%{"type" => "tool_use"} = block) do
+    Messages.decode_content(block)
   end
 end
