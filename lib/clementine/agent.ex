@@ -203,6 +203,7 @@ defmodule Clementine.Agent do
           [] ->
             task_id = generate_task_id()
             config = build_loop_config(state)
+            consumer_monitor_ref = Process.monitor(stream_consumer)
 
             task =
               Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
@@ -215,7 +216,8 @@ defmodule Clementine.Agent do
               task: task,
               status: :running,
               waiters: [],
-              stream_consumer: stream_consumer
+              stream_consumer: stream_consumer,
+              consumer_monitor_ref: consumer_monitor_ref
             }
 
             tasks = Map.put(state.tasks, task_id, entry)
@@ -230,6 +232,7 @@ defmodule Clementine.Agent do
       def handle_call({:cancel_stream, task_id}, _from, state) do
         case Map.get(state.tasks, task_id) do
           %{status: :running, stream_consumer: _consumer, task: task} ->
+            demonitor_stream_consumer(Map.get(state.tasks, task_id))
             Task.shutdown(task, :brutal_kill)
             {:reply, :ok, %{state | tasks: Map.delete(state.tasks, task_id)}}
 
@@ -298,13 +301,9 @@ defmodule Clementine.Agent do
 
         case find_task_by_ref(state.tasks, ref) do
           {task_id, task_info} ->
-            state =
-              case result do
-                {:ok, _text, messages} -> %{state | history: messages}
-                _ -> state
-              end
-
-            notify_stream_consumer(task_id, task_info, result)
+            demonitor_stream_consumer(task_info)
+            state = maybe_apply_task_history(state, task_info, result)
+            maybe_notify_stream_consumer(task_id, task_info, result)
             tasks = finish_task(state.tasks, task_id, task_info, :completed, result)
             {:noreply, %{state | tasks: tasks}}
 
@@ -314,24 +313,38 @@ defmodule Clementine.Agent do
       end
 
       @impl true
-      def handle_info({:DOWN, _ref, :process, _pid, :normal}, state) do
-        # Normal exit follows a successful {ref, result} which already
-        # handled the task. Process.demonitor(:flush) usually eats this,
-        # but it can arrive if the demonitor races. Safe to ignore.
-        {:noreply, state}
+      def handle_info({:DOWN, ref, :process, _pid, :normal}, state) do
+        case find_stream_by_consumer_monitor_ref(state.tasks, ref) do
+          {task_id, task_info} ->
+            Task.shutdown(task_info.task, :brutal_kill)
+            {:noreply, %{state | tasks: Map.delete(state.tasks, task_id)}}
+
+          nil ->
+            # Normal task exits follow a successful {ref, result} which already
+            # handled the task. Process.demonitor(:flush) usually eats these,
+            # but they can arrive if the demonitor races. Safe to ignore.
+            {:noreply, state}
+        end
       end
 
       @impl true
       def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-        # Abnormal exit or :shutdown — task crashed or was terminated
-        case find_task_by_ref(state.tasks, ref) do
-          {task_id, %{status: :running} = task_info} ->
+        cond do
+          stream = find_stream_by_consumer_monitor_ref(state.tasks, ref) ->
+            {task_id, task_info} = stream
+            Task.shutdown(task_info.task, :brutal_kill)
+            {:noreply, %{state | tasks: Map.delete(state.tasks, task_id)}}
+
+          task = find_task_by_ref(state.tasks, ref) ->
+            # Abnormal exit or :shutdown — task crashed or was terminated
+            {task_id, %{status: :running} = task_info} = task
             result = {:error, {:task_crashed, reason}}
+            demonitor_stream_consumer(task_info)
             notify_stream_consumer(task_id, task_info, result)
             tasks = finish_task(state.tasks, task_id, task_info, :failed, result)
             {:noreply, %{state | tasks: tasks}}
 
-          _ ->
+          true ->
             # Task already terminal or unknown — ignore
             {:noreply, state}
         end
@@ -422,6 +435,13 @@ defmodule Clementine.Agent do
         end)
       end
 
+      defp find_stream_by_consumer_monitor_ref(tasks, ref) do
+        Enum.find_value(tasks, fn
+          {task_id, %{consumer_monitor_ref: ^ref} = info} -> {task_id, info}
+          _ -> nil
+        end)
+      end
+
       defp running_task_ids(%{tasks: tasks}) do
         tasks
         |> Enum.flat_map(fn
@@ -436,6 +456,34 @@ defmodule Clementine.Agent do
       end
 
       defp notify_stream_consumer(_task_id, _task_info, _result), do: :ok
+
+      defp maybe_notify_stream_consumer(task_id, %{stream_consumer: consumer} = task_info, result) do
+        if Process.alive?(consumer) do
+          notify_stream_consumer(task_id, task_info, result)
+        else
+          :ok
+        end
+      end
+
+      defp maybe_notify_stream_consumer(task_id, task_info, result) do
+        notify_stream_consumer(task_id, task_info, result)
+      end
+
+      defp maybe_apply_task_history(state, %{stream_consumer: consumer}, {:ok, _text, messages}) do
+        if Process.alive?(consumer), do: %{state | history: messages}, else: state
+      end
+
+      defp maybe_apply_task_history(state, _task_info, {:ok, _text, messages}) do
+        %{state | history: messages}
+      end
+
+      defp maybe_apply_task_history(state, _task_info, _result), do: state
+
+      defp demonitor_stream_consumer(%{consumer_monitor_ref: ref}) do
+        Process.demonitor(ref, [:flush])
+      end
+
+      defp demonitor_stream_consumer(_task_info), do: :ok
 
       # Transition a task to a terminal state, replying to any blocked waiters.
       # If waiters exist, the task entry is removed (waiters got the result).

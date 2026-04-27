@@ -179,6 +179,46 @@ defmodule Clementine.AgentTest do
 
       GenServer.stop(agent)
     end
+
+    test "cancels stream task when consumer exits before cleanup" do
+      test_pid = self()
+
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        send(test_pid, :stream_started)
+        Process.sleep(200)
+
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:text_delta, "late"},
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+          {:message_stop}
+        ]
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+
+      consumer =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert {:ok, task_id} = GenServer.call(agent, {:run_stream, "Hi", consumer}, :infinity)
+      assert_receive :stream_started
+
+      send(consumer, :stop)
+
+      assert_eventually(fn ->
+        assert {:error, :not_found} = Clementine.Agent.status(agent, task_id)
+      end)
+
+      Process.sleep(250)
+      assert Clementine.Agent.get_history(agent) == []
+
+      GenServer.stop(agent)
+    end
   end
 
   describe "get_history/1" do
@@ -723,4 +763,16 @@ defmodule Clementine.AgentTest do
       assert msg =~ "must be a list of messages"
     end
   end
+
+  defp assert_eventually(fun, attempts \\ 20)
+
+  defp assert_eventually(fun, attempts) when attempts > 1 do
+    fun.()
+  rescue
+    ExUnit.AssertionError ->
+      Process.sleep(10)
+      assert_eventually(fun, attempts - 1)
+  end
+
+  defp assert_eventually(fun, 1), do: fun.()
 end
