@@ -103,6 +103,19 @@ defmodule Clementine.LLM.MessageTest do
              ] = msg.content
     end
 
+    test "formats invalid tool results as invocation errors" do
+      msg = ToolResultMessage.new([{"id1", {:ok, %{not: "binary"}}}])
+
+      assert [
+               %Content{
+                 type: :tool_result,
+                 tool_use_id: "id1",
+                 content: "Error: Invalid tool result: " <> _,
+                 is_error: true
+               }
+             ] = msg.content
+    end
+
     test "handles mixed result types" do
       results = [
         {"id1", {:ok, "good"}},

@@ -539,8 +539,12 @@ defmodule MyAppWeb.ChatController do
         send_event(conn, "tool_delta", %{input_chunk: chunk})
         stream_loop(conn, state)
 
-      {:tool_result, id, {:ok, result}} ->
+      {:tool_result, id, {:ok, %{content: result, is_error: false}}} ->
         send_event(conn, "tool_end", %{id: id, result: result, error: nil})
+        stream_loop(conn, state)
+
+      {:tool_result, id, {:ok, %{content: result, is_error: true}}} ->
+        send_event(conn, "tool_end", %{id: id, result: nil, error: result})
         stream_loop(conn, state)
 
       {:tool_result, id, {:error, error}} ->

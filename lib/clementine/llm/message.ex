@@ -206,21 +206,21 @@ defmodule Clementine.LLM.Message do
 
     Supports all result forms returned by `Clementine.ToolRunner.execute/4`:
 
-      * `{id, {:ok, content}}` — successful result
+      * `{id, {:ok, content}}` — successful callback result
+      * `{id, {:ok, %Clementine.ToolResult{}}}` — normalized successful result
       * `{id, {:ok, content, opts}}` — successful result with options (e.g. `is_error: true`)
       * `{id, {:error, reason}}` — error result
     """
     def new(results) when is_list(results) do
       content =
-        Enum.map(results, fn
-          {id, {:ok, content, opts}} when is_list(opts) ->
-            Content.tool_result(id, content, Keyword.get(opts, :is_error, false))
+        Enum.map(results, fn {id, result} ->
+          normalized = Clementine.ToolResult.normalize(result)
 
-          {id, {:ok, result}} ->
-            Content.tool_result(id, result, false)
-
-          {id, {:error, error}} ->
-            Content.tool_result(id, "Error: #{error}", true)
+          Content.tool_result(
+            id,
+            Clementine.ToolResult.content(normalized),
+            Clementine.ToolResult.error?(normalized)
+          )
         end)
 
       %__MODULE__{content: content}

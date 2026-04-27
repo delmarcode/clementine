@@ -168,7 +168,12 @@ Clementine.Loop.run_stream(
   fn
     {:text_delta, text} -> IO.write(text)
     {:tool_use_start, _id, name} -> IO.write("\n[calling #{name}...] ")
-    {:tool_result, _id, {:ok, result}} -> IO.puts("[got #{String.length(result)} chars]")
+    {:tool_result, _id, {:ok, %{content: result, is_error: false}}} ->
+      IO.puts("[got #{String.length(result)} chars]")
+
+    {:tool_result, _id, {:ok, %{content: result, is_error: true}}} ->
+      IO.puts("[tool error: #{result}]")
+
     {:tool_result, _id, {:error, err}} -> IO.puts("[error: #{err}]")
     _ -> :ok
   end

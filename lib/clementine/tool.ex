@@ -48,7 +48,8 @@ defmodule Clementine.Tool do
           optional(atom()) => any()
         }
 
-  @type result :: {:ok, String.t()} | {:ok, String.t(), keyword()} | {:error, String.t()}
+  @type callback_result :: {:ok, String.t()} | {:ok, String.t(), keyword()} | {:error, String.t()}
+  @type result :: {:ok, Clementine.ToolResult.t()} | {:error, String.t()}
 
   @doc """
   Execute the tool with the given arguments and context.
@@ -56,15 +57,17 @@ defmodule Clementine.Tool do
   Arguments are passed as a map with atom keys. The context provides
   additional information about the execution environment.
 
-  Returns `{:ok, result}` where result is always a string, or
-  `{:error, reason}` where reason is a string description of the error.
+  Returns `{:ok, %Clementine.ToolResult{}}`, or `{:error, reason}` where
+  reason is a string description of the error.
 
   A tool may also return `{:ok, result, opts}` where opts is a keyword list.
   Use `is_error: true` to signal a command-level failure (e.g. non-zero exit)
   that should be surfaced to the model as an error, while distinguishing it
   from an invocation failure (`{:error, reason}`).
+  `execute/2` normalizes `{:ok, result}` callback returns into
+  `{:ok, %Clementine.ToolResult{content: result, is_error: false}}`.
   """
-  @callback run(args :: map(), context :: context()) :: result()
+  @callback run(args :: map(), context :: context()) :: callback_result()
 
   @doc """
   Returns a human-readable summary of a tool invocation for logging.
@@ -137,7 +140,9 @@ defmodule Clementine.Tool do
         case Clementine.Tool.validate_args(@tool_parameters, args) do
           :ok ->
             try do
-              run(args, context)
+              __MODULE__
+              |> apply(:run, [args, context])
+              |> Clementine.ToolResult.normalize()
             rescue
               e ->
                 {:error, "Tool crashed: #{Exception.message(e)}"}

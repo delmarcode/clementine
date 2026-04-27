@@ -49,6 +49,14 @@ Tool `run/2` must return one of three shapes:
 
 Both `content` and `reason` must be strings.
 
+`Clementine.Tool.execute/2` validates those callback returns and normalizes
+successful results to `{:ok, %Clementine.ToolResult{}}` before telemetry, stream
+events, or message formatting see them. Malformed callback returns become
+`{:error, "Invalid tool result: ..."}` invocation failures.
+
+Success options other than `:is_error` are preserved as
+`ToolResult.metadata`; they do not affect LLM message formatting.
+
 ### When to use each form
 
 **`{:ok, content}`** — the tool ran and produced a normal result.
@@ -284,7 +292,8 @@ test "ping tool via ToolRunner" do
   calls = [%{id: "call_1", name: "ping", input: %{"host" => "localhost"}}]
 
   results = Clementine.ToolRunner.execute(tools, calls, %{})
-  assert [{"call_1", {:ok, _}}] = results
+  assert [{"call_1", {:ok, %Clementine.ToolResult{content: _content, is_error: false}}}] =
+           results
 end
 ```
 
