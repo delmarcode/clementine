@@ -39,11 +39,22 @@ defmodule Clementine.LLM.OpenAIStreamParser do
         :ignore ->
           {[], state}
 
-        {:error, _reason} ->
-          {[], state}
+        {:error, reason} ->
+          {[{:error, parse_error("Malformed SSE JSON", reason)}], state}
       end
     end
   end
+
+  defp parse_error(message, reason) do
+    %{
+      "type" => "stream_parse_error",
+      "message" => message,
+      "reason" => exception_message(reason)
+    }
+  end
+
+  defp exception_message(%_{} = reason), do: Exception.message(reason)
+  defp exception_message(reason), do: inspect(reason)
 
   defp split_events(data) do
     parts = String.split(data, "\n\n")

@@ -142,6 +142,25 @@ defmodule Clementine.LLM.StreamParserTest do
 
       assert events == []
     end
+
+    test "emits parse error for malformed event JSON" do
+      events =
+        parse_one("""
+        event: content_block_delta
+        data: {"type":"content_block_delta","index":0,"delta":
+        """)
+
+      assert [
+               {:error,
+                %{
+                  "type" => "stream_parse_error",
+                  "message" => "Malformed SSE JSON",
+                  "reason" => reason
+                }}
+             ] = events
+
+      assert is_binary(reason)
+    end
   end
 
   describe "parse/2 buffering and sequencing" do
@@ -376,6 +395,50 @@ defmodule Clementine.LLM.StreamParserTest do
       assert tool.id == "toolu_123"
       assert tool.name == "read_file"
       assert tool.input == %{"path" => "test.txt"}
+    end
+
+    test "captures malformed tool input JSON instead of producing empty args" do
+      acc =
+        Accumulator.new()
+        |> Accumulator.process({:tool_use_start, "toolu_123", "read_file"})
+        |> Accumulator.process({:input_json_delta, "toolu_123", "{\"path\":"})
+        |> Accumulator.process({:content_block_stop, 0})
+
+      assert Accumulator.error?(acc)
+      assert acc.tool_uses == []
+
+      assert %{
+               "type" => "stream_parse_error",
+               "message" => "Malformed streamed tool input JSON",
+               "tool_use_id" => "toolu_123",
+               "tool_name" => "read_file",
+               "reason" => reason
+             } = acc.error
+
+      assert is_binary(reason)
+    end
+
+    test "captures non-object tool input JSON as malformed" do
+      acc =
+        Accumulator.new()
+        |> Accumulator.process({:tool_use_start, "toolu_123", "read_file"})
+        |> Accumulator.process({:input_json_delta, "toolu_123", "[]"})
+        |> Accumulator.process({:content_block_stop, 0})
+
+      assert Accumulator.error?(acc)
+      assert acc.tool_uses == []
+      assert acc.error["reason"] == "expected a JSON object, got: []"
+    end
+
+    test "collect_stream returns parser errors" do
+      stream = [
+        {:tool_use_start, "toolu_123", "read_file"},
+        {:input_json_delta, "toolu_123", "{\"path\":"},
+        {:content_block_stop, 0}
+      ]
+
+      assert {:error, %{"type" => "stream_parse_error", "tool_use_id" => "toolu_123"}} =
+               Clementine.LLM.collect_stream(stream)
     end
 
     test "tracks stop_reason and usage" do

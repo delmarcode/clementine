@@ -93,11 +93,22 @@ defmodule Clementine.LLM.StreamParser do
         :ignore ->
           []
 
-        {:error, _reason} ->
-          []
+        {:error, reason} ->
+          [{:error, parse_error("Malformed SSE JSON", reason)}]
       end
     end
   end
+
+  defp parse_error(message, reason) do
+    %{
+      "type" => "stream_parse_error",
+      "message" => message,
+      "reason" => exception_message(reason)
+    }
+  end
+
+  defp exception_message(%_{} = reason), do: Exception.message(reason)
+  defp exception_message(reason), do: inspect(reason)
 
   # Enrich raw events with tracked state (attaches tool IDs to input_json_delta)
   defp enrich_events(events, state) do
@@ -274,14 +285,25 @@ defmodule Clementine.LLM.StreamParser do
           {:content_block_stop, _}
         )
         when tool != nil do
-      parsed_input =
-        case Jason.decode(input) do
-          {:ok, parsed} -> parsed
-          {:error, _} -> %{}
-        end
+      case decode_tool_input(input) do
+        {:ok, parsed_input} ->
+          tool_use = Map.put(tool, :input, parsed_input)
 
-      tool_use = Map.put(tool, :input, parsed_input)
-      %{acc | tool_uses: acc.tool_uses ++ [tool_use], current_tool: nil, current_tool_input: ""}
+          %{
+            acc
+            | tool_uses: acc.tool_uses ++ [tool_use],
+              current_tool: nil,
+              current_tool_input: ""
+          }
+
+        {:error, reason} ->
+          %{
+            acc
+            | error: acc.error || tool_input_error(tool, reason),
+              current_tool: nil,
+              current_tool_input: ""
+          }
+      end
     end
 
     def process(%__MODULE__{} = acc, {:content_block_stop, _}) do
@@ -308,6 +330,38 @@ defmodule Clementine.LLM.StreamParser do
     def process(%__MODULE__{} = acc, _event) do
       acc
     end
+
+    defp decode_tool_input(""), do: {:ok, %{}}
+
+    defp decode_tool_input(input) do
+      case Jason.decode(input) do
+        {:ok, parsed} when is_map(parsed) ->
+          {:ok, parsed}
+
+        {:ok, parsed} ->
+          {:error, {:not_an_object, parsed}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+
+    defp tool_input_error(tool, reason) do
+      %{
+        "type" => "stream_parse_error",
+        "message" => "Malformed streamed tool input JSON",
+        "tool_use_id" => tool.id,
+        "tool_name" => tool.name,
+        "reason" => error_reason(reason)
+      }
+    end
+
+    defp error_reason({:not_an_object, parsed}) do
+      "expected a JSON object, got: #{inspect(parsed)}"
+    end
+
+    defp error_reason(%_{} = reason), do: Exception.message(reason)
+    defp error_reason(reason), do: inspect(reason)
 
     @doc "Returns true if the accumulator has captured an error"
     def error?(%__MODULE__{error: nil}), do: false
