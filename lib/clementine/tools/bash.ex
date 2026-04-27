@@ -35,30 +35,32 @@ defmodule Clementine.Tools.Bash do
 
   @impl true
   def run(%{command: command} = args, context) do
-    working_dir = Map.get(context, :working_dir, File.cwd!())
-    timeout = Map.get(args, :timeout_ms, @default_timeout)
+    with :ok <- Clementine.ToolContext.require_capability(context, :shell),
+         {:ok, working_dir} <- Clementine.ToolContext.resolve_path(".", context) do
+      timeout = Map.get(args, :timeout_ms, @default_timeout)
 
-    opts = [
-      cd: working_dir,
-      env: [{"LANG", "C"}, {"LC_ALL", "C"}],
-      stderr_to_stdout: true
-    ]
+      opts = [
+        cd: working_dir,
+        env: [{"LANG", "C"}, {"LC_ALL", "C"}],
+        stderr_to_stdout: true
+      ]
 
-    # Use a Task with timeout to handle long-running commands
-    task =
-      Task.async(fn ->
-        System.cmd("bash", ["-c", command], opts)
-      end)
+      # Use a Task with timeout to handle long-running commands
+      task =
+        Task.async(fn ->
+          System.cmd("bash", ["-c", command], opts)
+        end)
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, exit_code}} ->
-        format_result(output, exit_code)
+      case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+        {:ok, {output, exit_code}} ->
+          format_result(output, exit_code)
 
-      nil ->
-        {:error, "Command timed out after #{timeout}ms"}
+        nil ->
+          {:error, "Command timed out after #{timeout}ms"}
 
-      {:exit, reason} ->
-        {:error, "Command failed: #{inspect(reason)}"}
+        {:exit, reason} ->
+          {:error, "Command failed: #{inspect(reason)}"}
+      end
     end
   end
 

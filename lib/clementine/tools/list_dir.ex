@@ -28,44 +28,37 @@ defmodule Clementine.Tools.ListDir do
 
   @impl true
   def run(args, context) do
-    path = resolve_path(args.path, context)
-    show_hidden = Map.get(args, :show_hidden, false)
+    with :ok <- Clementine.ToolContext.require_capability(context, :read),
+         {:ok, path} <- Clementine.ToolContext.resolve_path(args.path, context) do
+      show_hidden = Map.get(args, :show_hidden, false)
 
-    case File.ls(path) do
-      {:ok, entries} ->
-        entries =
-          entries
-          |> maybe_filter_hidden(show_hidden)
-          |> Enum.sort()
-          |> Enum.map(fn entry ->
-            full_path = Path.join(path, entry)
-            type = get_entry_type(full_path)
-            "#{type_indicator(type)} #{entry}"
-          end)
+      case File.ls(path) do
+        {:ok, entries} ->
+          entries =
+            entries
+            |> maybe_filter_hidden(show_hidden)
+            |> Enum.sort()
+            |> Enum.map(fn entry ->
+              full_path = Path.join(path, entry)
+              type = get_entry_type(full_path)
+              "#{type_indicator(type)} #{entry}"
+            end)
 
-        output = Enum.join(entries, "\n")
-        {:ok, if(output == "", do: "(empty directory)", else: output)}
+          output = Enum.join(entries, "\n")
+          {:ok, if(output == "", do: "(empty directory)", else: output)}
 
-      {:error, :enoent} ->
-        {:error, "Directory not found: #{path}"}
+        {:error, :enoent} ->
+          {:error, "Directory not found: #{path}"}
 
-      {:error, :enotdir} ->
-        {:error, "Not a directory: #{path}"}
+        {:error, :enotdir} ->
+          {:error, "Not a directory: #{path}"}
 
-      {:error, :eacces} ->
-        {:error, "Permission denied: #{path}"}
+        {:error, :eacces} ->
+          {:error, "Permission denied: #{path}"}
 
-      {:error, reason} ->
-        {:error, "Failed to list directory: #{inspect(reason)}"}
-    end
-  end
-
-  defp resolve_path(path, context) do
-    if Path.type(path) == :absolute do
-      path
-    else
-      working_dir = Map.get(context, :working_dir, File.cwd!())
-      Path.join(working_dir, path)
+        {:error, reason} ->
+          {:error, "Failed to list directory: #{inspect(reason)}"}
+      end
     end
   end
 

@@ -38,6 +38,12 @@ defmodule Clementine.Tool do
 
   @type context :: %{
           optional(:working_dir) => String.t(),
+          optional(:workspace_root) => String.t(),
+          optional(:capabilities) => %{
+            optional(:read) => boolean(),
+            optional(:write) => boolean(),
+            optional(:shell) => boolean()
+          },
           optional(:agent_pid) => pid(),
           optional(atom()) => any()
         }
