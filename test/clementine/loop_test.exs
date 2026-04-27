@@ -173,6 +173,30 @@ defmodule Clementine.LoopTest do
 
       assert {:error, {:api_error, 500, _}} = Loop.run(config, "Hi")
     end
+
+    test "returns normalized error when LLM client raises" do
+      Clementine.LLM.MockClient
+      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+        raise "missing configuration"
+      end)
+
+      config = [model: :claude_sonnet]
+
+      assert {:error, {:llm_exception, %{kind: :error, message: "missing configuration"}}} =
+               Loop.run(config, "Hi")
+    end
+
+    test "returns normalized error when LLM client returns an invalid shape" do
+      Clementine.LLM.MockClient
+      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+        :not_a_valid_client_result
+      end)
+
+      config = [model: :claude_sonnet]
+
+      assert {:error, {:invalid_llm_client_result, :not_a_valid_client_result}} =
+               Loop.run(config, "Hi")
+    end
   end
 
   describe "events" do

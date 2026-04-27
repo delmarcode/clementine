@@ -40,6 +40,7 @@ defmodule Clementine.Tools.Bash do
 
     opts = [
       cd: working_dir,
+      env: [{"LANG", "C"}, {"LC_ALL", "C"}],
       stderr_to_stdout: true
     ]
 

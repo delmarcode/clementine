@@ -39,7 +39,16 @@ defmodule Clementine.LLM do
   """
   def call(model, system, messages, tools, opts \\ []) do
     client = get_client()
-    client.call(model, system, messages, tools, opts)
+
+    client
+    |> apply(:call, [model, system, messages, tools, opts])
+    |> normalize_call_result()
+  rescue
+    e ->
+      {:error, exception_reason(:error, e)}
+  catch
+    kind, reason ->
+      {:error, exception_reason(kind, reason)}
   end
 
   @doc """
@@ -71,6 +80,12 @@ defmodule Clementine.LLM do
   def stream(model, system, messages, tools, opts \\ []) do
     client = get_client()
     client.stream(model, system, messages, tools, opts)
+  rescue
+    e ->
+      [{:error, exception_reason(:error, e)}]
+  catch
+    kind, reason ->
+      [{:error, exception_reason(kind, reason)}]
   end
 
   @doc """
@@ -102,7 +117,9 @@ defmodule Clementine.LLM do
       {:ok, Accumulator.to_response(acc)}
     end
   rescue
-    e -> {:error, e}
+    e -> {:error, exception_reason(:error, e)}
+  catch
+    kind, reason -> {:error, exception_reason(kind, reason)}
   end
 
   @doc """
@@ -137,5 +154,22 @@ defmodule Clementine.LLM do
   # Get the configured LLM client (allows for mocking in tests)
   defp get_client do
     Application.get_env(:clementine, :llm_client, Clementine.LLM.Router)
+  end
+
+  defp normalize_call_result({:ok, %Clementine.LLM.Response{}} = result), do: result
+  defp normalize_call_result({:error, _reason} = error), do: error
+  defp normalize_call_result(other), do: {:error, {:invalid_llm_client_result, other}}
+
+  defp exception_reason(:error, exception) do
+    {:llm_exception,
+     %{
+       kind: :error,
+       exception: exception,
+       message: Exception.message(exception)
+     }}
+  end
+
+  defp exception_reason(kind, reason) do
+    {:llm_exception, %{kind: kind, reason: reason}}
   end
 end

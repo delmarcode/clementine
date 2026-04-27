@@ -123,6 +123,28 @@ defmodule Clementine.AgentTest do
 
       GenServer.stop(agent)
     end
+
+    test "rejects clearing history while an async run is active" do
+      Clementine.LLM.MockClient
+      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+        Process.sleep(100)
+
+        {:ok,
+         %Response{
+           content: [Content.text("Async response")],
+           stop_reason: "end_turn",
+           usage: %{}
+         }}
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+      {:ok, task_id} = Clementine.Agent.run_async(agent, "Async task")
+
+      assert {:error, {:agent_busy, [^task_id]}} = Clementine.Agent.clear_history(agent)
+      assert {:ok, "Async response"} = Clementine.Agent.await(agent, task_id)
+
+      GenServer.stop(agent)
+    end
   end
 
   describe "run_async/2" do
@@ -154,7 +176,7 @@ defmodule Clementine.AgentTest do
       GenServer.stop(agent)
     end
 
-    test "agent survives when async task crashes" do
+    test "agent normalizes async LLM client exceptions" do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         raise "simulated LLM failure"
@@ -162,16 +184,18 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "This will crash")
+      {:ok, task_id} = Clementine.Agent.run_async(agent, "This will fail")
 
-      # Wait for the task to crash and the :DOWN message to be processed
+      # Wait for the task to complete with a normalized error
       Process.sleep(100)
 
       # Agent should still be alive
       assert Process.alive?(agent)
 
-      # Task should be marked as failed
-      assert {:ok, :failed} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :completed} = Clementine.Agent.status(agent, task_id)
+
+      assert {:error, {:llm_exception, %{message: "simulated LLM failure"}}} =
+               Clementine.Agent.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -198,6 +222,56 @@ defmodule Clementine.AgentTest do
       {:ok, task_id} = Clementine.Agent.run_async(agent, "Slow task")
 
       assert {:ok, :running} = Clementine.Agent.status(agent, task_id)
+
+      GenServer.stop(agent)
+    end
+
+    test "rejects a second async run while one is already running" do
+      Clementine.LLM.MockClient
+      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+        Process.sleep(100)
+
+        {:ok,
+         %Response{
+           content: [Content.text("First response")],
+           stop_reason: "end_turn",
+           usage: %{}
+         }}
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+
+      {:ok, task_id} = Clementine.Agent.run_async(agent, "First async task")
+
+      assert {:error, {:agent_busy, [^task_id]}} =
+               Clementine.Agent.run_async(agent, "Second async task")
+
+      assert {:ok, "First response"} = Clementine.Agent.await(agent, task_id)
+
+      GenServer.stop(agent)
+    end
+
+    test "rejects a synchronous run while an async run is already running" do
+      Clementine.LLM.MockClient
+      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+        Process.sleep(100)
+
+        {:ok,
+         %Response{
+           content: [Content.text("Async response")],
+           stop_reason: "end_turn",
+           usage: %{}
+         }}
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+
+      {:ok, task_id} = Clementine.Agent.run_async(agent, "Async task")
+
+      assert {:error, {:agent_busy, [^task_id]}} =
+               Clementine.Agent.run(agent, "Sync task")
+
+      assert {:ok, "Async response"} = Clementine.Agent.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -254,16 +328,17 @@ defmodule Clementine.AgentTest do
       GenServer.stop(agent)
     end
 
-    test "returns error when async task crashes" do
+    test "returns normalized error when async LLM client raises" do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         raise "boom"
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Crash task")
+      {:ok, task_id} = Clementine.Agent.run_async(agent, "Fail task")
 
-      assert {:error, {:task_crashed, _reason}} = Clementine.Agent.await(agent, task_id)
+      assert {:error, {:llm_exception, %{message: "boom"}}} =
+               Clementine.Agent.await(agent, task_id)
 
       # Agent still alive
       assert Process.alive?(agent)
