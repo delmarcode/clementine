@@ -198,6 +198,47 @@ defmodule Clementine.Agent do
       end
 
       @impl true
+      def handle_call({:run_stream, prompt, stream_consumer}, _from, state) do
+        case running_task_ids(state) do
+          [] ->
+            task_id = generate_task_id()
+            config = build_loop_config(state)
+
+            task =
+              Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
+                Loop.run_stream(config, prompt, fn event ->
+                  send(stream_consumer, {:clementine_stream_event, task_id, event})
+                end)
+              end)
+
+            entry = %{
+              task: task,
+              status: :running,
+              waiters: [],
+              stream_consumer: stream_consumer
+            }
+
+            tasks = Map.put(state.tasks, task_id, entry)
+            {:reply, {:ok, task_id}, %{state | tasks: tasks}}
+
+          task_ids ->
+            {:reply, {:error, {:agent_busy, task_ids}}, state}
+        end
+      end
+
+      @impl true
+      def handle_call({:cancel_stream, task_id}, _from, state) do
+        case Map.get(state.tasks, task_id) do
+          %{status: :running, stream_consumer: _consumer, task: task} ->
+            Task.shutdown(task, :brutal_kill)
+            {:reply, :ok, %{state | tasks: Map.delete(state.tasks, task_id)}}
+
+          _ ->
+            {:reply, :ok, state}
+        end
+      end
+
+      @impl true
       def handle_call({:status, task_id}, _from, state) do
         case Map.get(state.tasks, task_id) do
           nil ->
@@ -263,6 +304,7 @@ defmodule Clementine.Agent do
                 _ -> state
               end
 
+            notify_stream_consumer(task_id, task_info, result)
             tasks = finish_task(state.tasks, task_id, task_info, :completed, result)
             {:noreply, %{state | tasks: tasks}}
 
@@ -285,6 +327,7 @@ defmodule Clementine.Agent do
         case find_task_by_ref(state.tasks, ref) do
           {task_id, %{status: :running} = task_info} ->
             result = {:error, {:task_crashed, reason}}
+            notify_stream_consumer(task_id, task_info, result)
             tasks = finish_task(state.tasks, task_id, task_info, :failed, result)
             {:noreply, %{state | tasks: tasks}}
 
@@ -388,6 +431,12 @@ defmodule Clementine.Agent do
         |> Enum.sort()
       end
 
+      defp notify_stream_consumer(task_id, %{stream_consumer: consumer}, result) do
+        send(consumer, {:clementine_stream_done, task_id, normalize_result(result)})
+      end
+
+      defp notify_stream_consumer(_task_id, _task_info, _result), do: :ok
+
       # Transition a task to a terminal state, replying to any blocked waiters.
       # If waiters exist, the task entry is removed (waiters got the result).
       # If no waiters, the entry is kept so a later await/3 can retrieve it.
@@ -400,14 +449,19 @@ defmodule Clementine.Agent do
           GenServer.reply(from, normalized)
         end
 
-        if waiters == [] do
-          Map.put(tasks, task_id, %{
-            status: status,
-            result: result,
-            completed_at: System.monotonic_time(:millisecond)
-          })
-        else
-          Map.delete(tasks, task_id)
+        cond do
+          Map.has_key?(task_info, :stream_consumer) ->
+            Map.delete(tasks, task_id)
+
+          waiters == [] ->
+            Map.put(tasks, task_id, %{
+              status: status,
+              result: result,
+              completed_at: System.monotonic_time(:millisecond)
+            })
+
+          true ->
+            Map.delete(tasks, task_id)
         end
       end
 
@@ -439,6 +493,65 @@ defmodule Clementine.Agent do
   def run_async(agent, prompt) when is_binary(prompt) do
     GenServer.call(agent, {:run_async, prompt})
   end
+
+  @doc """
+  Streams a prompt execution on an agent.
+
+  The returned stream emits real loop streaming events as they occur, followed
+  by `{:done, :success}` or `{:done, :error}`. A successful streaming run
+  updates the agent conversation history just like `run/2`.
+  """
+  def stream(agent, prompt) when is_binary(prompt) do
+    Stream.resource(
+      fn ->
+        case GenServer.call(agent, {:run_stream, prompt, self()}, :infinity) do
+          {:ok, task_id} -> {:running, agent, task_id, false}
+          {:error, reason} -> {:emit, [{:error, reason}, {:done, :error}]}
+        end
+      end,
+      &next_stream_event/1,
+      &cleanup_stream/1
+    )
+  end
+
+  defp next_stream_event({:emit, []}) do
+    {:halt, :done}
+  end
+
+  defp next_stream_event({:emit, [event | rest]}) do
+    {[event], {:emit, rest}}
+  end
+
+  defp next_stream_event(:done) do
+    {:halt, :done}
+  end
+
+  defp next_stream_event({:running, agent, task_id, saw_error?} = state) do
+    receive do
+      {:clementine_stream_event, ^task_id, {:error, _reason} = event} ->
+        {[event], {:running, agent, task_id, true}}
+
+      {:clementine_stream_event, ^task_id, event} ->
+        {[event], state}
+
+      {:clementine_stream_done, ^task_id, {:ok, _text}} ->
+        {[{:done, :success}], :done}
+
+      {:clementine_stream_done, ^task_id, {:error, reason}} ->
+        events = if saw_error?, do: [{:done, :error}], else: [{:error, reason}, {:done, :error}]
+        {events, :done}
+    end
+  end
+
+  defp cleanup_stream({:running, agent, task_id, _saw_error?}) do
+    try do
+      GenServer.call(agent, {:cancel_stream, task_id}, 5_000)
+    catch
+      :exit, _reason -> :ok
+    end
+  end
+
+  defp cleanup_stream(_state), do: :ok
 
   @doc """
   Awaits the result of an async task.

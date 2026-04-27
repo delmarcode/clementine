@@ -203,38 +203,10 @@ defmodule Clementine do
       end)
       |> Stream.run()
 
-  Note: This is a simplified streaming interface. For full streaming support
-  with real-time LLM output, use the underlying `Clementine.LLM.stream/5` directly.
+  Successful streams update the agent conversation history just like `run/2`.
+  The stream emits `{:done, :success}` or `{:done, :error}` before halting.
   """
-  def stream(agent, prompt) do
-    # For now, this wraps run/2 and emits events
-    # A full implementation would stream from the LLM
-    Stream.resource(
-      fn ->
-        task = Task.async(fn -> run(agent, prompt) end)
-        task
-      end,
-      fn task ->
-        case Task.yield(task, 100) do
-          nil ->
-            {[], task}
-
-          {:ok, {:ok, result}} ->
-            {[{:text, result}, {:done, :success}], :done}
-
-          {:ok, {:error, reason}} ->
-            {[{:error, reason}, {:done, :error}], :done}
-
-          {:exit, reason} ->
-            {[{:error, {:exit, reason}}, {:done, :error}], :done}
-        end
-      end,
-      fn
-        :done -> :ok
-        task -> Task.shutdown(task, :brutal_kill)
-      end
-    )
-  end
+  defdelegate stream(agent, prompt), to: Agent
 
   @doc """
   Executes a tool directly without the LLM loop.

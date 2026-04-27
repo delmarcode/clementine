@@ -91,6 +91,96 @@ defmodule Clementine.AgentTest do
     end
   end
 
+  describe "stream/2" do
+    test "emits real streaming events and updates history" do
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:content_block_start, 0, :text},
+          {:text_delta, "Hello "},
+          {:text_delta, "stream!"},
+          {:content_block_stop, 0},
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+          {:message_stop}
+        ]
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+
+      events = Clementine.Agent.stream(agent, "Hi") |> Enum.to_list()
+
+      assert {:text_delta, "Hello "} in events
+      assert {:text_delta, "stream!"} in events
+      assert List.last(events) == {:done, :success}
+
+      history = Clementine.Agent.get_history(agent)
+      assert length(history) == 2
+      assert Enum.at(history, 0).role == :user
+      assert Enum.at(history, 1).role == :assistant
+
+      GenServer.stop(agent)
+    end
+
+    test "emits streaming errors once before done" do
+      error = %{"type" => "stream_parse_error", "message" => "bad stream"}
+
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:text_delta, "partial"},
+          {:error, error}
+        ]
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+
+      events = Clementine.Agent.stream(agent, "Hi") |> Enum.to_list()
+
+      assert events == [
+               {:loop_event, {:loop_start, "Hi"}},
+               {:loop_event, {:iteration_start, 1}},
+               {:loop_event, :llm_call_start},
+               {:text_delta, "partial"},
+               {:error, error},
+               {:loop_event, {:llm_call_end, {:error, error}}},
+               {:loop_event, {:loop_end, {:error, error}}},
+               {:done, :error}
+             ]
+
+      assert Clementine.Agent.get_history(agent) == []
+
+      GenServer.stop(agent)
+    end
+
+    test "returns busy error when another task is active" do
+      Clementine.LLM.MockClient
+      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+        Process.sleep(100)
+
+        {:ok,
+         %Response{
+           content: [Content.text("Async response")],
+           stop_reason: "end_turn",
+           usage: %{}
+         }}
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+      {:ok, task_id} = Clementine.Agent.run_async(agent, "Async task")
+
+      assert [
+               {:error, {:agent_busy, [^task_id]}},
+               {:done, :error}
+             ] = Clementine.Agent.stream(agent, "Hi") |> Enum.to_list()
+
+      assert {:ok, "Async response"} = Clementine.Agent.await(agent, task_id)
+
+      GenServer.stop(agent)
+    end
+  end
+
   describe "get_history/1" do
     test "returns empty history initially" do
       {:ok, agent} = TestAgent.start_link()
