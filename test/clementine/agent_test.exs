@@ -180,6 +180,57 @@ defmodule Clementine.AgentTest do
       GenServer.stop(agent)
     end
 
+    test "emits an error and terminates when the agent exits before stream completion" do
+      test_pid = self()
+
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        send(test_pid, :stream_started)
+        Process.sleep(:infinity)
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+
+      consumer =
+        Task.async(fn ->
+          Clementine.Agent.stream(agent, "Hi") |> Enum.to_list()
+        end)
+
+      assert_receive :stream_started
+      GenServer.stop(agent)
+
+      events = Task.await(consumer, 1_000)
+
+      assert {:error, {:agent_down, :normal}} in events
+      assert List.last(events) == {:done, :error}
+    end
+
+    test "drains queued stream messages when consumer stops early" do
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_1"}},
+          {:content_block_start, 0, :text}
+          | Enum.map(1..100, &{:text_delta, Integer.to_string(&1)})
+        ] ++
+          [
+            {:content_block_stop, 0},
+            {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+            {:message_stop}
+          ]
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+
+      assert [_loop_start, _iteration_start, _llm_call_start, _message_start] =
+               Clementine.Agent.stream(agent, "Hi") |> Enum.take(4)
+
+      Process.sleep(50)
+      assert_no_stream_mailbox_messages()
+
+      GenServer.stop(agent)
+    end
+
     test "cancels stream task when consumer exits before cleanup" do
       test_pid = self()
 
@@ -775,4 +826,14 @@ defmodule Clementine.AgentTest do
   end
 
   defp assert_eventually(fun, 1), do: fun.()
+
+  defp assert_no_stream_mailbox_messages do
+    {:messages, messages} = Process.info(self(), :messages)
+
+    refute Enum.any?(messages, fn
+             {:clementine_stream_event, _task_id, _event} -> true
+             {:clementine_stream_done, _task_id, _result} -> true
+             _message -> false
+           end)
+  end
 end

@@ -199,6 +199,19 @@ defmodule Clementine.Agent do
 
       @impl true
       def handle_call({:run_stream, prompt, stream_consumer}, _from, state) do
+        start_stream_task(prompt, stream_consumer, state, fn task_id, _task ->
+          {:ok, task_id}
+        end)
+      end
+
+      @impl true
+      def handle_call({:run_stream, prompt, stream_consumer, :return_owner}, _from, state) do
+        start_stream_task(prompt, stream_consumer, state, fn task_id, task ->
+          {:ok, task_id, self(), task.pid}
+        end)
+      end
+
+      defp start_stream_task(prompt, stream_consumer, state, reply_fun) do
         case running_task_ids(state) do
           [] ->
             task_id = generate_task_id()
@@ -221,7 +234,7 @@ defmodule Clementine.Agent do
             }
 
             tasks = Map.put(state.tasks, task_id, entry)
-            {:reply, {:ok, task_id}, %{state | tasks: tasks}}
+            {:reply, reply_fun.(task_id, task), %{state | tasks: tasks}}
 
           task_ids ->
             {:reply, {:error, {:agent_busy, task_ids}}, state}
@@ -552,14 +565,24 @@ defmodule Clementine.Agent do
   def stream(agent, prompt) when is_binary(prompt) do
     Stream.resource(
       fn ->
-        case GenServer.call(agent, {:run_stream, prompt, self()}, :infinity) do
-          {:ok, task_id} -> {:running, agent, task_id, false}
-          {:error, reason} -> {:emit, [{:error, reason}, {:done, :error}]}
+        case start_stream(agent, prompt) do
+          {:ok, task_id, agent_pid, task_pid} ->
+            agent_monitor_ref = Process.monitor(agent_pid)
+            {:running, agent, task_id, agent_monitor_ref, task_pid, false}
+
+          {:error, reason} ->
+            {:emit, [{:error, reason}, {:done, :error}]}
         end
       end,
       &next_stream_event/1,
       &cleanup_stream/1
     )
+  end
+
+  defp start_stream(agent, prompt) do
+    GenServer.call(agent, {:run_stream, prompt, self(), :return_owner}, :infinity)
+  catch
+    :exit, reason -> {:error, {:agent_down, reason}}
   end
 
   defp next_stream_event({:emit, []}) do
@@ -574,32 +597,81 @@ defmodule Clementine.Agent do
     {:halt, :done}
   end
 
-  defp next_stream_event({:running, agent, task_id, saw_error?} = state) do
+  defp next_stream_event(
+         {:running, agent, task_id, agent_monitor_ref, task_pid, saw_error?} = state
+       ) do
     receive do
       {:clementine_stream_event, ^task_id, {:error, _reason} = event} ->
-        {[event], {:running, agent, task_id, true}}
+        {[event], {:running, agent, task_id, agent_monitor_ref, task_pid, true}}
 
       {:clementine_stream_event, ^task_id, event} ->
         {[event], state}
 
       {:clementine_stream_done, ^task_id, {:ok, _text}} ->
+        demonitor_agent(agent_monitor_ref)
+        drain_stream_messages(task_id)
         {[{:done, :success}], :done}
 
       {:clementine_stream_done, ^task_id, {:error, reason}} ->
-        events = if saw_error?, do: [{:done, :error}], else: [{:error, reason}, {:done, :error}]
+        demonitor_agent(agent_monitor_ref)
+        drain_stream_messages(task_id)
+        events = stream_error_events(reason, saw_error?)
         {events, :done}
+
+      {:DOWN, ^agent_monitor_ref, :process, _pid, reason} ->
+        terminate_stream_task(task_pid)
+        drain_stream_messages(task_id)
+        {stream_error_events({:agent_down, reason}, saw_error?), :done}
     end
   end
 
-  defp cleanup_stream({:running, agent, task_id, _saw_error?}) do
-    try do
-      GenServer.call(agent, {:cancel_stream, task_id}, 5_000)
-    catch
-      :exit, _reason -> :ok
+  defp cleanup_stream({:running, agent, task_id, agent_monitor_ref, task_pid, _saw_error?}) do
+    demonitor_agent(agent_monitor_ref)
+
+    case cancel_stream(agent, task_id) do
+      :ok -> :ok
+      {:error, _reason} -> terminate_stream_task(task_pid)
     end
+
+    drain_stream_messages(task_id)
   end
 
   defp cleanup_stream(_state), do: :ok
+
+  defp cancel_stream(agent, task_id) do
+    GenServer.call(agent, {:cancel_stream, task_id}, 5_000)
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp demonitor_agent(ref) do
+    Process.demonitor(ref, [:flush])
+  end
+
+  defp drain_stream_messages(task_id) do
+    receive do
+      {:clementine_stream_event, ^task_id, _event} -> drain_stream_messages(task_id)
+      {:clementine_stream_done, ^task_id, _result} -> drain_stream_messages(task_id)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp terminate_stream_task(task_pid) when is_pid(task_pid) do
+    task_ref = Process.monitor(task_pid)
+    Process.exit(task_pid, :kill)
+
+    receive do
+      {:DOWN, ^task_ref, :process, ^task_pid, _reason} -> :ok
+    after
+      500 -> Process.demonitor(task_ref, [:flush])
+    end
+
+    :ok
+  end
+
+  defp stream_error_events(_reason, true), do: [{:done, :error}]
+  defp stream_error_events(reason, false), do: [{:error, reason}, {:done, :error}]
 
   @doc """
   Awaits the result of an async task.
