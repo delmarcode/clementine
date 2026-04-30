@@ -29,6 +29,7 @@ defmodule Clementine.LLM.Anthropic do
 
   alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Anthropic.{Messages, Tools}
+  alias Clementine.LLM.Error
   alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
 
@@ -106,8 +107,9 @@ defmodule Clementine.LLM.Anthropic do
     parent = self()
     ref = make_ref()
 
-    # Spawn a process to make the request and send chunks back
-    pid = spawn_link(fn -> do_stream_request(body, headers, parent, ref) end)
+    # Spawn a process to make the request and send chunks back.
+    # Keep failures as stream errors instead of linking them into the caller.
+    pid = start_stream_request(body, headers, parent, ref)
 
     Stream.resource(
       fn -> {ref, pid, StreamParser.new()} end,
@@ -125,6 +127,20 @@ defmodule Clementine.LLM.Anthropic do
           :ok
       end
     )
+  end
+
+  defp start_stream_request(body, headers, parent, ref) do
+    spawn(fn ->
+      try do
+        do_stream_request(body, headers, parent, ref)
+      rescue
+        e ->
+          send(parent, {ref, {:error, Error.normalize_exception(:error, e)}})
+      catch
+        kind, reason ->
+          send(parent, {ref, {:error, Error.normalize_exception(kind, reason)}})
+      end
+    end)
   end
 
   defp do_stream_request(body, headers, parent, ref) do

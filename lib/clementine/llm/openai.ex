@@ -8,6 +8,7 @@ defmodule Clementine.LLM.OpenAI do
   @behaviour Clementine.LLM.ClientBehaviour
 
   alias Clementine.LLM.ModelRegistry
+  alias Clementine.LLM.Error
   alias Clementine.LLM.Message.Content
   alias Clementine.LLM.OpenAI.{Messages, Tools}
   alias Clementine.LLM.OpenAIStreamParser
@@ -60,7 +61,7 @@ defmodule Clementine.LLM.OpenAI do
     headers = build_headers()
     parent = self()
     ref = make_ref()
-    pid = spawn_link(fn -> do_stream_request(body, headers, parent, ref) end)
+    pid = start_stream_request(body, headers, parent, ref)
 
     Stream.resource(
       fn -> {ref, pid, OpenAIStreamParser.new()} end,
@@ -78,6 +79,20 @@ defmodule Clementine.LLM.OpenAI do
           :ok
       end
     )
+  end
+
+  defp start_stream_request(body, headers, parent, ref) do
+    spawn(fn ->
+      try do
+        do_stream_request(body, headers, parent, ref)
+      rescue
+        e ->
+          send(parent, {ref, {:error, Error.normalize_exception(:error, e)}})
+      catch
+        kind, reason ->
+          send(parent, {ref, {:error, Error.normalize_exception(kind, reason)}})
+      end
+    end)
   end
 
   defp do_stream_request(body, headers, parent, ref) do

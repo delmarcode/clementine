@@ -393,6 +393,18 @@ defmodule Clementine.LoopTest do
       assert_receive {:stream_event, {:text_delta, "partial"}}
     end
 
+    test "lazy stream exceptions return normalized LLM errors" do
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        Stream.map([:boom], fn _ -> raise "stream blew up" end)
+      end)
+
+      config = [model: :claude_sonnet, tools: []]
+
+      assert {:error, {:llm_exception, %{kind: :error, message: "stream blew up"}}} =
+               Loop.run_stream(config, "Hi", fn _ -> :ok end)
+    end
+
     test "stream error emits correct {:llm_call_end, {:error, ...}} loop event" do
       test_pid = self()
 

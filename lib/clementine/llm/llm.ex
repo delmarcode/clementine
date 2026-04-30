@@ -17,6 +17,7 @@ defmodule Clementine.LLM do
   """
 
   alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.Error
 
   @doc """
   Makes a synchronous LLM call.
@@ -81,7 +82,9 @@ defmodule Clementine.LLM do
   """
   def stream(model, system, messages, tools, opts \\ []) do
     client = get_client()
+
     client.stream(model, system, messages, tools, opts)
+    |> normalize_stream_result()
   rescue
     e ->
       [{:error, exception_reason(:error, e)}]
@@ -162,16 +165,59 @@ defmodule Clementine.LLM do
   defp normalize_call_result({:error, _reason} = error), do: error
   defp normalize_call_result(other), do: {:error, {:invalid_llm_client_result, other}}
 
-  defp exception_reason(:error, exception) do
-    {:llm_exception,
-     %{
-       kind: :error,
-       exception: exception,
-       message: Exception.message(exception)
-     }}
+  defp normalize_stream_result(stream) do
+    if Enumerable.impl_for(stream) do
+      Stream.resource(
+        fn -> {:stream, stream} end,
+        &next_safe_stream_event/1,
+        &cleanup_safe_stream/1
+      )
+    else
+      [{:error, {:invalid_llm_client_stream, stream}}]
+    end
   end
 
-  defp exception_reason(kind, reason) do
-    {:llm_exception, %{kind: kind, reason: reason}}
+  defp next_safe_stream_event(:done), do: {:halt, :done}
+
+  defp next_safe_stream_event({:stream, stream}) do
+    reduce_next_stream_event(fn acc ->
+      Enumerable.reduce(stream, {:cont, acc}, &suspend_after_event/2)
+    end)
   end
+
+  defp next_safe_stream_event({:continuation, continuation}) do
+    reduce_next_stream_event(fn acc -> continuation.({:cont, acc}) end)
+  end
+
+  defp reduce_next_stream_event(reduce_fun) do
+    case reduce_fun.(nil) do
+      {:suspended, event, continuation} ->
+        {[event], {:continuation, continuation}}
+
+      {:done, _acc} ->
+        {:halt, :done}
+
+      {:halted, _acc} ->
+        {:halt, :done}
+    end
+  rescue
+    e ->
+      {[{:error, exception_reason(:error, e)}], :done}
+  catch
+    kind, reason ->
+      {[{:error, exception_reason(kind, reason)}], :done}
+  end
+
+  defp suspend_after_event(event, _acc), do: {:suspend, event}
+
+  defp cleanup_safe_stream({:continuation, continuation}) do
+    continuation.({:halt, nil})
+    :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp cleanup_safe_stream(_state), do: :ok
+
+  defp exception_reason(kind, reason), do: Error.normalize_exception(kind, reason)
 end
