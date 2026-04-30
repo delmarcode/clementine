@@ -29,6 +29,7 @@ defmodule Clementine.LLM.Anthropic do
 
   alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Anthropic.{Messages, Tools}
+  alias Clementine.LLM.ProviderStream
   alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
 
@@ -103,28 +104,10 @@ defmodule Clementine.LLM.Anthropic do
   def stream(model, system, messages, tools, opts \\ []) do
     body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
     headers = build_headers()
-    parent = self()
-    ref = make_ref()
 
-    # Spawn a process to make the request and send chunks back
-    pid = spawn_link(fn -> do_stream_request(body, headers, parent, ref) end)
-
-    Stream.resource(
-      fn -> {ref, pid, StreamParser.new()} end,
-      &receive_chunk/1,
-      fn
-        {_ref, pid, _parser} ->
-          Process.unlink(pid)
-          Process.exit(pid, :shutdown)
-
-        {:halting, pid} ->
-          Process.unlink(pid)
-          Process.exit(pid, :shutdown)
-
-        _ ->
-          :ok
-      end
-    )
+    ProviderStream.new(StreamParser, fn parent, ref ->
+      do_stream_request(body, headers, parent, ref)
+    end)
   end
 
   defp do_stream_request(body, headers, parent, ref) do
@@ -184,32 +167,6 @@ defmodule Clementine.LLM.Anthropic do
       {:error, reason} ->
         send(parent, {ref, {:error, {:request_failed, reason}}})
     end
-  end
-
-  defp receive_chunk({ref, pid, parser}) do
-    receive do
-      {^ref, {:data, data}} ->
-        {events, new_parser} = StreamParser.parse(parser, data)
-        {events, {ref, pid, new_parser}}
-
-      {^ref, :retry_reset} ->
-        {[], {ref, pid, StreamParser.new()}}
-
-      {^ref, :done} ->
-        {:halt, :done}
-
-      {^ref, {:error, reason}} ->
-        {[{:error, reason}], {:halting, pid}}
-    after
-      300_000 ->
-        {[{:error, :timeout}], {:halting, pid}}
-    end
-  end
-
-  # After emitting an error event, halt the stream on the next call.
-  # Keeps pid accessible so the cleanup function can terminate it.
-  defp receive_chunk({:halting, pid}) do
-    {:halt, {:halting, pid}}
   end
 
   defp base_url do
