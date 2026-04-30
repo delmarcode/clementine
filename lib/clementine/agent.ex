@@ -198,6 +198,63 @@ defmodule Clementine.Agent do
       end
 
       @impl true
+      def handle_call({:run_stream, prompt, stream_consumer}, _from, state) do
+        start_stream_task(prompt, stream_consumer, state, fn task_id, _task ->
+          {:ok, task_id}
+        end)
+      end
+
+      @impl true
+      def handle_call({:run_stream, prompt, stream_consumer, :return_owner}, _from, state) do
+        start_stream_task(prompt, stream_consumer, state, fn task_id, task ->
+          {:ok, task_id, self(), task.pid}
+        end)
+      end
+
+      defp start_stream_task(prompt, stream_consumer, state, reply_fun) do
+        case running_task_ids(state) do
+          [] ->
+            task_id = generate_task_id()
+            config = build_loop_config(state)
+            consumer_monitor_ref = Process.monitor(stream_consumer)
+
+            task =
+              Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
+                Loop.run_stream(config, prompt, fn event ->
+                  send(stream_consumer, {:clementine_stream_event, task_id, event})
+                end)
+              end)
+
+            entry = %{
+              task: task,
+              status: :running,
+              waiters: [],
+              stream_consumer: stream_consumer,
+              consumer_monitor_ref: consumer_monitor_ref
+            }
+
+            tasks = Map.put(state.tasks, task_id, entry)
+            {:reply, reply_fun.(task_id, task), %{state | tasks: tasks}}
+
+          task_ids ->
+            {:reply, {:error, {:agent_busy, task_ids}}, state}
+        end
+      end
+
+      @impl true
+      def handle_call({:cancel_stream, task_id}, _from, state) do
+        case Map.get(state.tasks, task_id) do
+          %{status: :running, stream_consumer: _consumer, task: task} ->
+            demonitor_stream_consumer(Map.get(state.tasks, task_id))
+            Task.shutdown(task, :brutal_kill)
+            {:reply, :ok, %{state | tasks: Map.delete(state.tasks, task_id)}}
+
+          _ ->
+            {:reply, :ok, state}
+        end
+      end
+
+      @impl true
       def handle_call({:status, task_id}, _from, state) do
         case Map.get(state.tasks, task_id) do
           nil ->
@@ -257,12 +314,9 @@ defmodule Clementine.Agent do
 
         case find_task_by_ref(state.tasks, ref) do
           {task_id, task_info} ->
-            state =
-              case result do
-                {:ok, _text, messages} -> %{state | history: messages}
-                _ -> state
-              end
-
+            demonitor_stream_consumer(task_info)
+            state = maybe_apply_task_history(state, task_info, result)
+            maybe_notify_stream_consumer(task_id, task_info, result)
             tasks = finish_task(state.tasks, task_id, task_info, :completed, result)
             {:noreply, %{state | tasks: tasks}}
 
@@ -272,23 +326,38 @@ defmodule Clementine.Agent do
       end
 
       @impl true
-      def handle_info({:DOWN, _ref, :process, _pid, :normal}, state) do
-        # Normal exit follows a successful {ref, result} which already
-        # handled the task. Process.demonitor(:flush) usually eats this,
-        # but it can arrive if the demonitor races. Safe to ignore.
-        {:noreply, state}
+      def handle_info({:DOWN, ref, :process, _pid, :normal}, state) do
+        case find_stream_by_consumer_monitor_ref(state.tasks, ref) do
+          {task_id, task_info} ->
+            Task.shutdown(task_info.task, :brutal_kill)
+            {:noreply, %{state | tasks: Map.delete(state.tasks, task_id)}}
+
+          nil ->
+            # Normal task exits follow a successful {ref, result} which already
+            # handled the task. Process.demonitor(:flush) usually eats these,
+            # but they can arrive if the demonitor races. Safe to ignore.
+            {:noreply, state}
+        end
       end
 
       @impl true
       def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-        # Abnormal exit or :shutdown — task crashed or was terminated
-        case find_task_by_ref(state.tasks, ref) do
-          {task_id, %{status: :running} = task_info} ->
+        cond do
+          stream = find_stream_by_consumer_monitor_ref(state.tasks, ref) ->
+            {task_id, task_info} = stream
+            Task.shutdown(task_info.task, :brutal_kill)
+            {:noreply, %{state | tasks: Map.delete(state.tasks, task_id)}}
+
+          task = find_task_by_ref(state.tasks, ref) ->
+            # Abnormal exit or :shutdown — task crashed or was terminated
+            {task_id, %{status: :running} = task_info} = task
             result = {:error, {:task_crashed, reason}}
+            demonitor_stream_consumer(task_info)
+            notify_stream_consumer(task_id, task_info, result)
             tasks = finish_task(state.tasks, task_id, task_info, :failed, result)
             {:noreply, %{state | tasks: tasks}}
 
-          _ ->
+          true ->
             # Task already terminal or unknown — ignore
             {:noreply, state}
         end
@@ -379,6 +448,13 @@ defmodule Clementine.Agent do
         end)
       end
 
+      defp find_stream_by_consumer_monitor_ref(tasks, ref) do
+        Enum.find_value(tasks, fn
+          {task_id, %{consumer_monitor_ref: ^ref} = info} -> {task_id, info}
+          _ -> nil
+        end)
+      end
+
       defp running_task_ids(%{tasks: tasks}) do
         tasks
         |> Enum.flat_map(fn
@@ -387,6 +463,40 @@ defmodule Clementine.Agent do
         end)
         |> Enum.sort()
       end
+
+      defp notify_stream_consumer(task_id, %{stream_consumer: consumer}, result) do
+        send(consumer, {:clementine_stream_done, task_id, normalize_result(result)})
+      end
+
+      defp notify_stream_consumer(_task_id, _task_info, _result), do: :ok
+
+      defp maybe_notify_stream_consumer(task_id, %{stream_consumer: consumer} = task_info, result) do
+        if Process.alive?(consumer) do
+          notify_stream_consumer(task_id, task_info, result)
+        else
+          :ok
+        end
+      end
+
+      defp maybe_notify_stream_consumer(task_id, task_info, result) do
+        notify_stream_consumer(task_id, task_info, result)
+      end
+
+      defp maybe_apply_task_history(state, %{stream_consumer: consumer}, {:ok, _text, messages}) do
+        if Process.alive?(consumer), do: %{state | history: messages}, else: state
+      end
+
+      defp maybe_apply_task_history(state, _task_info, {:ok, _text, messages}) do
+        %{state | history: messages}
+      end
+
+      defp maybe_apply_task_history(state, _task_info, _result), do: state
+
+      defp demonitor_stream_consumer(%{consumer_monitor_ref: ref}) do
+        Process.demonitor(ref, [:flush])
+      end
+
+      defp demonitor_stream_consumer(_task_info), do: :ok
 
       # Transition a task to a terminal state, replying to any blocked waiters.
       # If waiters exist, the task entry is removed (waiters got the result).
@@ -400,14 +510,19 @@ defmodule Clementine.Agent do
           GenServer.reply(from, normalized)
         end
 
-        if waiters == [] do
-          Map.put(tasks, task_id, %{
-            status: status,
-            result: result,
-            completed_at: System.monotonic_time(:millisecond)
-          })
-        else
-          Map.delete(tasks, task_id)
+        cond do
+          Map.has_key?(task_info, :stream_consumer) ->
+            Map.delete(tasks, task_id)
+
+          waiters == [] ->
+            Map.put(tasks, task_id, %{
+              status: status,
+              result: result,
+              completed_at: System.monotonic_time(:millisecond)
+            })
+
+          true ->
+            Map.delete(tasks, task_id)
         end
       end
 
@@ -439,6 +554,124 @@ defmodule Clementine.Agent do
   def run_async(agent, prompt) when is_binary(prompt) do
     GenServer.call(agent, {:run_async, prompt})
   end
+
+  @doc """
+  Streams a prompt execution on an agent.
+
+  The returned stream emits real loop streaming events as they occur, followed
+  by `{:done, :success}` or `{:done, :error}`. A successful streaming run
+  updates the agent conversation history just like `run/2`.
+  """
+  def stream(agent, prompt) when is_binary(prompt) do
+    Stream.resource(
+      fn ->
+        case start_stream(agent, prompt) do
+          {:ok, task_id, agent_pid, task_pid} ->
+            agent_monitor_ref = Process.monitor(agent_pid)
+            {:running, agent, task_id, agent_monitor_ref, task_pid, false}
+
+          {:error, reason} ->
+            {:emit, [{:error, reason}, {:done, :error}]}
+        end
+      end,
+      &next_stream_event/1,
+      &cleanup_stream/1
+    )
+  end
+
+  defp start_stream(agent, prompt) do
+    GenServer.call(agent, {:run_stream, prompt, self(), :return_owner}, :infinity)
+  catch
+    :exit, reason -> {:error, {:agent_down, reason}}
+  end
+
+  defp next_stream_event({:emit, []}) do
+    {:halt, :done}
+  end
+
+  defp next_stream_event({:emit, [event | rest]}) do
+    {[event], {:emit, rest}}
+  end
+
+  defp next_stream_event(:done) do
+    {:halt, :done}
+  end
+
+  defp next_stream_event(
+         {:running, agent, task_id, agent_monitor_ref, task_pid, saw_error?} = state
+       ) do
+    receive do
+      {:clementine_stream_event, ^task_id, {:error, _reason} = event} ->
+        {[event], {:running, agent, task_id, agent_monitor_ref, task_pid, true}}
+
+      {:clementine_stream_event, ^task_id, event} ->
+        {[event], state}
+
+      {:clementine_stream_done, ^task_id, {:ok, _text}} ->
+        demonitor_agent(agent_monitor_ref)
+        drain_stream_messages(task_id)
+        {[{:done, :success}], :done}
+
+      {:clementine_stream_done, ^task_id, {:error, reason}} ->
+        demonitor_agent(agent_monitor_ref)
+        drain_stream_messages(task_id)
+        events = stream_error_events(reason, saw_error?)
+        {events, :done}
+
+      {:DOWN, ^agent_monitor_ref, :process, _pid, reason} ->
+        terminate_stream_task(task_pid)
+        drain_stream_messages(task_id)
+        {stream_error_events({:agent_down, reason}, saw_error?), :done}
+    end
+  end
+
+  defp cleanup_stream({:running, agent, task_id, agent_monitor_ref, task_pid, _saw_error?}) do
+    demonitor_agent(agent_monitor_ref)
+
+    case cancel_stream(agent, task_id) do
+      :ok -> :ok
+      {:error, _reason} -> terminate_stream_task(task_pid)
+    end
+
+    drain_stream_messages(task_id)
+  end
+
+  defp cleanup_stream(_state), do: :ok
+
+  defp cancel_stream(agent, task_id) do
+    GenServer.call(agent, {:cancel_stream, task_id}, 5_000)
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp demonitor_agent(ref) do
+    Process.demonitor(ref, [:flush])
+  end
+
+  defp drain_stream_messages(task_id) do
+    receive do
+      {:clementine_stream_event, ^task_id, _event} -> drain_stream_messages(task_id)
+      {:clementine_stream_done, ^task_id, _result} -> drain_stream_messages(task_id)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp terminate_stream_task(task_pid) when is_pid(task_pid) do
+    task_ref = Process.monitor(task_pid)
+    Process.exit(task_pid, :kill)
+
+    receive do
+      {:DOWN, ^task_ref, :process, ^task_pid, _reason} -> :ok
+    after
+      500 -> Process.demonitor(task_ref, [:flush])
+    end
+
+    :ok
+  end
+
+  defp stream_error_events(_reason, true), do: [{:done, :error}]
+  defp stream_error_events(reason, false), do: [{:error, reason}, {:done, :error}]
 
   @doc """
   Awaits the result of an async task.

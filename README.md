@@ -158,6 +158,21 @@ end
 Stream responses token-by-token as they arrive from the LLM:
 
 ```elixir
+Clementine.stream(agent, "Explain this code")
+|> Stream.each(fn
+  {:text_delta, text} -> IO.write(text)
+  {:tool_use_start, _id, name} -> IO.write("\n[calling #{name}...] ")
+  {:tool_result, _id, _result} -> IO.puts("[done]")
+  {:done, :success} -> IO.puts("\n")
+  {:error, reason} -> IO.puts("\nstream failed: #{inspect(reason)}")
+  _ -> :ok
+end)
+|> Stream.run()
+```
+
+For lower-level control without an agent process, use `Clementine.Loop.run_stream/3`:
+
+```elixir
 Clementine.Loop.run_stream(
   [
     model: :claude_sonnet,
