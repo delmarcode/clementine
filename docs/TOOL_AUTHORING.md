@@ -100,9 +100,13 @@ Parameters are defined as a keyword list. Each parameter has these options:
 | `:type` | atom | yes | One of `:string`, `:integer`, `:number`, `:boolean`, `:array`, `:object` |
 | `:required` | boolean | no | Whether the LLM must provide this parameter (default: `false`) |
 | `:description` | string | no | Describes the parameter to the LLM |
-| `:enum` | list | no | For `:string` type, restricts to allowed values |
+| `:enum` | list of strings | no | For `:string` type, restricts to allowed values |
 | `:items` | keyword | no | For `:array` type, the schema of each item |
 | `:properties` | keyword | no | For `:object` type, nested parameter definitions |
+| `:minimum` | number | no | For `:integer` or `:number` types, inclusive lower bound |
+| `:maximum` | number | no | For `:integer` or `:number` types, inclusive upper bound |
+| `:min_length` | non-negative integer | no | For `:string` type, inclusive minimum length |
+| `:max_length` | non-negative integer | no | For `:string` type, inclusive maximum length |
 
 ### Examples
 
@@ -121,6 +125,15 @@ parameters: [
 ```elixir
 parameters: [
   format: [type: :string, required: true, description: "Output format", enum: ["json", "csv", "text"]]
+]
+```
+
+**Bounds:**
+
+```elixir
+parameters: [
+  query: [type: :string, required: true, min_length: 1, max_length: 200],
+  max_results: [type: :integer, required: false, minimum: 1, maximum: 100]
 ]
 ```
 
@@ -174,12 +187,16 @@ When `:properties` is declared, keys are atomized and validated as usual. Only o
 parameters: []
 ```
 
-Parameters are validated at compile time. Invalid types or missing `:type` fields will raise `ArgumentError`.
+Parameters are validated at compile time. Invalid types, missing `:type` fields,
+unknown schema option keys, malformed nested schemas, enum declarations on
+non-string parameters, bounds on the wrong type, and inverted bounds all raise
+`ArgumentError`.
 
 At runtime, `validate_args/2` checks types and enums in addition to required-field presence. This means tool `run/2` implementations can trust that arguments match their declared schema — no defensive type-checking needed. Validation covers:
 
 - **Types:** `:string` → `is_binary`, `:integer` → `is_integer`, `:number` → `is_number` (int or float), `:boolean` → `is_boolean`, `:array` → `is_list`, `:object` → `is_map`
-- **Enums:** value must be in the declared `:enum` list
+- **Enums:** string value must be in the declared `:enum` list
+- **Bounds:** numbers honor inclusive `:minimum`/`:maximum`; strings honor inclusive `:min_length`/`:max_length`
 - **Array items:** each element validated against the `:items` schema
 - **Nested objects:** each property validated against its `:properties` schema (including required checks)
 

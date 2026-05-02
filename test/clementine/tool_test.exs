@@ -48,6 +48,20 @@ defmodule Clementine.ToolTest do
       assert schema["properties"]["status"]["enum"] == ["active", "inactive", "pending"]
     end
 
+    test "converts string and numeric bounds" do
+      params = [
+        code: [type: :string, min_length: 2, max_length: 8],
+        score: [type: :number, minimum: 0, maximum: 1.5]
+      ]
+
+      schema = Tool.params_to_json_schema(params)
+
+      assert schema["properties"]["code"]["minLength"] == 2
+      assert schema["properties"]["code"]["maxLength"] == 8
+      assert schema["properties"]["score"]["minimum"] == 0
+      assert schema["properties"]["score"]["maximum"] == 1.5
+    end
+
     test "converts array parameter" do
       params = [
         tags: [type: :array, items: [type: :string]]
@@ -244,6 +258,38 @@ defmodule Clementine.ToolTest do
       assert msg =~ "xml"
     end
 
+    # Bounds validation
+
+    test "numeric bounds: valid values pass" do
+      params = [count: [type: :integer, required: true, minimum: 1, maximum: 5]]
+      assert :ok = Tool.validate_args(params, %{count: 3})
+    end
+
+    test "numeric bounds: values outside bounds rejected" do
+      params = [count: [type: :integer, required: true, minimum: 1, maximum: 5]]
+
+      assert {:error, low_msg} = Tool.validate_args(params, %{count: 0})
+      assert low_msg =~ "count must be greater than or equal to 1"
+
+      assert {:error, high_msg} = Tool.validate_args(params, %{count: 6})
+      assert high_msg =~ "count must be less than or equal to 5"
+    end
+
+    test "string bounds: valid values pass" do
+      params = [code: [type: :string, required: true, min_length: 2, max_length: 4]]
+      assert :ok = Tool.validate_args(params, %{code: "abc"})
+    end
+
+    test "string bounds: values outside bounds rejected" do
+      params = [code: [type: :string, required: true, min_length: 2, max_length: 4]]
+
+      assert {:error, short_msg} = Tool.validate_args(params, %{code: "a"})
+      assert short_msg =~ "code length must be at least 2"
+
+      assert {:error, long_msg} = Tool.validate_args(params, %{code: "abcde"})
+      assert long_msg =~ "code length must be at most 4"
+    end
+
     # Array item validation
 
     test "array: valid items pass" do
@@ -434,6 +480,12 @@ defmodule Clementine.ToolTest do
       end
     end
 
+    test "raises on unknown parameter option" do
+      assert_raise ArgumentError, ~r/unknown options \[:format\]/, fn ->
+        Tool.validate_schema!("tool", "description", param: [type: :string, format: :email])
+      end
+    end
+
     test "passes with valid schema" do
       assert :ok =
                Tool.validate_schema!("tool", "description",
@@ -461,6 +513,17 @@ defmodule Clementine.ToolTest do
       assert_raise ArgumentError, ~r/must have a :type/, fn ->
         Tool.validate_schema!("tool", "description",
           config: [type: :object, properties: [host: [required: true]]]
+        )
+      end
+    end
+
+    test "raises on unknown option in nested properties schema" do
+      assert_raise ArgumentError, ~r/parameter config\.host.*unknown options \[:format\]/, fn ->
+        Tool.validate_schema!("tool", "description",
+          config: [
+            type: :object,
+            properties: [host: [type: :string, format: :hostname]]
+          ]
         )
       end
     end
@@ -494,17 +557,67 @@ defmodule Clementine.ToolTest do
     end
 
     test "raises on non-keyword-list :items" do
-      assert_raise ArgumentError, ~r/:items must be a keyword list/, fn ->
+      assert_raise ArgumentError,
+                   ~r/invalid value for :items option: expected keyword list/,
+                   fn ->
+                     Tool.validate_schema!("tool", "description",
+                       tags: [type: :array, items: %{type: :string}]
+                     )
+                   end
+    end
+
+    test "raises on non-keyword-list :properties" do
+      assert_raise ArgumentError,
+                   ~r/invalid value for :properties option: expected keyword list/,
+                   fn ->
+                     Tool.validate_schema!("tool", "description",
+                       config: [type: :object, properties: %{host: [type: :string]}]
+                     )
+                   end
+    end
+
+    test "raises on enum with non-string type" do
+      assert_raise ArgumentError, ~r/has :enum but type is :integer, not :string/, fn ->
+        Tool.validate_schema!("tool", "description", count: [type: :integer, enum: ["1", "2"]])
+      end
+    end
+
+    test "raises on empty enum" do
+      assert_raise ArgumentError, ~r/:enum must contain at least one value/, fn ->
+        Tool.validate_schema!("tool", "description", status: [type: :string, enum: []])
+      end
+    end
+
+    test "raises on non-string enum values" do
+      assert_raise ArgumentError, ~r/invalid list in :enum option/, fn ->
+        Tool.validate_schema!("tool", "description", status: [type: :string, enum: [:ok]])
+      end
+    end
+
+    test "raises on numeric bounds with non-numeric type" do
+      assert_raise ArgumentError, ~r/has numeric bounds but type is :string/, fn ->
+        Tool.validate_schema!("tool", "description", name: [type: :string, minimum: 1])
+      end
+    end
+
+    test "raises on inverted numeric bounds" do
+      assert_raise ArgumentError, ~r/:minimum must be less than or equal to :maximum/, fn ->
         Tool.validate_schema!("tool", "description",
-          tags: [type: :array, items: %{type: :string}]
+          score: [type: :number, minimum: 10, maximum: 1]
         )
       end
     end
 
-    test "raises on non-keyword-list :properties" do
-      assert_raise ArgumentError, ~r/:properties must be a keyword list/, fn ->
+    test "raises on string length bounds with non-string type" do
+      assert_raise ArgumentError, ~r/has string length bounds but type is :integer/, fn ->
+        Tool.validate_schema!("tool", "description", count: [type: :integer, min_length: 1])
+      end
+    end
+
+    test "raises on inverted string length bounds" do
+      assert_raise ArgumentError, ~r/:min_length must be less than or equal to :max_length/, fn ->
         Tool.validate_schema!("tool", "description",
-          config: [type: :object, properties: %{host: [type: :string]}]
+          code: [type: :string, min_length: 5, max_length: 2]
         )
       end
     end
@@ -520,6 +633,15 @@ defmodule Clementine.ToolTest do
                      port: [type: :integer]
                    ]
                  ]
+               )
+    end
+
+    test "passes with valid enum and bounds" do
+      assert :ok =
+               Tool.validate_schema!("tool", "description",
+                 status: [type: :string, enum: ["open", "closed"]],
+                 code: [type: :string, min_length: 2, max_length: 8],
+                 score: [type: :number, minimum: 0, maximum: 1.0]
                )
     end
   end
@@ -566,6 +688,26 @@ defmodule Clementine.ToolTest do
     test "execute/2 validates required arguments" do
       assert {:error, message} = TestTool.execute(%{})
       assert message =~ "missing required parameter"
+    end
+
+    test "invalid schemas raise during module compilation" do
+      assert_raise ArgumentError, ~r/unknown options \[:format\]/, fn ->
+        Code.compile_quoted(
+          quote do
+            defmodule InvalidCompileTimeTool do
+              use Clementine.Tool,
+                name: "invalid_compile_time_tool",
+                description: "Invalid compile-time tool",
+                parameters: [
+                  input: [type: :string, format: :email]
+                ]
+
+              @impl true
+              def run(_, _), do: {:ok, "ok"}
+            end
+          end
+        )
+      end
     end
   end
 

@@ -34,6 +34,8 @@ defmodule Clementine.Tool do
   - `:enum` - For string types, a list of allowed values
   - `:items` - For array types, the schema of array items
   - `:properties` - For object types, nested parameter definitions
+  - `:minimum` / `:maximum` - For integer and number types, inclusive bounds
+  - `:min_length` / `:max_length` - For string types, inclusive length bounds
   """
 
   @type context :: %{
@@ -171,76 +173,215 @@ defmodule Clementine.Tool do
       raise ArgumentError, "Tool parameters must be a keyword list"
     end
 
-    Enum.each(parameters, fn {param_name, opts} ->
-      unless is_atom(param_name) do
-        raise ArgumentError, "Parameter name must be an atom, got: #{inspect(param_name)}"
-      end
+    validate_parameters!(parameters, :parameter, nil, [])
 
-      validate_param_opts!(param_name, opts)
-    end)
+    :ok
   end
 
   @valid_types [:string, :integer, :number, :boolean, :array, :object]
+  @numeric_bound_type {:or, [:integer, :float]}
+  @parameter_option_schema NimbleOptions.new!(
+                             type: [
+                               type: {:in, @valid_types},
+                               required: true
+                             ],
+                             required: [
+                               type: :boolean,
+                               default: false
+                             ],
+                             description: [
+                               type: :string
+                             ],
+                             enum: [
+                               type: {:list, :string}
+                             ],
+                             items: [
+                               type: :keyword_list
+                             ],
+                             properties: [
+                               type: :keyword_list
+                             ],
+                             minimum: [
+                               type: @numeric_bound_type
+                             ],
+                             maximum: [
+                               type: @numeric_bound_type
+                             ],
+                             min_length: [
+                               type: :non_neg_integer
+                             ],
+                             max_length: [
+                               type: :non_neg_integer
+                             ]
+                           )
 
-  defp validate_param_opts!(param_name, opts) do
-    type =
-      case Keyword.get(opts, :type) do
-        nil ->
-          raise ArgumentError, "Parameter #{param_name} must have a :type"
+  defp validate_parameters!(parameters, key_kind, parent_path, path_segments) do
+    Enum.each(parameters, fn
+      {name, opts} when is_atom(name) ->
+        validate_param_opts!(path_segments ++ [name], opts)
 
-        type when type in @valid_types ->
-          type
+      {name, _opts} ->
+        raise ArgumentError, invalid_schema_key_message(key_kind, parent_path, name)
 
-        invalid ->
-          raise ArgumentError,
-                "Parameter #{param_name} has invalid type #{inspect(invalid)}. " <>
-                  "Valid types: #{inspect(@valid_types)}"
-      end
-
-    # Validate :items schema for array types
-    if Keyword.has_key?(opts, :items) do
-      items = Keyword.get(opts, :items)
-
-      if type != :array do
+      other ->
         raise ArgumentError,
-              "Parameter #{param_name} has :items but type is #{inspect(type)}, not :array"
-      end
+              "Tool parameters must be a keyword list, got entry: #{inspect(other)}"
+    end)
+  end
 
-      if items != nil and items != [] do
-        unless keyword_list?(items) do
-          raise ArgumentError,
-                "Parameter #{param_name} :items must be a keyword list, got: #{inspect(items)}"
-        end
+  defp validate_param_opts!(path_segments, opts) do
+    path = schema_path(path_segments)
 
-        validate_param_opts!(:"#{param_name}[]", items)
-      end
+    unless keyword_list?(opts) do
+      raise ArgumentError,
+            "Parameter #{path} options must be a keyword list, got: #{inspect(opts)}"
     end
 
-    # Validate :properties schema for object types
-    if Keyword.has_key?(opts, :properties) do
-      props = Keyword.get(opts, :properties)
+    opts =
+      case NimbleOptions.validate(opts, @parameter_option_schema) do
+        {:ok, opts} ->
+          opts
 
-      if type != :object do
+        {:error, %NimbleOptions.ValidationError{} = error} ->
+          raise_param_schema_error!(path, error)
+      end
+
+    type = Keyword.fetch!(opts, :type)
+
+    validate_enum_schema!(path, type, opts)
+    validate_numeric_bounds_schema!(path, type, opts)
+    validate_string_bounds_schema!(path, type, opts)
+    validate_items_schema!(path_segments, path, type, opts)
+    validate_properties_schema!(path_segments, path, type, opts)
+  end
+
+  defp validate_items_schema!(path_segments, path, type, opts) do
+    case Keyword.fetch(opts, :items) do
+      :error ->
+        :ok
+
+      {:ok, _items} when type != :array ->
         raise ArgumentError,
-              "Parameter #{param_name} has :properties but type is #{inspect(type)}, not :object"
-      end
+              "Parameter #{path} has :items but type is #{inspect(type)}, not :array"
 
-      if props != nil and props != [] do
-        unless keyword_list?(props) do
-          raise ArgumentError,
-                "Parameter #{param_name} :properties must be a keyword list, got: #{inspect(props)}"
-        end
+      {:ok, []} ->
+        :ok
 
-        Enum.each(props, fn {prop_name, prop_opts} ->
-          unless is_atom(prop_name) do
-            raise ArgumentError,
-                  "Property name in #{param_name} must be an atom, got: #{inspect(prop_name)}"
-          end
-
-          validate_param_opts!(:"#{param_name}.#{prop_name}", prop_opts)
-        end)
-      end
+      {:ok, items} ->
+        validate_param_opts!(path_segments ++ [:array_item], items)
     end
+  end
+
+  defp validate_properties_schema!(path_segments, path, type, opts) do
+    case Keyword.fetch(opts, :properties) do
+      :error ->
+        :ok
+
+      {:ok, _properties} when type != :object ->
+        raise ArgumentError,
+              "Parameter #{path} has :properties but type is #{inspect(type)}, not :object"
+
+      {:ok, []} ->
+        :ok
+
+      {:ok, properties} ->
+        validate_parameters!(properties, :property, path, path_segments)
+    end
+  end
+
+  defp validate_enum_schema!(path, :string, opts) do
+    case Keyword.fetch(opts, :enum) do
+      :error ->
+        :ok
+
+      {:ok, []} ->
+        raise ArgumentError, "Parameter #{path} :enum must contain at least one value"
+
+      {:ok, _enum} ->
+        :ok
+    end
+  end
+
+  defp validate_enum_schema!(path, type, opts) do
+    if Keyword.has_key?(opts, :enum) do
+      raise ArgumentError,
+            "Parameter #{path} has :enum but type is #{inspect(type)}, not :string"
+    end
+
+    :ok
+  end
+
+  defp validate_numeric_bounds_schema!(path, type, opts) when type in [:integer, :number] do
+    minimum = Keyword.get(opts, :minimum)
+    maximum = Keyword.get(opts, :maximum)
+
+    if is_number(minimum) and is_number(maximum) and minimum > maximum do
+      raise ArgumentError,
+            "Parameter #{path} :minimum must be less than or equal to :maximum"
+    end
+
+    :ok
+  end
+
+  defp validate_numeric_bounds_schema!(path, type, opts) do
+    if Keyword.has_key?(opts, :minimum) or Keyword.has_key?(opts, :maximum) do
+      raise ArgumentError,
+            "Parameter #{path} has numeric bounds but type is #{inspect(type)}, not :integer or :number"
+    end
+
+    :ok
+  end
+
+  defp validate_string_bounds_schema!(path, :string, opts) do
+    min_length = Keyword.get(opts, :min_length)
+    max_length = Keyword.get(opts, :max_length)
+
+    if is_integer(min_length) and is_integer(max_length) and min_length > max_length do
+      raise ArgumentError,
+            "Parameter #{path} :min_length must be less than or equal to :max_length"
+    end
+
+    :ok
+  end
+
+  defp validate_string_bounds_schema!(path, type, opts) do
+    if Keyword.has_key?(opts, :min_length) or Keyword.has_key?(opts, :max_length) do
+      raise ArgumentError,
+            "Parameter #{path} has string length bounds but type is #{inspect(type)}, not :string"
+    end
+
+    :ok
+  end
+
+  defp raise_param_schema_error!(path, %NimbleOptions.ValidationError{key: :type, value: nil}) do
+    raise ArgumentError, "Parameter #{path} must have a :type"
+  end
+
+  defp raise_param_schema_error!(path, %NimbleOptions.ValidationError{key: :type, value: invalid}) do
+    raise ArgumentError,
+          "Parameter #{path} has invalid type #{inspect(invalid)}. " <>
+            "Valid types: #{inspect(@valid_types)}"
+  end
+
+  defp raise_param_schema_error!(path, %NimbleOptions.ValidationError{} = error) do
+    raise ArgumentError, "Invalid schema for parameter #{path}: #{Exception.message(error)}"
+  end
+
+  defp invalid_schema_key_message(:parameter, _parent_path, name) do
+    "Parameter name must be an atom, got: #{inspect(name)}"
+  end
+
+  defp invalid_schema_key_message(:property, parent_path, name) do
+    "Property name in #{parent_path} must be an atom, got: #{inspect(name)}"
+  end
+
+  defp schema_path(path_segments) do
+    Enum.reduce(path_segments, "", fn
+      :array_item, "" -> "[]"
+      :array_item, acc -> acc <> "[]"
+      segment, "" -> Atom.to_string(segment)
+      segment, acc -> acc <> "." <> Atom.to_string(segment)
+    end)
   end
 
   defp keyword_list?(list) when is_list(list) do
@@ -282,6 +423,10 @@ defmodule Clementine.Tool do
       %{"type" => type_to_json_type(type)}
       |> maybe_add("description", Keyword.get(opts, :description))
       |> maybe_add("enum", Keyword.get(opts, :enum))
+      |> maybe_add("minimum", Keyword.get(opts, :minimum))
+      |> maybe_add("maximum", Keyword.get(opts, :maximum))
+      |> maybe_add("minLength", Keyword.get(opts, :min_length))
+      |> maybe_add("maxLength", Keyword.get(opts, :max_length))
 
     case type do
       :array ->
@@ -351,7 +496,7 @@ defmodule Clementine.Tool do
     case Keyword.fetch(opts, :type) do
       {:ok, type} ->
         type_errors = validate_value(path, type, opts, value)
-        if type_errors == [], do: validate_enum(path, opts, value), else: type_errors
+        if type_errors == [], do: validate_constraints(path, type, opts, value), else: type_errors
 
       :error ->
         ["schema error: #{path} is missing :type"]
@@ -398,16 +543,117 @@ defmodule Clementine.Tool do
     ["schema error: #{path} has invalid type #{inspect(type)}"]
   end
 
-  defp validate_enum(path, opts, value) do
-    case Keyword.get(opts, :enum) do
-      nil ->
+  defp validate_constraints(path, type, opts, value) do
+    validate_enum(path, type, opts, value) ++
+      validate_numeric_bounds(path, type, opts, value) ++
+      validate_string_bounds(path, type, opts, value)
+  end
+
+  defp validate_enum(path, :string, opts, value) do
+    case Keyword.fetch(opts, :enum) do
+      :error ->
         []
 
-      allowed ->
+      {:ok, allowed} when is_list(allowed) ->
         if value in allowed,
           do: [],
           else: ["#{path} must be one of #{inspect(allowed)}, got: #{inspect(value)}"]
+
+      {:ok, invalid} ->
+        ["schema error: #{path} has invalid :enum #{inspect(invalid)}"]
     end
+  end
+
+  defp validate_enum(path, type, opts, _value) do
+    if Keyword.has_key?(opts, :enum),
+      do: ["schema error: #{path} has :enum but type is #{inspect(type)}, not :string"],
+      else: []
+  end
+
+  defp validate_numeric_bounds(path, type, opts, value) when type in [:integer, :number] do
+    min_errors =
+      case Keyword.fetch(opts, :minimum) do
+        :error ->
+          []
+
+        {:ok, minimum} when is_number(minimum) ->
+          if value >= minimum,
+            do: [],
+            else: [
+              "#{path} must be greater than or equal to #{inspect(minimum)}, got: #{inspect(value)}"
+            ]
+
+        {:ok, invalid} ->
+          ["schema error: #{path} has invalid :minimum #{inspect(invalid)}"]
+      end
+
+    max_errors =
+      case Keyword.fetch(opts, :maximum) do
+        :error ->
+          []
+
+        {:ok, maximum} when is_number(maximum) ->
+          if value <= maximum,
+            do: [],
+            else: [
+              "#{path} must be less than or equal to #{inspect(maximum)}, got: #{inspect(value)}"
+            ]
+
+        {:ok, invalid} ->
+          ["schema error: #{path} has invalid :maximum #{inspect(invalid)}"]
+      end
+
+    min_errors ++ max_errors
+  end
+
+  defp validate_numeric_bounds(path, type, opts, _value) do
+    if Keyword.has_key?(opts, :minimum) or Keyword.has_key?(opts, :maximum),
+      do: [
+        "schema error: #{path} has numeric bounds but type is #{inspect(type)}, not :integer or :number"
+      ],
+      else: []
+  end
+
+  defp validate_string_bounds(path, :string, opts, value) do
+    length = String.length(value)
+
+    min_errors =
+      case Keyword.fetch(opts, :min_length) do
+        :error ->
+          []
+
+        {:ok, min_length} when is_integer(min_length) and min_length >= 0 ->
+          if length >= min_length,
+            do: [],
+            else: ["#{path} length must be at least #{min_length}, got: #{length}"]
+
+        {:ok, invalid} ->
+          ["schema error: #{path} has invalid :min_length #{inspect(invalid)}"]
+      end
+
+    max_errors =
+      case Keyword.fetch(opts, :max_length) do
+        :error ->
+          []
+
+        {:ok, max_length} when is_integer(max_length) and max_length >= 0 ->
+          if length <= max_length,
+            do: [],
+            else: ["#{path} length must be at most #{max_length}, got: #{length}"]
+
+        {:ok, invalid} ->
+          ["schema error: #{path} has invalid :max_length #{inspect(invalid)}"]
+      end
+
+    min_errors ++ max_errors
+  end
+
+  defp validate_string_bounds(path, type, opts, _value) do
+    if Keyword.has_key?(opts, :min_length) or Keyword.has_key?(opts, :max_length),
+      do: [
+        "schema error: #{path} has string length bounds but type is #{inspect(type)}, not :string"
+      ],
+      else: []
   end
 
   defp validate_array_items(path, opts, items) do
