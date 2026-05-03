@@ -1,5 +1,10 @@
 # Streaming Agent Application Design Doc
 
+This is an application-level UI design sketch. For production hosts that need
+durable run state, deploy-safe execution, and reconnect semantics, use
+[`DURABLE_HOST_HARNESSES.md`](DURABLE_HOST_HARNESSES.md) as the architectural
+boundary between Clementine and the host application.
+
 A Phoenix + Next.js application with real-time streaming, tool visualization, and interactive UI blocks—powered by Clementine.
 
 ## Table of Contents

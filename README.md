@@ -198,6 +198,11 @@ Clementine.Loop.run_stream(
 `run_stream/3` returns `{:ok, text, messages}` on success or `{:error, reason}` if the stream errors.
 Partial text deltas may be emitted before an error occurs, so UIs should handle both streamed text and a terminal error.
 
+For production hosts that need conversations to survive deploys, pod exits, or
+client reconnects, treat Clementine as the loop executor and keep durable run
+state in the host application. See
+[`docs/DURABLE_HOST_HARNESSES.md`](docs/DURABLE_HOST_HARNESSES.md).
+
 The callback receives events as they happen:
 
 | Event | Description |
