@@ -67,6 +67,67 @@ defmodule Clementine.LLM.Message do
     def valid?(%ToolUse{}), do: true
     def valid?(%ToolResult{}), do: true
     def valid?(_other), do: false
+
+    @doc """
+    Converts a content block into a JSON-safe, string-keyed map tagged with a
+    `"type"` discriminator (`"text"`, `"tool_use"`, or `"tool_result"`).
+
+    The output contains only JSON-serializable values, so it survives a
+    `Jason.encode!/1`/`Jason.decode!/1` round trip and storage in Postgres
+    `jsonb` or Oban args. `ToolUse.input` is passed through unchanged; callers
+    that want exact `Jason` round-trip equality should provide string-keyed
+    input maps.
+    """
+    @spec to_map(t()) :: map()
+    def to_map(%Text{text: text}) do
+      %{"type" => "text", "text" => text}
+    end
+
+    def to_map(%ToolUse{id: id, name: name, input: input}) do
+      %{"type" => "tool_use", "id" => id, "name" => name, "input" => input}
+    end
+
+    def to_map(%ToolResult{tool_use_id: tool_use_id, content: content, is_error: is_error}) do
+      %{
+        "type" => "tool_result",
+        "tool_use_id" => tool_use_id,
+        "content" => content,
+        "is_error" => is_error
+      }
+    end
+
+    @doc """
+    Reconstructs a content block from a string-keyed map produced by `to_map/1`
+    (or returned by `Jason.decode!/1`), dispatching on the `"type"` field.
+
+    `ToolUse.input` is passed through unchanged. Raises `ArgumentError` on an
+    unknown or missing `"type"`.
+    """
+    @spec from_map(map()) :: t()
+    def from_map(%{"type" => "text", "text" => text}) do
+      %Text{text: text}
+    end
+
+    def from_map(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
+      %ToolUse{id: id, name: name, input: input}
+    end
+
+    def from_map(%{
+          "type" => "tool_result",
+          "tool_use_id" => tool_use_id,
+          "content" => content,
+          "is_error" => is_error
+        }) do
+      %ToolResult{tool_use_id: tool_use_id, content: content, is_error: is_error}
+    end
+
+    def from_map(%{"type" => type}) do
+      raise ArgumentError, "unknown content type: #{inspect(type)}"
+    end
+
+    def from_map(other) do
+      raise ArgumentError, "expected a content map with a \"type\" key, got: #{inspect(other)}"
+    end
   end
 
   defmodule UserMessage do
@@ -188,4 +249,76 @@ defmodule Clementine.LLM.Message do
           UserMessage.t()
           | AssistantMessage.t()
           | ToolResultMessage.t()
+
+  @doc """
+  Converts a message struct into a JSON-safe, string-keyed map.
+
+  The map carries an explicit `"kind"` discriminator (`"user"`, `"assistant"`,
+  or `"tool_result"`) because `UserMessage` and `ToolResultMessage` both use
+  `role: :user`, so `role` alone cannot reconstruct the struct.
+
+  `UserMessage.content` may be a plain string or a list of content blocks; both
+  forms are preserved (a string stays a string, a list stays a list of tagged
+  block maps). The result survives a `Jason.encode!/1`/`Jason.decode!/1` round
+  trip and storage in Postgres `jsonb` or Oban args.
+  """
+  @spec to_map(message()) :: map()
+  def to_map(%UserMessage{role: :user, content: content}) when is_binary(content) do
+    %{"kind" => "user", "role" => "user", "content" => content}
+  end
+
+  def to_map(%UserMessage{role: :user, content: content}) when is_list(content) do
+    %{"kind" => "user", "role" => "user", "content" => Enum.map(content, &Content.to_map/1)}
+  end
+
+  def to_map(%AssistantMessage{role: :assistant, content: content}) do
+    %{
+      "kind" => "assistant",
+      "role" => "assistant",
+      "content" => Enum.map(content, &Content.to_map/1)
+    }
+  end
+
+  def to_map(%ToolResultMessage{role: :user, content: content}) do
+    %{
+      "kind" => "tool_result",
+      "role" => "user",
+      "content" => Enum.map(content, &Content.to_map/1)
+    }
+  end
+
+  @doc """
+  Reconstructs a message struct from a string-keyed map produced by `to_map/1`
+  (or returned by `Jason.decode!/1`), dispatching on the `"kind"` field.
+
+  Raises `ArgumentError` on an unknown or missing `"kind"`.
+  """
+  @spec from_map(map()) :: message()
+  def from_map(%{"kind" => "user", "content" => content}) when is_binary(content) do
+    %UserMessage{role: :user, content: content}
+  end
+
+  def from_map(%{"kind" => "user", "content" => content}) when is_list(content) do
+    %UserMessage{role: :user, content: Enum.map(content, &Content.from_map/1)}
+  end
+
+  def from_map(%{"kind" => "assistant", "content" => content}) when is_list(content) do
+    %AssistantMessage{role: :assistant, content: Enum.map(content, &Content.from_map/1)}
+  end
+
+  def from_map(%{"kind" => "tool_result", "content" => content}) when is_list(content) do
+    %ToolResultMessage{role: :user, content: Enum.map(content, &Content.from_map/1)}
+  end
+
+  def from_map(%{"kind" => kind}) do
+    raise ArgumentError, "unknown message kind: #{inspect(kind)}"
+  end
+
+  def from_map(other) do
+    raise ArgumentError, "expected a message map with a \"kind\" key, got: #{inspect(other)}"
+  end
+
+  def from_map(other) do
+    raise ArgumentError, "expected a message map with a \"kind\" key, got: #{inspect(other)}"
+  end
 end
