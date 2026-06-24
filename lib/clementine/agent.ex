@@ -561,6 +561,21 @@ defmodule Clementine.Agent do
   The returned stream emits real loop streaming events as they occur, followed
   by `{:done, :success}` or `{:done, :error}`. A successful streaming run
   updates the agent conversation history just like `run/2`.
+
+  ## Consumer-owned: interactive use only
+
+  This API is **consumer-owned**: the run's lifetime is tied to the consumer
+  that iterates the returned stream. If the consumer stops iterating, or the
+  consuming process or the agent goes down, the underlying run is canceled
+  (see `cleanup_stream/1`, `cancel_stream/2`, and the `{:DOWN, ...}` handling in
+  `next_stream_event/1`). That makes it a good fit for interactive sessions
+  where exactly one consumer drives the run and abandoning it should stop it.
+
+  It is **not** the right tool for durable or multi-observer streaming, where
+  clients should be able to come and go without canceling the run. For that,
+  drive `Clementine.Loop.run_stream/3` yourself and fan its events out to
+  zero-or-more observers (e.g. via PubSub). That primitive is ownership-neutral
+  and server-owned — see its docs for the "observe, don't own" rationale.
   """
   def stream(agent, prompt) when is_binary(prompt) do
     Stream.resource(

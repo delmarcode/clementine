@@ -330,6 +330,25 @@ defmodule Clementine.Loop do
 
   Returns `{:ok, text, messages}` on success or `{:error, reason}` if the stream errors.
 
+  ## The streaming seam
+
+  This is the streaming primitive for durable, multi-observer, server-owned
+  execution. It runs synchronously **in the calling process** and pushes each
+  event to `stream_callback`; it does not spawn anything of its own and does not
+  tie the run's lifetime to any consumer. Whoever calls it owns the run.
+
+  Because there is no consumer coupling, it is the right building block when you
+  want to broadcast events to zero-or-more observers — e.g. fan them out over
+  Phoenix PubSub so clients can attach and detach freely while the run keeps
+  going. The run lives and dies with the process you drive it in, not with the
+  observers. This is the "observe, don't own" model: clients watch the stream
+  but never control its lifetime.
+
+  If instead you want interactive, consumer-owned streaming where iteration
+  stopping or the consumer dying should cancel the run, use
+  `Clementine.Agent.stream/2`, which wraps this in a consumer-owned
+  `Stream.resource`.
+
   ## Example
 
       Clementine.Loop.run_stream(config, "Hello", fn
