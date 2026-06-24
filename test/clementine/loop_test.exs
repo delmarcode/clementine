@@ -284,9 +284,81 @@ defmodule Clementine.LoopTest do
 
       assert {:ok, "Hello world!", _messages} = Loop.run_stream(config, "Hi", callback)
 
-      # Verify we received text deltas
-      assert_receive {:stream_event, {:text_delta, "Hello "}}
-      assert_receive {:stream_event, {:text_delta, "world!"}}
+      # Verify we received text deltas, now wrapped with a per-run seq
+      assert_receive {:stream_event, {_seq1, {:text_delta, "Hello "}}}
+      assert_receive {:stream_event, {_seq2, {:text_delta, "world!"}}}
+    end
+
+    test "wraps every event with a monotonically increasing per-run seq" do
+      test_pid = self()
+
+      Clementine.LLM.MockClient
+      |> expect(:stream, fn _model, _system, messages, _tools, _opts ->
+        if length(messages) == 1 do
+          # First call: tool use (exercises non-text events: tool_use_start,
+          # input_json_delta, tool_result)
+          [
+            {:message_start, %{"id" => "msg_1"}},
+            {:content_block_start, 0, :tool_use},
+            {:tool_use_start, "toolu_1", "echo"},
+            {:input_json_delta, "toolu_1", "{\"message\":\"hi\"}"},
+            {:content_block_stop, 0},
+            {:message_delta, %{"stop_reason" => "tool_use"}, %{}},
+            {:message_stop}
+          ]
+        else
+          [
+            {:message_start, %{"id" => "msg_2"}},
+            {:content_block_start, 0, :text},
+            {:text_delta, "Done!"},
+            {:content_block_stop, 0},
+            {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+            {:message_stop}
+          ]
+        end
+      end)
+      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:message_start, %{"id" => "msg_2"}},
+          {:content_block_start, 0, :text},
+          {:text_delta, "Done!"},
+          {:content_block_stop, 0},
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+          {:message_stop}
+        ]
+      end)
+
+      config = [model: :claude_sonnet, tools: [EchoTool]]
+
+      callback = fn event -> send(test_pid, {:stream_event, event}) end
+
+      assert {:ok, "Done!", _messages} = Loop.run_stream(config, "Echo", callback)
+
+      events = collect_stream_events()
+
+      # Every forwarded event is a {seq, inner_event} tuple.
+      assert Enum.all?(events, fn
+               {seq, _inner} when is_integer(seq) and seq >= 0 -> true
+               _ -> false
+             end)
+
+      seqs = Enum.map(events, fn {seq, _inner} -> seq end)
+
+      # seq starts at 0, is strictly increasing, and contiguous (covers ALL
+      # event types, including non-text ones).
+      assert hd(seqs) == 0
+      assert seqs == Enum.sort(seqs)
+      assert seqs == Enum.uniq(seqs)
+      assert seqs == Enum.to_list(0..(length(seqs) - 1))
+
+      inner_events = Enum.map(events, fn {_seq, inner} -> inner end)
+
+      # Non-text events are seq-covered too.
+      assert Enum.any?(inner_events, &match?({:tool_use_start, "toolu_1", "echo"}, &1))
+      assert Enum.any?(inner_events, &match?({:input_json_delta, "toolu_1", _}, &1))
+      assert Enum.any?(inner_events, &match?({:tool_result, "toolu_1", _}, &1))
+      assert Enum.any?(inner_events, &match?({:loop_event, _}, &1))
+      assert Enum.any?(inner_events, &match?({:text_delta, "Done!"}, &1))
     end
 
     test "streams tool use events" do
@@ -335,11 +407,11 @@ defmodule Clementine.LoopTest do
 
       assert {:ok, "Done!", _messages} = Loop.run_stream(config, "Echo test", callback)
 
-      # Verify tool use events
-      assert_receive {:stream_event, {:tool_use_start, "toolu_1", "echo"}}
-      assert_receive {:stream_event, {:input_json_delta, "toolu_1", "{\"message\":"}}
-      assert_receive {:stream_event, {:tool_result, "toolu_1", _result}}
-      assert_receive {:stream_event, {:text_delta, "Done!"}}
+      # Verify tool use events (each wrapped with a per-run seq)
+      assert_receive {:stream_event, {_s1, {:tool_use_start, "toolu_1", "echo"}}}
+      assert_receive {:stream_event, {_s2, {:input_json_delta, "toolu_1", "{\"message\":"}}}
+      assert_receive {:stream_event, {_s3, {:tool_result, "toolu_1", _result}}}
+      assert_receive {:stream_event, {_s4, {:text_delta, "Done!"}}}
     end
 
     test "emits loop events wrapped in :loop_event tuple" do
@@ -361,10 +433,10 @@ defmodule Clementine.LoopTest do
 
       {:ok, _, _} = Loop.run_stream(config, "Hello", callback)
 
-      # Loop events come wrapped
-      assert_receive {:stream_event, {:loop_event, {:loop_start, "Hello"}}}
-      assert_receive {:stream_event, {:loop_event, {:iteration_start, 1}}}
-      assert_receive {:stream_event, {:loop_event, :llm_call_start}}
+      # Loop events come wrapped in :loop_event, and then in {seq, _}
+      assert_receive {:stream_event, {_s1, {:loop_event, {:loop_start, "Hello"}}}}
+      assert_receive {:stream_event, {_s2, {:loop_event, {:iteration_start, 1}}}}
+      assert_receive {:stream_event, {_s3, {:loop_event, :llm_call_start}}}
     end
 
     test "stream error returns {:error, reason} and forwards error to callback" do
@@ -384,13 +456,12 @@ defmodule Clementine.LoopTest do
 
       callback = fn event -> send(test_pid, {:stream_event, event}) end
 
-      assert {:error, %{"type" => "overloaded_error"}} =
-               Loop.run_stream(config, "Hi", callback)
+      assert {:error, %{"type" => "overloaded_error"}} = Loop.run_stream(config, "Hi", callback)
 
-      # Error was forwarded to the callback
-      assert_receive {:stream_event, {:error, %{"type" => "overloaded_error"}}}
+      # Error was forwarded to the callback (seq-wrapped)
+      assert_receive {:stream_event, {_s1, {:error, %{"type" => "overloaded_error"}}}}
       # Text delta before the error was also forwarded
-      assert_receive {:stream_event, {:text_delta, "partial"}}
+      assert_receive {:stream_event, {_s2, {:text_delta, "partial"}}}
     end
 
     test "lazy stream exceptions return normalized LLM errors" do
@@ -423,7 +494,7 @@ defmodule Clementine.LoopTest do
       {:error, _} = Loop.run_stream(config, "Hi", callback)
 
       assert_receive {:stream_event,
-                      {:loop_event, {:llm_call_end, {:error, %{"type" => "api_error"}}}}}
+                      {_seq, {:loop_event, {:llm_call_end, {:error, %{"type" => "api_error"}}}}}}
     end
 
     test "stream error does not cause further iterations" do
@@ -458,8 +529,16 @@ defmodule Clementine.LoopTest do
 
       config = [model: :claude_sonnet, tools: [EchoTool], max_iterations: 2]
 
-      assert {:error, :max_iterations_reached} =
-               Loop.run_stream(config, "Loop", fn _ -> :ok end)
+      assert {:error, :max_iterations_reached} = Loop.run_stream(config, "Loop", fn _ -> :ok end)
+    end
+  end
+
+  # Drains all {:stream_event, _} messages from the mailbox in arrival order.
+  defp collect_stream_events(acc \\ []) do
+    receive do
+      {:stream_event, event} -> collect_stream_events([event | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 end

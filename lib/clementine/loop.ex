@@ -305,6 +305,16 @@ defmodule Clementine.Loop do
     iterate(state)
   end
 
+  # Wrap a forwarded stream event with the next per-run sequence number and
+  # deliver it to the raw callback as `{seq, event}`. seq starts at 0 and
+  # increments by 1 for every forwarded event, regardless of type.
+  defp emit_seq(seq_counter, raw_callback, event) do
+    # add_get returns the post-increment value; subtract 1 so the first event
+    # is seq 0.
+    seq = :atomics.add_get(seq_counter, 1, 1) - 1
+    raw_callback.({seq, event})
+  end
+
   # Emit events for callbacks
   defp emit_event(%State{on_event: nil}, _event), do: :ok
 
@@ -320,10 +330,19 @@ defmodule Clementine.Loop do
   Runs the loop with streaming output.
 
   Similar to `run/2` but streams text deltas in real-time via the callback.
-  The callback receives events like:
+
+  Every event delivered to the callback is wrapped as `{seq, event}`, where
+  `seq` is a per-run, monotonically increasing non-negative integer. It starts
+  at `0` and increments by `1` for each forwarded event, covering ALL event
+  types below. Each `run_stream/3` invocation has its own independent counter,
+  so downstream observers can dedupe and reorder events on reconnect across
+  every event type, not just text deltas.
+
+  The wrapped `event` is one of:
 
   - `{:text_delta, text}` - Text chunk from the model
   - `{:tool_use_start, id, name}` - Model is calling a tool
+  - `{:input_json_delta, id, json}` - Tool input JSON chunk
   - `{:tool_result, id, result}` - Tool execution result
   - `{:error, reason}` - Streaming error from the LLM
   - `{:loop_event, event}` - Internal loop events (iteration_start, etc.)
@@ -333,13 +352,21 @@ defmodule Clementine.Loop do
   ## Example
 
       Clementine.Loop.run_stream(config, "Hello", fn
-        {:text_delta, text} -> IO.write(text)
-        {:tool_use_start, _id, name} -> IO.puts("\\n[Calling \#{name}...]")
-        _ -> :ok
+        {_seq, {:text_delta, text}} -> IO.write(text)
+        {_seq, {:tool_use_start, _id, name}} -> IO.puts("\\n[Calling \#{name}...]")
+        {_seq, _event} -> :ok
       end)
 
   """
-  def run_stream(config, prompt, stream_callback) when is_function(stream_callback, 1) do
+  def run_stream(config, prompt, raw_callback) when is_function(raw_callback, 1) do
+    # Per-run monotonic sequence counter. run_stream/3 runs synchronously in a
+    # single process, so a private counter reference threaded through a closure
+    # gives us a clean, per-invocation ordinal without mutating loop state.
+    # `:atomics` is used rather than the process dictionary so the counter is
+    # scoped to this invocation (no cross-run leakage) and is unambiguous.
+    seq_counter = :atomics.new(1, signed: false)
+    stream_callback = fn event -> emit_seq(seq_counter, raw_callback, event) end
+
     state = %State{
       model: Keyword.fetch!(config, :model),
       system: Keyword.get(config, :system),

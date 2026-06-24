@@ -192,13 +192,21 @@ defmodule Clementine do
   @doc """
   Streams a prompt execution, returning events as they occur.
 
+  Each run event is a `{seq, event}` tuple, where `seq` is a per-run,
+  monotonically increasing non-negative integer (starting at `0`) covering
+  every forwarded event type. This lets a downstream observer dedupe and
+  reorder events on reconnect. The terminal `{:done, :success}` /
+  `{:done, :error}` markers (and the `{:error, reason}` emitted when the stream
+  fails to start) are produced by the stream itself and are NOT seq-wrapped.
+
   ## Example
 
       Clementine.stream(agent, "Explain this code")
       |> Stream.each(fn
-        {:text_delta, chunk} -> IO.write(chunk)
-        {:tool_use_start, _id, name} -> IO.puts("\\n[Calling \#{name}...]")
-        {:tool_result, _id, result} -> IO.puts("[Done]")
+        {_seq, {:text_delta, chunk}} -> IO.write(chunk)
+        {_seq, {:tool_use_start, _id, name}} -> IO.puts("\\n[Calling \#{name}...]")
+        {_seq, {:tool_result, _id, _result}} -> IO.puts("[Done]")
+        {:done, _status} -> :ok
         _ -> :ok
       end)
       |> Stream.run()
