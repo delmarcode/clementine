@@ -52,9 +52,10 @@ defmodule Clementine.LLM.MessageSerializationTest do
       end
     end
 
-    test "from_map ignores extra keys" do
-      assert Content.from_map(%{"type" => "text", "text" => "hi", "extra" => "ignored"}) ==
-               Content.text("hi")
+    test "from_map rejects extra keys" do
+      assert_raise ArgumentError, ~r/unexpected text content field/, fn ->
+        Content.from_map(%{"type" => "text", "text" => "hi", "extra" => "nope"})
+      end
     end
 
     test "from_map raises on missing required fields for a known type" do
@@ -113,18 +114,25 @@ defmodule Clementine.LLM.MessageSerializationTest do
                Message.to_map(ToolResultMessage.new([{"id", {:ok, "x"}}]))
     end
 
-    test "from_map accepts missing version as version 1" do
-      assert Message.from_map(%{"kind" => "user", "role" => "user", "content" => "hi"}) ==
-               UserMessage.new("hi")
+    test "from_map rejects missing version" do
+      assert_raise ArgumentError, ~r/expected message map to include "version"/, fn ->
+        Message.from_map(%{"kind" => "user", "role" => "user", "content" => "hi"})
+      end
     end
 
-    test "from_map ignores extra keys" do
-      msg = UserMessage.new("hi")
+    test "from_map rejects missing role" do
+      assert_raise ArgumentError, ~r/expected message map to include "role"/, fn ->
+        Message.from_map(%{"version" => 1, "kind" => "user", "content" => "hi"})
+      end
+    end
 
-      assert msg
-             |> Message.to_map()
-             |> Map.put("extra", "ignored")
-             |> Message.from_map() == msg
+    test "from_map rejects extra keys" do
+      assert_raise ArgumentError, ~r/unexpected message field/, fn ->
+        UserMessage.new("hi")
+        |> Message.to_map()
+        |> Map.put("extra", "nope")
+        |> Message.from_map()
+      end
     end
 
     test "from_map rejects unsupported version" do
@@ -146,7 +154,7 @@ defmodule Clementine.LLM.MessageSerializationTest do
 
     test "from_map raises on unknown kind" do
       assert_raise ArgumentError, ~r/unknown message kind/, fn ->
-        Message.from_map(%{"kind" => "bogus", "content" => "x"})
+        Message.from_map(%{"version" => 1, "kind" => "bogus", "role" => "user", "content" => "x"})
       end
     end
 
