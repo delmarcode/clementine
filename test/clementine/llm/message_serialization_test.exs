@@ -51,6 +51,29 @@ defmodule Clementine.LLM.MessageSerializationTest do
         Content.from_map(%{"text" => "no type"})
       end
     end
+
+    test "from_map ignores extra keys" do
+      assert Content.from_map(%{"type" => "text", "text" => "hi", "extra" => "ignored"}) ==
+               Content.text("hi")
+    end
+
+    test "from_map raises on missing required fields for a known type" do
+      assert_raise ArgumentError, ~r/expected content map to include "text"/, fn ->
+        Content.from_map(%{"type" => "text"})
+      end
+    end
+
+    test "to_map rejects tool_use input with non-string keys" do
+      assert_raise ArgumentError, ~r/string keys/, fn ->
+        Content.to_map(Content.tool_use("id1", "t", %{a: 1}))
+      end
+    end
+
+    test "to_map rejects nested non-JSON-safe tool_use input" do
+      assert_raise ArgumentError, ~r/JSON-safe/, fn ->
+        Content.to_map(Content.tool_use("id1", "t", %{"a" => {:tuple, "bad"}}))
+      end
+    end
   end
 
   describe "Message.to_map/1 and from_map/1 round trip" do
@@ -80,11 +103,45 @@ defmodule Clementine.LLM.MessageSerializationTest do
     end
 
     test "to_map carries an explicit kind discriminator" do
-      assert %{"kind" => "user"} = Message.to_map(UserMessage.new("hi"))
-      assert %{"kind" => "assistant"} = Message.to_map(AssistantMessage.text("hi"))
+      assert %{"version" => 1, "kind" => "user", "role" => "user"} =
+               Message.to_map(UserMessage.new("hi"))
 
-      assert %{"kind" => "tool_result"} =
+      assert %{"version" => 1, "kind" => "assistant", "role" => "assistant"} =
+               Message.to_map(AssistantMessage.text("hi"))
+
+      assert %{"version" => 1, "kind" => "tool_result", "role" => "user"} =
                Message.to_map(ToolResultMessage.new([{"id", {:ok, "x"}}]))
+    end
+
+    test "from_map accepts missing version as version 1" do
+      assert Message.from_map(%{"kind" => "user", "role" => "user", "content" => "hi"}) ==
+               UserMessage.new("hi")
+    end
+
+    test "from_map ignores extra keys" do
+      msg = UserMessage.new("hi")
+
+      assert msg
+             |> Message.to_map()
+             |> Map.put("extra", "ignored")
+             |> Message.from_map() == msg
+    end
+
+    test "from_map rejects unsupported version" do
+      assert_raise ArgumentError, ~r/unsupported message serialization version/, fn ->
+        Message.from_map(%{"version" => 2, "kind" => "user", "role" => "user", "content" => "x"})
+      end
+    end
+
+    test "from_map rejects kind and role mismatch" do
+      assert_raise ArgumentError, ~r/does not match kind/, fn ->
+        Message.from_map(%{
+          "version" => 1,
+          "kind" => "tool_result",
+          "role" => "assistant",
+          "content" => [Content.to_map(Content.tool_result("id1", "done"))]
+        })
+      end
     end
 
     test "from_map raises on unknown kind" do
@@ -97,6 +154,19 @@ defmodule Clementine.LLM.MessageSerializationTest do
       assert_raise ArgumentError, ~r/expected a message map/, fn ->
         Message.from_map(%{"role" => "user", "content" => "x"})
       end
+    end
+
+    test "from_map raises on invalid content shape for kind" do
+      assert_raise ArgumentError,
+                   ~r/expected assistant message content to be a content list/,
+                   fn ->
+                     Message.from_map(%{
+                       "version" => 1,
+                       "kind" => "assistant",
+                       "role" => "assistant",
+                       "content" => "x"
+                     })
+                   end
     end
   end
 
