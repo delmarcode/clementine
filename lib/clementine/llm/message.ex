@@ -112,18 +112,21 @@ defmodule Clementine.LLM.Message do
     (or returned by `Jason.decode!/1`), dispatching on the `"type"` field.
 
     `ToolUse.input` is passed through unchanged after validating that it is a
-    JSON object with string keys. Extra keys are ignored. Raises
-    `ArgumentError` on an unknown or missing `"type"`.
+    JSON object with string keys. Raises `ArgumentError` on an unknown or
+    missing `"type"`, unknown fields, or malformed required fields.
     """
     @spec from_map(map()) :: t()
     def from_map(%{"type" => type} = data) do
       case type do
         "text" ->
+          validate_keys!(data, ["type", "text"], "text content")
+
           data
           |> fetch_binary!("text", "text content")
           |> text()
 
         "tool_use" ->
+          validate_keys!(data, ["type", "id", "name", "input"], "tool_use content")
           input = fetch_json_object!(data, "input", "tool_use.input")
 
           data
@@ -131,6 +134,12 @@ defmodule Clementine.LLM.Message do
           |> tool_use(fetch_binary!(data, "name", "tool use name"), input)
 
         "tool_result" ->
+          validate_keys!(
+            data,
+            ["type", "tool_use_id", "content", "is_error"],
+            "tool_result content"
+          )
+
           data
           |> fetch_binary!("tool_use_id", "tool result tool_use_id")
           |> tool_result(
@@ -145,6 +154,16 @@ defmodule Clementine.LLM.Message do
 
     def from_map(other) do
       raise ArgumentError, "expected a content map with a \"type\" key, got: #{inspect(other)}"
+    end
+
+    defp validate_keys!(map, allowed_keys, label) do
+      case Map.keys(map) -- allowed_keys do
+        [] ->
+          :ok
+
+        keys ->
+          raise ArgumentError, "unexpected #{label} field(s): #{inspect(keys)}"
+      end
     end
 
     defp fetch_binary!(map, key, label) do
@@ -348,9 +367,9 @@ defmodule Clementine.LLM.Message do
   block maps). The result survives a `Jason.encode!/1`/`Jason.decode!/1` round
   trip and storage in Postgres `jsonb` or Oban args.
 
-  Maps include `"version"` for durable storage. Missing `"version"` is treated
-  as version 1 for compatibility with early serialized maps. Extra keys are
-  ignored. `"role"` is derived from `"kind"` and validated when present.
+  Maps include `"version"` for durable storage. `"role"` is derived from
+  `"kind"` and validated when decoding. Unknown fields are rejected so version 1
+  stays a tight contract.
   """
   @spec to_map(message()) :: map()
   def to_map(%UserMessage{role: :user, content: content}) when is_binary(content) do
@@ -389,11 +408,13 @@ defmodule Clementine.LLM.Message do
   (or returned by `Jason.decode!/1`), dispatching on the `"kind"` field.
 
   Raises `ArgumentError` on an unknown or missing `"kind"`, unsupported
-  `"version"`, inconsistent `"role"`, or invalid content.
+  `"version"`, missing or inconsistent `"role"`, unknown fields, or invalid
+  content.
   """
   @spec from_map(map()) :: message()
   def from_map(%{"kind" => kind} = data) do
     validate_version!(data)
+    validate_message_keys!(data)
 
     case kind do
       "user" ->
@@ -418,15 +439,33 @@ defmodule Clementine.LLM.Message do
   end
 
   defp validate_version!(%{"version" => @serialized_version}), do: :ok
-  defp validate_version!(%{} = data) when not is_map_key(data, "version"), do: :ok
+
+  defp validate_version!(%{} = data) when not is_map_key(data, "version") do
+    raise ArgumentError, "expected message map to include \"version\""
+  end
 
   defp validate_version!(%{"version" => version}) do
     raise ArgumentError,
           "unsupported message serialization version: #{inspect(version)}"
   end
 
+  defp validate_message_keys!(map) do
+    allowed_keys = ["version", "kind", "role", "content"]
+
+    case Map.keys(map) -- allowed_keys do
+      [] ->
+        :ok
+
+      keys ->
+        raise ArgumentError, "unexpected message field(s): #{inspect(keys)}"
+    end
+  end
+
   defp validate_role!(%{"role" => expected}, expected), do: :ok
-  defp validate_role!(%{} = data, _expected) when not is_map_key(data, "role"), do: :ok
+
+  defp validate_role!(%{} = data, _expected) when not is_map_key(data, "role") do
+    raise ArgumentError, "expected message map to include \"role\""
+  end
 
   defp validate_role!(%{"kind" => kind, "role" => role}, expected) do
     raise ArgumentError,
