@@ -49,6 +49,7 @@ defmodule Clementine.Loop do
       :max_iterations,
       :on_event,
       :loop_start_time,
+      :cancel_token,
       messages: [],
       iteration: 0
     ]
@@ -62,6 +63,7 @@ defmodule Clementine.Loop do
             max_iterations: pos_integer(),
             on_event: (term() -> any()) | nil,
             loop_start_time: integer() | nil,
+            cancel_token: Clementine.CancelToken.t() | nil,
             messages: [Clementine.LLM.Message.message()],
             iteration: non_neg_integer()
           }
@@ -83,6 +85,9 @@ defmodule Clementine.Loop do
     - `:max_iterations` - Maximum loop iterations (default: 10)
     - `:messages` - Initial message history
     - `:on_event` - Optional callback for events
+    - `:cancel_token` - Optional `Clementine.CancelToken` for cooperative
+      cancellation. When the token is cancelled (from any process), the run
+      stops at the next iteration boundary and returns `{:error, :cancelled}`.
 
   - `prompt` - The user prompt to execute
 
@@ -90,6 +95,7 @@ defmodule Clementine.Loop do
 
   - `{:ok, result, messages}` - Success with final text and updated message history
   - `{:error, reason}` - Failure with error reason
+  - `{:error, :cancelled}` - The run was cancelled via its `:cancel_token`
 
   """
   def run(config, prompt) when is_list(config) and is_binary(prompt) do
@@ -101,6 +107,7 @@ defmodule Clementine.Loop do
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       on_event: Keyword.get(config, :on_event),
+      cancel_token: Keyword.get(config, :cancel_token),
       messages: Keyword.get(config, :messages, []),
       loop_start_time: System.monotonic_time()
     }
@@ -134,6 +141,14 @@ defmodule Clementine.Loop do
   end
 
   defp iterate(%State{} = state) do
+    if cancelled?(state) do
+      handle_cancelled(state)
+    else
+      do_iterate(state)
+    end
+  end
+
+  defp do_iterate(%State{} = state) do
     state = %{state | iteration: state.iteration + 1}
     emit_event(state, {:iteration_start, state.iteration})
 
@@ -315,6 +330,28 @@ defmodule Clementine.Loop do
     raw_callback.({seq, event})
   end
 
+  # Cooperative cancellation: only cancelled when a token is present AND tripped.
+  # The nil case is always a no-op so runs without a token behave exactly as
+  # before.
+  defp cancelled?(%State{cancel_token: nil}), do: false
+
+  defp cancelled?(%State{cancel_token: token}),
+    do: Clementine.CancelToken.cancelled?(token)
+
+  # Tear down a cancelled run cooperatively, mirroring the other loop-end paths:
+  # emit a loop_end event, the loop stop telemetry, then return {:error, :cancelled}.
+  defp handle_cancelled(%State{} = state) do
+    emit_event(state, {:loop_end, :cancelled})
+
+    :telemetry.execute(
+      [:clementine, :loop, :stop],
+      %{duration: System.monotonic_time() - state.loop_start_time, iterations: state.iteration},
+      %{model: state.model, status: :cancelled}
+    )
+
+    {:error, :cancelled}
+  end
+
   # Emit events for callbacks
   defp emit_event(%State{on_event: nil}, _event), do: :ok
 
@@ -349,6 +386,11 @@ defmodule Clementine.Loop do
 
   Returns `{:ok, text, messages}` on success or `{:error, reason}` if the stream errors.
 
+  Like `run/2`, this accepts an optional `:cancel_token`
+  (`Clementine.CancelToken`) in `config`. When the token is cancelled, the run
+  stops at the next iteration boundary or between stream events and returns
+  `{:error, :cancelled}` without starting further iterations.
+
   ## Example
 
       Clementine.Loop.run_stream(config, "Hello", fn
@@ -375,6 +417,7 @@ defmodule Clementine.Loop do
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       on_event: fn event -> stream_callback.({:loop_event, event}) end,
+      cancel_token: Keyword.get(config, :cancel_token),
       messages: Keyword.get(config, :messages, []),
       loop_start_time: System.monotonic_time()
     }
@@ -408,12 +451,26 @@ defmodule Clementine.Loop do
   end
 
   defp iterate_streaming(%State{} = state, stream_callback) do
+    if cancelled?(state) do
+      handle_cancelled(state)
+    else
+      do_iterate_streaming(state, stream_callback)
+    end
+  end
+
+  defp do_iterate_streaming(%State{} = state, stream_callback) do
     state = %{state | iteration: state.iteration + 1}
     emit_event(state, {:iteration_start, state.iteration})
 
     case call_llm_streaming(state, stream_callback) do
       {:ok, response} ->
         handle_response_streaming(state, response, stream_callback)
+
+      {:error, :cancelled} ->
+        # Cooperative cancel observed mid-stream: a single clean teardown here
+        # (one {:loop_end, :cancelled} + loop stop telemetry), not the generic
+        # error path below, so cancel never looks like an LLM/loop error.
+        handle_cancelled(state)
 
       {:error, reason} ->
         emit_event(state, {:loop_end, {:error, reason}})
@@ -463,60 +520,73 @@ defmodule Clementine.Loop do
         state.tools
       )
 
-    # Process the stream, emitting events and accumulating the response
+    # Process the stream, emitting events and accumulating the response.
+    # reduce_while lets a cancel observed between stream events halt the
+    # consumption promptly rather than draining the rest of the stream.
     acc =
       stream
-      |> Enum.reduce(Accumulator.new(), fn event, acc ->
-        # Forward relevant events to the callback
-        case event do
-          {:text_delta, _} -> stream_callback.(event)
-          {:tool_use_start, _, _} -> stream_callback.(event)
-          {:input_json_delta, _, _} -> stream_callback.(event)
-          {:error, reason} -> stream_callback.({:error, reason})
-          _ -> :ok
-        end
+      |> Enum.reduce_while(Accumulator.new(), fn event, acc ->
+        if cancelled?(state) do
+          {:halt, {:cancelled, acc}}
+        else
+          # Forward relevant events to the callback
+          case event do
+            {:text_delta, _} -> stream_callback.(event)
+            {:tool_use_start, _, _} -> stream_callback.(event)
+            {:input_json_delta, _, _} -> stream_callback.(event)
+            {:error, reason} -> stream_callback.({:error, reason})
+            _ -> :ok
+          end
 
-        Accumulator.process(acc, event)
+          {:cont, Accumulator.process(acc, event)}
+        end
       end)
 
     llm_duration = System.monotonic_time() - llm_start
 
-    if Accumulator.error?(acc) do
-      emit_event(state, {:llm_call_end, {:error, acc.error}})
+    cond do
+      match?({:cancelled, _}, acc) ->
+        # Only signal cancellation up the chain; the loop-level teardown
+        # (loop_end + telemetry) happens once in do_iterate_streaming/2.
+        {:error, :cancelled}
 
-      :telemetry.execute(
-        [:clementine, :llm, :exception],
-        %{duration: llm_duration},
-        %{
-          model: state.model,
-          iteration: state.iteration,
-          kind: :error,
-          reason: acc.error,
-          streaming: true
-        }
-      )
+      Accumulator.error?(acc) ->
+        emit_event(state, {:llm_call_end, {:error, acc.error}})
 
-      {:error, acc.error}
-    else
-      result = Accumulator.to_response(acc)
-      emit_event(state, {:llm_call_end, {:ok, result}})
+        :telemetry.execute(
+          [:clementine, :llm, :exception],
+          %{duration: llm_duration},
+          %{
+            model: state.model,
+            iteration: state.iteration,
+            kind: :error,
+            reason: acc.error,
+            streaming: true
+          }
+        )
 
-      :telemetry.execute(
-        [:clementine, :llm, :stop],
-        %{
-          duration: llm_duration,
-          input_tokens: get_in(result.usage, ["input_tokens"]) || 0,
-          output_tokens: get_in(result.usage, ["output_tokens"]) || 0
-        },
-        %{
-          model: state.model,
-          iteration: state.iteration,
-          stop_reason: result.stop_reason,
-          streaming: true
-        }
-      )
+        {:error, acc.error}
 
-      {:ok, result}
+      true ->
+        result = Accumulator.to_response(acc)
+        emit_event(state, {:llm_call_end, {:ok, result}})
+
+        :telemetry.execute(
+          [:clementine, :llm, :stop],
+          %{
+            duration: llm_duration,
+            input_tokens: get_in(result.usage, ["input_tokens"]) || 0,
+            output_tokens: get_in(result.usage, ["output_tokens"]) || 0
+          },
+          %{
+            model: state.model,
+            iteration: state.iteration,
+            stop_reason: result.stop_reason,
+            streaming: true
+          }
+        )
+
+        {:ok, result}
     end
   rescue
     e ->
