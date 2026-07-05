@@ -1,7 +1,7 @@
 defmodule Clementine.CheckpointTest do
   use ExUnit.Case, async: true
 
-  alias Clementine.{Checkpoint, Error, Pending, ToolResult, Usage}
+  alias Clementine.{Checkpoint, Error, ToolResult, Usage}
   alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
   alias Clementine.Pending.ToolApproval
 
