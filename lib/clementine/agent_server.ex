@@ -1,4 +1,4 @@
-defmodule Clementine.Agent do
+defmodule Clementine.AgentServer do
   @moduledoc """
   Behaviour and macro for defining agents.
 
@@ -8,16 +8,13 @@ defmodule Clementine.Agent do
   ## Example
 
       defmodule MyApp.CodingAgent do
-        use Clementine.Agent,
+        use Clementine.AgentServer,
           name: "coding_agent",
           model: :claude_sonnet,
           tools: [
             MyApp.Tools.ReadFile,
             MyApp.Tools.WriteFile,
             MyApp.Tools.RunCommand
-          ],
-          verifiers: [
-            MyApp.Verifiers.TestsPassing
           ],
           system: \"\"\"
           You are a coding assistant. You have access to the filesystem
@@ -33,12 +30,11 @@ defmodule Clementine.Agent do
 
   ## Configuration
 
-  The following options can be set at compile time via `use Clementine.Agent`:
+  The following options can be set at compile time via `use Clementine.AgentServer`:
 
   - `:name` - Required. The agent's name for identification.
   - `:model` - The LLM model to use (default: from config)
   - `:tools` - List of tool modules (default: [])
-  - `:verifiers` - List of verifier modules (default: [])
   - `:system` - System prompt (default: "")
   - `:max_iterations` - Maximum loop iterations (default: from config)
 
@@ -46,7 +42,7 @@ defmodule Clementine.Agent do
 
   """
 
-  alias Clementine.Loop
+  alias Clementine.Rollout
 
   @type agent :: GenServer.server()
 
@@ -57,7 +53,6 @@ defmodule Clementine.Agent do
       :model,
       :system,
       :tools,
-      :verifiers,
       :max_iterations,
       :context,
       history: [],
@@ -73,7 +68,6 @@ defmodule Clementine.Agent do
   - `:name` - Required. The agent's name.
   - `:model` - LLM model reference (default: from config)
   - `:tools` - List of tool modules
-  - `:verifiers` - List of verifier modules
   - `:system` - System prompt
   - `:max_iterations` - Maximum loop iterations
   """
@@ -84,7 +78,6 @@ defmodule Clementine.Agent do
       @agent_name Keyword.fetch!(opts, :name)
       @agent_model Keyword.get(opts, :model)
       @agent_tools Keyword.get(opts, :tools, [])
-      @agent_verifiers Keyword.get(opts, :verifiers, [])
       @agent_system Keyword.get(opts, :system, "")
       @agent_max_iterations Keyword.get(opts, :max_iterations)
 
@@ -103,7 +96,7 @@ defmodule Clementine.Agent do
       - `:context` - Initial context map
       - `:working_dir` - Working directory for tools
       - `:history` - Initial conversation history (list of messages). Used by
-        `Clementine.Agent.fork/3` to seed the new agent with the source's history.
+        `Clementine.AgentServer.fork/3` to seed the new agent with the source's history.
       """
       def start_link(opts \\ []) do
         {gen_opts, agent_opts} = Keyword.split(opts, [:name])
@@ -118,7 +111,6 @@ defmodule Clementine.Agent do
           name: @agent_name,
           model: @agent_model,
           tools: @agent_tools,
-          verifiers: @agent_verifiers,
           system: @agent_system,
           max_iterations: @agent_max_iterations
         }
@@ -138,12 +130,11 @@ defmodule Clementine.Agent do
         history = Keyword.get(opts, :history, [])
         validate_history!(history)
 
-        state = %Clementine.Agent.State{
+        state = %Clementine.AgentServer.State{
           name: @agent_name,
           model: Keyword.get(opts, :model, @agent_model || default_model),
           system: Keyword.get(opts, :system, @agent_system),
           tools: @agent_tools,
-          verifiers: @agent_verifiers,
           max_iterations:
             Keyword.get(opts, :max_iterations, @agent_max_iterations || default_max_iterations),
           context: context,
@@ -162,7 +153,7 @@ defmodule Clementine.Agent do
             # Run synchronously
             config = build_loop_config(state)
 
-            case Loop.run(config, prompt) do
+            case Rollout.run(config, prompt) do
               {:ok, result, messages} ->
                 {:reply, {:ok, result}, %{state | history: messages}}
 
@@ -182,10 +173,10 @@ defmodule Clementine.Agent do
             task_id = generate_task_id()
             config = build_loop_config(state)
 
-            # Use async_nolink so a crash in Loop.run/2 doesn't take down the agent
+            # Use async_nolink so a crash in Rollout.run/2 doesn't take down the agent
             task =
               Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
-                Loop.run(config, prompt)
+                Rollout.run(config, prompt)
               end)
 
             entry = %{task: task, from: from_pid, status: :running, waiters: []}
@@ -220,7 +211,7 @@ defmodule Clementine.Agent do
 
             task =
               Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
-                Loop.run_stream(config, prompt, fn event ->
+                Rollout.run_stream(config, prompt, fn event ->
                   send(stream_consumer, {:clementine_stream_event, task_id, event})
                 end)
               end)
@@ -430,7 +421,6 @@ defmodule Clementine.Agent do
           model: state.model,
           system: state.system,
           tools: state.tools,
-          verifiers: state.verifiers,
           context: state.context,
           max_iterations: state.max_iterations,
           messages: state.history
@@ -526,7 +516,7 @@ defmodule Clementine.Agent do
         end
       end
 
-      # Convert internal Loop.run/2 results to the public await/3 contract,
+      # Convert internal Rollout.run/2 results to the public await/3 contract,
       # which matches run/2: {:ok, text} | {:error, reason}
       defp normalize_result({:ok, text, _messages}), do: {:ok, text}
       defp normalize_result({:error, _reason} = error), do: error
