@@ -209,6 +209,44 @@ defmodule Clementine.RolloutExecuteTest do
 
       assert {:cancelled, :user_stop} = Rollout.execute(rollout())
     end
+
+    test "a drain queued during the gather unwinds before the fence rises" do
+      test = self()
+
+      # The signal lands in the mailbox after the stream completed but
+      # before act: it must be honored before the fence write and before
+      # any tool task spawns — a pending drain must not forfeit requeue
+      # eligibility.
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        send(self(), {:clementine, :drain})
+        tool_events("tu_1", "echo", %{"message" => "never"})
+      end)
+
+      assert :drained =
+               Rollout.execute(rollout(tools: [NotifyingEcho], context: %{notify: test}),
+                 mark_effects: fn ->
+                   send(test, {:mark, :fence})
+                   :ok
+                 end
+               )
+
+      refute_received {:mark, :fence}
+      refute_received {:mark, :tool}
+    end
+
+    test "a cancel queued during the gather skips the batch entirely" do
+      test = self()
+
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        send(self(), {:clementine, :cancel, :queued_stop})
+        tool_events("tu_1", "echo", %{"message" => "never"})
+      end)
+
+      assert {:cancelled, :queued_stop} =
+               Rollout.execute(rollout(tools: [NotifyingEcho], context: %{notify: test}))
+
+      refute_received {:mark, :tool}
+    end
   end
 
   describe "tool-batch cancellation (matrix row 5)" do

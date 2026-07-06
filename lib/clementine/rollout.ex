@@ -404,8 +404,13 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # A signal that arrived during the gather is already in the mailbox:
+  # honor it before the fence write and before any tool starts — a
+  # pending drain must not forfeit requeue eligibility, and a superseded
+  # executor must not start new external effects.
   defp act_on_tools(%Execution{} = exec, tool_uses) do
-    with :continue <- check_approval_gate(exec, tool_uses),
+    with :continue <- check_signals(),
+         :continue <- check_approval_gate(exec, tool_uses),
          {:continue, exec} <- raise_fence(exec, tool_uses) do
       run_tool_batch(exec, tool_uses)
     else
