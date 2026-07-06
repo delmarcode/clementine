@@ -247,7 +247,7 @@ defmodule Clementine.LifecycleCase do
           Battery.projection_atomicity(__conformance__())
         end
 
-        test "the projection fires for finish with the exact Result variant" do
+        test "the projection fires for every finish Result variant" do
           Battery.projection_fires_for_finish(__conformance__())
         end
 

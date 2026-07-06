@@ -321,27 +321,34 @@ defmodule Clementine.LifecycleCase.Battery do
   end
 
   def projection_fires_for_finish(h) do
-    # The probe raises only on the exact variant, so an abort proves the
-    # projection ran and received precisely that result.
-    ref = create!(h, projection: {:raise_on, :completed})
-    lease = claim!(h, ref)
+    # Finish carries all four Result variants (cooperative cancel and the
+    # drain-with-effects interrupt arrive through finish, not through the
+    # control plane), so each one is probed. The probe raises only on the
+    # exact variant: the abort proves the projection ran and received
+    # precisely that result, and the follow-up finish under a different
+    # variant proves the probe was selective, not stuck.
+    probes = [
+      {:completed, Result.completed(), Result.failed(:conformance_probe)},
+      {:failed, Result.failed(:conformance_probe), Result.completed()},
+      {:cancelled, Result.cancelled(:user_stop), Result.completed()},
+      {:interrupted, Result.interrupted(:drain), Result.completed()}
+    ]
 
-    assert_aborts(fn -> Protocol.finish(lease, Result.completed()) end)
-    assert fetch!(h, ref).status == :running
+    for {variant, probed, control} <- probes do
+      ref = create!(h, projection: {:raise_on, variant})
+      lease = claim!(h, ref)
 
-    # The same run finishes cleanly under a different variant: the probe is
-    # selective, so the variant delivered to the projection was real.
-    {:ok, facts} = Protocol.finish(lease, Result.failed(:conformance_probe))
-    assert facts.status == :failed
+      assert_aborts(fn -> Protocol.finish(lease, probed) end)
 
-    ref2 = create!(h, projection: {:raise_on, :failed})
-    lease2 = claim!(h, ref2)
+      facts = fetch!(h, ref)
 
-    assert_aborts(fn -> Protocol.finish(lease2, Result.failed(:conformance_probe)) end)
-    assert fetch!(h, ref2).status == :running
+      assert facts.status == :running,
+             "finish(#{variant}) with a raising projection must not commit, " <>
+               "but the run reached #{facts.status}"
 
-    {:ok, facts2} = Protocol.finish(lease2, Result.completed())
-    assert facts2.status == :completed
+      {:ok, committed} = Protocol.finish(lease, control)
+      assert committed.status == Result.status(control)
+    end
   end
 
   def projection_fires_for_interrupt(h) do
