@@ -92,4 +92,41 @@ defmodule Clementine.LLM.ProviderStreamTest do
 
     assert_receive {:DOWN, ^monitor_ref, :process, ^worker, _reason}, 500
   end
+
+  test "a runner-directed signal aborts the blocked stream and the in-flight request" do
+    test = self()
+
+    stream =
+      ProviderStream.new(TestParser, fn _consumer, _ref ->
+        send(test, {:worker, self()})
+        Process.sleep(:infinity)
+      end)
+
+    task = Task.async(fn -> Enum.to_list(stream) end)
+
+    # The request is provably in flight; now the signal lands in the blocked
+    # consumer's mailbox.
+    assert_receive {:worker, worker}
+    send(task.pid, {:clementine, :drain})
+
+    assert Task.await(task) == [{:signal, {:clementine, :drain}}]
+
+    monitor_ref = Process.monitor(worker)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, _reason}, 500
+  end
+
+  test "three-element signals (lease lost) surface the same way" do
+    stream =
+      ProviderStream.new(TestParser, fn _consumer, _ref ->
+        Process.sleep(:infinity)
+      end)
+
+    task =
+      Task.async(fn ->
+        send(self(), {:clementine, :lease_lost, :fake_lease})
+        Enum.to_list(stream)
+      end)
+
+    assert Task.await(task) == [{:signal, {:clementine, :lease_lost, :fake_lease}}]
+  end
 end

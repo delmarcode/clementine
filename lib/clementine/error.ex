@@ -88,6 +88,16 @@ defmodule Clementine.Error do
     }
   end
 
+  def normalize(:deadline_exceeded, _provider) do
+    %__MODULE__{
+      kind: :rollout,
+      code: :deadline_exceeded,
+      message: "Execution deadline exceeded before a final answer.",
+      retryable?: false,
+      raw: :deadline_exceeded
+    }
+  end
+
   def normalize(other, provider) do
     %__MODULE__{
       kind: :runtime,

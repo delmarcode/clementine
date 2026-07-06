@@ -1,26 +1,34 @@
 defmodule Clementine do
   @moduledoc """
-  Clementine - A simple, process-oriented agent framework for Elixir.
+  Clementine - an agent framework for Elixir.
 
-  Clementine provides a straightforward way to build AI agents using Elixir's
-  process model. Inspired by Claude Code's architecture, it implements the
-  Gather → Act rollout loop with tools; verification is an outer-control
-  concern layered on top.
+  Clementine models agent work as inert definitions animated by explicit
+  execution machinery: an `Clementine.Agent` is a capability definition, a
+  `Clementine.Rollout` is one Gather → Act execution spec, a
+  `Clementine.Run` is one durable attempt, and a `Clementine.Runner` turns
+  the crank against the host's `Clementine.Lifecycle`.
 
   ## Quick Start
 
-      # Define an agent
-      defmodule MyAgent do
-        use Clementine.AgentServer,
-          name: "my_agent",
-          model: :claude_sonnet,
-          tools: [MyApp.Tools.ReadFile, MyApp.Tools.WriteFile],
-          system: "You are a helpful assistant."
-      end
+  The simplest consumption is one line — the same nouns production uses,
+  animated by an in-memory lifecycle:
 
-      # Start and use it
-      {:ok, agent} = MyAgent.start_link()
-      {:ok, result} = Clementine.run(agent, "Hello!")
+      agent =
+        Clementine.Agent.new(
+          model: :claude_sonnet,
+          instructions: "You are a helpful assistant.",
+          tools: [MyApp.Tools.ReadFile]
+        )
+
+      {:ok, %Clementine.Result.Completed{} = result} =
+        Clementine.run(agent, "Summarize README.md")
+
+      result.output
+
+  Production apps use the nouns explicitly: build a `Clementine.Run`, call
+  `Clementine.Runner.execute/2` from a host-owned worker with a durable
+  `Clementine.Lifecycle` implementation. See the durable execution RFC in
+  `docs/DURABLE_EXECUTION_RFC.md`.
 
   ## Core Concepts
 
@@ -44,39 +52,19 @@ defmodule Clementine do
 
   ### Verifiers
 
-  Verifiers check results against acceptance criteria. Define them with
-  `Clementine.Verifier`:
-
-      defmodule MyApp.Verifiers.TestsPassing do
-        use Clementine.Verifier
-
-        @impl true
-        def verify(_result, context) do
-          case System.cmd("mix", ["test"], cd: context.working_dir) do
-            {_, 0} -> :ok
-            {output, _} -> {:retry, "Tests failed: \#{output}"}
-          end
-        end
-      end
-
-  Verification is an outer-control concern, not part of the inner loop: invoke
-  verifiers standalone after a run completes.
+  Verification is an outer-control concern, not part of the inner loop:
+  judge a completed result and retry with feedback one floor above the
+  rollout. See `Clementine.Verifier` for the judge-function shape.
 
       {:ok, result} = Clementine.run(agent, "Refactor the parser")
       :ok = Clementine.Verifier.run_all([MyApp.Verifiers.TestsPassing], result, context)
 
-  ### Agents
+  ### Interactive agent processes
 
-  Agents are GenServers that run the agentic loop. Define them with
-  `Clementine.AgentServer`:
-
-      defmodule MyAgent do
-        use Clementine.AgentServer,
-          name: "my_agent",
-          model: :claude_sonnet,
-          tools: [MyApp.Tools.Echo],
-          system: "You are helpful."
-      end
+  `Clementine.AgentServer` wraps the same machinery in a GenServer for
+  interactive local use — a porch, not the house. `run_async/2`, `await/3`,
+  `status/2`, `get_history/1`, `clear_history/1`, and `fork/3` below
+  operate on those processes.
 
   ## Configuration
 
@@ -92,36 +80,187 @@ defmodule Clementine do
           provider: :anthropic,
           id: "claude-sonnet-4-20250514",
           defaults: [max_tokens: 8192]
-        ],
-        gpt_5: [
-          provider: :openai,
-          id: "gpt-5",
-          defaults: [max_output_tokens: 4096]
         ]
 
   """
 
-  alias Clementine.AgentServer
+  alias Clementine.{AgentServer, Events, Result, Rollout, Run, Runner}
+  alias Clementine.Lifecycle.{Ephemeral, Facts}
 
   @doc """
-  Runs a prompt on an agent synchronously.
+  Runs one rollout to a terminal result, in-process.
 
-  ## Example
+  The one-line script path: under it sit the same nouns production uses —
+  a `Clementine.Rollout` built from the agent and prompt, a
+  `Clementine.Run`, the `Clementine.Runner`, and the ephemeral in-memory
+  lifecycle. Deadline (`max_duration:`) and `max_iterations:` limits are
+  enforced exactly as in production; there is no heartbeat and no reaper
+  because a single process cannot lose a lease, and a crash is the
+  caller's crash.
 
-      {:ok, agent} = MyAgent.start_link()
-      {:ok, result} = Clementine.run(agent, "Hello!")
+  ## Options
+
+  - `:messages` - starting message history (default `[]`)
+  - `:context` - context map passed to tools (default `%{}`)
+  - `:limits` - `[max_iterations: n, max_duration: ms]`; unset keys fall
+    back to the agent's defaults
+  - `:events` - a `Clementine.Events` sink for execution events (default
+    `Clementine.Events.Null`)
 
   ## Returns
 
-  - `{:ok, result}` - The agent's text response
-  - `{:error, {:agent_busy, task_ids}}` - If an async run is already active
-  - `{:error, reason}` - If something went wrong
+  - `{:ok, %Clementine.Result.Completed{}}` — final output, generated
+    messages, and usage
+  - `{:error, result}` — the other terminal `Clementine.Result` variants
+    (`Failed`, `Cancelled`, `Interrupted`), each carrying usage
 
+  ## Example
+
+      {:ok, %Clementine.Result.Completed{} = result} =
+        Clementine.run(agent, "What is 6 x 7?")
+
+      result.output
   """
-  defdelegate run(agent, prompt), to: AgentServer
+  @spec run(Clementine.Agent.t(), String.t(), keyword()) ::
+          {:ok, Result.Completed.t()}
+          | {:error, Result.Failed.t() | Result.Cancelled.t() | Result.Interrupted.t()}
+  def run(%Clementine.Agent{} = agent, prompt, opts \\ []) when is_binary(prompt) do
+    {ref, ctx} = Ephemeral.create()
+    run = Run.new(ref: ref, rollout: build_rollout(agent, prompt, opts))
+
+    try do
+      case execute_ephemeral(run, ctx, Keyword.get(opts, :events, Events.Null)) do
+        %Result.Completed{} = completed -> {:ok, completed}
+        other -> {:error, other}
+      end
+    after
+      Ephemeral.delete(ctx)
+    end
+  end
 
   @doc """
-  Runs a prompt on an agent asynchronously.
+  Runs one rollout, streaming its execution events.
+
+  Returns a lazy enumerable of `Clementine.Event` structs in `(epoch, seq)`
+  order, ending with `{:result, result}` carrying the terminal
+  `Clementine.Result` (any variant). The stream is caller-owned
+  deliberately: a script is the rightful owner of its execution — consuming
+  it runs the rollout, and abandoning it aborts the run.
+
+  Options are as in `run/3`, minus `:events` — this stream is the event
+  sink.
+
+  ## Example
+
+      Clementine.stream(agent, "Explain this code")
+      |> Enum.each(fn
+        %Clementine.Event{type: :text_delta, payload: %{content: text}} -> IO.write(text)
+        {:result, %Clementine.Result.Completed{}} -> IO.puts("\\n[done]")
+        _ -> :ok
+      end)
+  """
+  @spec stream(Clementine.Agent.t(), String.t(), keyword()) :: Enumerable.t()
+  def stream(%Clementine.Agent{} = agent, prompt, opts \\ []) when is_binary(prompt) do
+    Stream.resource(
+      fn -> start_stream(agent, prompt, opts) end,
+      &next_stream_event/1,
+      &cleanup_stream/1
+    )
+  end
+
+  defp build_rollout(agent, prompt, opts) do
+    Rollout.new(
+      agent: agent,
+      input: prompt,
+      messages: Keyword.get(opts, :messages, []),
+      context: Keyword.get(opts, :context, %{}),
+      limits: Keyword.get(opts, :limits, [])
+    )
+  end
+
+  # The ephemeral translation of the worker contract: a drain requeue means
+  # "re-enqueue", which in a single process is simply running it again;
+  # any terminal reads the result the projection captured. The remaining
+  # runner outcomes are unreachable here by construction — a single-writer
+  # claim cannot lose, in-memory writes cannot fail transiently, and no
+  # in-scope rollout parks — so they fail loud instead of leaking a shape.
+  defp execute_ephemeral(run, ctx, sink) do
+    outcome =
+      Runner.execute(run,
+        lifecycle: Ephemeral,
+        ctx: ctx,
+        events: sink,
+        executor_id: "ephemeral:#{inspect(self())}",
+        heartbeat: false
+      )
+
+    case outcome do
+      {:finished, %Facts{status: :queued}} ->
+        execute_ephemeral(run, ctx, sink)
+
+      {:finished, %Facts{}} ->
+        Ephemeral.result(ctx)
+
+      {:suspended, _token} ->
+        raise "ephemeral runs cannot park: approval-gated tools are not " <>
+                "supported by Clementine.run/3 and Clementine.stream/3"
+
+      other ->
+        raise "ephemeral runner invariant violated: #{inspect(other)}"
+    end
+  end
+
+  # The tag pins event delivery to this enumerable: two streams consumed by
+  # the same process (Stream.zip, nested enumeration) must not cross-deliver
+  # or cross-flush each other's events. The result path is pinned by the
+  # task ref already; events need their own identity because the run ref is
+  # minted inside the task.
+  defp start_stream(agent, prompt, opts) do
+    owner = self()
+    tag = make_ref()
+
+    task =
+      Task.async(fn ->
+        {ref, ctx} = Ephemeral.create(forward_to: {owner, tag})
+        run = Run.new(ref: ref, rollout: build_rollout(agent, prompt, opts))
+        execute_ephemeral(run, ctx, Events.Forwarder)
+      end)
+
+    %{task: task, tag: tag, done: false}
+  end
+
+  defp next_stream_event(%{done: true} = state), do: {:halt, state}
+
+  defp next_stream_event(%{task: %Task{ref: ref}, tag: tag} = state) do
+    receive do
+      {:clementine_stream_event, ^tag, %Clementine.Event{} = event} ->
+        {[event], state}
+
+      {^ref, result} ->
+        Process.demonitor(ref, [:flush])
+        {[{:result, result}], %{state | done: true}}
+
+      {:DOWN, ^ref, :process, _pid, reason} ->
+        # No reaper on the ephemeral path: a crash is the caller's crash.
+        exit(reason)
+    end
+  end
+
+  defp cleanup_stream(%{task: task, tag: tag, done: done}) do
+    unless done, do: Task.shutdown(task, :brutal_kill)
+    flush_stream_events(tag)
+  end
+
+  defp flush_stream_events(tag) do
+    receive do
+      {:clementine_stream_event, ^tag, _event} -> flush_stream_events(tag)
+    after
+      0 -> :ok
+    end
+  end
+
+  @doc """
+  Runs a prompt on an interactive `Clementine.AgentServer` asynchronously.
 
   Returns immediately with a task ID. Use `await/3` to get the result.
   Returns `{:error, {:agent_busy, task_ids}}` if another run is already active
@@ -140,8 +279,9 @@ defmodule Clementine do
   Awaits the result of an async task.
 
   Blocks until the task completes or the timeout expires (default: 5000ms).
-  Returns the same `{:ok, text}` / `{:error, reason}` contract as `run/2`.
-  The task is removed from state after retrieval.
+  Returns the same `{:ok, text}` / `{:error, reason}` contract as
+  `Clementine.AgentServer.run/2`. The task is removed from state after
+  retrieval.
 
   ## Example
 
@@ -170,7 +310,7 @@ defmodule Clementine do
   defdelegate status(agent, task_id), to: AgentServer
 
   @doc """
-  Gets the conversation history from an agent.
+  Gets the conversation history from an interactive agent process.
 
   The history is a list of messages in chronological order.
   """
@@ -185,7 +325,8 @@ defmodule Clementine do
   defdelegate clear_history(agent), to: AgentServer
 
   @doc """
-  Forks an agent, creating a new agent with the same history.
+  Forks an interactive agent process, creating a new one with the same
+  history.
 
   This is useful for exploring different paths in a conversation.
 
@@ -196,25 +337,6 @@ defmodule Clementine do
 
   """
   defdelegate fork(agent, new_agent_module, opts \\ []), to: AgentServer
-
-  @doc """
-  Streams a prompt execution, returning events as they occur.
-
-  ## Example
-
-      Clementine.stream(agent, "Explain this code")
-      |> Stream.each(fn
-        {:text_delta, chunk} -> IO.write(chunk)
-        {:tool_use_start, _id, name} -> IO.puts("\\n[Calling \#{name}...]")
-        {:tool_result, _id, result} -> IO.puts("[Done]")
-        _ -> :ok
-      end)
-      |> Stream.run()
-
-  Successful streams update the agent conversation history just like `run/2`.
-  The stream emits `{:done, :success}` or `{:done, :error}` before halting.
-  """
-  defdelegate stream(agent, prompt), to: AgentServer
 
   @doc """
   Executes a tool directly without the LLM loop.
