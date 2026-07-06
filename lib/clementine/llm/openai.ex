@@ -59,21 +59,25 @@ defmodule Clementine.LLM.OpenAI do
   def stream(model, system, messages, tools, opts \\ []) do
     body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
     headers = build_headers()
-    # A runner caps this to the execution deadline's remaining budget.
+    # A runner caps this to the execution deadline's remaining budget. It
+    # bounds the whole streaming call, not one attempt: per-attempt receive
+    # timeout and retry backoff draw down the same window, and retries stop
+    # once it is spent.
     receive_timeout = Keyword.get(opts, :receive_timeout, 300_000)
+    budget_ends = System.monotonic_time(:millisecond) + receive_timeout
 
     ProviderStream.new(OpenAIStreamParser, fn parent, ref ->
-      do_stream_request(body, headers, parent, ref, receive_timeout)
+      do_stream_request(body, headers, parent, ref, budget_ends)
     end)
   end
 
-  defp do_stream_request(body, headers, parent, ref, receive_timeout) do
+  defp do_stream_request(body, headers, parent, ref, budget_ends) do
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
-    do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, 1)
+    do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, 1)
   end
 
-  defp do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, attempt) do
+  defp do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, attempt) do
     data_sent = :atomics.new(1, signed: false)
 
     callback = fn {:data, data}, acc ->
@@ -87,34 +91,40 @@ defmodule Clementine.LLM.OpenAI do
         json: body,
         headers: headers,
         into: callback,
-        receive_timeout: receive_timeout
+        receive_timeout: remaining_budget(budget_ends)
       )
 
     case result do
       {:ok, %{status: 200}} ->
         send(parent, {ref, :done})
 
-      {:ok, %{status: status}} when status in @retriable_statuses and attempt < max_attempts ->
-        send(parent, {ref, :retry_reset})
-        Process.sleep(calculate_backoff(attempt))
-        do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, attempt + 1)
+      {:ok, %{status: status, body: resp_body}}
+      when status in @retriable_statuses and attempt < max_attempts ->
+        retry_stream(
+          body,
+          headers,
+          parent,
+          ref,
+          budget_ends,
+          max_attempts,
+          attempt,
+          {:error, {:api_error, status, resp_body}}
+        )
 
       {:ok, %{status: status, body: resp_body}} ->
         send(parent, {ref, {:error, {:api_error, status, resp_body}}})
 
       {:error, reason} when attempt < max_attempts ->
         if :atomics.get(data_sent, 1) == 0 do
-          send(parent, {ref, :retry_reset})
-          Process.sleep(calculate_backoff(attempt))
-
-          do_stream_request(
+          retry_stream(
             body,
             headers,
             parent,
             ref,
-            receive_timeout,
+            budget_ends,
             max_attempts,
-            attempt + 1
+            attempt,
+            {:error, {:request_failed, reason}}
           )
         else
           send(parent, {ref, {:error, {:request_failed, reason}}})
@@ -123,6 +133,26 @@ defmodule Clementine.LLM.OpenAI do
       {:error, reason} ->
         send(parent, {ref, {:error, {:request_failed, reason}}})
     end
+  end
+
+  # A retry draws down the same budget as the attempt it follows: the
+  # backoff sleep is capped to what remains, and a spent budget sends the
+  # failure instead of retrying — a runner-capped stream must not outlive
+  # its deadline by sleeping.
+  defp retry_stream(body, headers, parent, ref, budget_ends, max_attempts, attempt, fail_message) do
+    remaining = remaining_budget(budget_ends)
+
+    if remaining > 0 do
+      send(parent, {ref, :retry_reset})
+      Process.sleep(min(calculate_backoff(attempt), remaining))
+      do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, attempt + 1)
+    else
+      send(parent, {ref, fail_message})
+    end
+  end
+
+  defp remaining_budget(budget_ends) do
+    max(budget_ends - System.monotonic_time(:millisecond), 0)
   end
 
   defp base_url do
