@@ -126,6 +126,7 @@ defmodule Clementine.Rollout do
       :deadline,
       :input_message,
       :prefix_len,
+      :started_at,
       messages: [],
       iteration: 0,
       usage: %Clementine.Usage{},
@@ -211,12 +212,29 @@ defmodule Clementine.Rollout do
       mark_effects: Keyword.get(opts, :mark_effects, fn -> :ok end),
       deadline: Keyword.get(opts, :deadline),
       input_message: input_message,
-      prefix_len: length(rollout.messages) + 1
+      prefix_len: length(rollout.messages) + 1,
+      started_at: System.monotonic_time()
     }
 
-    case restore(exec, Keyword.get(opts, :resume), rollout) do
-      {:ok, %Execution{} = exec} -> boundary(exec)
-      {:error, %Clementine.Error{} = error} -> fail(exec, error)
+    :telemetry.execute(
+      [:clementine, :rollout, :start],
+      %{system_time: System.system_time()},
+      %{model: exec.model, max_iterations: exec.max_iterations, tool_count: length(exec.tools)}
+    )
+
+    try do
+      case restore(exec, Keyword.get(opts, :resume), rollout) do
+        {:ok, %Execution{} = exec} -> boundary(exec)
+        {:error, %Clementine.Error{} = error} -> fail(exec, error)
+      end
+    rescue
+      e ->
+        emit_rollout_raise(exec, :error, e, __STACKTRACE__)
+        reraise e, __STACKTRACE__
+    catch
+      kind, reason ->
+        emit_rollout_raise(exec, kind, reason, __STACKTRACE__)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
   end
 
@@ -290,7 +308,7 @@ defmodule Clementine.Rollout do
       gather(%{exec | iteration: exec.iteration + 1})
     else
       {:error, %Clementine.Error{} = error} -> fail(exec, error)
-      unwound -> unwound
+      unwound -> conclude(exec, unwound)
     end
   end
 
@@ -337,7 +355,7 @@ defmodule Clementine.Rollout do
 
     case stream_response(exec) do
       {:ok, response} -> act(record_usage(exec, response), response)
-      {:signal, signal} -> unwind(signal)
+      {:signal, signal} -> conclude(exec, unwind(signal))
       {:error, reason} -> fail(exec, Clementine.Error.normalize(reason))
     end
   end
@@ -345,23 +363,93 @@ defmodule Clementine.Rollout do
   defp stream_response(%Execution{} = exec) do
     alias Clementine.LLM.StreamParser.Accumulator
 
+    metadata = %{
+      model: exec.model,
+      iteration: exec.iteration,
+      message_count: length(exec.messages),
+      tool_count: length(exec.tools),
+      streaming: true
+    }
+
+    :telemetry.execute(
+      [:clementine, :llm, :start],
+      %{system_time: System.system_time()},
+      metadata
+    )
+
+    started = System.monotonic_time()
     stream = LLM.stream(exec.model, exec.system, exec.messages, exec.tools, stream_opts(exec))
 
     {acc, signal} =
-      Enum.reduce_while(stream, {Accumulator.new(), nil}, fn
-        {:signal, message}, {acc, _signal} ->
-          {:halt, {acc, message}}
+      try do
+        Enum.reduce_while(stream, {Accumulator.new(), nil}, fn
+          {:signal, message}, {acc, _signal} ->
+            {:halt, {acc, message}}
 
-        event, {acc, nil} ->
-          forward_stream_event(exec, event)
-          {:cont, {Accumulator.process(acc, event), nil}}
-      end)
+          event, {acc, nil} ->
+            forward_stream_event(exec, event)
+            {:cont, {Accumulator.process(acc, event), nil}}
+        end)
+      rescue
+        e ->
+          emit_llm_raise(metadata, started, :error, e, __STACKTRACE__)
+          reraise e, __STACKTRACE__
+      catch
+        kind, reason ->
+          emit_llm_raise(metadata, started, kind, reason, __STACKTRACE__)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    duration = System.monotonic_time() - started
 
     cond do
-      signal != nil -> {:signal, signal}
-      Accumulator.error?(acc) -> {:error, acc.error}
-      true -> {:ok, Accumulator.to_response(acc)}
+      signal != nil ->
+        # Aborted by a runner signal: no provider stop_reason exists, and
+        # the partial usage is what actually burned.
+        emit_llm_stop(metadata, duration, Clementine.Usage.new(acc.usage), nil)
+        {:signal, signal}
+
+      Accumulator.error?(acc) ->
+        :telemetry.execute(
+          [:clementine, :llm, :exception],
+          %{duration: duration},
+          Map.merge(metadata, %{kind: :error, reason: acc.error})
+        )
+
+        {:error, acc.error}
+
+      true ->
+        response = Accumulator.to_response(acc)
+
+        emit_llm_stop(
+          metadata,
+          duration,
+          Clementine.Usage.new(response.usage),
+          response.stop_reason
+        )
+
+        {:ok, response}
     end
+  end
+
+  defp emit_llm_stop(metadata, duration, %Clementine.Usage{} = usage, stop_reason) do
+    :telemetry.execute(
+      [:clementine, :llm, :stop],
+      %{
+        duration: duration,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens
+      },
+      Map.put(metadata, :stop_reason, stop_reason)
+    )
+  end
+
+  defp emit_llm_raise(metadata, started, kind, reason, stacktrace) do
+    :telemetry.execute(
+      [:clementine, :llm, :exception],
+      %{duration: System.monotonic_time() - started},
+      Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: stacktrace})
+    )
   end
 
   defp forward_stream_event(exec, {:text_delta, text}),
@@ -394,13 +482,16 @@ defmodule Clementine.Rollout do
     if LLM.tool_use?(response) do
       act_on_tools(exec, LLM.get_tool_uses(response))
     else
-      {:ok,
-       Clementine.Result.completed(
-         input_message: exec.input_message,
-         messages: Enum.drop(exec.messages, exec.prefix_len),
-         output: LLM.get_text(response),
-         usage: exec.usage
-       )}
+      conclude(
+        exec,
+        {:ok,
+         Clementine.Result.completed(
+           input_message: exec.input_message,
+           messages: Enum.drop(exec.messages, exec.prefix_len),
+           output: LLM.get_text(response),
+           usage: exec.usage
+         )}
+      )
     end
   end
 
@@ -415,7 +506,7 @@ defmodule Clementine.Rollout do
       run_tool_batch(exec, tool_uses)
     else
       {:error, %Clementine.Error{} = error} -> fail(exec, error)
-      unwound -> unwound
+      unwound -> conclude(exec, unwound)
     end
   end
 
@@ -496,10 +587,10 @@ defmodule Clementine.Rollout do
       # The kill policy already ran inside the batch await; the loop stops
       # here, before the next gather.
       {:cancelled, reason} ->
-        {:cancelled, reason}
+        conclude(exec, {:cancelled, reason})
 
       unwound when unwound in [:lost_lease, :drained] ->
-        unwound
+        conclude(exec, unwound)
     end
   end
 
@@ -543,7 +634,55 @@ defmodule Clementine.Rollout do
 
   defp fail(%Execution{} = exec, %Clementine.Error{} = error) do
     emit_event(exec, :error, %{error: error})
-    {:error, error}
+    conclude(exec, {:error, error})
+  end
+
+  # Every exit from the loop flows through here exactly once — at the site
+  # that creates the terminal value, never the frames it propagates through.
+  # Returned errors emit `:exception` (the legacy `:loop` reading, kept
+  # across the rename); everything else is a `:stop` whose status names the
+  # branch of the closed return set.
+  defp conclude(%Execution{} = exec, result) do
+    measurements = %{
+      duration: System.monotonic_time() - exec.started_at,
+      iterations: exec.iteration
+    }
+
+    case result do
+      {:error, %Clementine.Error{} = error} ->
+        :telemetry.execute(
+          [:clementine, :rollout, :exception],
+          measurements,
+          %{model: exec.model, kind: :error, reason: error}
+        )
+
+      _stopped ->
+        :telemetry.execute(
+          [:clementine, :rollout, :stop],
+          measurements,
+          %{model: exec.model, status: stop_status(result)}
+        )
+    end
+
+    result
+  end
+
+  defp stop_status({:ok, %Clementine.Result.Completed{}}), do: :success
+  defp stop_status({:suspend, _request}), do: :suspended
+  defp stop_status({:cancelled, _reason}), do: :cancelled
+  defp stop_status(:drained), do: :drained
+  defp stop_status(:lost_lease), do: :lost_lease
+
+  # A genuine raise concludes no exit value, so `conclude/2` never sees it:
+  # the span still terminates — `:exception` with the raise's kind and
+  # stacktrace, no iteration count — and the raise continues to the
+  # runner's rescue tier.
+  defp emit_rollout_raise(%Execution{} = exec, kind, reason, stacktrace) do
+    :telemetry.execute(
+      [:clementine, :rollout, :exception],
+      %{duration: System.monotonic_time() - exec.started_at},
+      %{model: exec.model, kind: kind, reason: reason, stacktrace: stacktrace}
+    )
   end
 
   defp emit_event(%Execution{emit: nil}, _type, _payload), do: :ok
