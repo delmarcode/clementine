@@ -77,6 +77,8 @@ defmodule Clementine.CheckpointTest do
     malformed = [
       Map.delete(encoded, "rollout_id"),
       %{encoded | "messages" => [%{"kind" => "who_knows"}]},
+      %{encoded | "messages" => "not-a-list"},
+      %{encoded | "usage" => "lots"},
       %{encoded | "pending" => %{"shape" => "quantum"}},
       %{encoded | "cursor" => "not-a-cursor"},
       %{"version" => "one"},

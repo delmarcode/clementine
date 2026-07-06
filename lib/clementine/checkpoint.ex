@@ -83,7 +83,10 @@ defmodule Clementine.Checkpoint do
 
     {:ok, checkpoint}
   rescue
-    e in [ArgumentError, KeyError] ->
+    # Deserialization boundary: any raise here means a malformed envelope,
+    # and decode's contract is a clean :incompatible_checkpoint, never a
+    # crash — a corrupt durable checkpoint must not take down the resumer.
+    e ->
       {:error, incompatible("malformed checkpoint: #{Exception.message(e)}", data)}
   end
 
