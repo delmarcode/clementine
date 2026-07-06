@@ -230,6 +230,9 @@ defmodule Clementine.Lifecycle.EctoAdapterTest do
     end
 
     test "subscribe_cancel/1 is exported exactly when pubsub is configured" do
+      Code.ensure_loaded!(PubsubLifecycle)
+      Code.ensure_loaded!(Lifecycle)
+
       assert function_exported?(PubsubLifecycle, :subscribe_cancel, 1)
       refute function_exported?(Lifecycle, :subscribe_cancel, 1)
     end
