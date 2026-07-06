@@ -210,24 +210,30 @@ defmodule Clementine do
     end
   end
 
+  # The tag pins event delivery to this enumerable: two streams consumed by
+  # the same process (Stream.zip, nested enumeration) must not cross-deliver
+  # or cross-flush each other's events. The result path is pinned by the
+  # task ref already; events need their own identity because the run ref is
+  # minted inside the task.
   defp start_stream(agent, prompt, opts) do
     owner = self()
+    tag = make_ref()
 
     task =
       Task.async(fn ->
-        {ref, ctx} = Ephemeral.create(forward_to: owner)
+        {ref, ctx} = Ephemeral.create(forward_to: {owner, tag})
         run = Run.new(ref: ref, rollout: build_rollout(agent, prompt, opts))
         execute_ephemeral(run, ctx, Events.Forwarder)
       end)
 
-    %{task: task, done: false}
+    %{task: task, tag: tag, done: false}
   end
 
   defp next_stream_event(%{done: true} = state), do: {:halt, state}
 
-  defp next_stream_event(%{task: %Task{ref: ref}} = state) do
+  defp next_stream_event(%{task: %Task{ref: ref}, tag: tag} = state) do
     receive do
-      {:clementine_stream_event, %Clementine.Event{} = event} ->
+      {:clementine_stream_event, ^tag, %Clementine.Event{} = event} ->
         {[event], state}
 
       {^ref, result} ->
@@ -240,14 +246,14 @@ defmodule Clementine do
     end
   end
 
-  defp cleanup_stream(%{task: task, done: done}) do
+  defp cleanup_stream(%{task: task, tag: tag, done: done}) do
     unless done, do: Task.shutdown(task, :brutal_kill)
-    flush_stream_events()
+    flush_stream_events(tag)
   end
 
-  defp flush_stream_events do
+  defp flush_stream_events(tag) do
     receive do
-      {:clementine_stream_event, _event} -> flush_stream_events()
+      {:clementine_stream_event, ^tag, _event} -> flush_stream_events(tag)
     after
       0 -> :ok
     end

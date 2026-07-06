@@ -42,6 +42,12 @@ defmodule Clementine.FacadeTest do
     ]
   end
 
+  defp streamed_text(events) do
+    events
+    |> Enum.filter(&(&1.type == :text_delta))
+    |> Enum.map_join(& &1.payload.content)
+  end
+
   describe "run/3" do
     test "one line to a completed result" do
       expect_stream(text_events("Hello!"))
@@ -150,7 +156,36 @@ defmodule Clementine.FacadeTest do
 
       assert [%Event{}] = Clementine.stream(agent(), "Hi") |> Enum.take(1)
 
-      refute_receive {:clementine_stream_event, _event}, 50
+      refute_receive {:clementine_stream_event, _tag, _event}, 50
+    end
+
+    test "concurrent streams in one process do not cross-deliver events" do
+      stub(Clementine.LLM.MockClient, :stream, fn _model, _system, messages, _tools, _opts ->
+        case List.last(messages) do
+          %UserMessage{content: "left"} -> text_events("Left")
+          %UserMessage{content: "right"} -> text_events("Right")
+        end
+      end)
+
+      {left_items, right_items} =
+        Clementine.stream(agent(), "left")
+        |> Stream.zip(Clementine.stream(agent(), "right"))
+        |> Enum.to_list()
+        |> Enum.unzip()
+
+      assert {:result, %Result.Completed{output: "Left"}} = List.last(left_items)
+      assert {:result, %Result.Completed{output: "Right"}} = List.last(right_items)
+
+      left_events = Enum.drop(left_items, -1)
+      right_events = Enum.drop(right_items, -1)
+
+      # Each enumerable yields only its own run's events, in its own order.
+      assert [left_run] = left_events |> Enum.map(& &1.run_ref) |> Enum.uniq()
+      assert [right_run] = right_events |> Enum.map(& &1.run_ref) |> Enum.uniq()
+      refute left_run == right_run
+
+      assert streamed_text(left_events) == "Left"
+      assert streamed_text(right_events) == "Right"
     end
   end
 end

@@ -23,13 +23,14 @@ defmodule Clementine.Lifecycle.Ephemeral do
 
   alias Clementine.Lifecycle.{Facts, Transition}
 
-  @type ctx :: %{key: {module(), reference()}, forward_to: pid() | nil}
+  @type ctx :: %{key: {module(), reference()}, forward_to: {pid(), reference()} | nil}
 
   @doc """
   Seeds a fresh queued run in this process and returns `{run_ref, ctx}`.
 
-  `:forward_to` names the pid `Clementine.Events.Forwarder` mails stamped
-  events to (the streaming facade); `nil` means no forwarding.
+  `:forward_to` names the `{pid, tag}` destination `Clementine.Events.Forwarder`
+  mails stamped events to (the streaming facade — the tag pins delivery to
+  one stream enumerable); `nil` means no forwarding.
   """
   @spec create(keyword()) :: {reference(), ctx()}
   def create(opts \\ []) do
