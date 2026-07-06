@@ -7,8 +7,15 @@ defmodule Clementine.RunView do
 
   The fold is pure and total: `apply/2` never raises on taxonomy events,
   whatever their payloads hold — the view is advisory, and a malformed
-  payload must never take an observer down. Ordering discipline:
+  payload must never take an observer down. Payload keys read as atoms or
+  strings interchangeably: the stamper mints atom keys, but a host's
+  durable-log tier may round-trip events through JSON, and a replayed
+  stream must fold to the same view. Ordering discipline:
 
+  - Events (and terminal facts) for another run are ignored: the view
+    owns one run's identity, and a shared topic must not be able to wedge
+    it — a stray higher-epoch event from a neighbor would otherwise
+    supersede every real event that follows.
   - Events at or below the cursor (`{epoch, seq}`) are dropped — that one
     rule covers duplicates, reconnect overlap, and within-epoch reordering
     (live transport is ordered per emitter; anything behind the cursor is
@@ -87,11 +94,15 @@ defmodule Clementine.RunView do
 
   @doc """
   Folds one execution event into the view. Pure; returns the view
-  unchanged for anything the ordering discipline rejects (stale epoch,
-  at-or-below-cursor seq, any event after closure).
+  unchanged for anything the ordering discipline rejects (another run's
+  event, stale epoch, at-or-below-cursor seq, any event after closure).
   """
   @spec apply(t(), Event.t()) :: t()
   def apply(%__MODULE__{closed?: true} = view, %Event{}), do: view
+
+  def apply(%__MODULE__{run_ref: ref} = view, %Event{run_ref: event_ref})
+      when ref != event_ref,
+      do: view
 
   def apply(%__MODULE__{} = view, %Event{} = event) do
     cond do
@@ -114,14 +125,19 @@ defmodule Clementine.RunView do
   @doc """
   Pins terminal facts — the transition notification arrived; the fold is
   over. Closing is idempotent (terminal facts are unique per run: exactly
-  one terminal writer, dead-end statuses), and non-terminal facts are a
-  contract violation, not a close.
+  one terminal writer, dead-end statuses), another run's facts are
+  ignored like another run's events, and non-terminal facts for *this*
+  run are a contract violation, not a close.
 
   The cursor keeps its last live position; `status` and `final` carry the
   lifecycle truth.
   """
   @spec close(t(), Facts.t()) :: t()
   def close(%__MODULE__{closed?: true} = view, %Facts{}), do: view
+
+  def close(%__MODULE__{run_ref: ref} = view, %Facts{ref: facts_ref})
+      when ref != facts_ref,
+      do: view
 
   def close(%__MODULE__{} = view, %Facts{} = facts) do
     if not Facts.terminal?(facts) do
@@ -149,14 +165,14 @@ defmodule Clementine.RunView do
   end
 
   defp fold(view, %Event{type: :iteration_start, payload: payload}) do
-    case Map.get(payload, :n) do
+    case payload_value(payload, :n) do
       n when is_integer(n) and n >= 0 -> %{view | iteration: n}
       _ -> view
     end
   end
 
   defp fold(view, %Event{type: :text_delta, payload: payload}) do
-    case Map.get(payload, :content) do
+    case payload_value(payload, :content) do
       content when is_binary(content) -> %{view | text: view.text <> content}
       _ -> view
     end
@@ -164,7 +180,7 @@ defmodule Clementine.RunView do
 
   defp fold(view, %Event{type: :tool_use_start, payload: payload}) do
     with_tool_use_id(view, payload, fn view, id ->
-      tool = %{name: Map.get(payload, :name), input: "", approval_requested?: false}
+      tool = %{name: payload_value(payload, :name), input: "", approval_requested?: false}
       %{view | tools: Map.put(view.tools, id, tool)}
     end)
   end
@@ -172,7 +188,7 @@ defmodule Clementine.RunView do
   defp fold(view, %Event{type: :tool_input_delta, payload: payload}) do
     with_tool_use_id(view, payload, fn view, id ->
       content =
-        case Map.get(payload, :content) do
+        case payload_value(payload, :content) do
           content when is_binary(content) -> content
           _ -> ""
         end
@@ -190,7 +206,7 @@ defmodule Clementine.RunView do
 
   defp fold(view, %Event{type: :approval_requested, payload: payload}) do
     with_tool_use_id(view, payload, fn view, id ->
-      tool = Map.get(view.tools, id, %{unknown_tool() | name: Map.get(payload, :name)})
+      tool = Map.get(view.tools, id, %{unknown_tool() | name: payload_value(payload, :name)})
       %{view | tools: Map.put(view.tools, id, %{tool | approval_requested?: true})}
     end)
   end
@@ -207,11 +223,20 @@ defmodule Clementine.RunView do
   # A tool event whose start was lost to transport still folds — gaps are
   # tolerated, so entries materialize on first sighting.
   defp with_tool_use_id(view, payload, fun) do
-    case Map.get(payload, :tool_use_id) do
+    case payload_value(payload, :tool_use_id) do
       nil -> view
       id -> fun.(view, id)
     end
   end
 
   defp unknown_tool, do: %{name: nil, input: "", approval_requested?: false}
+
+  # The stamper mints atom keys; a durable-log round trip through JSON
+  # strings them. A replayed stream must fold to the same view.
+  defp payload_value(payload, key) do
+    case payload do
+      %{^key => value} -> value
+      _ -> Map.get(payload, Atom.to_string(key))
+    end
+  end
 end

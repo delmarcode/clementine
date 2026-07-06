@@ -34,6 +34,12 @@ defmodule Clementine.RunViewPropertyTest do
         name: StreamData.string(:alphanumeric, max_length: 6),
         content: StreamData.string(:printable, max_length: 6)
       }),
+      # A durable-log round trip strings the keys; the fold must read both.
+      StreamData.fixed_map(%{"content" => StreamData.string(:printable, max_length: 6)}),
+      StreamData.fixed_map(%{
+        "tool_use_id" => StreamData.string(:alphanumeric, min_length: 1, max_length: 3),
+        "name" => StreamData.string(:alphanumeric, max_length: 6)
+      }),
       StreamData.fixed_map(%{n: StreamData.integer(-2..6)}),
       StreamData.fixed_map(%{
         input_tokens: StreamData.integer(-5..100),
@@ -119,6 +125,23 @@ defmodule Clementine.RunViewPropertyTest do
       for ghost <- ghosts ++ events do
         assert RunView.apply(closed, ghost) == closed
       end
+    end
+  end
+
+  property "run identity: another run's events and terminal facts never touch the view" do
+    check all(
+            events <- stream_gen(),
+            strays <- StreamData.list_of(event_gen(0..9), min_length: 1, max_length: 15),
+            stray_facts <- terminal_facts_gen()
+          ) do
+      view = fold(events)
+
+      for stray <- strays do
+        assert RunView.apply(view, %{stray | run_ref: "someone_else"}) == view
+      end
+
+      assert RunView.close(view, %{stray_facts | ref: "someone_else"}) == view
+      refute RunView.closed?(RunView.close(view, %{stray_facts | ref: "someone_else"}))
     end
   end
 

@@ -97,6 +97,26 @@ defmodule Clementine.RunViewTest do
       assert RunView.cursor(view) == {1, 3}
     end
 
+    test "a JSON round-tripped stream (string keys) folds to the same view" do
+      atom_keyed = [
+        event(1, 1, :iteration_start, %{n: 2}),
+        event(1, 2, :text_delta, %{content: "Hello"}),
+        event(1, 3, :tool_use_start, %{tool_use_id: "tu_1", name: "search"}),
+        event(1, 4, :tool_input_delta, %{tool_use_id: "tu_1", content: "{}"}),
+        event(1, 5, :approval_requested, %{tool_use_id: "tu_1", name: "search"}),
+        event(1, 6, :usage_delta, %{input_tokens: 7, output_tokens: 3})
+      ]
+
+      replayed =
+        Enum.map(atom_keyed, fn e ->
+          %{e | payload: Map.new(e.payload, fn {k, v} -> {Atom.to_string(k), v} end)}
+        end)
+
+      assert fold(replayed) == fold(atom_keyed)
+      assert fold(replayed).text == "Hello"
+      assert %{"tu_1" => %{approval_requested?: true}} = fold(replayed).tools
+    end
+
     test "malformed payloads are tolerated, never a crash — the view is advisory" do
       view =
         fold([
@@ -146,6 +166,25 @@ defmodule Clementine.RunViewTest do
       assert RunView.cursor(view) == {2, 1}
     end
 
+    test "another run's event is ignored — a shared topic cannot wedge the view" do
+      view = fold([event(1, 1, :text_delta, %{content: "mine"})])
+
+      stray = %Event{
+        run_ref: "run_2",
+        epoch: 9,
+        seq: 1,
+        type: :text_delta,
+        payload: %{content: "not mine"}
+      }
+
+      assert RunView.apply(view, stray) == view
+
+      # The neighbor's higher epoch must not have poisoned the cursor:
+      # this run's own stream still applies.
+      continued = RunView.apply(view, event(1, 2, :text_delta, %{content: "!"}))
+      assert continued.text == "mine!"
+    end
+
     test "a higher epoch resets execution-scoped state — the new execution owns the run" do
       view =
         fold([
@@ -186,6 +225,15 @@ defmodule Clementine.RunViewTest do
           RunView.close(view, %Facts{ref: "run_1", status: status, epoch: 1})
         end
       end
+    end
+
+    test "another run's terminal facts are ignored, not a close" do
+      view = fold([event(1, 1, :text_delta, %{content: "still live"})])
+
+      unchanged = RunView.close(view, %Facts{ref: "run_2", status: :completed, epoch: 1})
+
+      assert unchanged == view
+      refute RunView.closed?(unchanged)
     end
 
     test "closing is idempotent — terminal facts are unique per run" do
