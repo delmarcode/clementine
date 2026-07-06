@@ -36,6 +36,19 @@ defmodule Clementine.Lifecycle do
 
   `ctx` is an opaque host context threaded from runner options (commonly
   `nil`; useful for multi-repo or tenant routing).
+
+  ## The optional cancel push channel
+
+  Cooperative cancellation's guarantee is the runner's boundary poll —
+  worst case one iteration of latency. A lifecycle may additionally export
+  `subscribe_cancel/1`: the runner calls it once after claim, and the
+  lifecycle arranges for `{:clementine, :cancel, reason}` to reach the
+  subscribing process when a cooperative cancel is flagged. The rollout's
+  blocking points treat the message like the poll result, aborting the
+  in-flight provider stream — a mid-stream cancel becomes effectively
+  instant. Push is best-effort by design: a missed or failed delivery
+  costs latency, never correctness (the Ecto adapter implements it over
+  `Phoenix.PubSub` when configured with `pubsub:`).
   """
 
   alias Clementine.Lifecycle.{Facts, Transition}
@@ -45,4 +58,8 @@ defmodule Clementine.Lifecycle do
 
   @callback apply(Transition.t(), ctx :: term()) ::
               {:ok, Facts.t()} | {:error, :stale} | {:error, term()}
+
+  @callback subscribe_cancel(lease :: Clementine.Lease.t()) :: :ok | {:error, term()}
+
+  @optional_callbacks subscribe_cancel: 1
 end

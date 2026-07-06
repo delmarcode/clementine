@@ -55,6 +55,19 @@ defmodule Clementine.Test.Ecto.Lifecycle do
   end
 end
 
+defmodule Clementine.Test.Ecto.PubsubLifecycle do
+  @moduledoc """
+  The adapter with the cancel push channel configured — otherwise the
+  same repo and schema as `Clementine.Test.Ecto.Lifecycle`. Tests start
+  the `Clementine.Test.PubSub` server themselves.
+  """
+
+  use Clementine.Lifecycle.Ecto,
+    repo: Clementine.TestRepo,
+    schema: Clementine.Test.Ecto.Run,
+    pubsub: Clementine.Test.PubSub
+end
+
 defmodule Clementine.Test.Ecto.HandWrittenLifecycle do
   @moduledoc """
   The de-sugared two-function implementation from the RFC (§A Hand-Written

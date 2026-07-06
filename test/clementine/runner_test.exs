@@ -23,7 +23,7 @@ defmodule Clementine.RunnerTest do
   alias Clementine.Lifecycle.{Facts, Protocol}
   alias Clementine.LLM.Message.{Content, ToolResultMessage, UserMessage}
   alias Clementine.Test.{CollectingSink, FlakyLifecycle, MemoryLifecycle}
-  alias Clementine.Test.Tools.{Crash, Echo, Slow}
+  alias Clementine.Test.Tools.{Crash, Echo, SafePush, Slow, UnsafeSlow}
 
   setup :verify_on_exit!
 
@@ -50,6 +50,41 @@ defmodule Clementine.RunnerTest do
 
       {:ok, "flagged"}
     end
+  end
+
+  defmodule PushLifecycle do
+    @moduledoc false
+    # MemoryLifecycle storage plus the optional push channel; delivering a
+    # pending cancel at subscription time is the deterministic stand-in
+    # for a broadcast landing mid-run (subscribe_cancel runs in the runner
+    # process, so self() is the right mailbox).
+    @behaviour Clementine.Lifecycle
+
+    @impl true
+    defdelegate fetch(run_ref, ctx), to: MemoryLifecycle
+
+    @impl true
+    defdelegate apply(transition, ctx), to: MemoryLifecycle
+
+    @impl true
+    def subscribe_cancel(_lease) do
+      send(self(), {:clementine, :cancel, :pushed_stop})
+      :ok
+    end
+  end
+
+  defmodule RaisingPushLifecycle do
+    @moduledoc false
+    @behaviour Clementine.Lifecycle
+
+    @impl true
+    defdelegate fetch(run_ref, ctx), to: MemoryLifecycle
+
+    @impl true
+    defdelegate apply(transition, ctx), to: MemoryLifecycle
+
+    @impl true
+    def subscribe_cancel(_lease), do: raise("pubsub down")
   end
 
   defp agent(opts) do
@@ -219,6 +254,68 @@ defmodule Clementine.RunnerTest do
 
       # The stamper's accumulated approximation rides on runner-built results.
       assert usage == %Usage{input_tokens: 5, output_tokens: 2}
+    end
+  end
+
+  describe "failure matrix row 4 (push flavor)" do
+    test "matrix row 4: a pushed cancel aborts without waiting for the poll",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      # Zero stream expectations: the push lands before the first gather
+      # and Mox verifies no provider call ever happened — the latency is
+      # the signal's, not an iteration's.
+      assert {:finished, %Facts{status: :cancelled}} =
+               execute(build_run(ref), store, lifecycle: PushLifecycle)
+
+      assert [{^ref, %Result.Cancelled{reason: :pushed_stop}}] =
+               MemoryLifecycle.projections(store)
+    end
+
+    @tag capture_log: true
+    test "a failing subscription costs latency, never the run",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_stream(text_events("Fine"))
+
+      assert {:finished, %Facts{status: :completed}} =
+               execute(build_run(ref), store, lifecycle: RaisingPushLifecycle)
+    end
+  end
+
+  describe "failure matrix row 5" do
+    test "matrix row 5: cancel during an unsafe tool — safe siblings killed, unsafe runs out, finish(cancelled)",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      expect_stream([
+        {:tool_use_start, "tu_1", "safe_push"},
+        {:input_json_delta, "tu_1", "{}"},
+        {:content_block_stop, 0},
+        {:tool_use_start, "tu_2", "unsafe_slow"},
+        {:input_json_delta, "tu_2", Jason.encode!(%{"delay_ms" => 80})},
+        {:content_block_stop, 1},
+        {:message_delta, %{"stop_reason" => "tool_use"},
+         %{"input_tokens" => 5, "output_tokens" => 2}}
+      ])
+
+      run =
+        build_run(ref, [tools: [SafePush, UnsafeSlow]],
+          context: %{push_to: self(), notify: self()}
+        )
+
+      started = System.monotonic_time(:millisecond)
+
+      assert {:finished, %Facts{status: :cancelled}} = execute(run, store)
+
+      # The unsafe tool's external effect settled before the terminal wrote.
+      assert_received {:unsafe_done, 80}
+      # SafePush sleeps forever: finishing at all proves the kill; finishing
+      # fast proves nobody waited for a timeout.
+      assert System.monotonic_time(:millisecond) - started < 2_000
+
+      assert [{^ref, %Result.Cancelled{reason: :mid_batch_stop}}] =
+               MemoryLifecycle.projections(store)
     end
   end
 

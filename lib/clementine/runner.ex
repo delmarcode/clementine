@@ -25,13 +25,23 @@ defmodule Clementine.Runner do
   stopped only after the terminal or suspend write returns, so those writes
   retry transient storage errors under a live lease instead of racing the
   reaper.
+
+  Cooperative cancellation reaches the run two ways: the rollout's boundary
+  poll (the guarantee — worst-case latency is one iteration) and, when the
+  lifecycle exports `subscribe_cancel/1`, a push notification that aborts
+  the in-flight provider stream (≈ instant). The runner subscribes after
+  claim, best-effort: a failed subscription costs latency, never
+  correctness.
   """
+
+  require Logger
 
   alias Clementine.{
     ApprovalRequest,
     Error,
     Events,
     Heartbeat,
+    Lease,
     Result,
     Rollout,
     Run,
@@ -89,6 +99,7 @@ defmodule Clementine.Runner do
     rollout_execute = Keyword.get(opts, :rollout_execute, &Rollout.execute/2)
     stamper = Events.stamper(sink, lease)
     heartbeat = start_heartbeat(lease, stamper, Keyword.get(opts, :heartbeat, []))
+    subscribe_cancel(lease)
 
     rollout_result =
       try do
@@ -120,6 +131,32 @@ defmodule Clementine.Runner do
       Heartbeat.start_link(lease, Keyword.merge(opts, notify: self(), usage: stamper))
 
     pid
+  end
+
+  # The optional cancel push channel: delivery lands in this process's
+  # mailbox as {:clementine, :cancel, reason} and the rollout's blocking
+  # points honor it. Best-effort — the boundary poll is the guarantee, so
+  # a failed subscription is logged, never fatal.
+  defp subscribe_cancel(%Lease{lifecycle: lifecycle} = lease) do
+    if function_exported?(lifecycle, :subscribe_cancel, 1) do
+      try do
+        lease.lifecycle.subscribe_cancel(lease)
+      rescue
+        e ->
+          Logger.warning(
+            "#{inspect(lifecycle)}.subscribe_cancel/1 raised: #{Exception.message(e)} " <>
+              "(run: #{inspect(lease.run_ref)}); falling back to the boundary poll"
+          )
+      catch
+        kind, reason ->
+          Logger.warning(
+            "#{inspect(lifecycle)}.subscribe_cancel/1 #{kind}: #{inspect(reason)} " <>
+              "(run: #{inspect(lease.run_ref)}); falling back to the boundary poll"
+          )
+      end
+    end
+
+    :ok
   end
 
   # The rollout's closed return set, every branch — plus the defensive
