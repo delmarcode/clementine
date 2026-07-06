@@ -26,7 +26,7 @@ defmodule Clementine.AgentServer do
       {:ok, agent} = MyApp.CodingAgent.start_link()
 
       # Run a task
-      {:ok, result} = Clementine.run(agent, "Add a fibonacci function to lib/math.ex")
+      {:ok, result} = Clementine.AgentServer.run(agent, "Add a fibonacci function to lib/math.ex")
 
   ## Configuration
 
