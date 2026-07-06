@@ -1,9 +1,38 @@
+defmodule Clementine.Test.Ecto.ProjectionProbe do
+  @moduledoc """
+  Decodes the `Clementine.LifecycleCase` projection-probe convention from
+  a run row's `label`: `"raise"` raises on every projected result;
+  `"raise:<variant>"` raises exactly when the projected result is that
+  `Clementine.Result` variant. Any other label is inert.
+  """
+
+  alias Clementine.Result
+
+  def check!("raise", _result), do: raise("conformance projection probe")
+
+  def check!("raise:" <> variant, result) do
+    if variant == variant_of(result) do
+      raise("conformance projection probe: #{variant}")
+    end
+
+    :ok
+  end
+
+  def check!(_label, _result), do: :ok
+
+  defp variant_of(%Result.Completed{}), do: "completed"
+  defp variant_of(%Result.Failed{}), do: "failed"
+  defp variant_of(%Result.Cancelled{}), do: "cancelled"
+  defp variant_of(%Result.Interrupted{}), do: "interrupted"
+end
+
 defmodule Clementine.Test.Ecto.Lifecycle do
   @moduledoc """
   The adapter under test. `ctx` is the test pid: the projection and the
   notification hook report there, so tests assert both what committed and
   what observers were told. A row labeled `"boom"` makes the projection
-  raise — the atomicity probe.
+  raise — the atomicity probe — and `raise`/`raise:<variant>` labels carry
+  the `LifecycleCase` probe convention.
   """
 
   use Clementine.Lifecycle.Ecto,
@@ -13,6 +42,7 @@ defmodule Clementine.Test.Ecto.Lifecycle do
   @impl Clementine.Lifecycle.Ecto
   def project(result, row, ctx) do
     if row.label == "boom", do: raise("projection boom")
+    Clementine.Test.Ecto.ProjectionProbe.check!(row.label, result)
     if is_pid(ctx), do: send(ctx, {:projected, result, row})
     :ok
   end
@@ -83,13 +113,19 @@ defmodule Clementine.Test.Ecto.HandWrittenLifecycle do
   end
 
   # Every terminal transition carries a Result (finish, interrupt, direct
-  # cancel); project the variants you care about, ignore the rest.
-  defp project(%Transition{result: %Result.Completed{} = r}, run, ctx) do
-    if is_pid(ctx), do: send(ctx, {:hand_written_projected, r, run})
+  # cancel); project the variants you care about, ignore the rest. The
+  # label marker is the LifecycleCase probe convention.
+  defp project(%Transition{result: nil}, _run, _ctx), do: :ok
+
+  defp project(%Transition{result: result}, run, ctx) do
+    Clementine.Test.Ecto.ProjectionProbe.check!(run.label, result)
+
+    if is_pid(ctx) and match?(%Result.Completed{}, result) do
+      send(ctx, {:hand_written_projected, result, run})
+    end
+
     :ok
   end
-
-  defp project(_transition, _run, _ctx), do: :ok
 
   # Writes exactly the keys present in `set`; resolves symbolic :now and
   # {:now_plus, ms} against the database clock (fragment("now()")).
