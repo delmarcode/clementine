@@ -263,6 +263,27 @@ defmodule Clementine.Lifecycle.EctoAdapterTest do
     end
   end
 
+  describe "cancel push channel without a running pubsub" do
+    alias Clementine.Test.Ecto.PubsubLifecycle
+
+    # No Phoenix.PubSub started: the configured registry does not exist,
+    # so the post-commit broadcast raises internally. Best-effort means
+    # the committed transition must not notice.
+    @tag capture_log: true
+    test "a downed pubsub never fails a committed cancel flag" do
+      run = insert_run!()
+
+      {:ok, _lease} =
+        Protocol.claim(PubsubLifecycle, run.id, executor: "test:push", ctx: self())
+
+      assert {:ok, :flagged} =
+               Protocol.request_cancel(PubsubLifecycle, run.id, :user_stop, self())
+
+      {:ok, facts} = PubsubLifecycle.fetch(run.id, self())
+      assert facts.cancel.reason == :user_stop
+    end
+  end
+
   describe "finish" do
     test "commits the terminal atomically with the projection" do
       run = insert_run!()

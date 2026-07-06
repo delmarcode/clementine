@@ -384,8 +384,11 @@ if Code.ensure_loaded?(Ecto.Query) do
     # The library-side half of the cancel push channel: a committed
     # cooperative-cancel flag (the flavor whose set carries :cancel, not a
     # terminal status) broadcasts to whichever executor subscribed at
-    # claim. Post-commit and best-effort — the boundary poll guarantees
-    # delivery semantics, so a lost broadcast costs latency only.
+    # claim. Post-commit and best-effort exactly like notify/3 — a downed
+    # or misconfigured PubSub must not crash a committed transition or
+    # keep it from reaching after_transition/3; the boundary poll
+    # guarantees delivery semantics, so a lost broadcast costs latency
+    # only.
     defp push_cancel(%{pubsub: pubsub}, %Transition{
            op: :cancel_request,
            run_ref: run_ref,
@@ -393,6 +396,18 @@ if Code.ensure_loaded?(Ecto.Query) do
          })
          when not is_nil(pubsub) do
       pubsub_broadcast(pubsub, cancel_topic(run_ref), {:clementine, :cancel, reason})
+    rescue
+      e ->
+        Logger.error(
+          "cancel push broadcast raised: #{Exception.message(e)} " <>
+            "(pubsub: #{inspect(pubsub)}, run: #{inspect(run_ref)})"
+        )
+    catch
+      kind, reason ->
+        Logger.error(
+          "cancel push broadcast #{kind}: #{inspect(reason)} " <>
+            "(pubsub: #{inspect(pubsub)}, run: #{inspect(run_ref)})"
+        )
     end
 
     defp push_cancel(_config, _transition), do: :ok
