@@ -50,6 +50,15 @@ defmodule Clementine.LLM.ProviderStream do
 
       {^ref, {:error, reason}} ->
         {[{:error, reason}], {:halting, pid}}
+
+      # Runner-directed signals (lease lost, drain, cancel push) must be able
+      # to interrupt a blocked stream consumer; halting kills the request
+      # process, aborting the in-flight HTTP stream.
+      {:clementine, _} = signal ->
+        {[{:signal, signal}], {:halting, pid}}
+
+      {:clementine, _, _} = signal ->
+        {[{:signal, signal}], {:halting, pid}}
     after
       @receive_timeout ->
         {[{:error, :timeout}], {:halting, pid}}
