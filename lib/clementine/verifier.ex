@@ -28,11 +28,21 @@ defmodule Clementine.Verifier do
   Run them after a rollout completes, threading feedback into the next
   attempt — a judge loop in ordinary code:
 
-      {:ok, text, messages} = Clementine.Rollout.run(config, prompt)
+      def run_judged(agent, prompt, verifiers, context, attempts \\\\ 3) do
+        Enum.reduce_while(1..attempts, {prompt, []}, fn _, {input, history} ->
+          {:ok, %Clementine.Result.Completed{} = result} =
+            Clementine.run(agent, input, messages: history)
 
-      case Clementine.Verifier.run_all(verifiers, text, context) do
-        :ok -> {:ok, text, messages}
-        {:retry, feedback} -> Clementine.Rollout.continue(config, messages, feedback)
+          case Clementine.Verifier.run_all(verifiers, result, context) do
+            :ok ->
+              {:halt, {:ok, result}}
+
+            {:retry, feedback} ->
+              # Thread the full suffix: input + generated messages, so the
+              # retry sees everything the failed attempt produced.
+              {:cont, {feedback, history ++ [result.input_message | result.messages]}}
+          end
+        end)
       end
 
   """

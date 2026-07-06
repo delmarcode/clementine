@@ -184,7 +184,10 @@ defmodule Clementine do
   # runner outcomes are unreachable here by construction — a single-writer
   # claim cannot lose, in-memory writes cannot fail transiently, and no
   # in-scope rollout parks — so they fail loud instead of leaking a shape.
-  defp execute_ephemeral(run, ctx, sink) do
+  # Public for `Clementine.AgentServer`, the other ephemeral-path consumer;
+  # not host API.
+  @doc false
+  def execute_ephemeral(run, ctx, sink) do
     outcome =
       Runner.execute(run,
         lifecycle: Ephemeral,
@@ -270,7 +273,7 @@ defmodule Clementine do
 
       {:ok, task_id} = Clementine.run_async(agent, "Long running task")
       # ... do other things ...
-      {:ok, result} = Clementine.await(agent, task_id)
+      {:ok, %Clementine.Result.Completed{}} = Clementine.await(agent, task_id)
 
   """
   defdelegate run_async(agent, prompt), to: AgentServer
@@ -279,9 +282,9 @@ defmodule Clementine do
   Awaits the result of an async task.
 
   Blocks until the task completes or the timeout expires (default: 5000ms).
-  Returns the same `{:ok, text}` / `{:error, reason}` contract as
-  `Clementine.AgentServer.run/2`. The task is removed from state after
-  retrieval.
+  Returns the same `{:ok, %Clementine.Result.Completed{}}` /
+  `{:error, result_or_reason}` contract as `Clementine.AgentServer.run/2`.
+  The task is removed from state after retrieval.
 
   ## Example
 

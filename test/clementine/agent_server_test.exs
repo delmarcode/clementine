@@ -2,8 +2,9 @@ defmodule Clementine.AgentServerTest do
   # Need sync for Mox global mode
   use ExUnit.Case, async: false
   import Mox
-  alias Clementine.LLM.Message.Content
-  alias Clementine.LLM.Response
+
+  alias Clementine.{Error, Event, Result}
+  alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
 
   setup :set_mox_global
   setup :verify_on_exit!
@@ -20,6 +21,24 @@ defmodule Clementine.AgentServerTest do
   setup do
     # The TaskSupervisor is started by the application
     :ok
+  end
+
+  defp text_events(text) do
+    [
+      {:text_delta, text},
+      {:message_delta, %{"stop_reason" => "end_turn"},
+       %{"input_tokens" => 7, "output_tokens" => 3}}
+    ]
+  end
+
+  defp expect_stream(events, count \\ 1) do
+    expect(Clementine.LLM.MockClient, :stream, count, fn _model,
+                                                         _system,
+                                                         _messages,
+                                                         _tools,
+                                                         _opts ->
+      events
+    end)
   end
 
   describe "start_link/1" do
@@ -48,34 +67,19 @@ defmodule Clementine.AgentServerTest do
   end
 
   describe "run/2" do
-    test "executes prompt and returns result" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Hello from agent!")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
-      end)
+    test "executes prompt and returns a completed result" do
+      expect_stream(text_events("Hello from agent!"))
 
       {:ok, agent} = TestAgent.start_link()
 
-      assert {:ok, "Hello from agent!"} = Clementine.AgentServer.run(agent, "Hi")
+      assert {:ok, %Result.Completed{output: "Hello from agent!"}} =
+               Clementine.AgentServer.run(agent, "Hi")
 
       GenServer.stop(agent)
     end
 
     test "updates history after successful run" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Response 1")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
-      end)
+      expect_stream(text_events("Response 1"))
 
       {:ok, agent} = TestAgent.start_link()
 
@@ -84,70 +88,81 @@ defmodule Clementine.AgentServerTest do
 
       # user + assistant
       assert length(history) == 2
-      assert Enum.at(history, 0).role == :user
-      assert Enum.at(history, 1).role == :assistant
+      assert %UserMessage{} = Enum.at(history, 0)
+      assert %AssistantMessage{} = Enum.at(history, 1)
+
+      GenServer.stop(agent)
+    end
+
+    test "a failed turn returns the terminal result and leaves history alone" do
+      expect_stream([{:error, {:api_error, 500, "boom"}}])
+
+      {:ok, agent} = TestAgent.start_link()
+
+      assert {:error, %Result.Failed{error: %Error{code: :provider_unavailable}}} =
+               Clementine.AgentServer.run(agent, "Hi")
+
+      assert Clementine.AgentServer.get_history(agent) == []
 
       GenServer.stop(agent)
     end
   end
 
   describe "stream/2" do
-    test "emits real streaming events and updates history" do
-      Clementine.LLM.MockClient
-      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
-        [
-          {:message_start, %{"id" => "msg_1"}},
-          {:content_block_start, 0, :text},
-          {:text_delta, "Hello "},
-          {:text_delta, "stream!"},
-          {:content_block_stop, 0},
-          {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
-          {:message_stop}
-        ]
-      end)
+    test "emits stamped events ending with the result, and updates history" do
+      expect_stream([
+        {:message_start, %{"id" => "msg_1"}},
+        {:content_block_start, 0, :text},
+        {:text_delta, "Hello "},
+        {:text_delta, "stream!"},
+        {:content_block_stop, 0},
+        {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
+        {:message_stop}
+      ])
 
       {:ok, agent} = TestAgent.start_link()
 
-      events = Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
+      output = Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
 
-      assert {:text_delta, "Hello "} in events
-      assert {:text_delta, "stream!"} in events
-      assert List.last(events) == {:done, :success}
+      assert {:result, %Result.Completed{output: "Hello stream!"}} = List.last(output)
 
+      events = Enum.drop(output, -1)
+      assert Enum.all?(events, &match?(%Event{epoch: 1}, &1))
+      assert Enum.map(events, & &1.seq) == Enum.to_list(1..length(events))
+
+      text =
+        events
+        |> Enum.filter(&(&1.type == :text_delta))
+        |> Enum.map_join(& &1.payload.content)
+
+      assert text == "Hello stream!"
+
+      # The done element arrives after the server applied the fold.
       history = Clementine.AgentServer.get_history(agent)
       assert length(history) == 2
-      assert Enum.at(history, 0).role == :user
-      assert Enum.at(history, 1).role == :assistant
+      assert %UserMessage{} = Enum.at(history, 0)
+      assert %AssistantMessage{} = Enum.at(history, 1)
 
       GenServer.stop(agent)
     end
 
-    test "emits streaming errors once before done" do
-      error = %{"type" => "stream_parse_error", "message" => "bad stream"}
-
-      Clementine.LLM.MockClient
-      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
-        [
-          {:message_start, %{"id" => "msg_1"}},
-          {:text_delta, "partial"},
-          {:error, error}
-        ]
-      end)
+    test "a streaming error ends with a failed result and no history change" do
+      expect_stream([
+        {:message_start, %{"id" => "msg_1"}},
+        {:text_delta, "partial"},
+        {:error, {:api_error, 529, "overloaded"}}
+      ])
 
       {:ok, agent} = TestAgent.start_link()
 
-      events = Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
+      output = Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
 
-      assert events == [
-               {:loop_event, {:loop_start, "Hi"}},
-               {:loop_event, {:iteration_start, 1}},
-               {:loop_event, :llm_call_start},
-               {:text_delta, "partial"},
-               {:error, error},
-               {:loop_event, {:llm_call_end, {:error, error}}},
-               {:loop_event, {:loop_end, {:error, error}}},
-               {:done, :error}
-             ]
+      assert {:result, %Result.Failed{error: %Error{} = error}} = List.last(output)
+      assert error.retryable?
+
+      # The advisory error event precedes the terminal result.
+      types = output |> Enum.drop(-1) |> Enum.map(& &1.type)
+      assert types == [:iteration_start, :text_delta, :error]
 
       assert Clementine.AgentServer.get_history(agent) == []
 
@@ -155,27 +170,19 @@ defmodule Clementine.AgentServerTest do
     end
 
     test "returns busy error when another task is active" do
-      Clementine.LLM.MockClient
-      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+      stub(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(100)
-
-        {:ok,
-         %Response{
-           content: [Content.text("Async response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("Async response")
       end)
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Async task")
 
-      assert [
-               {:error, {:agent_busy, [^task_id]}},
-               {:done, :error}
-             ] = Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
+      assert [{:error, {:agent_busy, [^task_id]}}] =
+               Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
 
-      assert {:ok, "Async response"} = Clementine.AgentServer.await(agent, task_id)
+      assert {:ok, %Result.Completed{output: "Async response"}} =
+               Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -183,8 +190,7 @@ defmodule Clementine.AgentServerTest do
     test "emits an error and terminates when the agent exits before stream completion" do
       test_pid = self()
 
-      Clementine.LLM.MockClient
-      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         send(test_pid, :stream_started)
         Process.sleep(:infinity)
       end)
@@ -201,13 +207,11 @@ defmodule Clementine.AgentServerTest do
 
       events = Task.await(consumer, 1_000)
 
-      assert {:error, {:agent_down, :normal}} in events
-      assert List.last(events) == {:done, :error}
+      assert List.last(events) == {:error, {:agent_down, :normal}}
     end
 
     test "drains queued stream messages when consumer stops early" do
-      Clementine.LLM.MockClient
-      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+      expect_stream(
         [
           {:message_start, %{"id" => "msg_1"}},
           {:content_block_start, 0, :text}
@@ -218,11 +222,11 @@ defmodule Clementine.AgentServerTest do
             {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
             {:message_stop}
           ]
-      end)
+      )
 
       {:ok, agent} = TestAgent.start_link()
 
-      assert [_loop_start, _iteration_start, _llm_call_start, _message_start] =
+      assert [%Event{type: :iteration_start} | _] =
                Clementine.AgentServer.stream(agent, "Hi") |> Enum.take(4)
 
       Process.sleep(50)
@@ -234,17 +238,10 @@ defmodule Clementine.AgentServerTest do
     test "cancels stream task when consumer exits before cleanup" do
       test_pid = self()
 
-      Clementine.LLM.MockClient
-      |> expect(:stream, fn _model, _system, _messages, _tools, _opts ->
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         send(test_pid, :stream_started)
         Process.sleep(200)
-
-        [
-          {:message_start, %{"id" => "msg_1"}},
-          {:text_delta, "late"},
-          {:message_delta, %{"stop_reason" => "end_turn"}, %{}},
-          {:message_stop}
-        ]
+        text_events("late")
       end)
 
       {:ok, agent} = TestAgent.start_link()
@@ -256,7 +253,9 @@ defmodule Clementine.AgentServerTest do
           end
         end)
 
-      assert {:ok, task_id} = GenServer.call(agent, {:run_stream, "Hi", consumer}, :infinity)
+      assert {:ok, task_id, _agent_pid, _task_pid} =
+               GenServer.call(agent, {:run_stream, "Hi", consumer, make_ref()}, :infinity)
+
       assert_receive :stream_started
 
       send(consumer, :stop)
@@ -284,15 +283,7 @@ defmodule Clementine.AgentServerTest do
 
   describe "clear_history/1" do
     test "clears the conversation history" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
-      end)
+      expect_stream(text_events("Response"))
 
       {:ok, agent} = TestAgent.start_link()
 
@@ -306,23 +297,18 @@ defmodule Clementine.AgentServerTest do
     end
 
     test "rejects clearing history while an async run is active" do
-      Clementine.LLM.MockClient
-      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+      stub(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(100)
-
-        {:ok,
-         %Response{
-           content: [Content.text("Async response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("Async response")
       end)
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Async task")
 
       assert {:error, {:agent_busy, [^task_id]}} = Clementine.AgentServer.clear_history(agent)
-      assert {:ok, "Async response"} = Clementine.AgentServer.await(agent, task_id)
+
+      assert {:ok, %Result.Completed{output: "Async response"}} =
+               Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -330,16 +316,9 @@ defmodule Clementine.AgentServerTest do
 
   describe "run_async/2" do
     test "returns task_id immediately" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(10)
-
-        {:ok,
-         %Response{
-           content: [Content.text("Async response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("Async response")
       end)
 
       {:ok, agent} = TestAgent.start_link()
@@ -357,9 +336,8 @@ defmodule Clementine.AgentServerTest do
       GenServer.stop(agent)
     end
 
-    test "agent normalizes async LLM client exceptions" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+    test "an LLM client exception is rescued into a failed result, not a crash" do
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         raise "simulated LLM failure"
       end)
 
@@ -367,16 +345,16 @@ defmodule Clementine.AgentServerTest do
 
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "This will fail")
 
-      # Wait for the task to complete with a normalized error
+      # The exception is normalized into a Failed result, so the task
+      # completed — it did not crash.
       Process.sleep(100)
-
-      # Agent should still be alive
       assert Process.alive?(agent)
-
       assert {:ok, :completed} = Clementine.AgentServer.status(agent, task_id)
 
-      assert {:error, {:llm_exception, %{message: "simulated LLM failure"}}} =
+      assert {:error, %Result.Failed{error: %Error{code: :exception} = error}} =
                Clementine.AgentServer.await(agent, task_id)
+
+      assert error.message =~ "simulated LLM failure"
 
       GenServer.stop(agent)
     end
@@ -386,16 +364,9 @@ defmodule Clementine.AgentServerTest do
       # that the task is still :running when we check status. expect/2 fails
       # because GenServer.stop kills the agent before the 500ms sleep expires,
       # and the task (async_nolink, under TaskSupervisor) may never reach the mock.
-      Clementine.LLM.MockClient
-      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+      stub(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(500)
-
-        {:ok,
-         %Response{
-           content: [Content.text("Delayed response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("Delayed response")
       end)
 
       {:ok, agent} = TestAgent.start_link()
@@ -408,16 +379,9 @@ defmodule Clementine.AgentServerTest do
     end
 
     test "rejects a second async run while one is already running" do
-      Clementine.LLM.MockClient
-      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+      stub(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(100)
-
-        {:ok,
-         %Response{
-           content: [Content.text("First response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("First response")
       end)
 
       {:ok, agent} = TestAgent.start_link()
@@ -427,22 +391,16 @@ defmodule Clementine.AgentServerTest do
       assert {:error, {:agent_busy, [^task_id]}} =
                Clementine.AgentServer.run_async(agent, "Second async task")
 
-      assert {:ok, "First response"} = Clementine.AgentServer.await(agent, task_id)
+      assert {:ok, %Result.Completed{output: "First response"}} =
+               Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
 
     test "rejects a synchronous run while an async run is already running" do
-      Clementine.LLM.MockClient
-      |> stub(:call, fn _model, _system, _messages, _tools, _opts ->
+      stub(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(100)
-
-        {:ok,
-         %Response{
-           content: [Content.text("Async response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("Async response")
       end)
 
       {:ok, agent} = TestAgent.start_link()
@@ -452,7 +410,8 @@ defmodule Clementine.AgentServerTest do
       assert {:error, {:agent_busy, [^task_id]}} =
                Clementine.AgentServer.run(agent, "Sync task")
 
-      assert {:ok, "Async response"} = Clementine.AgentServer.await(agent, task_id)
+      assert {:ok, %Result.Completed{output: "Async response"}} =
+               Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -460,37 +419,23 @@ defmodule Clementine.AgentServerTest do
 
   describe "await/3" do
     test "blocks until async task completes and returns result" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(30)
-
-        {:ok,
-         %Response{
-           content: [Content.text("Awaited response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("Awaited response")
       end)
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Async message")
 
       # await blocks until the result is ready
-      assert {:ok, "Awaited response"} = Clementine.AgentServer.await(agent, task_id)
+      assert {:ok, %Result.Completed{output: "Awaited response"}} =
+               Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
 
     test "returns result immediately when task already completed" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Fast response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
-      end)
+      expect_stream(text_events("Fast response"))
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Quick task")
@@ -500,7 +445,8 @@ defmodule Clementine.AgentServerTest do
       assert {:ok, :completed} = Clementine.AgentServer.status(agent, task_id)
 
       # await returns the result and cleans up
-      assert {:ok, "Fast response"} = Clementine.AgentServer.await(agent, task_id)
+      assert {:ok, %Result.Completed{output: "Fast response"}} =
+               Clementine.AgentServer.await(agent, task_id)
 
       # Task entry is consumed — status and await both return :not_found
       assert {:error, :not_found} = Clementine.AgentServer.status(agent, task_id)
@@ -509,17 +455,18 @@ defmodule Clementine.AgentServerTest do
       GenServer.stop(agent)
     end
 
-    test "returns normalized error when async LLM client raises" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+    test "returns a failed result when the async LLM client raises" do
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         raise "boom"
       end)
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Fail task")
 
-      assert {:error, {:llm_exception, %{message: "boom"}}} =
+      assert {:error, %Result.Failed{error: %Error{code: :exception} = error}} =
                Clementine.AgentServer.await(agent, task_id)
+
+      assert error.message =~ "boom"
 
       # Agent still alive
       assert Process.alive?(agent)
@@ -528,16 +475,9 @@ defmodule Clementine.AgentServerTest do
     end
 
     test "returns {:error, :timeout} when task takes too long" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(5_000)
-
-        {:ok,
-         %Response{
-           content: [Content.text("Too slow")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("Too slow")
       end)
 
       {:ok, agent} = TestAgent.start_link()
@@ -560,37 +500,30 @@ defmodule Clementine.AgentServerTest do
     end
 
     test "await with :infinity timeout blocks until completion" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
         Process.sleep(50)
-
-        {:ok,
-         %Response{
-           content: [Content.text("Infinite patience")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+        text_events("Infinite patience")
       end)
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Wait forever")
 
-      assert {:ok, "Infinite patience"} = Clementine.AgentServer.await(agent, task_id, :infinity)
+      assert {:ok, %Result.Completed{output: "Infinite patience"}} =
+               Clementine.AgentServer.await(agent, task_id, :infinity)
 
       GenServer.stop(agent)
     end
 
-    test "completed status reflects Rollout.run error results" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:error, :max_iterations_exceeded}
-      end)
+    test "completed status covers turns whose result is a non-completed terminal" do
+      expect_stream([{:error, {:api_error, 500, "boom"}}])
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Will error")
 
-      # Rollout.run returned {:error, ...} but the function completed normally
-      assert {:error, :max_iterations_exceeded} = Clementine.AgentServer.await(agent, task_id)
+      # The turn produced {:error, %Failed{}} but the task function
+      # returned normally.
+      assert {:error, %Result.Failed{error: %Error{code: :provider_unavailable}}} =
+               Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -598,15 +531,7 @@ defmodule Clementine.AgentServerTest do
 
   describe "task cleanup" do
     test "sweeps unawaited terminal tasks after TTL expires" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Forgotten result")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
-      end)
+      expect_stream(text_events("Forgotten result"))
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Fire and forget")
@@ -640,15 +565,7 @@ defmodule Clementine.AgentServerTest do
     end
 
     test "does not sweep tasks within TTL" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Recent result")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
-      end)
+      expect_stream(text_events("Recent result"))
 
       {:ok, agent} = TestAgent.start_link()
       {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Recent task")
@@ -677,15 +594,7 @@ defmodule Clementine.AgentServerTest do
 
   describe "fork/3" do
     test "forked agent preserves conversation history from source" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Source response")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
-      end)
+      expect_stream(text_events("Source response"))
 
       {:ok, source} = TestAgent.start_link()
       {:ok, _} = Clementine.AgentServer.run(source, "Hello source")
@@ -717,14 +626,8 @@ defmodule Clementine.AgentServerTest do
     end
 
     test "forked agent can continue conversation using copied history" do
-      Clementine.LLM.MockClient
-      |> expect(:call, 2, fn _model, _system, messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Response #{length(messages)}")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
+      expect(Clementine.LLM.MockClient, :stream, 2, fn _model, _system, messages, _tools, _opts ->
+        text_events("Response #{length(messages)}")
       end)
 
       {:ok, source} = TestAgent.start_link()
@@ -734,7 +637,7 @@ defmodule Clementine.AgentServerTest do
       {:ok, result} = Clementine.AgentServer.run(forked, "Second message")
 
       # The forked agent received 2 prior messages (from source) + 1 new user message = 3
-      assert result == "Response 3"
+      assert result.output == "Response 3"
 
       forked_history = Clementine.AgentServer.get_history(forked)
       # 2 from source + 2 from the new run = 4
@@ -783,7 +686,7 @@ defmodule Clementine.AgentServerTest do
   end
 
   describe "history validation" do
-    alias Clementine.LLM.Message.{AssistantMessage, Content, UserMessage}
+    alias Clementine.LLM.Message.Content
 
     test "accepts valid message structs in :history" do
       history = [
@@ -831,8 +734,8 @@ defmodule Clementine.AgentServerTest do
     {:messages, messages} = Process.info(self(), :messages)
 
     refute Enum.any?(messages, fn
-             {:clementine_stream_event, _task_id, _event} -> true
-             {:clementine_stream_done, _task_id, _result} -> true
+             {:clementine_stream_event, _tag, _event} -> true
+             {:clementine_stream_done, _tag, _result} -> true
              _message -> false
            end)
   end

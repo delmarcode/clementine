@@ -5,7 +5,7 @@ defmodule Clementine.RolloutExecuteTest do
 
   alias Clementine.{Checkpoint, Error, Event, Lease, Pending, Result, Rollout, Usage}
   alias Clementine.Events.Stamper
-  alias Clementine.LLM.Message.UserMessage
+  alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
   alias Clementine.Test.CollectingSink
   alias Clementine.Test.Tools.Echo
 
@@ -81,6 +81,14 @@ defmodule Clementine.RolloutExecuteTest do
     end
   end
 
+  defp count_received(message, acc \\ 0) do
+    receive do
+      ^message -> count_received(message, acc + 1)
+    after
+      0 -> acc
+    end
+  end
+
   describe "completed" do
     test "separates generated messages from history and input" do
       history = [UserMessage.new("before"), UserMessage.new("context")]
@@ -95,6 +103,18 @@ defmodule Clementine.RolloutExecuteTest do
       assert [%{content: _}] = result.messages
       assert result.usage == %Usage{input_tokens: 7, output_tokens: 3}
     end
+
+    test "a tool loop's generated messages ride in the result" do
+      expect_stream(tool_events("tu_1", "echo", %{"message" => "test"}))
+      expect_stream(text_events("Done!"))
+
+      assert {:ok, %Result.Completed{} = result} = Rollout.execute(rollout(tools: [Echo]))
+
+      assert result.output == "Done!"
+      # assistant (tool use), tool results, assistant (final) — the input
+      # rides separately in input_message.
+      assert [%AssistantMessage{}, %ToolResultMessage{}, %AssistantMessage{}] = result.messages
+    end
   end
 
   describe "limits" do
@@ -103,6 +123,19 @@ defmodule Clementine.RolloutExecuteTest do
 
       assert {:error, %Error{kind: :rollout, code: :max_iterations, retryable?: false}} =
                Rollout.execute(rollout(tools: [Echo], limits: [max_iterations: 1]))
+    end
+
+    test "the engine default caps iterations at 10 when no limit is set" do
+      test = self()
+
+      stub(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        send(test, :gather)
+        tool_events("tu_1", "echo", %{"message" => "loop"})
+      end)
+
+      assert {:error, %Error{code: :max_iterations}} = Rollout.execute(rollout(tools: [Echo]))
+
+      assert count_received(:gather) == 10
     end
 
     test "an expired deadline fails at the boundary before any provider call" do

@@ -23,8 +23,8 @@ defmodule Clementine.CoreSpecsTest do
     end
   end
 
-  describe "Rollout.new/1 and to_config/1" do
-    test "builds a spec and lowers it to engine config" do
+  describe "Rollout.new/1 and limits/1" do
+    test "builds an inert spec" do
       agent =
         Agent.new(
           model: :claude_sonnet,
@@ -41,28 +41,26 @@ defmodule Clementine.CoreSpecsTest do
           context: %{workspace_id: 7}
         )
 
-      config = Rollout.to_config(rollout)
-
-      assert config[:model] == :claude_sonnet
-      assert config[:system] == "sys"
-      assert config[:tools] == [ToolA]
-      assert config[:messages] == [:prior]
-      assert config[:context] == %{workspace_id: 7}
-      assert config[:max_iterations] == 5
+      assert %Rollout{agent: ^agent, input: "do the thing", messages: [:prior]} = rollout
+      assert rollout.context == %{workspace_id: 7}
     end
 
-    test "rollout limits win over agent defaults" do
-      agent = Agent.new(model: :claude_sonnet, defaults: [max_iterations: 5])
+    test "rollout limits win over agent defaults, unset keys fall through" do
+      agent =
+        Agent.new(model: :claude_sonnet, defaults: [max_iterations: 5, max_duration: 60_000])
+
       rollout = Rollout.new(agent: agent, input: "x", limits: [max_iterations: 2])
+      limits = Rollout.limits(rollout)
 
-      assert Rollout.to_config(rollout)[:max_iterations] == 2
+      assert Keyword.get(limits, :max_iterations) == 2
+      assert Keyword.get(limits, :max_duration) == 60_000
     end
 
-    test "max_iterations falls back to the engine default" do
+    test "limits are empty when neither agent nor rollout set any" do
       agent = Agent.new(model: :claude_sonnet)
       rollout = Rollout.new(agent: agent, input: "x")
 
-      assert Rollout.to_config(rollout)[:max_iterations] == 10
+      assert Rollout.limits(rollout) == []
     end
 
     test "agent and input are required" do

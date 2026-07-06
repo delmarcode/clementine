@@ -155,64 +155,56 @@ end
 
 ### Streaming
 
-Stream responses token-by-token as they arrive from the LLM:
+Stream a run's execution events as they happen. `Clementine.stream/3` takes an
+agent value and returns a lazy enumerable of `(epoch, seq)`-stamped
+`Clementine.Event` structs, ending with `{:result, result}` carrying the
+terminal `Clementine.Result`:
 
 ```elixir
-Clementine.stream(agent, "Explain this code")
-|> Stream.each(fn
-  {:text_delta, text} -> IO.write(text)
-  {:tool_use_start, _id, name} -> IO.write("\n[calling #{name}...] ")
-  {:tool_result, _id, _result} -> IO.puts("[done]")
-  {:done, :success} -> IO.puts("\n")
-  {:error, reason} -> IO.puts("\nstream failed: #{inspect(reason)}")
-  _ -> :ok
-end)
-|> Stream.run()
-```
-
-For lower-level control without an agent process, use `Clementine.Loop.run_stream/3`:
-
-```elixir
-Clementine.Loop.run_stream(
-  [
+agent =
+  Clementine.Agent.new(
     model: :claude_sonnet,
-    system: "You have tools. Use them when asked. Be brief.",
+    instructions: "You have tools. Use them when asked. Be brief.",
     tools: [Clementine.Tools.ListDir]
-  ],
-  "What files are in the current directory?",
-  fn
-    {:text_delta, text} -> IO.write(text)
-    {:tool_use_start, _id, name} -> IO.write("\n[calling #{name}...] ")
-    {:tool_result, _id, {:ok, %{content: result, is_error: false}}} ->
-      IO.puts("[got #{String.length(result)} chars]")
+  )
 
-    {:tool_result, _id, {:ok, %{content: result, is_error: true}}} ->
-      IO.puts("[tool error: #{result}]")
+Clementine.stream(agent, "What files are in the current directory?")
+|> Enum.each(fn
+  %Clementine.Event{type: :text_delta, payload: %{content: text}} ->
+    IO.write(text)
 
-    {:tool_result, _id, {:error, err}} -> IO.puts("[error: #{err}]")
-    _ -> :ok
-  end
-)
+  %Clementine.Event{type: :tool_use_start, payload: %{name: name}} ->
+    IO.write("\n[calling #{name}...] ")
+
+  %Clementine.Event{type: :tool_result, payload: %{is_error: is_error}} ->
+    IO.puts(if is_error, do: "[tool error]", else: "[done]")
+
+  {:result, %Clementine.Result.Completed{}} ->
+    IO.puts("")
+
+  {:result, %Clementine.Result.Failed{error: error}} ->
+    IO.puts("\nrun failed: #{error.message}")
+
+  _ ->
+    :ok
+end)
 ```
 
-`run_stream/3` returns `{:ok, text, messages}` on success or `{:error, reason}` if the stream errors.
-Partial text deltas may be emitted before an error occurs, so UIs should handle both streamed text and a terminal error.
+The stream is caller-owned: consuming it runs the rollout, and abandoning it
+aborts the run. Event types are the closed taxonomy in `Clementine.Event`
+(`iteration_start`, `text_delta`, `tool_use_start`, `tool_input_delta`,
+`tool_result`, `approval_requested`, `usage_delta`, `error`). Advisory deltas —
+including `error` events — may precede the terminal `{:result, _}` element;
+the result is truth.
+
+`Clementine.AgentServer.stream/2` yields the same vocabulary for interactive
+agent processes and folds a completed turn into the agent's history.
 
 For production hosts that need conversations to survive deploys, pod exits, or
-client reconnects, treat Clementine as the loop executor and keep durable run
-state in the host application. See
+client reconnects, keep durable run state in the host application and drive the
+runner from a host-owned worker. See
+[`docs/DURABLE_EXECUTION_RFC.md`](docs/DURABLE_EXECUTION_RFC.md) and
 [`docs/DURABLE_HOST_HARNESSES.md`](docs/DURABLE_HOST_HARNESSES.md).
-
-The callback receives events as they happen:
-
-| Event | Description |
-|-------|-------------|
-| `{:text_delta, text}` | A chunk of text from the model |
-| `{:tool_use_start, id, name}` | Model is calling a tool |
-| `{:input_json_delta, id, json}` | Tool input JSON chunk (includes tool use ID) |
-| `{:tool_result, id, result}` | Tool finished executing |
-| `{:error, reason}` | Streaming error from the LLM |
-| `{:loop_event, event}` | Internal loop events |
 
 #### Streaming in Phoenix LiveView
 
@@ -222,19 +214,23 @@ defmodule MyAppWeb.ChatLive do
 
   def handle_event("submit", %{"prompt" => prompt}, socket) do
     pid = self()
+    agent = MyApp.Agents.assistant()   # a %Clementine.Agent{} value
 
     Task.start(fn ->
-      Clementine.Loop.run_stream(
-        [model: :claude_sonnet, tools: [Clementine.Tools.Bash]],
-        prompt,
-        fn
-          {:text_delta, text} -> send(pid, {:stream, text})
-          {:tool_use_start, _, name} -> send(pid, {:tool, name})
-          {:error, reason} -> send(pid, {:error, reason})
-          _ -> :ok
-        end
-      )
-      send(pid, :done)
+      Clementine.stream(agent, prompt)
+      |> Enum.each(fn
+        %Clementine.Event{type: :text_delta, payload: %{content: text}} ->
+          send(pid, {:stream, text})
+
+        %Clementine.Event{type: :tool_use_start, payload: %{name: name}} ->
+          send(pid, {:tool, name})
+
+        {:result, result} ->
+          send(pid, {:done, result})
+
+        _ ->
+          :ok
+      end)
     end)
 
     {:noreply, assign(socket, :streaming, true)}
@@ -248,12 +244,12 @@ defmodule MyAppWeb.ChatLive do
     {:noreply, assign(socket, :current_tool, name)}
   end
 
-  def handle_info(:done, socket) do
+  def handle_info({:done, %Clementine.Result.Completed{}}, socket) do
     {:noreply, assign(socket, :streaming, false)}
   end
 
-  def handle_info({:error, reason}, socket) do
-    {:noreply, assign(socket, :streaming, false) |> assign(:error, inspect(reason))}
+  def handle_info({:done, result}, socket) do
+    {:noreply, assign(socket, :streaming, false) |> assign(:error, inspect(result))}
   end
 end
 ```
@@ -323,7 +319,8 @@ config :clementine, :models,
 You can also bypass aliases and pass provider model IDs directly:
 
 ```elixir
-{:ok, result} = Clementine.Loop.run([model: {:openai, "gpt-5"}, tools: []], "Hi")
+agent = Clementine.Agent.new(model: {:openai, "gpt-5"})
+{:ok, result} = Clementine.run(agent, "Hi")
 ```
 
 ## Why Clementine?
