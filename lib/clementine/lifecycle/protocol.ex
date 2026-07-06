@@ -473,21 +473,30 @@ defmodule Clementine.Lifecycle.Protocol do
   the projection fires for reaped runs exactly as for finished ones (usage
   is the heartbeat-piggybacked approximation). A concurrent live finish
   wins the CAS and that is correct — exactly one terminal writer per run.
+
+  Terminal facts are refused outright: the exact-pair CAS would happily
+  match a stale-fetched terminal snapshot and rewrite a dead-end status,
+  firing a second projection. Dead-end enforcement is this module's job,
+  not the caller's pre-filtering.
   """
   @spec interrupt(module(), Facts.t(), InterruptReason.t(), term()) ::
-          {:ok, Facts.t()} | {:error, :stale} | {:error, term()}
+          {:ok, Facts.t()} | {:error, :already_terminal | :stale} | {:error, term()}
   def interrupt(lifecycle, %Facts{} = facts, %InterruptReason{} = reason, ctx \\ nil) do
-    result = Result.interrupted(reason, facts.usage || %Usage{})
+    if Facts.terminal?(facts) do
+      {:error, :already_terminal}
+    else
+      result = Result.interrupted(reason, facts.usage || %Usage{})
 
-    transition = %Transition{
-      op: :interrupt,
-      run_ref: facts.ref,
-      expect: expect(facts),
-      set: %{status: :interrupted, interrupt: reason, finished_at: :now},
-      result: result
-    }
+      transition = %Transition{
+        op: :interrupt,
+        run_ref: facts.ref,
+        expect: expect(facts),
+        set: %{status: :interrupted, interrupt: reason, finished_at: :now},
+        result: result
+      }
 
-    apply_with_retry(lifecycle, transition, ctx)
+      apply_with_retry(lifecycle, transition, ctx)
+    end
   end
 
   ## Requeue
@@ -519,12 +528,21 @@ defmodule Clementine.Lifecycle.Protocol do
   @doc """
   Reaper flavor of `requeue/2`: fired on the same stale-heartbeat evidence
   as an interrupt, when policy opts in, guarded by the exact observed
-  facts.
+  facts. Only `running` runs are requeueable — anything else (including a
+  stale-fetched terminal snapshot) is refused with a clean error, for the
+  same reason `interrupt/4` refuses terminal facts.
   """
   @spec requeue(module(), Facts.t(), term(), term()) ::
-          {:ok, Facts.t()} | {:error, :effects_present | :stale | term()}
+          {:ok, Facts.t()}
+          | {:error, :effects_present | {:not_requeueable, Facts.status()} | :stale | term()}
+  def requeue(lifecycle, facts, reason, ctx \\ nil)
+
   def requeue(lifecycle, %Facts{status: :running} = facts, reason, ctx) do
     do_requeue(lifecycle, facts, reason, ctx)
+  end
+
+  def requeue(_lifecycle, %Facts{} = facts, _reason, _ctx) do
+    {:error, {:not_requeueable, facts.status}}
   end
 
   defp do_requeue(_lifecycle, %Facts{effects?: true}, _reason, _ctx) do

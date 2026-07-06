@@ -121,12 +121,13 @@ defmodule Clementine.Lifecycle.ProtocolPropertyTest do
     Protocol.finish(lease, Result.interrupted(:drain))
   end
 
+  # Deliberately unfiltered: the protocol, not the caller, must refuse
+  # wrong-state interrupts — a pre-filter here once masked exactly that
+  # hole (PR #33 review).
   defp execute(:interrupt, store, _lease) do
     case MemoryLifecycle.fetch("run", store) do
       {:ok, %Facts{} = facts} ->
-        if Facts.active?(facts) do
-          Protocol.interrupt(MemoryLifecycle, facts, InterruptReason.new(:lease_expired), store)
-        end
+        Protocol.interrupt(MemoryLifecycle, facts, InterruptReason.new(:lease_expired), store)
 
       _ ->
         :ok
@@ -135,7 +136,7 @@ defmodule Clementine.Lifecycle.ProtocolPropertyTest do
 
   defp execute(:requeue_reaper, store, _lease) do
     case MemoryLifecycle.fetch("run", store) do
-      {:ok, %Facts{status: :running} = facts} ->
+      {:ok, %Facts{} = facts} ->
         Protocol.requeue(MemoryLifecycle, facts, :lease_expired, store)
 
       _ ->

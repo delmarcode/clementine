@@ -410,6 +410,28 @@ defmodule Clementine.Lifecycle.ProtocolTest do
 
       assert [{"r1", %Result.Completed{}}] = MemoryLifecycle.projections(store)
     end
+
+    test "refuses terminal facts outright — dead-end enforcement is the protocol's job",
+         %{store: store} do
+      MemoryLifecycle.seed_queued(store, "r1")
+      lease = claim!(store, "r1")
+      {:ok, _} = Protocol.finish(lease, Result.completed())
+
+      # Fetched AFTER the terminal commit: the exact-pair CAS would match
+      # this snapshot, so the protocol itself must refuse it.
+      {:ok, terminal_facts} = MemoryLifecycle.fetch("r1", store)
+
+      assert {:error, :already_terminal} =
+               Protocol.interrupt(
+                 MemoryLifecycle,
+                 terminal_facts,
+                 InterruptReason.new(:lease_expired),
+                 store
+               )
+
+      assert MemoryLifecycle.facts!(store, "r1").status == :completed
+      assert [{"r1", %Result.Completed{}}] = MemoryLifecycle.projections(store)
+    end
   end
 
   describe "requeue" do
@@ -440,6 +462,18 @@ defmodule Clementine.Lifecycle.ProtocolTest do
                Protocol.requeue(MemoryLifecycle, observed, :lease_expired, store)
 
       assert {:error, :effects_present} = Protocol.requeue(lease, :drain)
+    end
+
+    test "refuses non-running facts with a clean error", %{store: store} do
+      MemoryLifecycle.seed_queued(store, "r1")
+      lease = claim!(store, "r1")
+      {:ok, _} = Protocol.finish(lease, Result.completed())
+      {:ok, terminal_facts} = MemoryLifecycle.fetch("r1", store)
+
+      assert {:error, {:not_requeueable, :completed}} =
+               Protocol.requeue(MemoryLifecycle, terminal_facts, :lease_expired, store)
+
+      assert MemoryLifecycle.facts!(store, "r1").status == :completed
     end
 
     test "drain flavor requeues via the lease; a zombie is fenced the moment it commits",
