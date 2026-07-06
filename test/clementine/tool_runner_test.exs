@@ -315,6 +315,141 @@ defmodule Clementine.ToolRunnerTest do
     end
   end
 
+  describe "run_batch/4" do
+    alias Clementine.Test.Tools.{SafePush, UnsafeSlow}
+
+    @batch_tools @tools ++ [SafePush, UnsafeSlow]
+
+    test "with no signal, matches execute/4: parallel, ordered, crash-isolated" do
+      calls = [
+        %{id: "call_1", name: "echo", input: %{"message" => "first"}},
+        %{id: "call_2", name: "crash", input: %{}},
+        %{id: "call_3", name: "echo", input: %{"message" => "third"}}
+      ]
+
+      assert {:ok, results} = ToolRunner.run_batch(@batch_tools, calls, %{})
+      assert Enum.map(results, fn {id, _} -> id end) == ["call_1", "call_2", "call_3"]
+
+      result_map = Map.new(results)
+      assert {:ok, %ToolResult{content: "Echo: first", is_error: false}} = result_map["call_1"]
+      assert {:error, _} = result_map["call_2"]
+      assert {:ok, %ToolResult{content: "Echo: third", is_error: false}} = result_map["call_3"]
+    end
+
+    test "a tool exceeding the timeout settles as a timeout error, batch unharmed" do
+      calls = [
+        %{id: "call_1", name: "slow", input: %{"delay_ms" => 5_000}},
+        %{id: "call_2", name: "echo", input: %{"message" => "hello"}}
+      ]
+
+      assert {:ok, results} = ToolRunner.run_batch(@batch_tools, calls, %{}, timeout: 100)
+
+      result_map = Map.new(results)
+      assert {:error, message} = result_map["call_1"]
+      assert message =~ "timed out after 100ms"
+      assert {:ok, %ToolResult{content: "Echo: hello"}} = result_map["call_2"]
+    end
+
+    test "timeout telemetry matches execute/4's shape" do
+      handler_id = "run-batch-timeout-#{System.unique_integer([:positive])}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:clementine, :tool, :exception],
+        fn _event, measurements, metadata, _config ->
+          send(parent, {:tool_exception, measurements, metadata})
+        end,
+        %{}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      calls = [%{id: "call_1", name: "slow", input: %{"delay_ms" => 5_000}}]
+      assert {:ok, _} = ToolRunner.run_batch(@batch_tools, calls, %{}, timeout: 50)
+
+      expected_duration = System.convert_time_unit(50, :millisecond, :native)
+
+      assert_receive {:tool_exception, %{duration: ^expected_duration},
+                      %{tool_call_id: "call_1", reason: :timeout}}
+    end
+
+    test "a cancel push kills safe tools at once and lets unsafe ones run out" do
+      calls = [
+        %{id: "call_1", name: "safe_push", input: %{}},
+        %{id: "call_2", name: "unsafe_slow", input: %{"delay_ms" => 80}}
+      ]
+
+      started = System.monotonic_time(:millisecond)
+
+      assert {:cancelled, :mid_batch_stop} =
+               ToolRunner.run_batch(@batch_tools, calls, %{push_to: self(), notify: self()})
+
+      # The unsafe tool ran to completion — its effect settled coherently.
+      assert_received {:unsafe_done, 80}
+      # The safe tool sleeps forever; returning at all proves the kill.
+      assert System.monotonic_time(:millisecond) - started < 2_000
+    end
+
+    test "a cancel over an all-safe batch returns as soon as the kills land" do
+      calls = [%{id: "call_1", name: "safe_push", input: %{}}]
+
+      started = System.monotonic_time(:millisecond)
+
+      assert {:cancelled, :mid_batch_stop} =
+               ToolRunner.run_batch(@batch_tools, calls, %{push_to: self()})
+
+      assert System.monotonic_time(:millisecond) - started < 2_000
+    end
+
+    test "the first cancel reason wins when pushes stack" do
+      send(self(), {:clementine, :cancel, :first})
+      send(self(), {:clementine, :cancel, :second})
+
+      calls = [%{id: "call_1", name: "echo", input: %{"message" => "hi"}}]
+
+      assert {:cancelled, :first} = ToolRunner.run_batch(@batch_tools, calls, %{})
+    end
+
+    test "a drain kills the whole batch immediately, safe and unsafe alike" do
+      runner = self()
+
+      spawn(fn ->
+        Process.sleep(30)
+        send(runner, {:clementine, :drain})
+      end)
+
+      calls = [
+        %{id: "call_1", name: "unsafe_slow", input: %{"delay_ms" => 5_000}},
+        %{id: "call_2", name: "slow", input: %{"delay_ms" => 5_000}}
+      ]
+
+      started = System.monotonic_time(:millisecond)
+      assert :drained = ToolRunner.run_batch(@batch_tools, calls, %{})
+      assert System.monotonic_time(:millisecond) - started < 2_000
+      refute_received {:unsafe_done, _}
+    end
+
+    test "a lost lease kills the whole batch immediately" do
+      send(self(), {:clementine, :lease_lost, :fake_lease})
+
+      calls = [%{id: "call_1", name: "slow", input: %{"delay_ms" => 5_000}}]
+
+      started = System.monotonic_time(:millisecond)
+      assert :lost_lease = ToolRunner.run_batch(@batch_tools, calls, %{})
+      assert System.monotonic_time(:millisecond) - started < 2_000
+    end
+
+    test "leaves unrelated mailbox messages untouched" do
+      send(self(), {:unrelated, :message})
+
+      calls = [%{id: "call_1", name: "echo", input: %{"message" => "hi"}}]
+      assert {:ok, _} = ToolRunner.run_batch(@batch_tools, calls, %{})
+
+      assert_received {:unrelated, :message}
+    end
+  end
+
   describe "format_results/1" do
     test "formats successful results" do
       results = [

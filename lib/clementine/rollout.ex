@@ -39,9 +39,13 @@ defmodule Clementine.Rollout do
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
   alias Clementine.LLM.Message.ToolResultMessage
-  alias Clementine.{LLM, ToolRunner}
+  alias Clementine.{LLM, Tool, ToolRunner}
 
   @default_max_iterations 10
+
+  # Mirrors the streaming clients' default receive timeout; the execution
+  # deadline may only shrink it, never extend it.
+  @provider_receive_timeout :timer.minutes(5)
 
   @enforce_keys [:agent, :input]
   defstruct agent: nil,
@@ -161,21 +165,35 @@ defmodule Clementine.Rollout do
     at iteration boundaries (before each gather, which is also after each
     tool batch).
   - `:mark_effects` - zero-arity closure over `Protocol.mark_effects/1`,
-    called once before the first tool batch. Tools carry no retry metadata
-    yet, so every batch is treated as effectful (`:unknown` is `:unsafe`).
+    called once, before the first tool batch containing a tool whose
+    `retry` metadata is not `:safe` (`:unknown` is `:unsafe`). Batches of
+    only `:safe` tools leave the fence down: nothing external can happen,
+    so the run stays requeue-eligible.
   - `:deadline` - the execution deadline minted at claim, checked at
-    iteration boundaries.
+    iteration boundaries and applied as a cap on the provider stream's
+    receive timeout and on per-tool timeouts.
 
   ## Signals
 
-  The blocking points — the provider-stream receive loop and the tool-await
-  — additionally match runner-directed messages and unwind, aborting
+  The blocking points — the provider-stream receive loop and the tool-batch
+  await — additionally match runner-directed messages and unwind, aborting
   in-flight work: `{:clementine, :lease_lost, lease}` → `:lost_lease`,
   `{:clementine, :drain}` → `:drained`, `{:clementine, :cancel, reason}` →
-  `{:cancelled, reason}`. A cancel push is not honored mid tool batch —
-  killing an effectful tool creates unknowable external state — so it waits
-  for the boundary poll; infrastructure signals (lease loss, drain) abort
-  the batch.
+  `{:cancelled, reason}`. Infrastructure signals (lease loss, drain) abort
+  a tool batch outright; a cancel push applies the cooperative kill policy
+  instead — `retry: :safe` tools are killed immediately, unsafe tools run
+  out their own timeout (killing an effectful tool mid-flight creates
+  unknowable external state), and the loop stops before the next gather.
+
+  ## Cancellation Latency
+
+  The boundary poll alone bounds cancel latency to one iteration — at
+  worst one full model response plus one tool batch. With the optional
+  push channel (`subscribe_cancel` on the lifecycle) the signal lands in
+  the blocking points and aborts the in-flight provider stream, making a
+  mid-stream cancel effectively instant; mid-batch, only unsafe tools'
+  own timeouts remain. The poll is the guarantee; push is the
+  optimization.
   """
   @spec execute(t(), keyword()) :: execute_result()
   def execute(%__MODULE__{} = rollout, opts \\ []) do
@@ -327,7 +345,7 @@ defmodule Clementine.Rollout do
   defp stream_response(%Execution{} = exec) do
     alias Clementine.LLM.StreamParser.Accumulator
 
-    stream = LLM.stream(exec.model, exec.system, exec.messages, exec.tools)
+    stream = LLM.stream(exec.model, exec.system, exec.messages, exec.tools, stream_opts(exec))
 
     {acc, signal} =
       Enum.reduce_while(stream, {Accumulator.new(), nil}, fn
@@ -386,37 +404,86 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # A signal that arrived during the gather is already in the mailbox:
+  # honor it before the fence write and before any tool starts — a
+  # pending drain must not forfeit requeue eligibility, and a superseded
+  # executor must not start new external effects.
   defp act_on_tools(%Execution{} = exec, tool_uses) do
-    case raise_fence(exec) do
-      {:continue, exec} -> run_tool_batch(exec, tool_uses)
+    with :continue <- check_signals(),
+         :continue <- check_approval_gate(exec, tool_uses),
+         {:continue, exec} <- raise_fence(exec, tool_uses) do
+      run_tool_batch(exec, tool_uses)
+    else
+      {:error, %Clementine.Error{} = error} -> fail(exec, error)
       unwound -> unwound
     end
   end
 
-  # The effect fence must be durable before the first effect exists. Tools
-  # carry no retry metadata yet, so every batch counts as effectful; a
-  # fence write that fails transiently fails the run closed — proceeding
-  # unfenced would make a later requeue double-execute the batch.
-  defp raise_fence(%Execution{fence_raised?: true} = exec), do: {:continue, exec}
+  # Suspend-for-approval arrives with gated tools; until this engine can
+  # park a run for a decision, executing an approval-gated tool ungated
+  # would silently dishonor the tool's own declaration — so it fails
+  # closed instead, exactly like a pending operation it cannot resolve.
+  defp check_approval_gate(%Execution{tools: tools}, tool_uses) do
+    gated =
+      Enum.find(tool_uses, fn use ->
+        case Tool.find_by_name(tools, use.name) do
+          nil -> false
+          tool -> Tool.approval(tool) != :never
+        end
+      end)
 
-  defp raise_fence(%Execution{mark_effects: mark_effects} = exec) do
-    case mark_effects.() do
-      :ok -> {:continue, %{exec | fence_raised?: true}}
-      {:error, :lost_lease} -> :lost_lease
-      {:error, reason} -> fail(exec, Clementine.Error.normalize(reason))
+    case gated do
+      nil ->
+        :continue
+
+      %{name: name} ->
+        {:error,
+         %Clementine.Error{
+           kind: :rollout,
+           code: :approval_unsupported,
+           message:
+             "tool #{name} declares approval gating, which this engine version " <>
+               "cannot honor yet (suspend-for-approval arrives with gated tools)",
+           retryable?: false
+         }}
     end
+  end
+
+  # The effect fence must be durable before the first effect exists — but
+  # only batches that can cause one raise it: a batch of only retry: :safe
+  # tools leaves the run requeue-eligible by those tools' own declaration.
+  # A fence write that fails transiently fails the run closed — proceeding
+  # unfenced would make a later requeue double-execute the batch.
+  defp raise_fence(%Execution{fence_raised?: true} = exec, _tool_uses), do: {:continue, exec}
+
+  defp raise_fence(%Execution{mark_effects: mark_effects} = exec, tool_uses) do
+    if batch_effectful?(exec.tools, tool_uses) do
+      case mark_effects.() do
+        :ok -> {:continue, %{exec | fence_raised?: true}}
+        {:error, :lost_lease} -> :lost_lease
+        {:error, reason} -> {:error, Clementine.Error.normalize(reason)}
+      end
+    else
+      {:continue, exec}
+    end
+  end
+
+  # An unresolvable tool name never executes anything — it settles as an
+  # "Unknown tool" error result — so it cannot produce an effect.
+  defp batch_effectful?(tools, tool_uses) do
+    Enum.any?(tool_uses, fn use ->
+      case Tool.find_by_name(tools, use.name) do
+        nil -> false
+        tool -> Tool.retry(tool) != :safe
+      end
+    end)
   end
 
   defp run_tool_batch(%Execution{} = exec, tool_uses) do
     tool_calls = Enum.map(tool_uses, fn t -> %{id: t.id, name: t.name, input: t.input} end)
     context = Map.put(exec.context, :_clementine_iteration, exec.iteration)
 
-    task =
-      Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
-        ToolRunner.execute(exec.tools, tool_calls, context)
-      end)
-
-    case await_tools(task) do
+    case ToolRunner.run_batch(exec.tools, tool_calls, context, batch_opts(exec)) do
       {:ok, results} ->
         Enum.each(results, &emit_tool_result(exec, &1))
         result_content = ToolRunner.format_results(results)
@@ -426,35 +493,38 @@ defmodule Clementine.Rollout do
           | messages: exec.messages ++ [%ToolResultMessage{content: result_content}]
         })
 
-      {:error, %Clementine.Error{} = error} ->
-        fail(exec, error)
+      # The kill policy already ran inside the batch await; the loop stops
+      # here, before the next gather.
+      {:cancelled, reason} ->
+        {:cancelled, reason}
 
-      unwound ->
+      unwound when unwound in [:lost_lease, :drained] ->
         unwound
     end
   end
 
-  # The tool-await blocking point. Infrastructure signals abort the batch
-  # (a superseded or draining executor must unwind now); a cancel push does
-  # not — the batch settles and the boundary poll honors the flag, so an
-  # effectful tool is never killed mid-flight by a user cancel.
-  defp await_tools(%Task{ref: ref} = task) do
-    receive do
-      {^ref, results} ->
-        Process.demonitor(ref, [:flush])
-        {:ok, results}
+  defp stream_opts(%Execution{deadline: nil}), do: []
 
-      {:DOWN, ^ref, :process, _pid, reason} ->
-        {:error, Clementine.Error.from_exception(:exit, reason, [])}
+  defp stream_opts(%Execution{deadline: deadline}) do
+    [receive_timeout: min(@provider_receive_timeout, remaining_ms(deadline))]
+  end
 
-      {:clementine, :lease_lost, _lease} ->
-        Task.shutdown(task, :brutal_kill)
-        :lost_lease
+  defp batch_opts(%Execution{deadline: nil}), do: []
 
-      {:clementine, :drain} ->
-        Task.shutdown(task, :brutal_kill)
-        :drained
-    end
+  defp batch_opts(%Execution{deadline: deadline}) do
+    [timeout: min(ToolRunner.default_timeout(), remaining_ms(deadline))]
+  end
+
+  # Ceiling division: a cap computed by flooring could expire a hair
+  # before the deadline instant, letting the boundary check pass once more.
+  # Overshooting by under a millisecond is harmless — the boundary is the
+  # enforcement, the cap only bounds the wait.
+  defp remaining_ms(%DateTime{} = deadline) do
+    deadline
+    |> DateTime.diff(DateTime.utc_now(), :microsecond)
+    |> max(0)
+    |> Kernel.+(999)
+    |> div(1000)
   end
 
   defp emit_tool_result(exec, {id, result}) do

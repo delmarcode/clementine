@@ -220,6 +220,70 @@ defmodule Clementine.Lifecycle.EctoAdapterTest do
     end
   end
 
+  describe "cancel push channel" do
+    alias Clementine.Lifecycle.Ecto, as: EctoAdapter
+    alias Clementine.Test.Ecto.PubsubLifecycle
+
+    setup do
+      start_supervised!({Phoenix.PubSub, name: Clementine.Test.PubSub})
+      :ok
+    end
+
+    test "subscribe_cancel/1 is exported exactly when pubsub is configured" do
+      Code.ensure_loaded!(PubsubLifecycle)
+      Code.ensure_loaded!(Lifecycle)
+
+      assert function_exported?(PubsubLifecycle, :subscribe_cancel, 1)
+      refute function_exported?(Lifecycle, :subscribe_cancel, 1)
+    end
+
+    test "a committed cancel flag broadcasts to the executor subscribed at claim" do
+      run = insert_run!()
+
+      {:ok, lease} =
+        Protocol.claim(PubsubLifecycle, run.id, executor: "test:push", ctx: self())
+
+      assert :ok = PubsubLifecycle.subscribe_cancel(lease)
+
+      assert {:ok, :flagged} =
+               Protocol.request_cancel(PubsubLifecycle, run.id, {:user, 7}, self())
+
+      # Exactly the message shape the rollout's blocking points match.
+      assert_receive {:clementine, :cancel, {:user, 7}}
+    end
+
+    test "a direct cancel of an unowned run does not broadcast" do
+      run = insert_run!()
+      :ok = Phoenix.PubSub.subscribe(Clementine.Test.PubSub, EctoAdapter.cancel_topic(run.id))
+
+      assert {:ok, :finished} =
+               Protocol.request_cancel(PubsubLifecycle, run.id, :abandoned, self())
+
+      refute_receive {:clementine, :cancel, _}, 100
+    end
+  end
+
+  describe "cancel push channel without a running pubsub" do
+    alias Clementine.Test.Ecto.PubsubLifecycle
+
+    # No Phoenix.PubSub started: the configured registry does not exist,
+    # so the post-commit broadcast raises internally. Best-effort means
+    # the committed transition must not notice.
+    @tag capture_log: true
+    test "a downed pubsub never fails a committed cancel flag" do
+      run = insert_run!()
+
+      {:ok, _lease} =
+        Protocol.claim(PubsubLifecycle, run.id, executor: "test:push", ctx: self())
+
+      assert {:ok, :flagged} =
+               Protocol.request_cancel(PubsubLifecycle, run.id, :user_stop, self())
+
+      {:ok, facts} = PubsubLifecycle.fetch(run.id, self())
+      assert facts.cancel.reason == :user_stop
+    end
+  end
+
   describe "finish" do
     test "commits the terminal atomically with the projection" do
       run = insert_run!()

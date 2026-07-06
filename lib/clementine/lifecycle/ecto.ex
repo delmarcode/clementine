@@ -54,6 +54,19 @@ if Code.ensure_loaded?(Ecto.Query) do
     and never affect the committed transition. Hosts that find per-heartbeat
     notifications noisy filter on `transition.op`.
 
+    ## The cancel push channel
+
+    Pass `pubsub: MyApp.PubSub` (requires the optional `phoenix_pubsub`
+    dependency) to light up token-latency cancellation: the adapter then
+    exports `subscribe_cancel/1` — the runner subscribes after claim — and
+    broadcasts `{:clementine, :cancel, reason}` on `cancel_topic/1`
+    post-commit whenever a cooperative cancel flag lands. Push is an
+    optimization; the runner's boundary poll remains the guarantee, so a
+    lost broadcast costs latency, never correctness. Direct cancels of
+    unowned (`queued`/`waiting`) runs do not broadcast — there is no
+    executor to reach; observers learn of them through
+    `after_transition/3` like every other transition.
+
     ## The escape hatch: a hand-written lifecycle
 
     The adapter hides column mapping, not the model. The de-sugared
@@ -175,13 +188,22 @@ if Code.ensure_loaded?(Ecto.Query) do
         @clementine_ecto_repo Keyword.fetch!(opts, :repo)
         @clementine_ecto_schema Keyword.fetch!(opts, :schema)
         @clementine_ecto_fields Keyword.get(opts, :fields, [])
+        @clementine_ecto_pubsub Keyword.get(opts, :pubsub)
+
+        if @clementine_ecto_pubsub && !Code.ensure_loaded?(Phoenix.PubSub) do
+          raise ArgumentError,
+                "#{inspect(__MODULE__)} sets pubsub: #{inspect(@clementine_ecto_pubsub)} " <>
+                  "but Phoenix.PubSub is not available; add {:phoenix_pubsub, \"~> 2.1\"} " <>
+                  "to your dependencies"
+        end
 
         @doc false
         def __clementine_config__ do
           Clementine.Lifecycle.Ecto.config(
             @clementine_ecto_repo,
             @clementine_ecto_schema,
-            @clementine_ecto_fields
+            @clementine_ecto_fields,
+            @clementine_ecto_pubsub
           )
         end
 
@@ -195,6 +217,13 @@ if Code.ensure_loaded?(Ecto.Query) do
           Clementine.Lifecycle.Ecto.apply_transition(__MODULE__, transition, ctx)
         end
 
+        if @clementine_ecto_pubsub do
+          @impl Clementine.Lifecycle
+          def subscribe_cancel(lease) do
+            Clementine.Lifecycle.Ecto.subscribe_cancel(__MODULE__, lease)
+          end
+        end
+
         @impl Clementine.Lifecycle.Ecto
         def project(_result, _row, _ctx), do: :ok
 
@@ -206,14 +235,33 @@ if Code.ensure_loaded?(Ecto.Query) do
     end
 
     @doc false
-    def config(repo, schema, field_overrides) do
+    def config(repo, schema, field_overrides, pubsub \\ nil) do
       [ref_column] = schema.__schema__(:primary_key)
 
       %{
         repo: repo,
         schema: schema,
-        fields: Codec.resolve_fields(ref_column, field_overrides)
+        fields: Codec.resolve_fields(ref_column, field_overrides),
+        pubsub: pubsub
       }
+    end
+
+    @doc """
+    The push-channel topic for one run's cancel notifications. Both halves
+    of the channel — the adapter's post-commit broadcast and the runner's
+    `subscribe_cancel/1` subscription — derive it from the same `run_ref`.
+    """
+    @spec cancel_topic(term()) :: String.t()
+    def cancel_topic(run_ref), do: "clementine:cancel:#{ref_string(run_ref)}"
+
+    defp ref_string(run_ref) when is_binary(run_ref), do: run_ref
+    defp ref_string(run_ref) when is_integer(run_ref), do: Integer.to_string(run_ref)
+    defp ref_string(run_ref), do: inspect(run_ref)
+
+    @doc false
+    def subscribe_cancel(module, %Clementine.Lease{run_ref: run_ref}) do
+      %{pubsub: pubsub} = module.__clementine_config__()
+      pubsub_subscribe(pubsub, cancel_topic(run_ref))
     end
 
     @doc false
@@ -260,6 +308,7 @@ if Code.ensure_loaded?(Ecto.Query) do
       end)
       |> case do
         {:ok, row} ->
+          push_cancel(config, transition)
           notify(module, Codec.to_facts(row, fields), transition, ctx)
 
         {:error, reason} ->
@@ -330,6 +379,49 @@ if Code.ensure_loaded?(Ecto.Query) do
     defp storage_now(repo) do
       %{rows: [[%DateTime{} = now]]} = repo.query!("SELECT now()")
       now
+    end
+
+    # The library-side half of the cancel push channel: a committed
+    # cooperative-cancel flag (the flavor whose set carries :cancel, not a
+    # terminal status) broadcasts to whichever executor subscribed at
+    # claim. Post-commit and best-effort exactly like notify/3 — a downed
+    # or misconfigured PubSub must not crash a committed transition or
+    # keep it from reaching after_transition/3; the boundary poll
+    # guarantees delivery semantics, so a lost broadcast costs latency
+    # only.
+    defp push_cancel(%{pubsub: pubsub}, %Transition{
+           op: :cancel_request,
+           run_ref: run_ref,
+           set: %{cancel: %{reason: reason}}
+         })
+         when not is_nil(pubsub) do
+      pubsub_broadcast(pubsub, cancel_topic(run_ref), {:clementine, :cancel, reason})
+    rescue
+      e ->
+        Logger.error(
+          "cancel push broadcast raised: #{Exception.message(e)} " <>
+            "(pubsub: #{inspect(pubsub)}, run: #{inspect(run_ref)})"
+        )
+    catch
+      kind, reason ->
+        Logger.error(
+          "cancel push broadcast #{kind}: #{inspect(reason)} " <>
+            "(pubsub: #{inspect(pubsub)}, run: #{inspect(run_ref)})"
+        )
+    end
+
+    defp push_cancel(_config, _transition), do: :ok
+
+    if Code.ensure_loaded?(Phoenix.PubSub) do
+      defp pubsub_subscribe(pubsub, topic), do: Phoenix.PubSub.subscribe(pubsub, topic)
+
+      defp pubsub_broadcast(pubsub, topic, message) do
+        Phoenix.PubSub.broadcast(pubsub, topic, message)
+        :ok
+      end
+    else
+      defp pubsub_subscribe(_pubsub, _topic), do: {:error, :phoenix_pubsub_unavailable}
+      defp pubsub_broadcast(_pubsub, _topic, _message), do: :ok
     end
 
     # Post-commit, best-effort: a failed notification must never fail (or

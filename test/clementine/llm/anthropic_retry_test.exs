@@ -118,6 +118,47 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       Agent.stop(counter)
     end
 
+    test "a spent receive_timeout budget stops the retry loop", %{bypass: bypass} do
+      # A backoff long enough that any uncapped sleep fails this test's
+      # elapsed bound: the budget must cap the sleep and then refuse the
+      # next retry, instead of dutifully burning attempts long past the
+      # window the runner granted.
+      Application.put_env(:clementine, :retry,
+        max_attempts: 3,
+        base_delay: 60_000,
+        max_delay: 60_000
+      )
+
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        Agent.update(counter, fn n -> n + 1 end)
+
+        Plug.Conn.resp(
+          conn,
+          429,
+          ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}})
+        )
+      end)
+
+      started = System.monotonic_time(:millisecond)
+
+      events =
+        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], [],
+          receive_timeout: 150
+        )
+        |> Enum.to_list()
+
+      # The failure surfaced (as the 429, or as a timeout if the budget
+      # expired mid-attempt), the third attempt never ran, and nothing
+      # slept a full backoff.
+      assert Enum.any?(events, &match?({:error, _}, &1))
+      assert Agent.get(counter, & &1) < 3
+      assert System.monotonic_time(:millisecond) - started < 5_000
+
+      Agent.stop(counter)
+    end
+
     test "retries on network error and succeeds", %{bypass: bypass} do
       # Use a small backoff so Bypass has time to come back up between attempts
       Application.put_env(:clementine, :retry, max_attempts: 3, base_delay: 100, max_delay: 100)

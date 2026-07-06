@@ -32,6 +32,9 @@ defmodule Clementine.MixProject do
       # app brings these in.
       {:ecto_sql, "~> 3.10", optional: true},
       {:postgrex, "~> 0.18", optional: true},
+      # Optional: the Ecto adapter's cancel push channel lights up only
+      # when a host configures `pubsub:`.
+      {:phoenix_pubsub, "~> 2.1", optional: true},
       {:nimble_options, "~> 1.1"},
       {:telemetry, "~> 1.0"},
       {:telemetry_metrics, "~> 1.0"},
