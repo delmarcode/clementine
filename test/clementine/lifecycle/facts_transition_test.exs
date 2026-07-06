@@ -41,6 +41,48 @@ defmodule Clementine.Lifecycle.FactsTransitionTest do
     end
   end
 
+  describe "Facts observation order" do
+    defp facts(status, epoch), do: %Facts{ref: "run_1", status: status, epoch: epoch}
+
+    test "a full lifecycle trajectory is strictly increasing — notifications order themselves" do
+      trajectory = [
+        facts(:queued, 0),
+        facts(:running, 1),
+        facts(:waiting, 1),
+        facts(:queued, 1),
+        facts(:running, 2),
+        facts(:completed, 2)
+      ]
+
+      for [earlier, later] <- Enum.chunk_every(trajectory, 2, 1, :discard) do
+        assert Facts.compare(earlier, later) == :lt
+        assert Facts.supersedes?(later, earlier)
+        refute Facts.supersedes?(earlier, later)
+      end
+    end
+
+    test "requeue orders after running within the same epoch" do
+      assert Facts.supersedes?(facts(:queued, 3), facts(:running, 3))
+    end
+
+    test "every terminal outranks every active status at the same epoch" do
+      for terminal <- Facts.terminal_statuses(), active <- Facts.active_statuses() do
+        assert Facts.supersedes?(facts(terminal, 2), facts(active, 2))
+      end
+    end
+
+    test "epoch dominates status rank — a fresh claim supersedes an old wait" do
+      assert Facts.supersedes?(facts(:running, 6), facts(:waiting, 5))
+    end
+
+    test "same-slot updates (heartbeat, flags) compare equal; latest arrival wins" do
+      flagged = %Facts{ref: "run_1", status: :running, epoch: 4, cancel: %{reason: :user}}
+
+      assert Facts.compare(facts(:running, 4), flagged) == :eq
+      refute Facts.supersedes?(flagged, facts(:running, 4))
+    end
+  end
+
   describe "Transition" do
     test "the op set matches the protocol" do
       assert Enum.sort(Transition.ops()) ==
