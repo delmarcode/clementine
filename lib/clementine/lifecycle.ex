@@ -23,6 +23,17 @@ defmodule Clementine.Lifecycle do
   writes NULL, and symbolic timestamps (`:now`, `{:now_plus, ms}`) resolve
   against the *storage* clock, never the app node's.
 
+  Because every transition — runner-driven or not — flows through
+  `apply/2`, it is the one universal observation point: hosts broadcast
+  the committed facts post-commit as *transition notifications* (the Ecto
+  adapter exposes an `after_transition/3` hook for this; hand-written
+  lifecycles broadcast from their own `apply` wrapper). This is how
+  observers learn about resume, reap, and direct cancel — transitions no
+  executor was alive to announce as events. A notification is the new
+  facts and needs no sequence number: `(status, epoch)` orders itself
+  (`Clementine.Lifecycle.Facts.supersedes?/2`), and a terminal
+  notification closes the run's `Clementine.RunView` fold.
+
   `ctx` is an opaque host context threaded from runner options (commonly
   `nil`; useful for multi-repo or tenant routing).
   """

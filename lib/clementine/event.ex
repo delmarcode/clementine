@@ -12,18 +12,52 @@ defmodule Clementine.Event do
   than the highest seen (a superseded executor's stragglers), and a closed
   RunView rejects everything at or below its final epoch (a reaped run's
   ghosts).
+
+  The type set is the closed execution-event taxonomy. It deliberately has
+  no `run_started`/`run_finished`: lifecycle facts travel as transition
+  notifications through the host's `apply`, never through this stream —
+  three transitions (resume, reaper interrupt, direct cancel) happen with
+  no execution alive to stamp a sequence number. `approval_requested`
+  carries no resume token: the token is a control-plane reference read
+  from stored facts by authorized code, not broadcast to every observer.
+  Payload fields are non-final; the identity envelope and the
+  execution/transition split are decided.
   """
+
+  @types [
+    :iteration_start,
+    :text_delta,
+    :tool_use_start,
+    :tool_input_delta,
+    :tool_result,
+    :approval_requested,
+    :usage_delta,
+    :error
+  ]
 
   @enforce_keys [:run_ref, :epoch, :seq, :type]
   defstruct run_ref: nil, epoch: 0, seq: 0, type: nil, payload: %{}
+
+  @type type ::
+          :iteration_start
+          | :text_delta
+          | :tool_use_start
+          | :tool_input_delta
+          | :tool_result
+          | :approval_requested
+          | :usage_delta
+          | :error
 
   @type t :: %__MODULE__{
           run_ref: term(),
           epoch: non_neg_integer(),
           seq: non_neg_integer(),
-          type: atom(),
+          type: type(),
           payload: map()
         }
+
+  @spec types() :: [type()]
+  def types, do: @types
 
   @doc "Lexicographic `(epoch, seq)` comparison."
   @spec compare(t(), t()) :: :lt | :eq | :gt

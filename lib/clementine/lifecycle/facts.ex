@@ -73,4 +73,39 @@ defmodule Clementine.Lifecycle.Facts do
   @spec active?(t() | status()) :: boolean()
   def active?(%__MODULE__{status: status}), do: active?(status)
   def active?(status) when status in @statuses, do: status in @active
+
+  # Within one epoch the state machine can only move running -> waiting ->
+  # queued -> terminal (suspend, resume, requeue, finish/interrupt/cancel);
+  # entering :running mints a new epoch. So (epoch, rank) totally orders
+  # every fact a run can ever produce.
+  @observation_rank %{running: 0, waiting: 1, queued: 2}
+
+  @doc """
+  Observation order for transition notifications: notifications carry the
+  new facts, and `(epoch, status)` orders itself — no sequence numbers
+  needed. Facts with equal order (same status, same epoch: a heartbeat, a
+  cancel flag) are same-slot updates; consumers should let the latest
+  arrival win, i.e. replace held facts unless the incoming ones compare
+  `:lt`.
+  """
+  @spec compare(t(), t()) :: :lt | :eq | :gt
+  def compare(%__MODULE__{} = a, %__MODULE__{} = b) do
+    key_a = {a.epoch, observation_rank(a.status)}
+    key_b = {b.epoch, observation_rank(b.status)}
+
+    cond do
+      key_a < key_b -> :lt
+      key_a > key_b -> :gt
+      true -> :eq
+    end
+  end
+
+  @doc "True when `facts` strictly supersede `held` in observation order."
+  @spec supersedes?(t(), t()) :: boolean()
+  def supersedes?(%__MODULE__{} = facts, %__MODULE__{} = held) do
+    compare(facts, held) == :gt
+  end
+
+  defp observation_rank(status) when status in @terminal, do: 3
+  defp observation_rank(status), do: Map.fetch!(@observation_rank, status)
 end
