@@ -212,7 +212,11 @@ defmodule Clementine.Telemetry do
       summary("clementine.rollout.stop.duration", unit: {:native, :millisecond}),
       summary("clementine.rollout.stop.iterations"),
       counter("clementine.rollout.stop.iterations", tags: [:status]),
-      counter("clementine.rollout.exception.duration",
+      # The mechanical rename of clementine.loop.exception.iterations. The
+      # count is synthesized because reporters drop an event whose
+      # measurement is missing, and the raise flavor omits :iterations —
+      # every exception must stay countable.
+      counter("clementine.rollout.exception.iterations",
         event_name: [:clementine, :rollout, :exception],
         measurement: fn _measurements -> 1 end
       ),

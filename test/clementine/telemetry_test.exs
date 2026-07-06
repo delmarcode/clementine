@@ -497,6 +497,17 @@ defmodule Clementine.TelemetryTest do
                metric.event_name == [:clementine, :rollout, :stop]
              end)
 
+      # Every legacy loop metric name survives the mechanical rename —
+      # dashboards swap :loop for :rollout and find their metric.
+      for legacy <- [
+            [:clementine, :rollout, :stop, :duration],
+            [:clementine, :rollout, :stop, :iterations],
+            [:clementine, :rollout, :exception, :iterations]
+          ] do
+        assert Enum.any?(metrics, fn metric -> metric.name == legacy end),
+               "missing renamed legacy metric #{Enum.join(legacy, ".")}"
+      end
+
       for [:clementine, :run, event] <- @run_events do
         assert Enum.any?(metrics, fn metric ->
                  metric.event_name == [:clementine, :run, event]
