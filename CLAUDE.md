@@ -8,7 +8,7 @@ Clementine is an Elixir agent framework that models agent work as inert
 definitions animated by explicit execution machinery. The inner loop is
 Gather → Act (call the model, execute tools, feed results back); durability,
 cancellation, suspension, and observation are the runner and lifecycle
-layers around it. The spec is `docs/DURABLE_EXECUTION_RFC.md` (v2.1) — when
+layers around it. The spec is `docs/DURABLE_EXECUTION_RFC.md` (v2.2) — when
 code and RFC disagree, the RFC wins.
 
 ## Architecture

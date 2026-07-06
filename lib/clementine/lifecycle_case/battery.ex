@@ -440,6 +440,12 @@ defmodule Clementine.LifecycleCase.Battery do
     assert facts.executor_id == nil
     assert facts.deadline == nil
     assert facts.heartbeat_at == nil
+
+    # The complement: suspend enters an unowned state, so it re-stamps
+    # queued_at — the entry time the reaper's max_wait ceiling measures
+    # from, which must not include pre-claim queue time.
+    assert %DateTime{} = facts.queued_at
+    assert DateTime.compare(facts.queued_at, before.queued_at) != :lt
   end
 
   def resume_round_trip(h) do
@@ -731,15 +737,20 @@ defmodule Clementine.LifecycleCase.Battery do
     assert_stamped_between(t0, facts.finished_at, t1, "finish finished_at")
   end
 
-  def storage_clock_requeue_and_resume(h) do
+  def storage_clock_unowned_entry_stamps(h) do
     requeued = create!(h)
     lease = claim!(h, requeued)
 
     {t0, {:ok, facts}, t1} = bracket(h, fn -> Protocol.requeue(lease, :drain) end)
     assert_stamped_between(t0, facts.queued_at, t1, "requeue queued_at")
 
-    resumed = create!(h)
-    {:ok, token} = Protocol.suspend(claim!(h, resumed), suspension_request(), cursor: {1, 0})
+    parked = create!(h)
+    lease2 = claim!(h, parked)
+
+    {t0, {:ok, token}, t1} =
+      bracket(h, fn -> Protocol.suspend(lease2, suspension_request(), cursor: {1, 0}) end)
+
+    assert_stamped_between(t0, fetch!(h, parked).queued_at, t1, "suspend queued_at")
 
     {t0, {:ok, facts}, t1} =
       bracket(h, fn -> Protocol.resume(h.lifecycle, token, {:approved, %{by: 1}}, h.ctx) end)

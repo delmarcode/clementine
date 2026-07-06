@@ -1,5 +1,5 @@
 ---
-description: Implement a SKUNK issue from the Clementine durable-execution RFC (v2.1)
+description: Implement a SKUNK issue from the Clementine durable-execution RFC (v2.2)
 ---
 
 You are implementing **$ARGUMENTS** in this repo (the Clementine Elixir library).
@@ -7,7 +7,7 @@ You are implementing **$ARGUMENTS** in this repo (the Clementine Elixir library)
 ## Orientation — do all of this before writing any code
 
 1. Fetch **$ARGUMENTS** from Linear (`get_issue`). Its **Scope** and **Acceptance** sections are your work order. Its parent epic **SKUNK-124** carries lineage context (this epic supersedes the SKUNK-117-era `Executor` framing — if you find leftover code from that round, flag it; do not build on it). If the Linear MCP is not connected in this session, stop and ask for the issue text.
-2. Read the spec: `docs/DURABLE_EXECUTION_RFC.md` in this repo (v2.1). Non-negotiable minimum: **Governing Invariants**, **Vocabulary**, **Run State Machine**, **The Lifecycle Contract**, plus every section your issue cites. The 18-row **Failure Matrix** is the system's proof obligation — your acceptance criteria reference its rows by number.
+2. Read the spec: `docs/DURABLE_EXECUTION_RFC.md` in this repo (v2.2). Non-negotiable minimum: **Governing Invariants**, **Vocabulary**, **Run State Machine**, **The Lifecycle Contract**, plus every section your issue cites. The 18-row **Failure Matrix** is the system's proof obligation — your acceptance criteria reference its rows by number.
 3. Read the RFC's **Normative Baseline** section, then the existing modules it lists (canonical message structs, `Tool` contract, `ToolRunner`, `Usage`, provider clients). You inherit these; do not reinvent or re-specify them.
 4. Verify every issue listed in your `blockedBy` relations is merged to `main`. If one isn't, stop and report instead of building on unmerged work.
 
