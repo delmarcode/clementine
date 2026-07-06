@@ -1,8 +1,8 @@
-defmodule Clementine.LoopTest do
+defmodule Clementine.RolloutTest do
   use ExUnit.Case, async: true
   import Mox
 
-  alias Clementine.Loop
+  alias Clementine.Rollout
   alias Clementine.LLM.Message.{AssistantMessage, Content, UserMessage}
   alias Clementine.LLM.Response
 
@@ -25,28 +25,6 @@ defmodule Clementine.LoopTest do
     def run(%{message: msg}, _ctx), do: {:ok, "Echo: #{msg}"}
   end
 
-  # Test verifiers
-  defmodule PassingVerifier do
-    use Clementine.Verifier
-    @impl true
-    def verify(_result, _ctx), do: :ok
-  end
-
-  defmodule FailOnceVerifier do
-    use Clementine.Verifier
-
-    @impl true
-    def verify(_result, ctx) do
-      count = Map.get(ctx, :verify_count, 0)
-
-      if count > 0 do
-        :ok
-      else
-        {:retry, "First attempt failed"}
-      end
-    end
-  end
-
   describe "run/2 with text response" do
     test "returns text when model responds without tools" do
       Clementine.LLM.MockClient
@@ -65,7 +43,7 @@ defmodule Clementine.LoopTest do
         tools: []
       ]
 
-      assert {:ok, "Hello world!", messages} = Loop.run(config, "Hi")
+      assert {:ok, "Hello world!", messages} = Rollout.run(config, "Hi")
       # user + assistant
       assert length(messages) == 2
     end
@@ -109,31 +87,10 @@ defmodule Clementine.LoopTest do
         tools: [EchoTool]
       ]
 
-      assert {:ok, "Done!", messages} = Loop.run(config, "Echo test")
+      assert {:ok, "Done!", messages} = Rollout.run(config, "Echo test")
 
       # Should have: user, assistant (tool use), user (tool result), assistant (final)
       assert length(messages) == 4
-    end
-  end
-
-  describe "run/2 with verification" do
-    test "runs verifiers on final response" do
-      Clementine.LLM.MockClient
-      |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
-        {:ok,
-         %Response{
-           content: [Content.text("Hello")],
-           stop_reason: "end_turn",
-           usage: %{}
-         }}
-      end)
-
-      config = [
-        model: :claude_sonnet,
-        verifiers: [PassingVerifier]
-      ]
-
-      assert {:ok, "Hello", _messages} = Loop.run(config, "Hi")
     end
   end
 
@@ -158,7 +115,7 @@ defmodule Clementine.LoopTest do
         max_iterations: 3
       ]
 
-      assert {:error, :max_iterations_reached} = Loop.run(config, "Loop forever")
+      assert {:error, :max_iterations_reached} = Rollout.run(config, "Loop forever")
     end
   end
 
@@ -171,7 +128,7 @@ defmodule Clementine.LoopTest do
 
       config = [model: :claude_sonnet]
 
-      assert {:error, {:api_error, 500, _}} = Loop.run(config, "Hi")
+      assert {:error, {:api_error, 500, _}} = Rollout.run(config, "Hi")
     end
 
     test "returns normalized error when LLM client raises" do
@@ -183,7 +140,7 @@ defmodule Clementine.LoopTest do
       config = [model: :claude_sonnet]
 
       assert {:error, {:llm_exception, %{kind: :error, message: "missing configuration"}}} =
-               Loop.run(config, "Hi")
+               Rollout.run(config, "Hi")
     end
 
     test "returns normalized error when LLM client returns an invalid shape" do
@@ -195,7 +152,7 @@ defmodule Clementine.LoopTest do
       config = [model: :claude_sonnet]
 
       assert {:error, {:invalid_llm_client_result, :not_a_valid_client_result}} =
-               Loop.run(config, "Hi")
+               Rollout.run(config, "Hi")
     end
   end
 
@@ -218,7 +175,7 @@ defmodule Clementine.LoopTest do
         on_event: fn event -> send(agent, {:event, event}) end
       ]
 
-      {:ok, _, _} = Loop.run(config, "Hi")
+      {:ok, _, _} = Rollout.run(config, "Hi")
 
       # Check we received events
       assert_receive {:event, {:loop_start, "Hi"}}
@@ -252,7 +209,7 @@ defmodule Clementine.LoopTest do
 
       config = [model: :claude_sonnet]
 
-      {:ok, result, messages} = Loop.continue(config, initial_messages, "Follow up")
+      {:ok, result, messages} = Rollout.continue(config, initial_messages, "Follow up")
 
       assert result == "Continuing conversation"
       # 2 initial + user + assistant
@@ -282,7 +239,7 @@ defmodule Clementine.LoopTest do
 
       callback = fn event -> send(test_pid, {:stream_event, event}) end
 
-      assert {:ok, "Hello world!", _messages} = Loop.run_stream(config, "Hi", callback)
+      assert {:ok, "Hello world!", _messages} = Rollout.run_stream(config, "Hi", callback)
 
       # Verify we received text deltas
       assert_receive {:stream_event, {:text_delta, "Hello "}}
@@ -333,7 +290,7 @@ defmodule Clementine.LoopTest do
 
       callback = fn event -> send(test_pid, {:stream_event, event}) end
 
-      assert {:ok, "Done!", _messages} = Loop.run_stream(config, "Echo test", callback)
+      assert {:ok, "Done!", _messages} = Rollout.run_stream(config, "Echo test", callback)
 
       # Verify tool use events
       assert_receive {:stream_event, {:tool_use_start, "toolu_1", "echo"}}
@@ -359,7 +316,7 @@ defmodule Clementine.LoopTest do
 
       callback = fn event -> send(test_pid, {:stream_event, event}) end
 
-      {:ok, _, _} = Loop.run_stream(config, "Hello", callback)
+      {:ok, _, _} = Rollout.run_stream(config, "Hello", callback)
 
       # Loop events come wrapped
       assert_receive {:stream_event, {:loop_event, {:loop_start, "Hello"}}}
@@ -385,7 +342,7 @@ defmodule Clementine.LoopTest do
       callback = fn event -> send(test_pid, {:stream_event, event}) end
 
       assert {:error, %{"type" => "overloaded_error"}} =
-               Loop.run_stream(config, "Hi", callback)
+               Rollout.run_stream(config, "Hi", callback)
 
       # Error was forwarded to the callback
       assert_receive {:stream_event, {:error, %{"type" => "overloaded_error"}}}
@@ -402,7 +359,7 @@ defmodule Clementine.LoopTest do
       config = [model: :claude_sonnet, tools: []]
 
       assert {:error, {:llm_exception, %{kind: :error, message: "stream blew up"}}} =
-               Loop.run_stream(config, "Hi", fn _ -> :ok end)
+               Rollout.run_stream(config, "Hi", fn _ -> :ok end)
     end
 
     test "stream error emits correct {:llm_call_end, {:error, ...}} loop event" do
@@ -420,7 +377,7 @@ defmodule Clementine.LoopTest do
 
       callback = fn event -> send(test_pid, {:stream_event, event}) end
 
-      {:error, _} = Loop.run_stream(config, "Hi", callback)
+      {:error, _} = Rollout.run_stream(config, "Hi", callback)
 
       assert_receive {:stream_event,
                       {:loop_event, {:llm_call_end, {:error, %{"type" => "api_error"}}}}}
@@ -437,7 +394,7 @@ defmodule Clementine.LoopTest do
 
       config = [model: :claude_sonnet, tools: [EchoTool]]
 
-      assert {:error, _} = Loop.run_stream(config, "Hi", fn _ -> :ok end)
+      assert {:error, _} = Rollout.run_stream(config, "Hi", fn _ -> :ok end)
 
       # Mox's expect with count 1 verifies no additional stream calls were made
     end
@@ -459,7 +416,7 @@ defmodule Clementine.LoopTest do
       config = [model: :claude_sonnet, tools: [EchoTool], max_iterations: 2]
 
       assert {:error, :max_iterations_reached} =
-               Loop.run_stream(config, "Loop", fn _ -> :ok end)
+               Rollout.run_stream(config, "Loop", fn _ -> :ok end)
     end
   end
 end

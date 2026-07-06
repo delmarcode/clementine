@@ -1,40 +1,101 @@
-defmodule Clementine.Loop do
+defmodule Clementine.Rollout do
   @moduledoc """
-  The core agentic loop implementation.
+  One inner agent execution: the Gather → Act loop, and the inert spec that
+  describes it.
 
-  This module implements the gather→act→verify loop that powers Clementine agents.
-  It's designed as a pure functional module that can be used by different
-  execution contexts (GenServer, one-off scripts, etc.).
+  A rollout is Clementine's inner unit of agent work: call the model, execute
+  tool calls, feed results back, repeat until a final answer or a limit. The
+  `%Clementine.Rollout{}` struct is the inert spec (what to try); the
+  functions in this module are the engine that animates it. Durable execution
+  wraps rollouts in runs — see the durable execution RFC.
 
   ## The Loop
 
   ```
-  ┌─────────────────────────────────────────────────────────┐
-  │                                                         │
-  │   ┌─────────┐    ┌─────────┐    ┌─────────┐           │
-  │   │ Gather  │───▶│   Act   │───▶│ Verify  │───┐       │
-  │   │ Context │    │         │    │         │   │       │
-  │   └─────────┘    └─────────┘    └─────────┘   │       │
-  │        ▲                                       │       │
-  │        └───────────────────────────────────────┘       │
-  │                                                         │
-  │                    until done                           │
-  └─────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────┐
+  │                                       │
+  │   ┌─────────┐        ┌─────────┐      │
+  │   │ Gather  │───────▶│   Act   │───┐  │
+  │   └─────────┘        └─────────┘   │  │
+  │        ▲                           │  │
+  │        └───────────────────────────┘  │
+  │                                       │
+  │              until done               │
+  └───────────────────────────────────────┘
   ```
 
   The loop continues until:
   - The model returns a final response (no tool calls)
-  - A verification step confirms success
   - Max iterations reached
   - An unrecoverable error occurs
 
+  Verification is deliberately not part of the inner loop: judging a result
+  and deciding to retry is outer-control work (see `Clementine.Verifier` for
+  the judge-function shape it uses).
+
+  Formerly `Clementine.Loop`; renamed so `Loop` can name the outer control
+  primitive.
   """
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
   alias Clementine.LLM.Message.ToolResultMessage
-  alias Clementine.{LLM, ToolRunner, Verifier}
+  alias Clementine.{LLM, ToolRunner}
 
   @default_max_iterations 10
+
+  @enforce_keys [:agent, :input]
+  defstruct agent: nil,
+            input: nil,
+            messages: [],
+            context: %{},
+            limits: []
+
+  @type t :: %__MODULE__{
+          agent: Clementine.Agent.t(),
+          input: String.t(),
+          messages: [Clementine.LLM.Message.message()],
+          context: map(),
+          limits: keyword()
+        }
+
+  @doc """
+  Builds a rollout spec: an agent, an input prompt, and optional starting
+  history, context, and limits. The spec is inert data — nothing executes
+  until an engine function (or a runner) animates it.
+
+  ## Options
+
+  - `:agent` (required) - a `Clementine.Agent` struct
+  - `:input` (required) - the user prompt for this rollout
+  - `:messages` - starting message history (default `[]`)
+  - `:context` - context map passed to tools (default `%{}`)
+  - `:limits` - `[max_iterations: pos_integer(), max_duration: pos_integer()]`;
+    unset keys fall back to the agent's defaults
+  """
+  @spec new(keyword()) :: t()
+  def new(opts) when is_list(opts) do
+    struct!(__MODULE__, opts)
+  end
+
+  @doc """
+  Lowers a rollout spec into the keyword config the engine functions accept.
+
+  Agent defaults merge under rollout limits (the rollout wins).
+  """
+  @spec to_config(t()) :: keyword()
+  def to_config(%__MODULE__{} = rollout) do
+    %Clementine.Agent{} = agent = rollout.agent
+    limits = Keyword.merge(agent.defaults, rollout.limits)
+
+    [
+      model: agent.model,
+      system: agent.instructions,
+      tools: agent.tools,
+      context: rollout.context,
+      messages: rollout.messages,
+      max_iterations: Keyword.get(limits, :max_iterations, @default_max_iterations)
+    ]
+  end
 
   defmodule State do
     @moduledoc """
@@ -44,7 +105,6 @@ defmodule Clementine.Loop do
       :model,
       :system,
       :tools,
-      :verifiers,
       :context,
       :max_iterations,
       :on_event,
@@ -57,7 +117,6 @@ defmodule Clementine.Loop do
             model: Clementine.LLM.ModelRegistry.model_ref(),
             system: String.t() | nil,
             tools: [module()],
-            verifiers: [module()],
             context: map(),
             max_iterations: pos_integer(),
             on_event: (term() -> any()) | nil,
@@ -78,7 +137,6 @@ defmodule Clementine.Loop do
     - `:model` - Model reference (required): alias atom (e.g. `:claude_sonnet`) or `{provider, id}` tuple
     - `:system` - System prompt
     - `:tools` - List of tool modules
-    - `:verifiers` - List of verifier modules
     - `:context` - Context map for tools
     - `:max_iterations` - Maximum loop iterations (default: 10)
     - `:messages` - Initial message history
@@ -97,7 +155,6 @@ defmodule Clementine.Loop do
       model: Keyword.fetch!(config, :model),
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
-      verifiers: Keyword.get(config, :verifiers, []),
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       on_event: Keyword.get(config, :on_event),
@@ -262,47 +319,18 @@ defmodule Clementine.Loop do
   defp handle_final_response(%State{} = state, response) do
     text = LLM.get_text(response)
     emit_event(state, {:final_text, text})
+    emit_event(state, {:loop_end, :success})
 
-    # Run verifiers
-    case run_verifiers(state, text) do
-      :ok ->
-        emit_event(state, {:loop_end, :success})
+    :telemetry.execute(
+      [:clementine, :loop, :stop],
+      %{
+        duration: System.monotonic_time() - state.loop_start_time,
+        iterations: state.iteration
+      },
+      %{model: state.model, status: :success}
+    )
 
-        :telemetry.execute(
-          [:clementine, :loop, :stop],
-          %{
-            duration: System.monotonic_time() - state.loop_start_time,
-            iterations: state.iteration
-          },
-          %{model: state.model, status: :success}
-        )
-
-        {:ok, text, state.messages}
-
-      {:retry, reason} ->
-        handle_verification_failure(state, reason)
-    end
-  end
-
-  # Run verifiers on the result
-  defp run_verifiers(%State{verifiers: []}, _text), do: :ok
-
-  defp run_verifiers(%State{verifiers: verifiers, context: context}, text) do
-    Verifier.run_all(verifiers, text, context)
-  end
-
-  # Handle verification failure
-  defp handle_verification_failure(%State{} = state, reason) do
-    emit_event(state, {:verification_failed, reason})
-
-    # Add retry message to conversation
-    retry_message =
-      UserMessage.new("Verification failed: #{reason}\n\nPlease fix the issues and try again.")
-
-    state = %{state | messages: state.messages ++ [retry_message]}
-
-    # Continue the loop
-    iterate(state)
+    {:ok, text, state.messages}
   end
 
   # Emit events for callbacks
@@ -344,7 +372,6 @@ defmodule Clementine.Loop do
       model: Keyword.fetch!(config, :model),
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
-      verifiers: Keyword.get(config, :verifiers, []),
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       on_event: fn event -> stream_callback.({:loop_event, event}) end,

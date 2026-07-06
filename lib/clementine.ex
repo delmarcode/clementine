@@ -4,13 +4,14 @@ defmodule Clementine do
 
   Clementine provides a straightforward way to build AI agents using Elixir's
   process model. Inspired by Claude Code's architecture, it implements the
-  gather→act→verify loop pattern with tools and verification.
+  Gather → Act rollout loop with tools; verification is an outer-control
+  concern layered on top.
 
   ## Quick Start
 
       # Define an agent
       defmodule MyAgent do
-        use Clementine.Agent,
+        use Clementine.AgentServer,
           name: "my_agent",
           model: :claude_sonnet,
           tools: [MyApp.Tools.ReadFile, MyApp.Tools.WriteFile],
@@ -43,7 +44,8 @@ defmodule Clementine do
 
   ### Verifiers
 
-  Verifiers check results after each action. Define them with `Clementine.Verifier`:
+  Verifiers check results against acceptance criteria. Define them with
+  `Clementine.Verifier`:
 
       defmodule MyApp.Verifiers.TestsPassing do
         use Clementine.Verifier
@@ -57,16 +59,22 @@ defmodule Clementine do
         end
       end
 
+  Verification is an outer-control concern, not part of the inner loop: invoke
+  verifiers standalone after a run completes.
+
+      {:ok, result} = Clementine.run(agent, "Refactor the parser")
+      :ok = Clementine.Verifier.run_all([MyApp.Verifiers.TestsPassing], result, context)
+
   ### Agents
 
-  Agents are GenServers that run the agentic loop. Define them with `Clementine.Agent`:
+  Agents are GenServers that run the agentic loop. Define them with
+  `Clementine.AgentServer`:
 
       defmodule MyAgent do
-        use Clementine.Agent,
+        use Clementine.AgentServer,
           name: "my_agent",
           model: :claude_sonnet,
           tools: [MyApp.Tools.Echo],
-          verifiers: [MyApp.Verifiers.TestsPassing],
           system: "You are helpful."
       end
 
@@ -93,7 +101,7 @@ defmodule Clementine do
 
   """
 
-  alias Clementine.Agent
+  alias Clementine.AgentServer
 
   @doc """
   Runs a prompt on an agent synchronously.
@@ -110,7 +118,7 @@ defmodule Clementine do
   - `{:error, reason}` - If something went wrong
 
   """
-  defdelegate run(agent, prompt), to: Agent
+  defdelegate run(agent, prompt), to: AgentServer
 
   @doc """
   Runs a prompt on an agent asynchronously.
@@ -126,7 +134,7 @@ defmodule Clementine do
       {:ok, result} = Clementine.await(agent, task_id)
 
   """
-  defdelegate run_async(agent, prompt), to: Agent
+  defdelegate run_async(agent, prompt), to: AgentServer
 
   @doc """
   Awaits the result of an async task.
@@ -144,7 +152,7 @@ defmodule Clementine do
       {:ok, result} = Clementine.await(agent, task_id, 30_000)
 
   """
-  defdelegate await(agent, task_id, timeout \\ 5000), to: Agent
+  defdelegate await(agent, task_id, timeout \\ 5000), to: AgentServer
 
   @doc """
   Gets the status of an async task.
@@ -159,14 +167,14 @@ defmodule Clementine do
   - `{:error, :not_found}` - Unknown task ID
 
   """
-  defdelegate status(agent, task_id), to: Agent
+  defdelegate status(agent, task_id), to: AgentServer
 
   @doc """
   Gets the conversation history from an agent.
 
   The history is a list of messages in chronological order.
   """
-  defdelegate get_history(agent), to: Agent
+  defdelegate get_history(agent), to: AgentServer
 
   @doc """
   Clears the conversation history.
@@ -174,7 +182,7 @@ defmodule Clementine do
   This starts a fresh conversation.
   Returns `{:error, {:agent_busy, task_ids}}` if an async run is active.
   """
-  defdelegate clear_history(agent), to: Agent
+  defdelegate clear_history(agent), to: AgentServer
 
   @doc """
   Forks an agent, creating a new agent with the same history.
@@ -187,7 +195,7 @@ defmodule Clementine do
       # forked has the same history as agent
 
   """
-  defdelegate fork(agent, new_agent_module, opts \\ []), to: Agent
+  defdelegate fork(agent, new_agent_module, opts \\ []), to: AgentServer
 
   @doc """
   Streams a prompt execution, returning events as they occur.
@@ -206,7 +214,7 @@ defmodule Clementine do
   Successful streams update the agent conversation history just like `run/2`.
   The stream emits `{:done, :success}` or `{:done, :error}` before halting.
   """
-  defdelegate stream(agent, prompt), to: Agent
+  defdelegate stream(agent, prompt), to: AgentServer
 
   @doc """
   Executes a tool directly without the LLM loop.

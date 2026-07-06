@@ -1,10 +1,13 @@
 defmodule Clementine.Verifier do
   @moduledoc """
-  Behaviour for implementing verification checks.
+  Behaviour for judge functions: verify a result, or ask for a retry with
+  feedback.
 
-  Verifiers are optional checks that run after the model returns a final
-  response (one without tool calls). They can trigger re-attempts if
-  verification fails.
+  Verification is outer-control work, not part of the inner rollout loop —
+  judging a result and deciding to retry belongs one floor above the
+  model/tool loop, where it can also fan out, compare candidates, or
+  escalate to a human. This module supplies the judge-function *shape* that
+  outer control uses.
 
   ## Example
 
@@ -22,14 +25,14 @@ defmodule Clementine.Verifier do
 
   ## Using Verifiers
 
-  Verifiers are attached to agents and run in sequence after each final response:
+  Run them after a rollout completes, threading feedback into the next
+  attempt — a judge loop in ordinary code:
 
-      defmodule MyAgent do
-        use Clementine.Agent,
-          verifiers: [
-            MyApp.Verifiers.TypeCheck,
-            MyApp.Verifiers.TestsPassing
-          ]
+      {:ok, text, messages} = Clementine.Rollout.run(config, prompt)
+
+      case Clementine.Verifier.run_all(verifiers, text, context) do
+        :ok -> {:ok, text, messages}
+        {:retry, feedback} -> Clementine.Rollout.continue(config, messages, feedback)
       end
 
   """

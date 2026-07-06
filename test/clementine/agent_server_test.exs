@@ -1,4 +1,4 @@
-defmodule Clementine.AgentTest do
+defmodule Clementine.AgentServerTest do
   # Need sync for Mox global mode
   use ExUnit.Case, async: false
   import Mox
@@ -10,7 +10,7 @@ defmodule Clementine.AgentTest do
 
   # Define a test agent
   defmodule TestAgent do
-    use Clementine.Agent,
+    use Clementine.AgentServer,
       name: "test_agent",
       model: :claude_sonnet,
       tools: [],
@@ -61,7 +61,7 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      assert {:ok, "Hello from agent!"} = Clementine.Agent.run(agent, "Hi")
+      assert {:ok, "Hello from agent!"} = Clementine.AgentServer.run(agent, "Hi")
 
       GenServer.stop(agent)
     end
@@ -79,8 +79,8 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      {:ok, _} = Clementine.Agent.run(agent, "First message")
-      history = Clementine.Agent.get_history(agent)
+      {:ok, _} = Clementine.AgentServer.run(agent, "First message")
+      history = Clementine.AgentServer.get_history(agent)
 
       # user + assistant
       assert length(history) == 2
@@ -108,13 +108,13 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      events = Clementine.Agent.stream(agent, "Hi") |> Enum.to_list()
+      events = Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
 
       assert {:text_delta, "Hello "} in events
       assert {:text_delta, "stream!"} in events
       assert List.last(events) == {:done, :success}
 
-      history = Clementine.Agent.get_history(agent)
+      history = Clementine.AgentServer.get_history(agent)
       assert length(history) == 2
       assert Enum.at(history, 0).role == :user
       assert Enum.at(history, 1).role == :assistant
@@ -136,7 +136,7 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      events = Clementine.Agent.stream(agent, "Hi") |> Enum.to_list()
+      events = Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
 
       assert events == [
                {:loop_event, {:loop_start, "Hi"}},
@@ -149,7 +149,7 @@ defmodule Clementine.AgentTest do
                {:done, :error}
              ]
 
-      assert Clementine.Agent.get_history(agent) == []
+      assert Clementine.AgentServer.get_history(agent) == []
 
       GenServer.stop(agent)
     end
@@ -168,14 +168,14 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Async task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Async task")
 
       assert [
                {:error, {:agent_busy, [^task_id]}},
                {:done, :error}
-             ] = Clementine.Agent.stream(agent, "Hi") |> Enum.to_list()
+             ] = Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
 
-      assert {:ok, "Async response"} = Clementine.Agent.await(agent, task_id)
+      assert {:ok, "Async response"} = Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -193,7 +193,7 @@ defmodule Clementine.AgentTest do
 
       consumer =
         Task.async(fn ->
-          Clementine.Agent.stream(agent, "Hi") |> Enum.to_list()
+          Clementine.AgentServer.stream(agent, "Hi") |> Enum.to_list()
         end)
 
       assert_receive :stream_started
@@ -223,7 +223,7 @@ defmodule Clementine.AgentTest do
       {:ok, agent} = TestAgent.start_link()
 
       assert [_loop_start, _iteration_start, _llm_call_start, _message_start] =
-               Clementine.Agent.stream(agent, "Hi") |> Enum.take(4)
+               Clementine.AgentServer.stream(agent, "Hi") |> Enum.take(4)
 
       Process.sleep(50)
       assert_no_stream_mailbox_messages()
@@ -262,11 +262,11 @@ defmodule Clementine.AgentTest do
       send(consumer, :stop)
 
       assert_eventually(fn ->
-        assert {:error, :not_found} = Clementine.Agent.status(agent, task_id)
+        assert {:error, :not_found} = Clementine.AgentServer.status(agent, task_id)
       end)
 
       Process.sleep(250)
-      assert Clementine.Agent.get_history(agent) == []
+      assert Clementine.AgentServer.get_history(agent) == []
 
       GenServer.stop(agent)
     end
@@ -276,7 +276,7 @@ defmodule Clementine.AgentTest do
     test "returns empty history initially" do
       {:ok, agent} = TestAgent.start_link()
 
-      assert [] = Clementine.Agent.get_history(agent)
+      assert [] = Clementine.AgentServer.get_history(agent)
 
       GenServer.stop(agent)
     end
@@ -296,11 +296,11 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      {:ok, _} = Clementine.Agent.run(agent, "Message")
-      assert length(Clementine.Agent.get_history(agent)) > 0
+      {:ok, _} = Clementine.AgentServer.run(agent, "Message")
+      assert length(Clementine.AgentServer.get_history(agent)) > 0
 
-      :ok = Clementine.Agent.clear_history(agent)
-      assert [] = Clementine.Agent.get_history(agent)
+      :ok = Clementine.AgentServer.clear_history(agent)
+      assert [] = Clementine.AgentServer.get_history(agent)
 
       GenServer.stop(agent)
     end
@@ -319,10 +319,10 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Async task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Async task")
 
-      assert {:error, {:agent_busy, [^task_id]}} = Clementine.Agent.clear_history(agent)
-      assert {:ok, "Async response"} = Clementine.Agent.await(agent, task_id)
+      assert {:error, {:agent_busy, [^task_id]}} = Clementine.AgentServer.clear_history(agent)
+      assert {:ok, "Async response"} = Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -344,7 +344,7 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Async message")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Async message")
 
       assert is_binary(task_id)
       assert byte_size(task_id) > 0
@@ -352,7 +352,7 @@ defmodule Clementine.AgentTest do
       # Wait a bit for the task to complete
       Process.sleep(50)
 
-      assert {:ok, :completed} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :completed} = Clementine.AgentServer.status(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -365,7 +365,7 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "This will fail")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "This will fail")
 
       # Wait for the task to complete with a normalized error
       Process.sleep(100)
@@ -373,10 +373,10 @@ defmodule Clementine.AgentTest do
       # Agent should still be alive
       assert Process.alive?(agent)
 
-      assert {:ok, :completed} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :completed} = Clementine.AgentServer.status(agent, task_id)
 
       assert {:error, {:llm_exception, %{message: "simulated LLM failure"}}} =
-               Clementine.Agent.await(agent, task_id)
+               Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -400,9 +400,9 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Slow task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Slow task")
 
-      assert {:ok, :running} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :running} = Clementine.AgentServer.status(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -422,12 +422,12 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "First async task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "First async task")
 
       assert {:error, {:agent_busy, [^task_id]}} =
-               Clementine.Agent.run_async(agent, "Second async task")
+               Clementine.AgentServer.run_async(agent, "Second async task")
 
-      assert {:ok, "First response"} = Clementine.Agent.await(agent, task_id)
+      assert {:ok, "First response"} = Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -447,12 +447,12 @@ defmodule Clementine.AgentTest do
 
       {:ok, agent} = TestAgent.start_link()
 
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Async task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Async task")
 
       assert {:error, {:agent_busy, [^task_id]}} =
-               Clementine.Agent.run(agent, "Sync task")
+               Clementine.AgentServer.run(agent, "Sync task")
 
-      assert {:ok, "Async response"} = Clementine.Agent.await(agent, task_id)
+      assert {:ok, "Async response"} = Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -473,10 +473,10 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Async message")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Async message")
 
       # await blocks until the result is ready
-      assert {:ok, "Awaited response"} = Clementine.Agent.await(agent, task_id)
+      assert {:ok, "Awaited response"} = Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -493,18 +493,18 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Quick task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Quick task")
 
       # Let it finish
       Process.sleep(50)
-      assert {:ok, :completed} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :completed} = Clementine.AgentServer.status(agent, task_id)
 
       # await returns the result and cleans up
-      assert {:ok, "Fast response"} = Clementine.Agent.await(agent, task_id)
+      assert {:ok, "Fast response"} = Clementine.AgentServer.await(agent, task_id)
 
       # Task entry is consumed — status and await both return :not_found
-      assert {:error, :not_found} = Clementine.Agent.status(agent, task_id)
-      assert {:error, :not_found} = Clementine.Agent.await(agent, task_id)
+      assert {:error, :not_found} = Clementine.AgentServer.status(agent, task_id)
+      assert {:error, :not_found} = Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -516,10 +516,10 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Fail task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Fail task")
 
       assert {:error, {:llm_exception, %{message: "boom"}}} =
-               Clementine.Agent.await(agent, task_id)
+               Clementine.AgentServer.await(agent, task_id)
 
       # Agent still alive
       assert Process.alive?(agent)
@@ -541,12 +541,12 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Slow task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Slow task")
 
-      assert {:error, :timeout} = Clementine.Agent.await(agent, task_id, 50)
+      assert {:error, :timeout} = Clementine.AgentServer.await(agent, task_id, 50)
 
       # Task is still running (timeout doesn't cancel it)
-      assert {:ok, :running} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :running} = Clementine.AgentServer.status(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -554,7 +554,7 @@ defmodule Clementine.AgentTest do
     test "returns {:error, :not_found} for unknown task_id" do
       {:ok, agent} = TestAgent.start_link()
 
-      assert {:error, :not_found} = Clementine.Agent.await(agent, "nonexistent")
+      assert {:error, :not_found} = Clementine.AgentServer.await(agent, "nonexistent")
 
       GenServer.stop(agent)
     end
@@ -573,24 +573,24 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Wait forever")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Wait forever")
 
-      assert {:ok, "Infinite patience"} = Clementine.Agent.await(agent, task_id, :infinity)
+      assert {:ok, "Infinite patience"} = Clementine.AgentServer.await(agent, task_id, :infinity)
 
       GenServer.stop(agent)
     end
 
-    test "completed status reflects Loop.run error results" do
+    test "completed status reflects Rollout.run error results" do
       Clementine.LLM.MockClient
       |> expect(:call, fn _model, _system, _messages, _tools, _opts ->
         {:error, :max_iterations_exceeded}
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Will error")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Will error")
 
-      # Loop.run returned {:error, ...} but the function completed normally
-      assert {:error, :max_iterations_exceeded} = Clementine.Agent.await(agent, task_id)
+      # Rollout.run returned {:error, ...} but the function completed normally
+      assert {:error, :max_iterations_exceeded} = Clementine.AgentServer.await(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -609,11 +609,11 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Fire and forget")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Fire and forget")
 
       # Let the task complete
       Process.sleep(50)
-      assert {:ok, :completed} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :completed} = Clementine.AgentServer.status(agent, task_id)
 
       # Backdate the completed_at timestamp so the sweep will evict it
       state = GenServer.call(agent, :get_state)
@@ -634,7 +634,7 @@ defmodule Clementine.AgentTest do
       Process.sleep(10)
 
       # Task should be gone
-      assert {:error, :not_found} = Clementine.Agent.status(agent, task_id)
+      assert {:error, :not_found} = Clementine.AgentServer.status(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -651,16 +651,16 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, agent} = TestAgent.start_link()
-      {:ok, task_id} = Clementine.Agent.run_async(agent, "Recent task")
+      {:ok, task_id} = Clementine.AgentServer.run_async(agent, "Recent task")
 
       Process.sleep(50)
-      assert {:ok, :completed} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :completed} = Clementine.AgentServer.status(agent, task_id)
 
       # Trigger sweep — task is fresh, should survive
       send(agent, :task_cleanup)
       Process.sleep(10)
 
-      assert {:ok, :completed} = Clementine.Agent.status(agent, task_id)
+      assert {:ok, :completed} = Clementine.AgentServer.status(agent, task_id)
 
       GenServer.stop(agent)
     end
@@ -668,7 +668,7 @@ defmodule Clementine.AgentTest do
 
   # A second agent module used as the fork target
   defmodule ForkTargetAgent do
-    use Clementine.Agent,
+    use Clementine.AgentServer,
       name: "fork_target",
       model: :claude_sonnet,
       tools: [],
@@ -688,14 +688,14 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, source} = TestAgent.start_link()
-      {:ok, _} = Clementine.Agent.run(source, "Hello source")
+      {:ok, _} = Clementine.AgentServer.run(source, "Hello source")
 
-      source_history = Clementine.Agent.get_history(source)
+      source_history = Clementine.AgentServer.get_history(source)
       assert length(source_history) == 2
 
-      {:ok, forked} = Clementine.Agent.fork(source, ForkTargetAgent)
+      {:ok, forked} = Clementine.AgentServer.fork(source, ForkTargetAgent)
 
-      forked_history = Clementine.Agent.get_history(forked)
+      forked_history = Clementine.AgentServer.get_history(forked)
       assert forked_history == source_history
 
       GenServer.stop(forked)
@@ -705,7 +705,7 @@ defmodule Clementine.AgentTest do
     test "forked agent copies context, model, and system from source" do
       {:ok, source} = TestAgent.start_link(model: :claude_opus, context: %{custom: "data"})
 
-      {:ok, forked} = Clementine.Agent.fork(source, ForkTargetAgent)
+      {:ok, forked} = Clementine.AgentServer.fork(source, ForkTargetAgent)
 
       forked_state = GenServer.call(forked, :get_state)
       assert forked_state.model == :claude_opus
@@ -728,15 +728,15 @@ defmodule Clementine.AgentTest do
       end)
 
       {:ok, source} = TestAgent.start_link()
-      {:ok, _} = Clementine.Agent.run(source, "First message")
+      {:ok, _} = Clementine.AgentServer.run(source, "First message")
 
-      {:ok, forked} = Clementine.Agent.fork(source, ForkTargetAgent)
-      {:ok, result} = Clementine.Agent.run(forked, "Second message")
+      {:ok, forked} = Clementine.AgentServer.fork(source, ForkTargetAgent)
+      {:ok, result} = Clementine.AgentServer.run(forked, "Second message")
 
       # The forked agent received 2 prior messages (from source) + 1 new user message = 3
       assert result == "Response 3"
 
-      forked_history = Clementine.Agent.get_history(forked)
+      forked_history = Clementine.AgentServer.get_history(forked)
       # 2 from source + 2 from the new run = 4
       assert length(forked_history) == 4
 
@@ -748,7 +748,7 @@ defmodule Clementine.AgentTest do
       {:ok, source} = TestAgent.start_link()
 
       {:ok, forked} =
-        Clementine.Agent.fork(source, ForkTargetAgent,
+        Clementine.AgentServer.fork(source, ForkTargetAgent,
           model: :claude_haiku,
           context: %{overridden: true}
         )
@@ -792,7 +792,7 @@ defmodule Clementine.AgentTest do
       ]
 
       {:ok, agent} = TestAgent.start_link(history: history)
-      assert Clementine.Agent.get_history(agent) == history
+      assert Clementine.AgentServer.get_history(agent) == history
       GenServer.stop(agent)
     end
 

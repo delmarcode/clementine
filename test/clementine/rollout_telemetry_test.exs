@@ -1,8 +1,8 @@
-defmodule Clementine.LoopTelemetryTest do
+defmodule Clementine.RolloutTelemetryTest do
   use ExUnit.Case, async: true
   import Mox
 
-  alias Clementine.Loop
+  alias Clementine.Rollout
   alias Clementine.LLM.Message.Content
   alias Clementine.LLM.Response
 
@@ -63,7 +63,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet, tools: []]
 
-      assert {:ok, "Hello!", _messages} = Loop.run(config, "Hi")
+      assert {:ok, "Hello!", _messages} = Rollout.run(config, "Hi")
 
       # Loop start
       assert_receive {:telemetry, [:clementine, :loop, :start], %{system_time: _},
@@ -120,7 +120,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet, tools: [EchoTool]]
 
-      assert {:ok, "Done!", _} = Loop.run(config, "Echo test")
+      assert {:ok, "Done!", _} = Rollout.run(config, "Echo test")
 
       # Tool start
       assert_receive {:telemetry, [:clementine, :tool, :start], %{system_time: _},
@@ -152,7 +152,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet, tools: [EchoTool], max_iterations: 2]
 
-      assert {:error, :max_iterations_reached} = Loop.run(config, "Loop forever")
+      assert {:error, :max_iterations_reached} = Rollout.run(config, "Loop forever")
 
       assert_receive {:telemetry, [:clementine, :loop, :stop], %{duration: _, iterations: 2},
                       %{status: :max_iterations}}
@@ -168,7 +168,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet]
 
-      assert {:error, {:api_error, 500, _}} = Loop.run(config, "Hi")
+      assert {:error, {:api_error, 500, _}} = Rollout.run(config, "Hi")
 
       # LLM exception
       assert_receive {:telemetry, [:clementine, :llm, :exception], %{duration: _},
@@ -201,7 +201,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet, tools: []]
 
-      assert {:ok, "Hello!", _} = Loop.run_stream(config, "Hi", fn _ -> :ok end)
+      assert {:ok, "Hello!", _} = Rollout.run_stream(config, "Hi", fn _ -> :ok end)
 
       assert_receive {:telemetry, [:clementine, :loop, :start], _, %{model: :claude_sonnet}}
       assert_receive {:telemetry, [:clementine, :llm, :start], _, %{streaming: true}}
@@ -220,7 +220,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet, tools: []]
 
-      assert {:error, _} = Loop.run_stream(config, "Hi", fn _ -> :ok end)
+      assert {:error, _} = Rollout.run_stream(config, "Hi", fn _ -> :ok end)
 
       assert_receive {:telemetry, [:clementine, :llm, :exception], %{duration: _},
                       %{streaming: true, kind: :error}}
@@ -263,7 +263,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet, tools: [EchoTool]]
 
-      assert {:ok, "Done!", _} = Loop.run_stream(config, "Echo test", fn _ -> :ok end)
+      assert {:ok, "Done!", _} = Rollout.run_stream(config, "Echo test", fn _ -> :ok end)
 
       assert_receive {:telemetry, [:clementine, :tool, :start], _, %{tool: "echo"}}
       assert_receive {:telemetry, [:clementine, :tool, :stop], _, %{tool: "echo", result: :ok}}
@@ -284,7 +284,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet]
 
-      {:ok, _, _} = Loop.run(config, "Hi")
+      {:ok, _, _} = Rollout.run(config, "Hi")
 
       assert_receive {:telemetry, [:clementine, :llm, :stop], %{duration: llm_d}, _}
       assert is_integer(llm_d) and llm_d >= 0
@@ -308,7 +308,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet]
 
-      {:ok, _, _} = Loop.run(config, "Hi")
+      {:ok, _, _} = Rollout.run(config, "Hi")
 
       assert_receive {:telemetry, [:clementine, :llm, :stop],
                       %{input_tokens: 850, output_tokens: 120}, _}
@@ -327,7 +327,7 @@ defmodule Clementine.LoopTelemetryTest do
 
       config = [model: :claude_sonnet]
 
-      {:ok, _, _} = Loop.run(config, "Hi")
+      {:ok, _, _} = Rollout.run(config, "Hi")
 
       assert_receive {:telemetry, [:clementine, :llm, :stop],
                       %{input_tokens: 0, output_tokens: 0}, _}
