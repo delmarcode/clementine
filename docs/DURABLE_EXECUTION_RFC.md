@@ -1,6 +1,6 @@
 # RFC: Clementine Durable Execution Model
 
-Status: draft v2 (CAS revision)  
+Status: draft v2.2 (CAS revision)  
 Scope: greenfield Clementine API design  
 Origin: Meli integration learnings, especially Oban-backed turn execution  
 Supersedes: v1, which sketched a five-callback lifecycle protocol
@@ -102,6 +102,20 @@ revisions:
 - A Normative Baseline section scopes what this document specifies versus
   what it inherits from the existing library (canonical messages, tool
   contract, providers).
+
+### Changes from implementation (v2.2)
+
+- `Protocol.suspend` stamps `queued_at: :now` alongside its field-hygiene
+  clears (found implementing SKUNK-131, confirmed by review). Suspend is a
+  transition into an unowned state exactly like resume and requeue, which
+  both already stamped, so `queued_at` now uniformly records when the run
+  last entered its current unowned state. This is what makes the reaper's
+  `max_wait` ceiling implementable at all: v2.1 specified the ceiling over
+  suspension age while no fact recorded suspension time, and measuring
+  from an enqueue-era `queued_at` could expire a just-parked run whose
+  pre-claim queue wait exceeded a short ceiling. Each suspension gets its
+  own `max_wait` window; the queued-scope claim-timeout check is
+  unaffected because resume re-stamps on the way back to `queued`.
 
 ## Reader Frame
 
@@ -712,7 +726,10 @@ Design notes:
 - Field hygiene: every transition clears the fields whose meaning does not
   survive into the target status. `suspend` and `requeue` clear
   `executor_id`, `deadline`, and `heartbeat_at`; `claim` overwrites all
-  three. A `waiting` run has no executor, so no fact may claim one.
+  three. A `waiting` run has no executor, so no fact may claim one. The
+  complement: every transition into an unowned state — enqueue, suspend,
+  resume, requeue — stamps `queued_at`, the entry time the reaper's age
+  checks read.
 
 ## The Lifecycle Contract
 
@@ -782,7 +799,8 @@ defmodule Clementine.Lifecycle.Facts do
           usage: Clementine.Usage.t() | nil,
           error: Clementine.Error.t() | nil,          # terminal :failed detail
           interrupt: Clementine.InterruptReason.t() | nil,  # terminal :interrupted detail
-          queued_at: DateTime.t() | nil,   # when the run (re)entered queued
+          queued_at: DateTime.t() | nil,   # when the run last entered an
+                                           # unowned state (queued or waiting)
           finished_at: DateTime.t() | nil
         }
 end
@@ -916,8 +934,11 @@ from its event stamper; `suspend` now derives the token from the lease —
 `%ResumeToken{run_ref: ref, epoch: E, reason_type: type_of(reason)}` — and
 persists the assembled `%Suspension{}` inside the facts it writes:
 `expect: {running, E}, set: %{status: :waiting, suspension: s,
-executor_id: nil, deadline: nil, heartbeat_at: nil}` (field hygiene: a
-waiting run has no executor and no execution deadline). The token is
+queued_at: :now, executor_id: nil, deadline: nil, heartbeat_at: nil}`
+(field hygiene: a waiting run has no executor and no execution deadline —
+and, like every transition into an unowned state, suspend stamps
+`queued_at`, the entry time the reaper's `max_wait` ceiling measures
+from). The token is
 computed, not separately stored — it lives inside the suspension it
 authorizes and is valid exactly while the run is `waiting` with that
 suspension; see Checkpoints And Suspension for its security posture.
@@ -1665,10 +1686,14 @@ evidence means something:
   exceeded (fresh heartbeat, buggy runner) → `:deadline_exceeded`.
 - `queued`: `queued_at` older than the claim timeout → `:claim_timeout`
   (the job that should have claimed it is gone or wedged). `queued_at` is
-  stamped at enqueue, resume, and requeue, so the check covers all three
-  entries into `queued`.
+  stamped at every entry into an unowned state (enqueue, suspend, resume,
+  requeue); for a queued run it always reads as the time it entered
+  `queued` — resume and requeue re-stamp it — so one check covers all
+  three entries into `queued`.
 - `waiting`: only the policy ceiling — a suspension older than
-  `policy.max_wait` (or past its own expiry) → `:suspension_expired`.
+  `policy.max_wait` (or past its own expiry) → `:suspension_expired`,
+  with age measured from the `queued_at` stamp the suspend wrote: each
+  suspension gets its own window, never charged for pre-claim queue time.
   Nothing else about a waiting run is the reaper's business: it has no
   heartbeat, no deadline, and no executor *by design*.
 

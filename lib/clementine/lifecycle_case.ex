@@ -139,7 +139,9 @@ defmodule Clementine.LifecycleCase do
     * Requeue — `:effects_present` refusal (matrix row 18's guard),
       `queued_at` stamping, epoch untouched until the next claim.
     * Field hygiene after suspend and requeue — no `executor_id`,
-      `deadline`, or `heartbeat_at` left behind.
+      `deadline`, or `heartbeat_at` left behind — plus the complement:
+      suspend re-stamps `queued_at`, the unowned-state entry time the
+      reaper's `max_wait` ceiling measures from.
     * Reaper interrupt losing cleanly to a concurrent finish (matrix
       row 3), with no projection side effects from the loser.
     * With `:storage_now`, symbolic `:now`/`{:now_plus, ms}` resolution
@@ -265,7 +267,7 @@ defmodule Clementine.LifecycleCase do
           Battery.suspension_round_trip(__conformance__())
         end
 
-        test "field hygiene: suspend leaves no executor_id, deadline, or heartbeat_at" do
+        test "field hygiene: suspend clears the execution fields and re-stamps queued_at" do
           Battery.suspend_field_hygiene(__conformance__())
         end
 
@@ -365,8 +367,8 @@ defmodule Clementine.LifecycleCase do
           Battery.storage_clock_stamps(__conformance__())
         end
 
-        test "requeue and resume stamps resolve against the storage clock" do
-          Battery.storage_clock_requeue_and_resume(__conformance__())
+        test "suspend, requeue, and resume entry stamps resolve against the storage clock" do
+          Battery.storage_clock_unowned_entry_stamps(__conformance__())
         end
       end
     end
