@@ -711,6 +711,112 @@ defmodule Clementine.ToolTest do
     end
   end
 
+  describe "execution metadata" do
+    defmodule DefaultMetaTool do
+      use Clementine.Tool,
+        name: "default_meta",
+        description: "Declares no metadata",
+        parameters: []
+
+      @impl true
+      def run(_args, _context), do: {:ok, "ok"}
+    end
+
+    defmodule SafeReadTool do
+      use Clementine.Tool,
+        name: "safe_read",
+        description: "Declares itself effect-free",
+        retry: :safe,
+        parameters: []
+
+      @impl true
+      def run(_args, _context), do: {:ok, "ok"}
+    end
+
+    defmodule GatedDeployTool do
+      use Clementine.Tool,
+        name: "gated_deploy",
+        description: "Requires human approval",
+        approval: :required,
+        retry: :unsafe,
+        parameters: []
+
+      @impl true
+      def run(_args, _context), do: {:ok, "ok"}
+    end
+
+    defmodule PolicyGatedTool do
+      use Clementine.Tool,
+        name: "policy_gated",
+        description: "Reserved policy approval shape",
+        approval: {:policy, :prod_only},
+        parameters: []
+
+      @impl true
+      def run(_args, _context), do: {:ok, "ok"}
+    end
+
+    test "defaults: approval :never, retry :unknown" do
+      assert DefaultMetaTool.__approval__() == :never
+      assert DefaultMetaTool.__retry__() == :unknown
+    end
+
+    test "declared metadata round-trips through the accessors" do
+      assert SafeReadTool.__retry__() == :safe
+      assert GatedDeployTool.__approval__() == :required
+      assert GatedDeployTool.__retry__() == :unsafe
+      assert PolicyGatedTool.__approval__() == {:policy, :prod_only}
+    end
+
+    test "Tool.approval/1 and Tool.retry/1 read declared metadata" do
+      assert Tool.approval(GatedDeployTool) == :required
+      assert Tool.retry(SafeReadTool) == :safe
+    end
+
+    test "modules without the metadata functions fall back to the conservative defaults" do
+      # A hand-rolled tool module predating the metadata: approval gating
+      # is opt-in, retryability is unknown (treated as unsafe).
+      assert Tool.approval(String) == :never
+      assert Tool.retry(String) == :unknown
+    end
+
+    test "an invalid :retry raises at compile time" do
+      assert_raise ArgumentError, ~r/invalid :retry :sometimes/, fn ->
+        Code.compile_quoted(
+          quote do
+            defmodule InvalidRetryTool do
+              use Clementine.Tool,
+                name: "invalid_retry",
+                description: "Invalid retry metadata",
+                retry: :sometimes
+
+              @impl true
+              def run(_, _), do: {:ok, "ok"}
+            end
+          end
+        )
+      end
+    end
+
+    test "an invalid :approval raises at compile time" do
+      assert_raise ArgumentError, ~r/invalid :approval :ask_nicely/, fn ->
+        Code.compile_quoted(
+          quote do
+            defmodule InvalidApprovalTool do
+              use Clementine.Tool,
+                name: "invalid_approval",
+                description: "Invalid approval metadata",
+                approval: :ask_nicely
+
+              @impl true
+              def run(_, _), do: {:ok, "ok"}
+            end
+          end
+        )
+      end
+    end
+  end
+
   describe "tool module with crash handling" do
     defmodule CrashingTool do
       use Clementine.Tool,

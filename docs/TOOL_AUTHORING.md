@@ -91,6 +91,44 @@ Success options other than `:is_error` are preserved as
 
 `ToolRunner.has_errors?/1` and `get_errors/1` treat both `{:error, _}` and `{:ok, _, is_error: true}` as errors. This means downstream code that checks for failures (retry logic, verifiers, event callbacks) will see command-level failures.
 
+## Execution Metadata
+
+Beyond the wire schema the LLM sees, a tool declares how the execution
+machinery may treat it (durable execution RFC, §Attempts, Retries, And The
+Effect Fence):
+
+```elixir
+use Clementine.Tool,
+  name: "search_docs",
+  description: "Full-text search over the docs index",
+  retry: :safe,          # default :unknown
+  approval: :never,      # default :never
+  parameters: [ ... ]
+```
+
+**`retry: :safe | :unsafe | :unknown`** (default `:unknown`, treated as
+`:unsafe`). Declare `:safe` when the tool has no external effects: running
+it twice is as good as once, and killing it mid-flight loses nothing.
+The declaration has two consequences:
+
+- The **effect fence** (`Facts.effects?`) rises only before the first
+  batch containing a non-`:safe` tool. A run that only ever called
+  `:safe` tools stays eligible for same-run requeue — it survives a
+  graceful drain invisibly and can be retried by reaper policy.
+- On cooperative **cancellation** mid-batch, `:safe` tools are killed
+  immediately; non-`:safe` tools run out their own timeout, because
+  killing an effectful tool mid-flight creates unknowable external state.
+
+**`approval: :never | :required | {:policy, term}`** (default `:never`).
+Anything but `:never` asks the engine to pause for a human decision before
+executing the call. `{:policy, term}` is a reserved shape. The
+suspend-for-approval flow arrives with gated tools; until it lands, the
+engine fails closed (`%Clementine.Error{code: :approval_unsupported}`)
+rather than execute an approval-gated tool ungated.
+
+When in doubt, declare nothing: `:unknown` + `:never` is the conservative
+posture — never killed early, never retried, never silently gated.
+
 ## Parameter Schema
 
 Parameters are defined as a keyword list. Each parameter has these options:
@@ -404,6 +442,8 @@ When creating a new tool:
 
 1. Create `lib/clementine/tools/<name>.ex` (or `lib/your_app/tools/<name>.ex`)
 2. `use Clementine.Tool` with `name`, `description`, and `parameters`
-3. Implement `run/2` returning `{:ok, string}`, `{:ok, string, opts}`, or `{:error, string}`
-4. Create `test/clementine/tools/<name>_test.exs`
-5. Add the tool module to your agent's `tools:` list
+3. Declare `retry: :safe` if — and only if — the tool is genuinely
+   effect-free; leave the default otherwise
+4. Implement `run/2` returning `{:ok, string}`, `{:ok, string, opts}`, or `{:error, string}`
+5. Create `test/clementine/tools/<name>_test.exs`
+6. Add the tool module to your agent's `tools:` list

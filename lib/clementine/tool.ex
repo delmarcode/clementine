@@ -36,6 +36,23 @@ defmodule Clementine.Tool do
   - `:properties` - For object types, nested parameter definitions
   - `:minimum` / `:maximum` - For integer and number types, inclusive bounds
   - `:min_length` / `:max_length` - For string types, inclusive length bounds
+
+  ## Execution Metadata
+
+  Beyond the wire schema, a tool declares how the execution machinery may
+  treat it (RFC §Attempts, Retries, And The Effect Fence):
+
+  - `:retry` - `:safe | :unsafe | :unknown` (default `:unknown`, treated as
+    `:unsafe`). `:safe` declares the tool free of external effects: running
+    it twice is as good as once, and killing it mid-flight loses nothing.
+    The engine raises the effect fence only for batches containing a
+    non-`:safe` tool, and a cooperative cancel kills `:safe` tools
+    immediately while unsafe ones run out their own timeout.
+  - `:approval` - `:never | :required | {:policy, term()}` (default
+    `:never`). Anything but `:never` asks the engine to pause for a human
+    decision before executing; `{:policy, term}` is a reserved shape. The
+    suspend-for-approval flow arrives with gated tools — until then the
+    engine fails closed rather than execute an approval-gated tool ungated.
   """
 
   @type context :: %{
@@ -84,6 +101,9 @@ defmodule Clementine.Tool do
   """
   @callback summarize(args :: map()) :: String.t()
 
+  @type approval :: :never | :required | {:policy, term()}
+  @type retry :: :safe | :unsafe | :unknown
+
   @doc """
   Invoked when using the tool module.
 
@@ -92,6 +112,10 @@ defmodule Clementine.Tool do
   - `:name` - Required. The tool name as it will appear to the LLM.
   - `:description` - Required. A description of what the tool does.
   - `:parameters` - Optional. A keyword list defining the tool's parameters.
+  - `:approval` - Optional. `:never | :required | {:policy, term()}`
+    (default `:never`). See "Execution Metadata" above.
+  - `:retry` - Optional. `:safe | :unsafe | :unknown` (default `:unknown`,
+    treated as `:unsafe`). See "Execution Metadata" above.
   """
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do
@@ -100,9 +124,12 @@ defmodule Clementine.Tool do
       @tool_name Keyword.fetch!(opts, :name)
       @tool_description Keyword.fetch!(opts, :description)
       @tool_parameters Keyword.get(opts, :parameters, [])
+      @tool_approval Keyword.get(opts, :approval, :never)
+      @tool_retry Keyword.get(opts, :retry, :unknown)
 
       # Validate at compile time
       Clementine.Tool.validate_schema!(@tool_name, @tool_description, @tool_parameters)
+      Clementine.Tool.validate_metadata!(@tool_name, @tool_approval, @tool_retry)
 
       @doc """
       Returns the tool's provider-neutral schema.
@@ -124,6 +151,16 @@ defmodule Clementine.Tool do
       Returns the tool's parameter definitions.
       """
       def __parameters__, do: @tool_parameters
+
+      @doc """
+      Returns the tool's approval metadata.
+      """
+      def __approval__, do: @tool_approval
+
+      @doc """
+      Returns the tool's retry metadata.
+      """
+      def __retry__, do: @tool_retry
 
       @doc """
       Returns a human-readable summary of a tool invocation for logging.
@@ -174,6 +211,25 @@ defmodule Clementine.Tool do
     end
 
     validate_parameters!(parameters, :parameter, nil, [])
+
+    :ok
+  end
+
+  @doc """
+  Validates the tool's execution metadata at compile time.
+  """
+  def validate_metadata!(name, approval, retry) do
+    unless approval in [:never, :required] or match?({:policy, _}, approval) do
+      raise ArgumentError,
+            "Tool #{name} has invalid :approval #{inspect(approval)}. " <>
+              "Valid: :never, :required, or {:policy, term}"
+    end
+
+    unless retry in [:safe, :unsafe, :unknown] do
+      raise ArgumentError,
+            "Tool #{name} has invalid :retry #{inspect(retry)}. " <>
+              "Valid: :safe, :unsafe, or :unknown"
+    end
 
     :ok
   end
@@ -743,5 +799,32 @@ defmodule Clementine.Tool do
   """
   def find_by_name(tools, name) when is_list(tools) and is_binary(name) do
     Enum.find(tools, fn tool -> tool.__name__() == name end)
+  end
+
+  @doc """
+  A tool module's approval metadata. Modules predating the metadata (or
+  hand-rolled without the macro) default to `:never` — approval gating is
+  strictly opt-in.
+  """
+  @spec approval(module()) :: approval()
+  def approval(tool_module) when is_atom(tool_module) do
+    if Code.ensure_loaded?(tool_module) and function_exported?(tool_module, :__approval__, 0) do
+      tool_module.__approval__()
+    else
+      :never
+    end
+  end
+
+  @doc """
+  A tool module's retry metadata. Modules that do not declare it are
+  `:unknown` — which the execution machinery treats as `:unsafe`.
+  """
+  @spec retry(module()) :: retry()
+  def retry(tool_module) when is_atom(tool_module) do
+    if Code.ensure_loaded?(tool_module) and function_exported?(tool_module, :__retry__, 0) do
+      tool_module.__retry__()
+    else
+      :unknown
+    end
   end
 end
