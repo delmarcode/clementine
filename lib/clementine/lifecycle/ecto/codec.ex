@@ -11,9 +11,13 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
   Open `term()` positions (cancel reasons, external tags, resume payload
   metas, error `raw`) use a tagged encoding: values that survive a JSON
   round trip unchanged are stored as plain JSON (inspectable in the
-  database); anything else is stored as Base64-encoded ETF and decoded with
-  `:erlang.binary_to_term(bin, [:safe])`. These columns are the host's own
-  writes — trusted storage, not user input.
+  database); anything else is stored as Base64-encoded ETF. Decoding does
+  *not* use the `:safe` option: `:safe` refuses to intern new atoms, and an
+  atom this codec durably wrote may legitimately not be interned yet in a
+  freshly restarted VM — `fetch` must stay total on the codec's own writes
+  across restarts and deploys. The atom-creation surface is bounded by what
+  the host application itself stored: these columns are trusted storage,
+  not user input, and must never carry attacker-controlled bytes.
 
   A stored suspension whose embedded checkpoint no longer decodes (a deploy
   changed the checkpoint version between suspend and resume) keeps the raw
@@ -331,7 +335,9 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
   def decode_term(%{"t" => "json", "v" => value}), do: value
 
   def decode_term(%{"t" => "etf", "v" => encoded}) do
-    :erlang.binary_to_term(Base.decode64!(encoded), [:safe])
+    # No :safe — it would make fetch partial across VM restarts (see
+    # moduledoc). Trusted storage only.
+    :erlang.binary_to_term(Base.decode64!(encoded))
   end
 
   # True only when a JSON round trip returns the value unchanged.

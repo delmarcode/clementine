@@ -56,6 +56,19 @@ defmodule Clementine.Lifecycle.Ecto.CodecTest do
         assert Codec.decode_term(jsonb_round_trip(encoded)) == value
       end
     end
+
+    test "decodes atoms not yet interned in this VM — a durable row must survive restarts" do
+      # As after a restart/deploy: the writing VM interned this atom, the
+      # reading VM has not. A :safe decode would raise here and make fetch
+      # partial on the codec's own writes.
+      name = "cancel_reason_#{System.unique_integer([:positive])}"
+      assert_raise ArgumentError, fn -> String.to_existing_atom(name) end
+
+      etf = <<131, 119, byte_size(name), name::binary>>
+      encoded = jsonb_round_trip(%{"t" => "etf", "v" => Base.encode64(etf)})
+
+      assert encoded |> Codec.decode_term() |> Atom.to_string() == name
+    end
   end
 
   describe "cancel" do
