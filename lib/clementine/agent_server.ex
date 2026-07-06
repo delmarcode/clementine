@@ -1,9 +1,16 @@
 defmodule Clementine.AgentServer do
   @moduledoc """
-  Behaviour and macro for defining agents.
+  An interactive agent process: a GenServer that holds conversation history
+  and runs each turn through the same machinery production uses — a
+  `Clementine.Rollout` built from its state, a `Clementine.Run`, the
+  `Clementine.Runner`, and the ephemeral in-memory lifecycle. A porch, not
+  the house: convenience for interactive local use, never the ontology.
 
-  An agent is a GenServer that runs the agentic loop with a set of tools.
-  It maintains conversation history and can be supervised like any OTP process.
+  Each turn builds a rollout with `messages: history`; a `Completed` result
+  folds back as `history ++ [input_message] ++ messages`. Results follow
+  `Clementine.run/3`'s contract — `{:ok, %Clementine.Result.Completed{}}`
+  or `{:error, result}` with the other terminal `Clementine.Result`
+  variants, every one carrying usage.
 
   ## Example
 
@@ -26,7 +33,10 @@ defmodule Clementine.AgentServer do
       {:ok, agent} = MyApp.CodingAgent.start_link()
 
       # Run a task
-      {:ok, result} = Clementine.AgentServer.run(agent, "Add a fibonacci function to lib/math.ex")
+      {:ok, %Clementine.Result.Completed{} = result} =
+        Clementine.AgentServer.run(agent, "Add a fibonacci function to lib/math.ex")
+
+      result.output
 
   ## Configuration
 
@@ -41,8 +51,6 @@ defmodule Clementine.AgentServer do
   Runtime options can override compile-time options when calling `start_link/1`.
 
   """
-
-  alias Clementine.Rollout
 
   @type agent :: GenServer.server()
 
@@ -150,15 +158,14 @@ defmodule Clementine.AgentServer do
       def handle_call({:run, prompt}, _from, state) do
         case running_task_ids(state) do
           [] ->
-            # Run synchronously
-            config = build_loop_config(state)
+            # Run synchronously, in this process — the ephemeral lifecycle
+            # is single-writer by construction.
+            case execute_turn(turn_rollout(state, prompt)) do
+              {:ok, %Clementine.Result.Completed{} = result} ->
+                {:reply, {:ok, result}, apply_history(state, result)}
 
-            case Rollout.run(config, prompt) do
-              {:ok, result, messages} ->
-                {:reply, {:ok, result}, %{state | history: messages}}
-
-              {:error, reason} ->
-                {:reply, {:error, reason}, state}
+              {:error, _result} = error ->
+                {:reply, error, state}
             end
 
           task_ids ->
@@ -167,19 +174,19 @@ defmodule Clementine.AgentServer do
       end
 
       @impl true
-      def handle_call({:run_async, prompt}, {from_pid, _ref}, state) do
+      def handle_call({:run_async, prompt}, _from, state) do
         case running_task_ids(state) do
           [] ->
             task_id = generate_task_id()
-            config = build_loop_config(state)
+            rollout = turn_rollout(state, prompt)
 
-            # Use async_nolink so a crash in Rollout.run/2 doesn't take down the agent
+            # async_nolink so a crash in the turn doesn't take down the agent
             task =
               Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
-                Rollout.run(config, prompt)
+                execute_turn(rollout)
               end)
 
-            entry = %{task: task, from: from_pid, status: :running, waiters: []}
+            entry = %{task: task, status: :running, waiters: []}
             tasks = Map.put(state.tasks, task_id, entry)
             {:reply, {:ok, task_id}, %{state | tasks: tasks}}
 
@@ -189,43 +196,33 @@ defmodule Clementine.AgentServer do
       end
 
       @impl true
-      def handle_call({:run_stream, prompt, stream_consumer}, _from, state) do
-        start_stream_task(prompt, stream_consumer, state, fn task_id, _task ->
-          {:ok, task_id}
-        end)
-      end
-
-      @impl true
-      def handle_call({:run_stream, prompt, stream_consumer, :return_owner}, _from, state) do
-        start_stream_task(prompt, stream_consumer, state, fn task_id, task ->
-          {:ok, task_id, self(), task.pid}
-        end)
-      end
-
-      defp start_stream_task(prompt, stream_consumer, state, reply_fun) do
+      def handle_call({:run_stream, prompt, consumer, tag}, _from, state)
+          when is_pid(consumer) and is_reference(tag) do
         case running_task_ids(state) do
           [] ->
             task_id = generate_task_id()
-            config = build_loop_config(state)
-            consumer_monitor_ref = Process.monitor(stream_consumer)
+            rollout = turn_rollout(state, prompt)
+            consumer_monitor_ref = Process.monitor(consumer)
 
+            # Stamped events flow straight from the turn's execution to the
+            # consumer via the forwarder; only the terminal result routes
+            # back through this server (for the history fold).
             task =
               Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
-                Rollout.run_stream(config, prompt, fn event ->
-                  send(stream_consumer, {:clementine_stream_event, task_id, event})
-                end)
+                execute_turn(rollout, [forward_to: {consumer, tag}], Clementine.Events.Forwarder)
               end)
 
             entry = %{
               task: task,
               status: :running,
               waiters: [],
-              stream_consumer: stream_consumer,
-              consumer_monitor_ref: consumer_monitor_ref
+              stream_consumer: consumer,
+              consumer_monitor_ref: consumer_monitor_ref,
+              tag: tag
             }
 
             tasks = Map.put(state.tasks, task_id, entry)
-            {:reply, reply_fun.(task_id, task), %{state | tasks: tasks}}
+            {:reply, {:ok, task_id, self(), task.pid}, %{state | tasks: tasks}}
 
           task_ids ->
             {:reply, {:error, {:agent_busy, task_ids}}, state}
@@ -276,7 +273,7 @@ defmodule Clementine.AgentServer do
           %{result: result} ->
             # Task already finished — return result and clean up
             tasks = Map.delete(state.tasks, task_id)
-            {:reply, normalize_result(result), %{state | tasks: tasks}}
+            {:reply, result, %{state | tasks: tasks}}
         end
       end
 
@@ -307,7 +304,7 @@ defmodule Clementine.AgentServer do
           {task_id, task_info} ->
             demonitor_stream_consumer(task_info)
             state = maybe_apply_task_history(state, task_info, result)
-            maybe_notify_stream_consumer(task_id, task_info, result)
+            maybe_notify_stream_consumer(task_info, result)
             tasks = finish_task(state.tasks, task_id, task_info, :completed, result)
             {:noreply, %{state | tasks: tasks}}
 
@@ -344,7 +341,7 @@ defmodule Clementine.AgentServer do
             {task_id, %{status: :running} = task_info} = task
             result = {:error, {:task_crashed, reason}}
             demonitor_stream_consumer(task_info)
-            notify_stream_consumer(task_id, task_info, result)
+            notify_stream_consumer(task_info, result)
             tasks = finish_task(state.tasks, task_id, task_info, :failed, result)
             {:noreply, %{state | tasks: tasks}}
 
@@ -390,6 +387,46 @@ defmodule Clementine.AgentServer do
 
       # Private helpers
 
+      # One turn = one ephemeral run of the rollout, through the same
+      # Agent/Rollout/Run/Runner path `Clementine.run/3` uses. Returns that
+      # facade's contract: {:ok, Completed} | {:error, other_terminal}.
+      defp execute_turn(rollout, create_opts \\ [], sink \\ Clementine.Events.Null) do
+        {ref, ctx} = Clementine.Lifecycle.Ephemeral.create(create_opts)
+        run = Clementine.Run.new(ref: ref, rollout: rollout)
+
+        try do
+          case Clementine.execute_ephemeral(run, ctx, sink) do
+            %Clementine.Result.Completed{} = completed -> {:ok, completed}
+            other -> {:error, other}
+          end
+        after
+          Clementine.Lifecycle.Ephemeral.delete(ctx)
+        end
+      end
+
+      defp turn_rollout(state, prompt) do
+        agent =
+          Clementine.Agent.new(
+            model: state.model,
+            instructions: state.system,
+            tools: state.tools,
+            defaults: [max_iterations: state.max_iterations]
+          )
+
+        Clementine.Rollout.new(
+          agent: agent,
+          input: prompt,
+          messages: state.history,
+          context: state.context
+        )
+      end
+
+      # The history fold: history ++ [input_message] ++ generated messages —
+      # stated this way so the fold cannot silently drop user input.
+      defp apply_history(state, %Clementine.Result.Completed{} = result) do
+        %{state | history: state.history ++ [result.input_message | result.messages]}
+      end
+
       defp validate_history!(history) when is_list(history) do
         Enum.each(history, fn
           %Clementine.LLM.Message.UserMessage{} ->
@@ -414,17 +451,6 @@ defmodule Clementine.AgentServer do
 
       defp schedule_task_cleanup do
         Process.send_after(self(), :task_cleanup, @task_cleanup_interval_ms)
-      end
-
-      defp build_loop_config(state) do
-        [
-          model: state.model,
-          system: state.system,
-          tools: state.tools,
-          context: state.context,
-          max_iterations: state.max_iterations,
-          messages: state.history
-        ]
       end
 
       defp generate_task_id do
@@ -454,30 +480,38 @@ defmodule Clementine.AgentServer do
         |> Enum.sort()
       end
 
-      defp notify_stream_consumer(task_id, %{stream_consumer: consumer}, result) do
-        send(consumer, {:clementine_stream_done, task_id, normalize_result(result)})
+      defp notify_stream_consumer(%{stream_consumer: consumer, tag: tag}, result) do
+        send(consumer, {:clementine_stream_done, tag, result})
       end
 
-      defp notify_stream_consumer(_task_id, _task_info, _result), do: :ok
+      defp notify_stream_consumer(_task_info, _result), do: :ok
 
-      defp maybe_notify_stream_consumer(task_id, %{stream_consumer: consumer} = task_info, result) do
+      defp maybe_notify_stream_consumer(%{stream_consumer: consumer} = task_info, result) do
         if Process.alive?(consumer) do
-          notify_stream_consumer(task_id, task_info, result)
+          notify_stream_consumer(task_info, result)
         else
           :ok
         end
       end
 
-      defp maybe_notify_stream_consumer(task_id, task_info, result) do
-        notify_stream_consumer(task_id, task_info, result)
+      defp maybe_notify_stream_consumer(task_info, result) do
+        notify_stream_consumer(task_info, result)
       end
 
-      defp maybe_apply_task_history(state, %{stream_consumer: consumer}, {:ok, _text, messages}) do
-        if Process.alive?(consumer), do: %{state | history: messages}, else: state
+      defp maybe_apply_task_history(
+             state,
+             %{stream_consumer: consumer},
+             {:ok, %Clementine.Result.Completed{} = result}
+           ) do
+        if Process.alive?(consumer), do: apply_history(state, result), else: state
       end
 
-      defp maybe_apply_task_history(state, _task_info, {:ok, _text, messages}) do
-        %{state | history: messages}
+      defp maybe_apply_task_history(
+             state,
+             _task_info,
+             {:ok, %Clementine.Result.Completed{} = result}
+           ) do
+        apply_history(state, result)
       end
 
       defp maybe_apply_task_history(state, _task_info, _result), do: state
@@ -493,11 +527,10 @@ defmodule Clementine.AgentServer do
       # If no waiters, the entry is kept so a later await/3 can retrieve it.
       defp finish_task(tasks, task_id, task_info, status, result) do
         waiters = Map.get(task_info, :waiters, [])
-        normalized = normalize_result(result)
 
         for {from, timer_ref} <- waiters do
           if timer_ref, do: Process.cancel_timer(timer_ref)
-          GenServer.reply(from, normalized)
+          GenServer.reply(from, result)
         end
 
         cond do
@@ -515,11 +548,6 @@ defmodule Clementine.AgentServer do
             Map.delete(tasks, task_id)
         end
       end
-
-      # Convert internal Rollout.run/2 results to the public await/3 contract,
-      # which matches run/2: {:ok, text} | {:error, reason}
-      defp normalize_result({:ok, text, _messages}), do: {:ok, text}
-      defp normalize_result({:error, _reason} = error), do: error
     end
   end
 
@@ -528,6 +556,9 @@ defmodule Clementine.AgentServer do
   @doc """
   Runs a prompt synchronously on an agent.
 
+  Returns `{:ok, %Clementine.Result.Completed{}}` — final output, generated
+  messages, and usage — or `{:error, result}` carrying the other terminal
+  `Clementine.Result` variants (`Failed`, `Cancelled`, `Interrupted`).
   Returns `{:error, {:agent_busy, task_ids}}` if an async run is already
   active for this conversational agent.
   """
@@ -548,20 +579,37 @@ defmodule Clementine.AgentServer do
   @doc """
   Streams a prompt execution on an agent.
 
-  The returned stream emits real loop streaming events as they occur, followed
-  by `{:done, :success}` or `{:done, :error}`. A successful streaming run
-  updates the agent conversation history just like `run/2`.
+  Returns a lazy enumerable of stamped `Clementine.Event` structs in
+  `(epoch, seq)` order, ending with `{:result, result}` carrying the
+  terminal `Clementine.Result` (any variant). When the run cannot start or
+  its process dies, the final element is `{:error, reason}` instead —
+  `{:agent_busy, task_ids}`, `{:agent_down, reason}`, or
+  `{:task_crashed, reason}`.
+
+  A run that completes updates the agent's conversation history exactly as
+  `run/2` does. Abandoning the stream cancels the run.
+
+  ## Example
+
+      Clementine.AgentServer.stream(agent, "Explain this code")
+      |> Enum.each(fn
+        %Clementine.Event{type: :text_delta, payload: %{content: text}} -> IO.write(text)
+        {:result, %Clementine.Result.Completed{}} -> IO.puts("\\n[done]")
+        _ -> :ok
+      end)
   """
   def stream(agent, prompt) when is_binary(prompt) do
     Stream.resource(
       fn ->
-        case start_stream(agent, prompt) do
+        tag = make_ref()
+
+        case start_stream(agent, prompt, tag) do
           {:ok, task_id, agent_pid, task_pid} ->
             agent_monitor_ref = Process.monitor(agent_pid)
-            {:running, agent, task_id, agent_monitor_ref, task_pid, false}
+            {:running, agent, tag, task_id, agent_monitor_ref, task_pid}
 
           {:error, reason} ->
-            {:emit, [{:error, reason}, {:done, :error}]}
+            {:emit, [{:error, reason}]}
         end
       end,
       &next_stream_event/1,
@@ -569,8 +617,8 @@ defmodule Clementine.AgentServer do
     )
   end
 
-  defp start_stream(agent, prompt) do
-    GenServer.call(agent, {:run_stream, prompt, self(), :return_owner}, :infinity)
+  defp start_stream(agent, prompt, tag) do
+    GenServer.call(agent, {:run_stream, prompt, self(), tag}, :infinity)
   catch
     :exit, reason -> {:error, {:agent_down, reason}}
   end
@@ -579,43 +627,47 @@ defmodule Clementine.AgentServer do
     {:halt, :done}
   end
 
-  defp next_stream_event({:emit, [event | rest]}) do
-    {[event], {:emit, rest}}
+  defp next_stream_event({:emit, [item | rest]}) do
+    {[item], {:emit, rest}}
   end
 
   defp next_stream_event(:done) do
     {:halt, :done}
   end
 
-  defp next_stream_event(
-         {:running, agent, task_id, agent_monitor_ref, task_pid, saw_error?} = state
-       ) do
+  defp next_stream_event({:running, _agent, tag, _task_id, agent_monitor_ref, task_pid} = state) do
     receive do
-      {:clementine_stream_event, ^task_id, {:error, _reason} = event} ->
-        {[event], {:running, agent, task_id, agent_monitor_ref, task_pid, true}}
-
-      {:clementine_stream_event, ^task_id, event} ->
+      {:clementine_stream_event, ^tag, %Clementine.Event{} = event} ->
         {[event], state}
 
-      {:clementine_stream_done, ^task_id, {:ok, _text}} ->
+      {:clementine_stream_done, ^tag, result} ->
         demonitor_agent(agent_monitor_ref)
-        drain_stream_messages(task_id)
-        {[{:done, :success}], :done}
-
-      {:clementine_stream_done, ^task_id, {:error, reason}} ->
-        demonitor_agent(agent_monitor_ref)
-        drain_stream_messages(task_id)
-        events = stream_error_events(reason, saw_error?)
-        {events, :done}
+        drain_stream_messages(tag)
+        {[done_element(result)], :done}
 
       {:DOWN, ^agent_monitor_ref, :process, _pid, reason} ->
         terminate_stream_task(task_pid)
-        drain_stream_messages(task_id)
-        {stream_error_events({:agent_down, reason}, saw_error?), :done}
+        drain_stream_messages(tag)
+        {[{:error, {:agent_down, reason}}], :done}
     end
   end
 
-  defp cleanup_stream({:running, agent, task_id, agent_monitor_ref, task_pid, _saw_error?}) do
+  # The terminal element: any Result variant rides in {:result, _} — the
+  # result is truth, whichever way the run ended; a bare {:error, reason}
+  # is reserved for runs that never produced one (crashed task).
+  defp done_element({:ok, %Clementine.Result.Completed{} = result}), do: {:result, result}
+
+  defp done_element({:error, %struct{} = result})
+       when struct in [
+              Clementine.Result.Failed,
+              Clementine.Result.Cancelled,
+              Clementine.Result.Interrupted
+            ],
+       do: {:result, result}
+
+  defp done_element({:error, reason}), do: {:error, reason}
+
+  defp cleanup_stream({:running, agent, tag, task_id, agent_monitor_ref, task_pid}) do
     demonitor_agent(agent_monitor_ref)
 
     case cancel_stream(agent, task_id) do
@@ -623,7 +675,7 @@ defmodule Clementine.AgentServer do
       {:error, _reason} -> terminate_stream_task(task_pid)
     end
 
-    drain_stream_messages(task_id)
+    drain_stream_messages(tag)
   end
 
   defp cleanup_stream(_state), do: :ok
@@ -638,10 +690,10 @@ defmodule Clementine.AgentServer do
     Process.demonitor(ref, [:flush])
   end
 
-  defp drain_stream_messages(task_id) do
+  defp drain_stream_messages(tag) do
     receive do
-      {:clementine_stream_event, ^task_id, _event} -> drain_stream_messages(task_id)
-      {:clementine_stream_done, ^task_id, _result} -> drain_stream_messages(task_id)
+      {:clementine_stream_event, ^tag, _event} -> drain_stream_messages(tag)
+      {:clementine_stream_done, ^tag, _result} -> drain_stream_messages(tag)
     after
       0 -> :ok
     end
@@ -660,9 +712,6 @@ defmodule Clementine.AgentServer do
     :ok
   end
 
-  defp stream_error_events(_reason, true), do: [{:done, :error}]
-  defp stream_error_events(reason, false), do: [{:error, reason}, {:done, :error}]
-
   @doc """
   Awaits the result of an async task.
 
@@ -677,8 +726,9 @@ defmodule Clementine.AgentServer do
 
   ## Returns
 
-  - `{:ok, text}` — task completed successfully
-  - `{:error, reason}` — task failed (LLM error, crash, etc.)
+  - `{:ok, %Clementine.Result.Completed{}}` — the turn completed
+  - `{:error, result}` — the other terminal `Clementine.Result` variants
+  - `{:error, {:task_crashed, reason}}` — the task process crashed
   - `{:error, :timeout}` — task did not complete within the timeout
   - `{:error, :not_found}` — unknown or already-consumed task_id
   """
