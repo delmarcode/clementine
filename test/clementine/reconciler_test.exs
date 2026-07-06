@@ -288,6 +288,29 @@ defmodule Clementine.ReconcilerTest do
                Reconciler.judge(observed, sweep_now, policy)
     end
 
+    test "matrix row 15: the max_wait ceiling measures from the park, not the original enqueue",
+         %{store: store} do
+      # Review scenario: queued far longer than the ceiling before ever
+      # being claimed (12m in the queue, 10m ceiling), then suspended.
+      long_ago = DateTime.add(DateTime.utc_now(), -:timer.minutes(12), :millisecond)
+      MemoryLifecycle.seed_queued(store, "aged", queued_at: long_ago)
+
+      {:ok, lease} = Protocol.claim(MemoryLifecycle, "aged", executor: "e", ctx: store)
+      {:ok, _token} = Protocol.suspend(lease, suspension_request(), cursor: {1, 0})
+
+      waiting = MemoryLifecycle.facts!(store, "aged")
+      policy = Policy.new(max_wait: :timer.minutes(10))
+
+      # Freshly parked: healthy despite the 12 minutes of pre-claim history.
+      assert Reconciler.judge(waiting, DateTime.utc_now(), policy) == :healthy
+
+      # Expired only once the wait itself outlives the ceiling.
+      eleven_minutes_on = DateTime.add(DateTime.utc_now(), :timer.minutes(11), :millisecond)
+
+      assert {:interrupt, %InterruptReason{code: :suspension_expired}} =
+               Reconciler.judge(waiting, eleven_minutes_on, policy)
+    end
+
     test "matrix rows 10 + 15: a suspended run survives the full sweep and stays resumable",
          %{store: store} do
       {:ok, lease} = Protocol.claim(MemoryLifecycle, "run", executor: "e", ctx: store)

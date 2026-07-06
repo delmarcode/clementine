@@ -176,11 +176,10 @@ defmodule Clementine.Reconciler do
   end
 
   def judge(%Facts{status: :waiting} = facts, %DateTime{} = now, %Policy{} = policy) do
-    # Suspension age is approximated from queued_at — the run's last entry
-    # into the queued -> running cycle that parked it; the facts carry no
-    # suspended-at stamp. The estimate overshoots by the claim-to-suspend
-    # interval, so a ceiling fires at most that much early — noise at the
-    # day scale ceilings live on.
+    # `Protocol.suspend` re-stamps queued_at at the park (a transition into
+    # an unowned state, like resume and requeue), so for a waiting run the
+    # stamp is the suspension time and the ceiling measures true waiting
+    # age — never time spent queued or running before the park.
     case {policy.max_wait, age(now, facts.queued_at)} do
       {nil, _age} ->
         :healthy

@@ -182,7 +182,11 @@ defmodule Clementine.Lifecycle.Protocol do
   @doc """
   Parks the run: `running -> waiting`, with the assembled suspension stored
   durably and the executor fields cleared (a waiting run has no executor,
-  no deadline, no heartbeat).
+  no deadline, no heartbeat). Like resume and requeue, suspend is a
+  transition into an unowned state, so it re-stamps `queued_at` — the
+  reaper measures the wait's age from that stamp
+  (`Clementine.Reconciler`'s `max_wait` ceiling), which must not include
+  time spent queued or running before the park.
 
   The rollout produced the `Suspension.Request` body; the runner supplies
   `cursor:` (its event stamper position) and `rollout_id:`; this function
@@ -231,6 +235,7 @@ defmodule Clementine.Lifecycle.Protocol do
         executor_id: nil,
         deadline: nil,
         heartbeat_at: nil,
+        queued_at: :now,
         usage: request.usage
       }
     }

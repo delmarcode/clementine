@@ -172,6 +172,18 @@ defmodule Clementine.Lifecycle.ProtocolTest do
       assert facts.suspension.checkpoint.iteration == 2
     end
 
+    test "re-stamps queued_at: the wait's age starts at the park, not the original enqueue",
+         %{store: store} do
+      long_ago = DateTime.add(DateTime.utc_now(), -:timer.minutes(12), :millisecond)
+      MemoryLifecycle.seed_queued(store, "r1", queued_at: long_ago)
+      lease = claim!(store, "r1")
+
+      {:ok, _token} = Protocol.suspend(lease, approval_request(), cursor: {1, 1})
+
+      facts = MemoryLifecycle.facts!(store, "r1")
+      assert DateTime.compare(facts.queued_at, long_ago) == :gt
+    end
+
     test "matrix row 17, flag-first order: cancel before suspend converges to cancelled",
          %{store: store} do
       MemoryLifecycle.seed_queued(store, "r1")
