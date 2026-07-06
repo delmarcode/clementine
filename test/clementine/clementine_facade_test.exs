@@ -103,6 +103,16 @@ defmodule Clementine.FacadeTest do
       assert_received {:clementine_event, %Event{type: :text_delta}}
       assert_received {:clementine_event, %Event{type: :usage_delta}}
     end
+
+    test "an approval-gated tool cannot park an ephemeral run: it fails loud" do
+      # A parked run needs a survivor to resume it; a script's in-process
+      # facts die with the call. Gated tools belong on the durable path.
+      expect_stream(tool_events("tu_1", "gated_deploy", %{}))
+
+      assert_raise RuntimeError, ~r/ephemeral runs cannot park/, fn ->
+        Clementine.run(agent(tools: [Clementine.Test.Tools.GatedDeploy]), "deploy")
+      end
+    end
   end
 
   describe "stream/3" do

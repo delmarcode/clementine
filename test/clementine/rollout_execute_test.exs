@@ -3,11 +3,34 @@ defmodule Clementine.RolloutExecuteTest do
 
   import Mox
 
-  alias Clementine.{Checkpoint, Error, Event, Lease, Pending, Result, Rollout, Usage}
+  alias Clementine.{
+    ApprovalRequest,
+    Checkpoint,
+    Error,
+    Event,
+    Lease,
+    Pending,
+    Result,
+    Rollout,
+    Suspension,
+    ToolResult,
+    Usage
+  }
+
   alias Clementine.Events.Stamper
-  alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
+  alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
   alias Clementine.Test.CollectingSink
-  alias Clementine.Test.Tools.{Echo, SafeEcho, SafePush, Slow, UnsafeSlow}
+
+  alias Clementine.Test.Tools.{
+    Echo,
+    GatedDeploy,
+    PolicyGated,
+    SafeEcho,
+    SafeGatedLookup,
+    SafePush,
+    Slow,
+    UnsafeSlow
+  }
 
   setup :verify_on_exit!
 
@@ -23,18 +46,6 @@ defmodule Clementine.RolloutExecuteTest do
       send(context.notify, {:mark, :tool})
       {:ok, message}
     end
-  end
-
-  defmodule GatedDeploy do
-    @moduledoc false
-    use Clementine.Tool,
-      name: "gated_deploy",
-      description: "Requires human approval",
-      approval: :required,
-      parameters: []
-
-    @impl true
-    def run(_args, _context), do: {:ok, "deployed"}
   end
 
   defp rollout(opts \\ []) do
@@ -72,6 +83,53 @@ defmodule Clementine.RolloutExecuteTest do
       {:message_delta, %{"stop_reason" => "tool_use"},
        %{"input_tokens" => 5, "output_tokens" => 2}}
     ]
+  end
+
+  defp batch_events(calls) do
+    blocks =
+      calls
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {{id, name, input}, index} ->
+        [
+          {:tool_use_start, id, name},
+          {:input_json_delta, id, Jason.encode!(input)},
+          {:content_block_stop, index}
+        ]
+      end)
+
+    blocks ++
+      [
+        {:message_delta, %{"stop_reason" => "tool_use"},
+         %{"input_tokens" => 5, "output_tokens" => 2}}
+      ]
+  end
+
+  # A parked run's checkpoint: history + the assistant turn that issued
+  # the batch, with the first call pending unless overridden.
+  defp approval_checkpoint(opts \\ []) do
+    batch = Keyword.get(opts, :batch, [{"tu_1", "gated_deploy", %{"env" => "prod"}}])
+    {pending_id, pending_name, pending_args} = Keyword.get(opts, :pending, hd(batch))
+
+    %Checkpoint{
+      rollout_id: "r1",
+      iteration: Keyword.get(opts, :iteration, 1),
+      messages: [
+        UserMessage.new("go"),
+        %AssistantMessage{
+          content:
+            Enum.map(batch, fn {id, name, input} ->
+              %Content.ToolUse{id: id, name: name, input: input}
+            end)
+        }
+      ],
+      pending: %Pending.ToolApproval{
+        tool_use_id: pending_id,
+        tool_name: pending_name,
+        args: pending_args,
+        completed_results: Keyword.get(opts, :completed, %{})
+      },
+      usage: %Usage{input_tokens: 10, output_tokens: 5}
+    }
   end
 
   defp stamper do
@@ -327,18 +385,6 @@ defmodule Clementine.RolloutExecuteTest do
       assert {:error, %Error{code: :incompatible_checkpoint}} =
                Rollout.execute(rollout(), resume: {:corrupted, :elapsed})
     end
-
-    test "a pending operation is not yet resolvable and fails closed" do
-      checkpoint = %Checkpoint{
-        rollout_id: "r1",
-        pending: %Pending.ToolApproval{tool_use_id: "tu_1", tool_name: "deploy"}
-      }
-
-      assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
-               Rollout.execute(rollout(), resume: {checkpoint, {:approved, %{}}})
-
-      assert message =~ "pending operation"
-    end
   end
 
   describe "effect fence" do
@@ -446,14 +492,386 @@ defmodule Clementine.RolloutExecuteTest do
     end
   end
 
-  describe "approval gate" do
-    test "an approval-gated tool fails closed until gated execution lands" do
+  describe "approval gate (act phase)" do
+    test "a gated tool call suspends with the rollout's own loop state in the request" do
+      expect_stream(tool_events("tu_1", "gated_deploy", %{"env" => "prod"}))
+
+      assert {:suspend, %Suspension.Request{} = request} =
+               Rollout.execute(rollout(tools: [GatedDeploy], context: %{notify: self()}))
+
+      assert request.reason ==
+               {:approval,
+                %ApprovalRequest{
+                  tool_use_id: "tu_1",
+                  tool_name: "gated_deploy",
+                  args: %{"env" => "prod"}
+                }}
+
+      assert request.pending == %Pending.ToolApproval{
+               tool_use_id: "tu_1",
+               tool_name: "gated_deploy",
+               args: %{"env" => "prod"},
+               completed_results: %{}
+             }
+
+      assert request.iteration == 1
+      assert request.usage == %Usage{input_tokens: 5, output_tokens: 2}
+
+      # The full transcript rides in the request, ending with the
+      # assistant turn that issued the gated call.
+      assert [%UserMessage{content: "go"}, %AssistantMessage{} = assistant] = request.messages
+
+      assert [%Content.ToolUse{id: "tu_1", name: "gated_deploy"}] =
+               AssistantMessage.get_tool_uses(assistant)
+
+      # The gated call itself never ran.
+      refute_received {:deployed, _args}
+    end
+
+    test "ungated siblings execute and ride in the checkpoint; only the gated call is pending" do
+      expect_stream(
+        batch_events([
+          {"tu_1", "gated_deploy", %{"env" => "prod"}},
+          {"tu_2", "echo", %{"message" => "hi"}}
+        ])
+      )
+
+      assert {:suspend, %Suspension.Request{pending: pending}} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy, Echo], context: %{notify: self()}),
+                 emit: stamper()
+               )
+
+      assert pending.tool_use_id == "tu_1"
+
+      assert pending.completed_results == %{
+               "tu_2" => %ToolResult{content: "Echo: hi", is_error: false}
+             }
+
+      refute_received {:deployed, _args}
+
+      # The sibling's execution is observable; the approval event itself is
+      # the runner's to emit, only after the suspend commits.
+      events = collect_events()
+      assert Enum.any?(events, &(&1.type == :tool_result and &1.payload.tool_use_id == "tu_2"))
+      refute Enum.any?(events, &(&1.type == :approval_requested))
+    end
+
+    test "a batch of only gated calls parks on the first with nothing settled" do
+      expect_stream(
+        batch_events([
+          {"tu_1", "gated_deploy", %{"env" => "a"}},
+          {"tu_2", "gated_deploy", %{"env" => "b"}}
+        ])
+      )
+
+      assert {:suspend, %Suspension.Request{pending: pending}} =
+               Rollout.execute(rollout(tools: [GatedDeploy], context: %{notify: self()}))
+
+      assert pending.tool_use_id == "tu_1"
+      assert pending.completed_results == %{}
+      refute_received {:deployed, _args}
+    end
+
+    test "the fence keys to what executes now: a lone gated call leaves it down" do
+      test = self()
       expect_stream(tool_events("tu_1", "gated_deploy", %{}))
 
-      assert {:error, %Error{code: :approval_unsupported, retryable?: false} = error} =
-               Rollout.execute(rollout(tools: [GatedDeploy]))
+      assert {:suspend, _request} =
+               Rollout.execute(rollout(tools: [GatedDeploy]),
+                 mark_effects: fn ->
+                   send(test, {:mark, :fence})
+                   :ok
+                 end
+               )
 
-      assert error.message =~ "gated_deploy"
+      # Nothing executed, so nothing may forfeit requeue eligibility.
+      refute_received {:mark, :fence}
+    end
+
+    test "the fence rises for a non-safe sibling before the batch executes" do
+      test = self()
+
+      expect_stream(
+        batch_events([
+          {"tu_1", "gated_deploy", %{}},
+          {"tu_2", "echo", %{"message" => "touch"}}
+        ])
+      )
+
+      assert {:suspend, _request} =
+               Rollout.execute(rollout(tools: [GatedDeploy, Echo]),
+                 mark_effects: fn ->
+                   send(test, {:mark, :fence})
+                   :ok
+                 end
+               )
+
+      assert_received {:mark, :fence}
+    end
+
+    test "safe-only siblings settle without raising the fence" do
+      test = self()
+
+      expect_stream(
+        batch_events([
+          {"tu_1", "gated_deploy", %{}},
+          {"tu_2", "safe_echo", %{"message" => "read"}}
+        ])
+      )
+
+      assert {:suspend, %Suspension.Request{pending: pending}} =
+               Rollout.execute(rollout(tools: [GatedDeploy, SafeEcho]),
+                 mark_effects: fn ->
+                   send(test, {:mark, :fence})
+                   :ok
+                 end
+               )
+
+      assert %{"tu_2" => %ToolResult{content: "Echo: read"}} = pending.completed_results
+      refute_received {:mark, :fence}
+    end
+
+    test "a {:policy, _} declaration gates exactly like :required" do
+      expect_stream(tool_events("tu_1", "policy_gated", %{}))
+
+      assert {:suspend, %Suspension.Request{pending: pending}} =
+               Rollout.execute(rollout(tools: [PolicyGated], context: %{notify: self()}))
+
+      assert pending.tool_name == "policy_gated"
+      refute_received :policy_ran
+    end
+
+    test "a queued drain beats a gated batch: nothing executes, nothing parks" do
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        send(self(), {:clementine, :drain})
+        tool_events("tu_1", "gated_deploy", %{})
+      end)
+
+      assert :drained =
+               Rollout.execute(rollout(tools: [GatedDeploy], context: %{notify: self()}))
+
+      refute_received {:deployed, _args}
+    end
+  end
+
+  describe "resume (pending approval)" do
+    test "an approved resume executes the pending call and the loop continues" do
+      checkpoint = approval_checkpoint()
+      expect_stream(text_events("Shipped!"))
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                 resume: {checkpoint, {:approved, %{by: "u1"}}}
+               )
+
+      assert result.output == "Shipped!"
+      assert_received {:deployed, %{env: "prod"}}
+
+      # Generated messages: the checkpointed assistant turn, the settled
+      # batch, the final answer — the input rides separately.
+      assert [%AssistantMessage{}, %ToolResultMessage{content: [tool_result]}, _final] =
+               result.messages
+
+      assert %Content.ToolResult{tool_use_id: "tu_1", content: "deployed prod", is_error: false} =
+               tool_result
+
+      # Checkpointed usage plus the final gather.
+      assert result.usage == %Usage{input_tokens: 17, output_tokens: 8}
+    end
+
+    test "an approved resume merges checkpointed sibling results in tool-use order" do
+      checkpoint =
+        approval_checkpoint(
+          batch: [
+            {"tu_1", "gated_deploy", %{"env" => "prod"}},
+            {"tu_2", "echo", %{"message" => "hi"}}
+          ],
+          completed: %{"tu_2" => %ToolResult{content: "Echo: earlier", is_error: false}}
+        )
+
+      expect_stream(text_events("Done"))
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy, Echo], context: %{notify: self()}),
+                 resume: {checkpoint, {:approved, %{by: "u1"}}}
+               )
+
+      assert [_assistant, %ToolResultMessage{content: [first, second]}, _final] = result.messages
+      assert %Content.ToolResult{tool_use_id: "tu_1", content: "deployed prod"} = first
+      # The checkpointed content — not "Echo: hi" — proves the sibling did
+      # not re-execute on resume.
+      assert %Content.ToolResult{tool_use_id: "tu_2", content: "Echo: earlier"} = second
+    end
+
+    test "the fence rises before the approved call executes" do
+      test = self()
+      checkpoint = approval_checkpoint()
+      expect_stream(text_events("Done"))
+
+      assert {:ok, %Result.Completed{}} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: test}),
+                 resume: {checkpoint, {:approved, %{}}},
+                 mark_effects: fn ->
+                   send(test, {:mark, :fence})
+                   :ok
+                 end
+               )
+
+      # Strict mailbox order: the fence write precedes the effect.
+      assert {:mark, :fence} =
+               (receive do
+                  message -> message
+                after
+                  0 -> flunk("expected the fence write")
+                end)
+
+      assert {:deployed, _args} =
+               (receive do
+                  message -> message
+                after
+                  0 -> flunk("expected the deploy")
+                end)
+    end
+
+    test "an approved call declared retry: :safe leaves the fence down" do
+      test = self()
+
+      checkpoint = approval_checkpoint(batch: [{"tu_1", "safe_gated_lookup", %{}}])
+      expect_stream(text_events("Done"))
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(
+                 rollout(tools: [SafeGatedLookup]),
+                 resume: {checkpoint, {:approved, %{}}},
+                 mark_effects: fn ->
+                   send(test, {:mark, :fence})
+                   :ok
+                 end
+               )
+
+      assert [_assistant, %ToolResultMessage{content: [%Content.ToolResult{content: "42"}]}, _] =
+               result.messages
+
+      refute_received {:mark, :fence}
+    end
+
+    test "a denied resume synthesizes the approver's message; the tool never runs" do
+      checkpoint = approval_checkpoint()
+      expect_stream(text_events("Understood."))
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                 resume: {checkpoint, {:denied, %{by: "u2", message: "not in prod"}}},
+                 emit: stamper()
+               )
+
+      refute_received {:deployed, _args}
+
+      assert [_assistant, %ToolResultMessage{content: [denial]}, _final] = result.messages
+
+      assert %Content.ToolResult{tool_use_id: "tu_1", content: "not in prod", is_error: true} =
+               denial
+
+      # The synthesized result is observable exactly like an executed one.
+      assert Enum.any?(
+               collect_events(),
+               &(&1.type == :tool_result and
+                   &1.payload == %{
+                     tool_use_id: "tu_1",
+                     result: "not in prod",
+                     is_error: true
+                   })
+             )
+    end
+
+    test "a denial without a message defaults to \"Denied by approver.\"" do
+      checkpoint = approval_checkpoint()
+      expect_stream(text_events("Okay."))
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                 resume: {checkpoint, {:denied, %{by: "u2"}}}
+               )
+
+      assert [_assistant, %ToolResultMessage{content: [denial]}, _final] = result.messages
+
+      assert %Content.ToolResult{content: "Denied by approver.", is_error: true} = denial
+      refute_received {:deployed, _args}
+    end
+
+    test "matrix row 8: a pending tool absent from this rollout's toolset is incompatible" do
+      checkpoint = approval_checkpoint()
+
+      assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+               Rollout.execute(rollout(tools: []), resume: {checkpoint, {:approved, %{}}})
+
+      assert message =~ "does not resolve"
+    end
+
+    test "a checkpoint that cannot support its own pending call is incompatible" do
+      checkpoint = %Checkpoint{approval_checkpoint() | messages: [UserMessage.new("go")]}
+
+      assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy]),
+                 resume: {checkpoint, {:approved, %{}}}
+               )
+
+      assert message =~ "last assistant message"
+    end
+
+    test "an unrecognized payload for a pending approval fails cleanly, never crashes" do
+      checkpoint = approval_checkpoint()
+
+      assert {:error, %Error{code: :invalid_resume_payload, retryable?: false}} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                 resume: {checkpoint, :elapsed}
+               )
+
+      refute_received {:deployed, _args}
+    end
+
+    test "a second gated call parks the batch again with the first decision settled" do
+      checkpoint =
+        approval_checkpoint(
+          batch: [
+            {"tu_1", "gated_deploy", %{"env" => "a"}},
+            {"tu_2", "gated_deploy", %{"env" => "b"}}
+          ]
+        )
+
+      assert {:suspend, %Suspension.Request{pending: pending}} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                 resume: {checkpoint, {:approved, %{by: "u1"}}}
+               )
+
+      # The first decision executed its call; the batch parked again on
+      # the second, carrying the settled result — one decision at a time.
+      assert_received {:deployed, %{env: "a"}}
+      assert pending.tool_use_id == "tu_2"
+      assert %{"tu_1" => %ToolResult{content: "deployed a"}} = pending.completed_results
+      refute_received {:deployed, _args}
+    end
+
+    test "a signal queued at resume is honored before the approved call executes" do
+      send(self(), {:clementine, :drain})
+      checkpoint = approval_checkpoint()
+
+      assert :drained =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                 resume: {checkpoint, {:approved, %{}}}
+               )
+
+      refute_received {:deployed, _args}
     end
   end
 
