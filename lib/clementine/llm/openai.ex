@@ -59,19 +59,21 @@ defmodule Clementine.LLM.OpenAI do
   def stream(model, system, messages, tools, opts \\ []) do
     body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
     headers = build_headers()
+    # A runner caps this to the execution deadline's remaining budget.
+    receive_timeout = Keyword.get(opts, :receive_timeout, 300_000)
 
     ProviderStream.new(OpenAIStreamParser, fn parent, ref ->
-      do_stream_request(body, headers, parent, ref)
+      do_stream_request(body, headers, parent, ref, receive_timeout)
     end)
   end
 
-  defp do_stream_request(body, headers, parent, ref) do
+  defp do_stream_request(body, headers, parent, ref, receive_timeout) do
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
-    do_stream_request(body, headers, parent, ref, max_attempts, 1)
+    do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, 1)
   end
 
-  defp do_stream_request(body, headers, parent, ref, max_attempts, attempt) do
+  defp do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, attempt) do
     data_sent = :atomics.new(1, signed: false)
 
     callback = fn {:data, data}, acc ->
@@ -81,7 +83,12 @@ defmodule Clementine.LLM.OpenAI do
     end
 
     result =
-      Req.post(base_url(), json: body, headers: headers, into: callback, receive_timeout: 300_000)
+      Req.post(base_url(),
+        json: body,
+        headers: headers,
+        into: callback,
+        receive_timeout: receive_timeout
+      )
 
     case result do
       {:ok, %{status: 200}} ->
@@ -90,7 +97,7 @@ defmodule Clementine.LLM.OpenAI do
       {:ok, %{status: status}} when status in @retriable_statuses and attempt < max_attempts ->
         send(parent, {ref, :retry_reset})
         Process.sleep(calculate_backoff(attempt))
-        do_stream_request(body, headers, parent, ref, max_attempts, attempt + 1)
+        do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, attempt + 1)
 
       {:ok, %{status: status, body: resp_body}} ->
         send(parent, {ref, {:error, {:api_error, status, resp_body}}})
@@ -99,7 +106,16 @@ defmodule Clementine.LLM.OpenAI do
         if :atomics.get(data_sent, 1) == 0 do
           send(parent, {ref, :retry_reset})
           Process.sleep(calculate_backoff(attempt))
-          do_stream_request(body, headers, parent, ref, max_attempts, attempt + 1)
+
+          do_stream_request(
+            body,
+            headers,
+            parent,
+            ref,
+            receive_timeout,
+            max_attempts,
+            attempt + 1
+          )
         else
           send(parent, {ref, {:error, {:request_failed, reason}}})
         end

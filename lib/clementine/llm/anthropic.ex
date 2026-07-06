@@ -104,19 +104,21 @@ defmodule Clementine.LLM.Anthropic do
   def stream(model, system, messages, tools, opts \\ []) do
     body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
     headers = build_headers()
+    # A runner caps this to the execution deadline's remaining budget.
+    receive_timeout = Keyword.get(opts, :receive_timeout, 300_000)
 
     ProviderStream.new(StreamParser, fn parent, ref ->
-      do_stream_request(body, headers, parent, ref)
+      do_stream_request(body, headers, parent, ref, receive_timeout)
     end)
   end
 
-  defp do_stream_request(body, headers, parent, ref) do
+  defp do_stream_request(body, headers, parent, ref, receive_timeout) do
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
-    do_stream_request(body, headers, parent, ref, max_attempts, 1)
+    do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, 1)
   end
 
-  defp do_stream_request(body, headers, parent, ref, max_attempts, attempt) do
+  defp do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, attempt) do
     # Track whether the into callback sent any data to the parent.
     # For 429/529 the callback fires with the error body (not real SSE),
     # which the parser ignores, so those retries are always safe.
@@ -136,7 +138,7 @@ defmodule Clementine.LLM.Anthropic do
         json: body,
         headers: headers,
         into: callback,
-        receive_timeout: 300_000
+        receive_timeout: receive_timeout
       )
 
     case result do
@@ -148,7 +150,7 @@ defmodule Clementine.LLM.Anthropic do
         # callback was the JSON error body, not SSE events — safe to retry.
         send(parent, {ref, :retry_reset})
         Process.sleep(calculate_backoff(attempt))
-        do_stream_request(body, headers, parent, ref, max_attempts, attempt + 1)
+        do_stream_request(body, headers, parent, ref, receive_timeout, max_attempts, attempt + 1)
 
       {:ok, %{status: status, body: resp_body}} ->
         send(parent, {ref, {:error, {:api_error, status, resp_body}}})
@@ -158,7 +160,16 @@ defmodule Clementine.LLM.Anthropic do
           # No data was streamed — connection failed before any response.
           send(parent, {ref, :retry_reset})
           Process.sleep(calculate_backoff(attempt))
-          do_stream_request(body, headers, parent, ref, max_attempts, attempt + 1)
+
+          do_stream_request(
+            body,
+            headers,
+            parent,
+            ref,
+            receive_timeout,
+            max_attempts,
+            attempt + 1
+          )
         else
           # Data already streamed to consumer — retrying would duplicate events.
           send(parent, {ref, {:error, {:request_failed, reason}}})

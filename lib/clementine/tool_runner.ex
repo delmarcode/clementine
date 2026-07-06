@@ -73,37 +73,196 @@ defmodule Clementine.ToolRunner do
         {call.id, result}
 
       {{:exit, :timeout}, call} ->
-        timeout_native = System.convert_time_unit(timeout, :millisecond, :native)
-
-        :telemetry.execute(
-          [:clementine, :tool, :exception],
-          %{duration: timeout_native},
-          %{
-            tool: call.name,
-            tool_call_id: call.id,
-            iteration: Map.get(context, :_clementine_iteration, 0),
-            kind: :exit,
-            reason: :timeout
-          }
-        )
-
-        {call.id, {:error, "Tool timed out after #{timeout}ms"}}
+        {call.id, timeout_result(call, context, timeout)}
 
       {{:exit, reason}, call} ->
-        :telemetry.execute(
-          [:clementine, :tool, :exception],
-          %{duration: 0},
-          %{
-            tool: call.name,
-            tool_call_id: call.id,
-            iteration: Map.get(context, :_clementine_iteration, 0),
-            kind: :exit,
-            reason: reason
-          }
-        )
-
-        {call.id, {:error, "Tool crashed: #{inspect(reason)}"}}
+        {call.id, exit_result(call, context, reason)}
     end)
+  end
+
+  @doc """
+  The per-tool timeout `execute/4` and `run_batch/4` default to. Exposed so
+  callers capping timeouts to an external budget (the rollout's execution
+  deadline) can shrink from the same base.
+  """
+  @spec default_timeout() :: pos_integer()
+  def default_timeout, do: @default_timeout
+
+  @doc """
+  Executes a tool batch as a blocking point in the calling process: the
+  same per-call supervised tasks, timeouts, and crash normalization as
+  `execute/4`, plus batch-level handling of runner-directed signals
+  arriving in the caller's mailbox.
+
+  Signals (RFC §Cancellation):
+
+  - `{:clementine, :cancel, reason}` — the cooperative kill policy: tools
+    whose `retry` metadata is `:safe` are killed immediately (running them
+    is free, so is losing them); non-`:safe` tools run out their own
+    timeout, because killing an effectful tool mid-flight creates
+    unknowable external state. When the batch settles, returns
+    `{:cancelled, reason}` — settled results are abandoned, the run is
+    terminal-bound and the terminal result is truth.
+  - `{:clementine, :lease_lost, _}` / `{:clementine, :drain}` — a
+    superseded or draining executor must unwind *now*: every task is
+    killed and `:lost_lease` / `:drained` returns immediately.
+
+  With no signal, returns `{:ok, results}` shaped exactly like
+  `execute/4`. All calls run concurrently (no `:max_concurrency`); each
+  task's timeout counts from spawn.
+  """
+  @spec run_batch([module()], [map()], map(), keyword()) ::
+          {:ok, [{String.t(), term()}]}
+          | {:cancelled, reason :: term()}
+          | :lost_lease
+          | :drained
+  def run_batch(tools, tool_calls, context, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
+    task_supervisor = Keyword.get(opts, :task_supervisor, Clementine.TaskSupervisor)
+
+    entries =
+      Enum.map(tool_calls, fn call ->
+        task =
+          Task.Supervisor.async_nolink(task_supervisor, fn ->
+            execute_single(tools, call, context)
+          end)
+
+        %{
+          call: call,
+          task: task,
+          timer: Process.send_after(self(), {__MODULE__, :timeout, task.ref}, timeout),
+          killable?: killable?(tools, call),
+          result: nil
+        }
+      end)
+
+    await_batch(%{
+      entries: entries,
+      awaiting: Map.new(Enum.with_index(entries), fn {e, i} -> {e.task.ref, i} end),
+      context: context,
+      timeout: timeout,
+      cancelled: nil
+    })
+  end
+
+  defp await_batch(%{awaiting: awaiting} = state) when map_size(awaiting) == 0 do
+    case state.cancelled do
+      nil -> {:ok, Enum.map(state.entries, fn e -> {e.call.id, e.result} end)}
+      reason -> {:cancelled, reason}
+    end
+  end
+
+  defp await_batch(%{awaiting: awaiting} = state) do
+    receive do
+      {ref, result} when is_map_key(awaiting, ref) ->
+        Process.demonitor(ref, [:flush])
+        state |> settle(ref, result) |> await_batch()
+
+      {:DOWN, ref, :process, _pid, reason} when is_map_key(awaiting, ref) ->
+        %{call: call} = entry(state, ref)
+        state |> settle(ref, exit_result(call, state.context, reason)) |> await_batch()
+
+      {__MODULE__, :timeout, ref} when is_map_key(awaiting, ref) ->
+        %{call: call, task: task} = entry(state, ref)
+        Task.shutdown(task, :brutal_kill)
+        state |> settle(ref, timeout_result(call, state.context, state.timeout)) |> await_batch()
+
+      {:clementine, :lease_lost, _lease} ->
+        kill_awaiting(state, fn _entry -> true end)
+        :lost_lease
+
+      {:clementine, :drain} ->
+        kill_awaiting(state, fn _entry -> true end)
+        :drained
+
+      {:clementine, :cancel, reason} ->
+        state
+        |> kill_awaiting(fn entry -> entry.killable? end)
+        |> Map.update!(:cancelled, fn existing -> existing || reason end)
+        |> await_batch()
+    end
+  end
+
+  defp entry(state, ref), do: Enum.at(state.entries, Map.fetch!(state.awaiting, ref))
+
+  defp settle(state, ref, result) do
+    {index, awaiting} = Map.pop!(state.awaiting, ref)
+    drop_timer(Enum.at(state.entries, index))
+
+    %{
+      state
+      | entries: List.update_at(state.entries, index, &%{&1 | result: result}),
+        awaiting: awaiting
+    }
+  end
+
+  defp kill_awaiting(state, kill?) do
+    {killed, awaiting} =
+      Enum.split_with(state.awaiting, fn {_ref, index} ->
+        kill?.(Enum.at(state.entries, index))
+      end)
+
+    Enum.each(killed, fn {_ref, index} ->
+      %{task: task} = e = Enum.at(state.entries, index)
+      Task.shutdown(task, :brutal_kill)
+      drop_timer(e)
+    end)
+
+    %{state | awaiting: Map.new(awaiting)}
+  end
+
+  # A settled or killed entry's timer must not fire later as an unmatchable
+  # mailbox leak: cancel it and flush an already-delivered message.
+  defp drop_timer(%{timer: timer, task: %Task{ref: ref}}) do
+    Process.cancel_timer(timer)
+
+    receive do
+      {__MODULE__, :timeout, ^ref} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  # Cancellation may kill only tools that declared themselves effect-free.
+  # An unresolvable name is not killable — its task settles instantly with
+  # an "Unknown tool" error anyway.
+  defp killable?(tools, %{name: name}) do
+    case Tool.find_by_name(tools, name) do
+      nil -> false
+      tool -> Tool.retry(tool) == :safe
+    end
+  end
+
+  defp timeout_result(call, context, timeout) do
+    :telemetry.execute(
+      [:clementine, :tool, :exception],
+      %{duration: System.convert_time_unit(timeout, :millisecond, :native)},
+      %{
+        tool: call.name,
+        tool_call_id: call.id,
+        iteration: Map.get(context, :_clementine_iteration, 0),
+        kind: :exit,
+        reason: :timeout
+      }
+    )
+
+    {:error, "Tool timed out after #{timeout}ms"}
+  end
+
+  defp exit_result(call, context, reason) do
+    :telemetry.execute(
+      [:clementine, :tool, :exception],
+      %{duration: 0},
+      %{
+        tool: call.name,
+        tool_call_id: call.id,
+        iteration: Map.get(context, :_clementine_iteration, 0),
+        kind: :exit,
+        reason: reason
+      }
+    )
+
+    {:error, "Tool crashed: #{inspect(reason)}"}
   end
 
   @doc """

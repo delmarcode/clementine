@@ -169,4 +169,58 @@ defmodule Clementine.Test.Tools do
       {:ok, "Count: #{count}"}
     end
   end
+
+  defmodule SafeEcho do
+    @moduledoc "Echo declared retry: :safe — an effect-free tool"
+    use Clementine.Tool,
+      name: "safe_echo",
+      description: "Echoes, declared effect-free",
+      retry: :safe,
+      parameters: [
+        message: [type: :string, required: true, description: "The message to echo"]
+      ]
+
+    @impl true
+    def run(%{message: message}, _context) do
+      {:ok, "Echo: #{message}"}
+    end
+  end
+
+  defmodule SafePush do
+    @moduledoc """
+    A `retry: :safe` tool that delivers a cancel push to `context.push_to`
+    the moment it starts, then blocks until the kill policy reaps it —
+    the failure-matrix row 5 scenario generator.
+    """
+    use Clementine.Tool,
+      name: "safe_push",
+      description: "Safe tool that pushes a cancel, then blocks",
+      retry: :safe,
+      parameters: []
+
+    @impl true
+    def run(_args, context) do
+      send(context.push_to, {:clementine, :cancel, :mid_batch_stop})
+      Process.sleep(:infinity)
+      {:ok, "unreachable"}
+    end
+  end
+
+  defmodule UnsafeSlow do
+    @moduledoc "An explicitly retry: :unsafe tool: sleeps, then reports its effect done"
+    use Clementine.Tool,
+      name: "unsafe_slow",
+      description: "Unsafe tool with a configurable duration",
+      retry: :unsafe,
+      parameters: [
+        delay_ms: [type: :integer, required: true, description: "Delay in ms"]
+      ]
+
+    @impl true
+    def run(%{delay_ms: delay_ms}, context) do
+      Process.sleep(delay_ms)
+      if notify = context[:notify], do: send(notify, {:unsafe_done, delay_ms})
+      {:ok, "effect done after #{delay_ms}ms"}
+    end
+  end
 end
