@@ -20,6 +20,12 @@ defmodule Clementine.Lifecycle.Protocol do
   transient storage errors bounded-with-backoff — a completed rollout must
   not convert into a reaped `interrupted` because of a two-second database
   blip. `:stale` is never retried; it is an answer, not an error.
+
+  Every committed write emits a `[:clementine, :run, ...]` telemetry event
+  after its CAS succeeds, and every lease-holding operation that discovers
+  lease loss emits `:lease_lost` — so run-level observability rides the
+  protocol itself, not any particular caller. Shapes are documented in
+  `Clementine.Telemetry`.
   """
 
   alias Clementine.Lifecycle.{Facts, Transition}
@@ -73,6 +79,8 @@ defmodule Clementine.Lifecycle.Protocol do
 
           case lifecycle.apply(transition, ctx) do
             {:ok, %Facts{} = claimed} ->
+              emit(:claimed, %{epoch: claimed.epoch}, %{run_ref: run_ref, executor_id: executor})
+
               {:ok,
                %Lease{
                  run_ref: run_ref,
@@ -123,9 +131,16 @@ defmodule Clementine.Lifecycle.Protocol do
     }
 
     case lease.lifecycle.apply(transition, lease.ctx) do
-      {:ok, _facts} -> :ok
-      {:error, :stale} -> {:error, :lost_lease}
-      {:error, reason} -> {:error, reason}
+      {:ok, _facts} ->
+        emit(:heartbeat, %{}, lease_metadata(lease))
+        :ok
+
+      {:error, :stale} ->
+        emit(:lease_lost, %{}, lease_metadata(lease))
+        {:error, :lost_lease}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -146,6 +161,7 @@ defmodule Clementine.Lifecycle.Protocol do
         end
 
       {:ok, %Facts{}} ->
+        emit(:lease_lost, %{}, lease_metadata(lease))
         {:error, :lost_lease}
 
       {:error, reason} ->
@@ -171,9 +187,15 @@ defmodule Clementine.Lifecycle.Protocol do
     }
 
     case lease.lifecycle.apply(transition, lease.ctx) do
-      {:ok, _facts} -> :ok
-      {:error, :stale} -> {:error, :lost_lease}
-      {:error, reason} -> {:error, reason}
+      {:ok, _facts} ->
+        :ok
+
+      {:error, :stale} ->
+        emit(:lease_lost, %{}, lease_metadata(lease))
+        {:error, :lost_lease}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -242,9 +264,11 @@ defmodule Clementine.Lifecycle.Protocol do
 
     case apply_with_retry(lease.lifecycle, transition, lease.ctx) do
       {:ok, _facts} ->
+        emit(:suspended, %{}, Map.put(lease_metadata(lease), :reason_type, token.reason_type))
         post_suspend_cancel_check(lease, token, request.usage)
 
       {:error, :stale} ->
+        emit(:lease_lost, %{}, lease_metadata(lease))
         {:error, :lost_lease}
 
       {:error, reason} ->
@@ -267,10 +291,20 @@ defmodule Clementine.Lifecycle.Protocol do
         }
 
         case apply_with_retry(lease.lifecycle, transition, lease.ctx) do
-          {:ok, cancelled_facts} -> {:cancelled, cancelled_facts}
+          {:ok, cancelled_facts} ->
+            emit_finished(lease.run_ref, lease.epoch, result,
+              claimed_at: lease.claimed_at,
+              finished_at: cancelled_facts.finished_at
+            )
+
+            {:cancelled, cancelled_facts}
+
           # Someone else terminalized it first; report what stands.
-          {:error, :stale} -> refetch_terminal_or_token(lease, token)
-          {:error, _reason} -> {:ok, token}
+          {:error, :stale} ->
+            refetch_terminal_or_token(lease, token)
+
+          {:error, _reason} ->
+            {:ok, token}
         end
 
       {:ok, %Facts{status: :waiting}} ->
@@ -356,9 +390,15 @@ defmodule Clementine.Lifecycle.Protocol do
           }
 
           case lifecycle.apply(transition, ctx) do
-            {:ok, resumed} -> {:ok, resumed}
-            {:error, :stale} -> do_resume(lifecycle, token, payload, ctx, attempts - 1)
-            {:error, reason} -> {:error, reason}
+            {:ok, resumed} ->
+              emit(:resumed, %{}, %{run_ref: token.run_ref, epoch: resumed.epoch})
+              {:ok, resumed}
+
+            {:error, :stale} ->
+              do_resume(lifecycle, token, payload, ctx, attempts - 1)
+
+            {:error, reason} ->
+              {:error, reason}
           end
       end
     end
@@ -414,9 +454,21 @@ defmodule Clementine.Lifecycle.Protocol do
           }
 
           case apply_with_retry(lifecycle, transition, ctx) do
-            {:ok, _} -> {:ok, :finished}
-            {:error, :stale} -> do_request_cancel(lifecycle, run_ref, reason, ctx, attempts - 1)
-            {:error, other} -> {:error, other}
+            {:ok, cancelled_facts} ->
+              # No execution owned the run, so there is no claim to measure
+              # a duration from.
+              emit_finished(run_ref, facts.epoch, result,
+                claimed_at: nil,
+                finished_at: cancelled_facts.finished_at
+              )
+
+              {:ok, :finished}
+
+            {:error, :stale} ->
+              do_request_cancel(lifecycle, run_ref, reason, ctx, attempts - 1)
+
+            {:error, other} ->
+              {:error, other}
           end
       end
     end
@@ -452,16 +504,25 @@ defmodule Clementine.Lifecycle.Protocol do
 
     case apply_with_retry(lease.lifecycle, transition, lease.ctx) do
       {:ok, facts} ->
+        emit_finished(lease.run_ref, lease.epoch, result,
+          claimed_at: lease.claimed_at,
+          finished_at: facts.finished_at
+        )
+
         {:ok, facts}
 
       {:error, :stale} ->
         case lease.lifecycle.fetch(lease.run_ref, lease.ctx) do
           {:ok, %Facts{} = facts} ->
-            if Facts.terminal?(facts),
-              do: {:error, :already_terminal},
-              else: {:error, :lost_lease}
+            if Facts.terminal?(facts) do
+              {:error, :already_terminal}
+            else
+              emit(:lease_lost, %{}, lease_metadata(lease))
+              {:error, :lost_lease}
+            end
 
           {:error, _} ->
+            emit(:lease_lost, %{}, lease_metadata(lease))
             {:error, :lost_lease}
         end
 
@@ -500,7 +561,14 @@ defmodule Clementine.Lifecycle.Protocol do
         result: result
       }
 
-      apply_with_retry(lifecycle, transition, ctx)
+      case apply_with_retry(lifecycle, transition, ctx) do
+        {:ok, reaped} ->
+          emit(:reaped, %{}, %{run_ref: facts.ref, epoch: facts.epoch, code: reason.code})
+          {:ok, reaped}
+
+        {:error, _} = error ->
+          error
+      end
     end
   end
 
@@ -523,6 +591,7 @@ defmodule Clementine.Lifecycle.Protocol do
         do_requeue(lease.lifecycle, facts, reason, lease.ctx)
 
       {:ok, %Facts{}} ->
+        emit(:lease_lost, %{}, lease_metadata(lease))
         {:error, :lost_lease}
 
       {:error, fetch_error} ->
@@ -569,10 +638,50 @@ defmodule Clementine.Lifecycle.Protocol do
       meta: %{reason: reason}
     }
 
-    lifecycle.apply(transition, ctx)
+    case lifecycle.apply(transition, ctx) do
+      {:ok, requeued} ->
+        emit(:requeued, %{}, %{run_ref: facts.ref, epoch: facts.epoch, reason: reason})
+        {:ok, requeued}
+
+      {:error, _} = error ->
+        error
+    end
   end
 
   ## Internals
+
+  defp emit(event, measurements, metadata) do
+    :telemetry.execute([:clementine, :run, event], measurements, metadata)
+  end
+
+  # A terminal write by a live lease measures its execution, claim to
+  # finish, on the storage clock that stamped both ends. A terminal with no
+  # owning execution (direct cancel of a queued/waiting run) has no claim
+  # to measure from and reports zero.
+  defp emit_finished(run_ref, epoch, result, stamps) do
+    duration =
+      case {Keyword.get(stamps, :claimed_at), Keyword.get(stamps, :finished_at)} do
+        {%DateTime{} = claimed_at, %DateTime{} = finished_at} ->
+          finished_at
+          |> DateTime.diff(claimed_at, :microsecond)
+          |> System.convert_time_unit(:microsecond, :native)
+          |> max(0)
+
+        _missing ->
+          0
+      end
+
+    emit(:finished, %{duration: duration}, %{
+      run_ref: run_ref,
+      epoch: epoch,
+      terminal: Result.status(result),
+      usage: Result.usage(result)
+    })
+  end
+
+  defp lease_metadata(%Lease{run_ref: run_ref, epoch: epoch}) do
+    %{run_ref: run_ref, epoch: epoch}
+  end
 
   defp expect(%Facts{status: status, epoch: epoch}), do: %{status: status, epoch: epoch}
 
