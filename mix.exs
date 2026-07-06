@@ -28,6 +28,10 @@ defmodule Clementine.MixProject do
     [
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
+      # Optional: the Ecto lifecycle adapter compiles only when the host
+      # app brings these in.
+      {:ecto_sql, "~> 3.10", optional: true},
+      {:postgrex, "~> 0.18", optional: true},
       {:nimble_options, "~> 1.1"},
       {:telemetry, "~> 1.0"},
       {:telemetry_metrics, "~> 1.0"},
