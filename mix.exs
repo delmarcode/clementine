@@ -33,6 +33,7 @@ defmodule Clementine.MixProject do
       {:telemetry_metrics, "~> 1.0"},
       {:mox, "~> 1.1", only: :test},
       {:bypass, "~> 2.1", only: :test},
+      {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
     ]
   end
