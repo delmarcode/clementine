@@ -6,9 +6,9 @@ You are implementing **$ARGUMENTS** in this repo (the Clementine Elixir library)
 
 ## Orientation — do all of this before writing any code
 
-1. Fetch **$ARGUMENTS** from Linear (`get_issue`). Its **Scope** and **Acceptance** sections are your work order. Its parent epic **SKUNK-124** carries lineage context (this epic supersedes the SKUNK-117-era `Executor` framing — if you find leftover code from that round, flag it; do not build on it). If the Linear MCP is not connected in this session, stop and ask for the issue text.
-2. Read the spec: `docs/DURABLE_EXECUTION_RFC.md` in this repo (v2.2). Non-negotiable minimum: **Governing Invariants**, **Vocabulary**, **Run State Machine**, **The Lifecycle Contract**, plus every section your issue cites. The 18-row **Failure Matrix** is the system's proof obligation — your acceptance criteria reference its rows by number.
-3. Read the RFC's **Normative Baseline** section, then the existing modules it lists (canonical message structs, `Tool` contract, `ToolRunner`, `Usage`, provider clients). You inherit these; do not reinvent or re-specify them.
+1. Fetch **$ARGUMENTS** from Linear (`get_issue`). Its **Scope** and **Acceptance** sections are your work order; its parent epic carries lineage context. If the Linear MCP is not connected in this session, stop and ask for the issue text.
+2. Read the spec: **the RFC your issue cites** — `docs/LOOP_RFC.md` for the durable-loops epic (SKUNK-142), `docs/DURABLE_EXECUTION_RFC.md` for the durable-execution layer — plus every section the issue names. `docs/DURABLE_EXECUTION_RFC.md` is always the normative baseline beneath the loop RFC; read its **Governing Invariants**, **Vocabulary**, **Run State Machine**, and **The Lifecycle Contract** regardless. Each RFC's **Failure Matrix** is its proof obligation — acceptance criteria reference rows by number (L-rows for loops).
+3. Read the cited RFC's **Normative Baseline** / **Amendments** sections, then the existing modules they list. You inherit shipped machinery; where your issue implements a named Amendment, that is the only sanctioned change to shipped behavior — anything else you think needs changing is a rule-1 finding, not a license.
 4. Verify every issue listed in your `blockedBy` relations is merged to `main`. If one isn't, stop and report instead of building on unmerged work.
 
 ## Ground rules
