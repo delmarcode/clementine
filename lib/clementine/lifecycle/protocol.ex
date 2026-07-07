@@ -21,11 +21,12 @@ defmodule Clementine.Lifecycle.Protocol do
   not convert into a reaped `interrupted` because of a two-second database
   blip. `:stale` is never retried; it is an answer, not an error.
 
-  Every committed write emits a `[:clementine, :run, ...]` telemetry event
-  after its CAS succeeds, and every lease-holding operation that discovers
-  lease loss emits `:lease_lost` — so run-level observability rides the
-  protocol itself, not any particular caller. Shapes are documented in
-  `Clementine.Telemetry`.
+  Committed writes emit `[:clementine, :run, ...]` telemetry events after
+  their CAS succeeds (the two flag writes — the effect fence and the
+  cooperative cancel flag — are the deliberate exceptions), and every
+  lease-holding operation that discovers lease loss emits `:lease_lost` —
+  so run-level observability rides the protocol itself, not any
+  particular caller. Shapes are documented in `Clementine.Telemetry`.
   """
 
   alias Clementine.Lifecycle.{Facts, Transition}

@@ -98,8 +98,9 @@ and swallowed; they never affect the committed transition.
 ## RunView: the canonical fold
 
 Clementine owns the event taxonomy, so Clementine owns the reduction from
-events to a live view — `Clementine.RunView`: assembled text per content
-block, tools in flight, usage so far, and the `{epoch, seq}` cursor.
+events to a live view — `Clementine.RunView`: the accumulated text so
+far, tools in flight, usage (scoped to the current epoch — see the module
+doc for that boundary), and the `{epoch, seq}` cursor.
 
 ```text
 view = RunView.new(run_ref)
@@ -225,7 +226,7 @@ system whose truth is the terminal result, not the stream.
 Execution and lifecycle are also instrumented with `:telemetry` events —
 `[:clementine, :rollout | :llm | :tool, ...]` around the engine and
 `[:clementine, :run, :claimed | :heartbeat | :suspended | :resumed |
-:finished | :requeued | :lease_lost | :reaped]` for every committed
-protocol write. `Clementine.Telemetry` documents every event and ships
+:finished | :requeued | :lease_lost | :reaped]` across the run
+lifecycle. `Clementine.Telemetry` documents every event and ships
 `metrics/0` definitions for `telemetry_metrics` reporters;
 `Clementine.Telemetry.Logger` is a ready-made dev/debug handler.

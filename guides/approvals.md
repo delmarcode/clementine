@@ -37,8 +37,9 @@ end
 ```
 
 `approval: :required` gates every call to this tool. `:never` (the
-default) never gates; `{:policy, term}` is reserved for app-resolved
-policies and not yet honored.
+default) never gates. `{:policy, term}` is reserved for app-resolved
+policies; until policy resolution exists, it gates exactly like
+`:required` — the safe reading of an unresolved policy.
 
 ## What happens at the gate
 
@@ -84,16 +85,8 @@ defmodule MyApp.Approvals do
   name and arguments, straight from the stored suspension.
   """
   def pending(run_id) do
-    case @lifecycle.fetch(run_id, nil) do
-      {:ok, %Facts{status: :waiting, suspension: %Suspension{} = suspension}} ->
-        {:approval, %ApprovalRequest{} = request} = suspension.reason
-        {:ok, request}
-
-      {:ok, %Facts{}} ->
-        {:error, :not_waiting}
-
-      {:error, reason} ->
-        {:error, reason}
+    with {:ok, %Suspension{reason: {:approval, request}}} <- suspension(run_id) do
+      {:ok, %ApprovalRequest{} = request}
     end
   end
 
@@ -103,12 +96,24 @@ defmodule MyApp.Approvals do
   """
   def decide(run_id, decision, %{id: user_id} = approver) do
     with :ok <- authorize!(run_id, approver),
-         {:ok, %Facts{suspension: %Suspension{token: token}}} <-
-           @lifecycle.fetch(run_id, nil),
+         {:ok, %Suspension{token: token}} <- suspension(run_id),
          {:ok, _facts} <- Protocol.resume(@lifecycle, token, payload(decision, user_id)) do
       # Resume never hides an enqueue: waiting -> queued happened, and
       # handing the run to a worker is explicitly the app's move.
       MyApp.Runs.re_enqueue!(run_id)
+    end
+  end
+
+  defp suspension(run_id) do
+    case @lifecycle.fetch(run_id, nil) do
+      {:ok, %Facts{status: :waiting, suspension: %Suspension{} = suspension}} ->
+        {:ok, suspension}
+
+      {:ok, %Facts{}} ->
+        {:error, :run_not_waiting}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

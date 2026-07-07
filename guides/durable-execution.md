@@ -333,6 +333,8 @@ defmodule MyApp.Workers.AgentRunWorker do
 
     case Clementine.Runner.execute(run,
            lifecycle: MyApp.ClementineLifecycle,
+           # The streaming sink — see the Observing Runs guide.
+           events: MyApp.ClementineEvents,
            executor_id: "oban:#{job_id}:#{node()}"
          ) do
       {:finished, %Facts{status: :queued}} ->
