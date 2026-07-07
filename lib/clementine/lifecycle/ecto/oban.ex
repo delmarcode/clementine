@@ -26,9 +26,15 @@ defmodule Clementine.Lifecycle.Ecto.Oban do
       job — pass that one.)
     * `running` — job missing, cancelled, discarded, or completed without
       the run reaching a terminal is an interrupt verdict.
-    * `queued` — a missing job means the claimer is never coming:
-      `:job_missing`. (Requeue-instead-of-interrupt is reaper policy, one
-      level up.)
+    * `queued` — a missing, cancelled, or discarded job means the claimer
+      is never coming: `:job_missing` / `:job_cancelled` / `:job_discarded`
+      (Meli adoption finding: an operator cancelling a queued job must not
+      strand the run until the claim timeout). A *completed* job is judged
+      `:healthy` here — a drain requeue's fresh `queued` row briefly
+      correlates to the old, legitimately completed job until the host
+      re-links `oban_job_id`; the claim-timeout check covers the
+      pathological completed-without-claiming case. (Requeue-instead-of-
+      interrupt is reaper policy, one level up.)
     * terminal — `:healthy`; nothing left to judge.
 
   The verdict is evidence, not action: the reaper turns `{:interrupt, _}`
@@ -59,6 +65,14 @@ defmodule Clementine.Lifecycle.Ecto.Oban do
 
   def judge_job(%Facts{status: :queued}, nil) do
     {:interrupt, InterruptReason.new(:job_missing, "no job found for queued run")}
+  end
+
+  def judge_job(%Facts{status: :queued}, %{state: "cancelled"} = job) do
+    {:interrupt, InterruptReason.new(:job_cancelled, job_detail(job))}
+  end
+
+  def judge_job(%Facts{status: :queued}, %{state: "discarded"} = job) do
+    {:interrupt, InterruptReason.new(:job_discarded, job_detail(job))}
   end
 
   def judge_job(%Facts{status: :queued}, _job), do: :healthy

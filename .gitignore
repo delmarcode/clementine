@@ -25,3 +25,5 @@ clementine-*.tar
 # Private exploration/design documents
 /private/
 
+# macOS
+.DS_Store

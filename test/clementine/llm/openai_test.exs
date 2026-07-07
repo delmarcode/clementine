@@ -102,6 +102,56 @@ defmodule Clementine.LLM.OpenAITest do
              OpenAI.call({:openai, "gpt-5"}, "system", [UserMessage.new("Hi")], [])
   end
 
+  test "call/5 includes configured reasoning", %{bypass: bypass} do
+    Application.put_env(:clementine, :models,
+      gpt_reasoning: [
+        provider: :openai,
+        id: "gpt-5",
+        reasoning: [effort: :high, summary: :auto]
+      ]
+    )
+
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+
+      assert request["reasoning"] == %{"effort" => "high", "summary" => "auto"}
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, text_response("Configured reasoning"))
+    end)
+
+    assert {:ok, %Response{content: [%Content.Text{text: "Configured reasoning"}]}} =
+             OpenAI.call(:gpt_reasoning, "system", [UserMessage.new("Hi")], [])
+  end
+
+  test "call/5 lets request opts override configured reasoning", %{bypass: bypass} do
+    Application.put_env(:clementine, :models,
+      gpt_reasoning: [provider: :openai, id: "gpt-5", reasoning: [effort: :high]]
+    )
+
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+
+      assert request["reasoning"] == %{"effort" => "low"}
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, text_response("Overridden reasoning"))
+    end)
+
+    assert {:ok, %Response{content: [%Content.Text{text: "Overridden reasoning"}]}} =
+             OpenAI.call(:gpt_reasoning, "system", [UserMessage.new("Hi")], [], reasoning: :low)
+  end
+
+  test "call/5 rejects invalid OpenAI reasoning opts" do
+    assert_raise ArgumentError, ~r/unsupported OpenAI reasoning effort/, fn ->
+      OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [], reasoning: :max)
+    end
+  end
+
   test "call/5 parses tool calls", %{bypass: bypass} do
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       response = %{
@@ -273,6 +323,21 @@ defmodule Clementine.LLM.OpenAITest do
 
   defp restore_env(key, nil), do: Application.delete_env(:clementine, key)
   defp restore_env(key, value), do: Application.put_env(:clementine, key, value)
+
+  defp text_response(text) do
+    Jason.encode!(%{
+      "id" => "resp_text",
+      "output" => [
+        %{
+          "type" => "message",
+          "id" => "msg_1",
+          "role" => "assistant",
+          "content" => [%{"type" => "output_text", "text" => text}]
+        }
+      ],
+      "usage" => %{"input_tokens" => 12, "output_tokens" => 4}
+    })
+  end
 
   defp text_stream_sse(text) do
     events = [

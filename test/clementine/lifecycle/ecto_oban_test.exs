@@ -48,9 +48,21 @@ defmodule Clementine.Lifecycle.Ecto.ObanTest do
                Oban.judge_job(facts(:queued), nil)
     end
 
-    test "a present job is healthy — claim timing is the reaper's queued_at check" do
+    test "a cancelled or discarded job is as dead as a missing one (Meli adoption finding)" do
+      assert {:interrupt, %InterruptReason{code: :job_cancelled}} =
+               Oban.judge_job(facts(:queued), job("cancelled"))
+
+      assert {:interrupt, %InterruptReason{code: :job_discarded}} =
+               Oban.judge_job(facts(:queued), job("discarded"))
+    end
+
+    test "a live job is healthy — claim timing is the reaper's queued_at check" do
       assert Oban.judge_job(facts(:queued), job("available")) == :healthy
       assert Oban.judge_job(facts(:queued), job("scheduled")) == :healthy
+    end
+
+    test "a completed job is healthy: a drain requeue briefly correlates to the old job" do
+      assert Oban.judge_job(facts(:queued), job("completed")) == :healthy
     end
   end
 

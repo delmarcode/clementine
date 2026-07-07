@@ -80,6 +80,12 @@ defmodule Clementine do
           provider: :anthropic,
           id: "claude-sonnet-4-20250514",
           defaults: [max_tokens: 8192]
+        ],
+        gpt_5: [
+          provider: :openai,
+          id: "gpt-5",
+          defaults: [max_output_tokens: 4096],
+          reasoning: [effort: :medium]
         ]
 
   """

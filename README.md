@@ -307,7 +307,8 @@ config :clementine, :models,
   gpt_5: [
     provider: :openai,
     id: "gpt-5",
-    defaults: [max_output_tokens: 4096]
+    defaults: [max_output_tokens: 4096],
+    reasoning: [effort: :medium]
   ],
   gpt_5_codex: [
     provider: :openai,
