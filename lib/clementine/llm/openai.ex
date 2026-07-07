@@ -9,6 +9,7 @@ defmodule Clementine.LLM.OpenAI do
 
   alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.Reasoning
   alias Clementine.LLM.ProviderStream
   alias Clementine.LLM.OpenAI.{Messages, Tools}
   alias Clementine.LLM.OpenAIStreamParser
@@ -193,6 +194,8 @@ defmodule Clementine.LLM.OpenAI do
       "max_output_tokens" => max_output_tokens
     }
 
+    body = maybe_put_reasoning(body, Keyword.get(opts, :reasoning, resolved.reasoning))
+
     body =
       if is_binary(system) and system != "" do
         Map.put(body, "instructions", system)
@@ -206,6 +209,18 @@ defmodule Clementine.LLM.OpenAI do
       |> Map.put("tool_choice", "auto")
     else
       body
+    end
+  end
+
+  defp maybe_put_reasoning(body, nil), do: body
+
+  defp maybe_put_reasoning(body, reasoning) do
+    reasoning = Reasoning.to_provider_config!(:openai, reasoning)
+
+    if map_size(reasoning) == 0 do
+      body
+    else
+      Map.put(body, "reasoning", reasoning)
     end
   end
 

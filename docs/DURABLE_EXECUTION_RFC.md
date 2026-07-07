@@ -1713,7 +1713,12 @@ as a helper, and it is scoped the same way:
 Clementine.Lifecycle.Ecto.Oban.judge_job(facts, oban_job_or_nil)
 # running: job missing | cancelled | discarded | completed-without-terminal
 #          -> {:interrupt, reason}
-# queued:  job missing -> {:interrupt, :job_missing}  (or requeue per policy)
+# queued:  job missing | cancelled | discarded -> {:interrupt, reason}
+#          (or requeue per policy); a COMPLETED job is healthy — a drain
+#          requeue's fresh queued row briefly correlates to the old,
+#          legitimately completed job until the app re-links its job
+#          column, and the claim-timeout check covers the pathological
+#          completed-without-claiming case (Meli adoption finding)
 # waiting: always :healthy — the job COMPLETED legitimately at suspend;
 #          a completed job is the NORMAL state of a suspended run, not
 #          evidence of failure

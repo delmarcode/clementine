@@ -18,26 +18,35 @@ defmodule Clementine.LLM.ModelRegistry do
         gpt_5: [
           provider: :openai,
           id: "gpt-5",
-          defaults: [max_output_tokens: 4096]
+          defaults: [max_output_tokens: 4096],
+          reasoning: [effort: :medium]
         ]
   """
+
+  alias Clementine.LLM.Reasoning
 
   @providers [:anthropic, :openai]
 
   @type provider :: :anthropic | :openai
   @type model_ref :: atom() | {provider(), String.t()}
+  @type reasoning_config :: Reasoning.config()
 
   @type resolved_model :: %{
           provider: provider(),
           id: String.t(),
           defaults: keyword(),
+          reasoning: reasoning_config(),
           alias: atom() | nil
         }
 
   @model_schema [
     provider: [type: {:in, @providers}, required: true],
     id: [type: :string, required: true],
-    defaults: [type: :keyword_list, default: []]
+    defaults: [type: :keyword_list, default: []],
+    reasoning: [
+      type: {:custom, Reasoning, :validate_config, []},
+      default: nil
+    ]
   ]
 
   @doc """
@@ -54,15 +63,8 @@ defmodule Clementine.LLM.ModelRegistry do
 
     Enum.each(models, fn
       {alias_name, config} when is_atom(alias_name) ->
-        case NimbleOptions.validate(config, @model_schema) do
-          {:ok, validated} ->
-            ensure_non_empty_id!(Keyword.fetch!(validated, :id), model_config_context(alias_name))
-            :ok
-
-          {:error, %NimbleOptions.ValidationError{} = error} ->
-            raise ArgumentError,
-                  "Invalid model config for #{inspect(alias_name)}: #{Exception.message(error)}"
-        end
+        validate_model_config!(alias_name, config)
+        :ok
 
       {alias_name, _config} ->
         raise ArgumentError,
@@ -77,7 +79,7 @@ defmodule Clementine.LLM.ModelRegistry do
   end
 
   @doc """
-  Resolves a model reference to `{provider, id, defaults}`.
+  Resolves a model reference to `{provider, id, defaults, reasoning}`.
   """
   @spec resolve!(model_ref()) :: resolved_model()
   def resolve!(model_ref)
@@ -94,7 +96,7 @@ defmodule Clementine.LLM.ModelRegistry do
               "Invalid model tuple #{inspect({provider, id})}: model id must be a non-empty string"
 
       true ->
-        %{provider: provider, id: id, defaults: [], alias: nil}
+        %{provider: provider, id: id, defaults: [], reasoning: nil, alias: nil}
     end
   end
 
@@ -107,24 +109,13 @@ defmodule Clementine.LLM.ModelRegistry do
               "Unknown model alias: #{inspect(model_alias)}. Configure it in :clementine, :models"
 
       config ->
-        validated =
-          case NimbleOptions.validate(config, @model_schema) do
-            {:ok, value} ->
-              value
-
-            {:error, %NimbleOptions.ValidationError{} = error} ->
-              raise ArgumentError,
-                    "Invalid model config for #{inspect(model_alias)}: #{Exception.message(error)}"
-          end
+        validated = validate_model_config!(model_alias, config)
 
         %{
           provider: Keyword.fetch!(validated, :provider),
-          id:
-            ensure_non_empty_id!(
-              Keyword.fetch!(validated, :id),
-              model_config_context(model_alias)
-            ),
+          id: Keyword.fetch!(validated, :id),
           defaults: Keyword.get(validated, :defaults, []),
+          reasoning: Keyword.get(validated, :reasoning),
           alias: model_alias
         }
     end
@@ -141,6 +132,31 @@ defmodule Clementine.LLM.ModelRegistry do
     end
 
     id
+  end
+
+  defp validate_model_config!(model_alias, config) do
+    validated =
+      case NimbleOptions.validate(config, @model_schema) do
+        {:ok, value} ->
+          value
+
+        {:error, %NimbleOptions.ValidationError{} = error} ->
+          raise ArgumentError,
+                "Invalid model config for #{inspect(model_alias)}: #{Exception.message(error)}"
+      end
+
+    context = model_config_context(model_alias)
+    provider = Keyword.fetch!(validated, :provider)
+    id = ensure_non_empty_id!(Keyword.fetch!(validated, :id), context)
+    reasoning = Keyword.get(validated, :reasoning)
+
+    case Reasoning.validate_model_config(provider, reasoning) do
+      {:ok, _reasoning} ->
+        Keyword.put(validated, :id, id)
+
+      {:error, message} ->
+        raise ArgumentError, "#{context}: :reasoning #{message}"
+    end
   end
 
   defp model_config_context(model_alias) do

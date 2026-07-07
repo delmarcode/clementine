@@ -30,6 +30,7 @@ defmodule Clementine.LLM do
   - `tools` - List of tool modules (can be empty)
   - `opts` - Additional options:
     - `:max_tokens` - Override max tokens for this request
+    - `:reasoning` - Override configured provider reasoning for this request
 
   ## Returns
 

@@ -24,7 +24,12 @@ defmodule Clementine.LLM.ModelRegistryTest do
         id: "claude-sonnet-4-20250514",
         defaults: [max_tokens: 8192]
       ],
-      gpt_5: [provider: :openai, id: "gpt-5", defaults: [max_output_tokens: 4096]]
+      gpt_5: [
+        provider: :openai,
+        id: "gpt-5",
+        defaults: [max_output_tokens: 4096],
+        reasoning: [effort: :medium]
+      ]
     )
 
     assert :ok = ModelRegistry.validate_config!()
@@ -46,15 +51,53 @@ defmodule Clementine.LLM.ModelRegistryTest do
     end
   end
 
+  test "validate_config!/0 raises for invalid reasoning shape" do
+    Application.put_env(:clementine, :models,
+      broken: [provider: :openai, id: "gpt-5", reasoning: 12]
+    )
+
+    assert_raise ArgumentError, ~r/expected atom, string, keyword list, or map/, fn ->
+      ModelRegistry.validate_config!()
+    end
+  end
+
+  test "validate_config!/0 raises for invalid OpenAI reasoning value" do
+    Application.put_env(:clementine, :models,
+      broken: [provider: :openai, id: "gpt-5", reasoning: [effort: :max]]
+    )
+
+    assert_raise ArgumentError, ~r/unsupported OpenAI reasoning effort/, fn ->
+      ModelRegistry.validate_config!()
+    end
+  end
+
+  test "validate_config!/0 raises when reasoning is configured for unsupported adapters" do
+    Application.put_env(:clementine, :models,
+      broken: [provider: :anthropic, id: "claude-sonnet", reasoning: [effort: :medium]]
+    )
+
+    assert_raise ArgumentError,
+                 ~r/:reasoning is not supported by Clementine's :anthropic adapter yet/,
+                 fn ->
+                   ModelRegistry.validate_config!()
+                 end
+  end
+
   test "resolve!/1 returns canonical model info for alias" do
     Application.put_env(:clementine, :models,
-      gpt_5: [provider: :openai, id: "gpt-5", defaults: [max_output_tokens: 4096]]
+      gpt_5: [
+        provider: :openai,
+        id: "gpt-5",
+        defaults: [max_output_tokens: 4096],
+        reasoning: [effort: :high, summary: :auto]
+      ]
     )
 
     assert %{
              provider: :openai,
              id: "gpt-5",
              defaults: [max_output_tokens: 4096],
+             reasoning: [effort: :high, summary: :auto],
              alias: :gpt_5
            } = ModelRegistry.resolve!(:gpt_5)
   end
