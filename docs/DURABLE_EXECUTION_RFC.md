@@ -2365,25 +2365,55 @@ Design pressure came from one production app; this table keeps the epistemics
 honest about which mechanisms are battle-tested and which are extrapolated.
 Reviewers should spend their skepticism on the right column.
 
+Statuses updated by the Meli adoption pass (SKUNK-136), which swapped Meli's
+hand-rolled machinery for this design end to end; the report below the table
+records the evidence and the revisions the adoption forced.
+
 | Mechanism | Status |
 |-----------|--------|
-| Claim / single-flight guard | Proven in Meli (row lock variant; CAS variant is new but conformance-tested) |
-| Heartbeat + stale-run reaping | Proven in Meli (15s/2min in production) |
-| Executor cross-check taxonomy | Proven in Meli for the pre-suspension world; the status-scoping (`waiting` is `:healthy`) is a designed revision |
-| Atomic terminal commit with projection | Proven in Meli (messages + completion in one transaction) |
-| Draft view for reconnects | Proven in Meli (ETS cache + sequence numbers); the RunView fold standardizes it |
-| Provider error normalization | Proven in Meli + library clients; retryability field is new |
-| Epoch fencing as explicit mechanism | New (Meli fences implicitly via terminal dead-ends); classical construction |
-| Cooperative cancellation | Designed; Meli never wired it end to end |
-| Suspension / checkpoint / resume | Designed; `Loop.continue/3` is the only existing ancestor |
-| Effect fence | Designed; `ProviderStream`'s no-bytes-sent retry is the in-library precedent |
-| Requeue / fence-gated same-run retry | Designed; default-off policy preserves the proven `max_attempts: 1` posture |
-| Transition notifications + fold closure | Designed; replaces v2.0's epoch-only zombie rule, which could not silence post-reap zombies |
-| Deadline enforcement | Designed |
-| RunView fold | Designed (extraction of proven Meli behavior into the library) |
+| Claim / single-flight guard | Proven; the CAS variant now carries Meli's production path (conformance suite green against Meli's table; duplicate execution discards on the lost claim race) |
+| Heartbeat + stale-run reaping | Proven; Meli now runs the library heartbeat and status-scoped judgment (15s/2min values kept) |
+| Executor cross-check taxonomy | Proven, with one adoption revision: `queued` runs with *cancelled/discarded* jobs interrupt immediately (the claimer is never coming); the `waiting`-is-`:healthy` scoping validated as load-bearing — a suspended run survives the sweep with its legitimately completed job |
+| Atomic terminal commit with projection | Proven; re-proven through the adapter (projection-in-transaction and retried-projection idempotency exercised against Meli's tables) |
+| Draft view for reconnects | Proven; Meli's cache now stores library-folded RunViews and its hand-rolled accumulation is deleted |
+| Provider error normalization | Proven; Meli's normalizers are deleted, channel payloads read the normalized `Error` columns, retryability recorded per failure |
+| Epoch fencing as explicit mechanism | Proven in Meli adoption via the conformance suite: zombie writes fenced across suspend/resume/re-claim cycles against the real table |
+| Cooperative cancellation | Proven in Meli adoption: a user-facing cancel mutation flags the run and the push channel aborts the in-flight provider stream (matrix row 4 as a live test); direct cancels of unowned runs exercised through the same mutation |
+| Suspension / checkpoint / resume | Proven in Meli adoption: `execute_code` is approval-gated end to end — park with durable checkpoint, approve over GraphQL, resume, next epoch executes the pending call; stale-token replay refused |
+| Effect fence | Validated for the unset path (drain requeues only fence-unset runs; requeue refusal on effects is conformance-tested); the fence-*set* drain interrupt has not yet arisen in a product flow — Meli's gated tool suspends before effects fire |
+| Requeue / fence-gated same-run retry | Drain requeue proven in Meli adoption (a mid-gather drain requeues the run and it survives the deploy, epoch untouched until the next claim); reaper requeue policy remains default-off and library-tested |
+| Transition notifications + fold closure | Proven in Meli adoption: every lifecycle broadcast — including reaper interrupts and direct cancels no executor announces — flows through `after_transition/3`, and terminal notifications close the cached folds |
+| Deadline enforcement | Wired in Meli (per-claim `max_duration` window); expiry itself remains library-proven — no product flow has hit a deadline yet |
+| RunView fold | Proven in Meli adoption: the fold serves reconnect snapshots; the per-app reimplementation it replaced is deleted |
 
-The designed rows are the validation burden of the first epic: Meli adopts
-each and reports back before any is declared stable.
+### Meli Adoption Report (SKUNK-136)
+
+What the adoption deleted, kept, and revised — the scorecard's claims, now
+measured:
+
+- **Deleted, as promised**: the claim SQL and `FOR UPDATE` transition
+  machinery, the changeset transition table, the heartbeat GenServer, the
+  reconciler's judgment logic, the draft cache's accumulation, and the
+  provider error normalizers (plus the pre-durability supervised execution
+  mode those modules propped up).
+- **Kept, as promised**: the `conversation_runs` table (now carrying the
+  recipe columns), the projection (`append_run_messages!`), the sweep query,
+  the Oban worker, and the channel payload shaping.
+- **Revisions the adoption forced**:
+  - `Ecto.Oban.judge_job/2` queued scope: cancelled/discarded jobs are as
+    conclusive as missing ones and interrupt immediately; a *completed* job
+    stays healthy in `queued` because a drain requeue's fresh row briefly
+    correlates to the old job until the app re-links its job column.
+  - Convention made explicit: pre-claim construction failures (the run's
+    agent or session no longer loads) resolve as a direct cancel carrying
+    the reason — the state machine has no `queued -> failed` by design, and
+    aging out on the claim timeout would be worse.
+- **Adoption notes for the next host**: resume/denial metas use atom keys
+  (`%{by: user_id, message: ...}`) — the rollout reads `meta[:message]`, and
+  the codec round-trips atom-keyed maps as opaque ETF; test factories must
+  let `queued_at` stamp from the column default (a node-clock stamp breaks
+  the storage-clock batteries); the single-active default (parked approvals
+  block new sends) was adopted as-is.
 
 ## Design Evaluation Scorecard
 
