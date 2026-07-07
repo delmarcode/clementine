@@ -873,6 +873,51 @@ defmodule Clementine.RolloutExecuteTest do
 
       refute_received {:deployed, _args}
     end
+
+    test "a cancel flagged after the claim is polled before the approved call executes" do
+      # The poll flavor, no push channel: the resumed act owes the
+      # boundary's cancel check before the gated call runs — a cancel that
+      # raced the claim must not be honored one batch late.
+      checkpoint = approval_checkpoint()
+
+      assert {:cancelled, :changed_mind} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                 resume: {checkpoint, {:approved, %{by: "u1"}}},
+                 cancel?: fn -> {:requested, :changed_mind} end
+               )
+
+      refute_received {:deployed, _args}
+    end
+
+    test "an expired deadline at resume fails before the approved call executes" do
+      checkpoint = approval_checkpoint()
+      deadline = DateTime.add(DateTime.utc_now(), -1, :second)
+
+      assert {:error, %Error{code: :deadline_exceeded, retryable?: false}} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                 resume: {checkpoint, {:approved, %{}}},
+                 deadline: deadline
+               )
+
+      refute_received {:deployed, _args}
+    end
+
+    test "a pending shape this engine cannot resolve is incompatible, never a crash" do
+      # A host-built checkpoint carrying a reserved/future pending shape:
+      # decoded envelopes fail inside decode; the struct path must take
+      # the same doctrine road.
+      checkpoint = %Checkpoint{approval_checkpoint() | pending: {:external_wait, "webhook_123"}}
+
+      assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+               Rollout.execute(
+                 rollout(tools: [GatedDeploy]),
+                 resume: {checkpoint, {:approved, %{}}}
+               )
+
+      assert message =~ "not resolvable"
+    end
   end
 
   describe "deadline caps" do

@@ -274,12 +274,31 @@ defmodule Clementine.Rollout do
           usage: checkpoint.usage
       }
 
+      # Shapes beyond ToolApproval are deliberately unspecified until their
+      # reasons activate; a checkpoint carrying one is exactly "content no
+      # longer understood" and takes the doctrine's incompatible path — a
+      # decoded envelope already fails inside decode, so this arm guards
+      # host-built structs.
       case checkpoint.pending do
-        nil -> {:ok, exec}
-        pending -> {:resolve, exec, pending, payload}
+        nil ->
+          {:ok, exec}
+
+        %Pending.ToolApproval{} = pending ->
+          {:resolve, exec, pending, payload}
+
+        other ->
+          {:error,
+           incompatible_checkpoint(
+             "pending operation #{pending_shape(other)} is not resolvable " <>
+               "by this engine version",
+             checkpoint
+           )}
       end
     end
   end
+
+  defp pending_shape(%struct{}), do: inspect(struct)
+  defp pending_shape(other), do: inspect(other)
 
   defp decode_checkpoint(%Clementine.Checkpoint{version: version} = checkpoint) do
     if version == Clementine.Checkpoint.version() do
@@ -298,14 +317,18 @@ defmodule Clementine.Rollout do
 
   # Resolving a pending approval completes the act it interrupted, before
   # the boundary decides whether the loop may gather again (RFC §The
-  # Resume Flow, step 7). Approval executes the gated call in this
-  # execution; denial synthesizes an error tool result carrying the
+  # Resume Flow, step 7) — so it owes the boundary's own checks first: a
+  # cancel flagged after the claim must be honored before the gated call
+  # executes, not one batch later. Approval executes the gated call in
+  # this execution; denial synthesizes an error tool result carrying the
   # approver's message and lets the model react. Either way the batch
   # settles through the same path as a fresh act, so a batch holding
   # further gated calls parks again, one decision at a time.
   defp resolve_pending(%Execution{} = exec, %Pending.ToolApproval{} = pending, payload) do
-    with {:ok, pending_use, batch} <- pending_batch(exec, pending),
-         :continue <- check_signals() do
+    with :continue <- check_signals(),
+         :continue <- check_deadline(exec),
+         :continue <- check_cancel(exec),
+         {:ok, pending_use, batch} <- pending_batch(exec, pending) do
       case payload do
         {:approved, _meta} ->
           case execute_now(exec, [pending_use], pending.completed_results) do
