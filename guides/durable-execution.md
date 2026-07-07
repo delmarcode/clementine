@@ -481,6 +481,7 @@ Schedule it on Oban Cron:
 ```elixir
 # config/config.exs
 config :my_app, Oban,
+  repo: MyApp.Repo,
   queues: [agents: [limit: 10], maintenance: [limit: 1]],
   plugins: [
     {Oban.Plugins.Cron,
@@ -594,7 +595,9 @@ children = [
 
 <!-- guide-sample: parse-only -->
 ```elixir
-# config/config.exs — give runs time to unwind and requeue
+# config/config.exs — adds to the Oban config from the reaper step
+# (Config merges same-key keyword lists): give runs time to unwind
+# and requeue.
 config :my_app, Oban,
   shutdown_grace_period: :timer.seconds(25)
 ```
