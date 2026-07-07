@@ -209,10 +209,14 @@ conformance coverage, before or alongside the loop epic's first consumer.
    clocks, no randomness. Actions are JSON-safe data; **all construction
    happens at host boundaries** — rollouts in the child worker, payload
    decoding at the seam.
-3. **The step is one atomic commit.** Consumed inputs, attempts/dead-letter
-   marks, the new envelope, child rows and jobs, sends, timer schedules,
-   and the transition (park, continue, or finish-with-sweep) commit
-   together or not at all. Dispatch is cargo, not a phase. Corollary:
+3. **The step is one atomic commit.** Consumed inputs, dead-letter marks,
+   the new envelope, child rows and jobs, sends, timer schedules, and the
+   transition (park, continue, or finish-with-sweep) commit together or not
+   at all. Dispatch is cargo, not a phase. One deliberate exception sits
+   *outside* the unit: the drain-time attempts bump (step phase 3) commits
+   independently, before handling — a payload that kills the VM must still
+   advance toward its dead-letter threshold, and a bump that rolled back
+   with the step would retry poison forever. Corollary:
 4. **A loop is always replayable.** Nothing durable exists that a committed
    step did not create, so a crashed step replays from unchanged inputs
    through pure decisions to an identical commit. No effect fence exists at
@@ -375,10 +379,15 @@ dispatch cargo — child specs `{tag_key, child_args}`, sends
 
 On Postgres both are one transaction (Oban jobs are rows; the run-row CAS
 serializes append against park). Substrates that cannot honor sentence 1's
-re-check perfectly leans on `:wake_pending` — correctness degrades to
+re-check perfectly lean on `:wake_pending` — correctness degrades to
 bounded latency, never to loss. Redis-shaped hosts implement the unit with
 their own primitives (MULTI/Lua); the sentences are the contract, not the
 SQL.
+
+`bump_attempts/2` deliberately belongs to *neither* atomic unit — it is
+invariant 3's one exception, committed before handling so that VM-death
+poison is counted (L7). Everything else the step causes is StepCommit
+cargo.
 
 `build_child/4` is where rollouts come from: the host loads whatever the
 JSON-safe `child_args` reference (agent config, history by cursor) and
@@ -472,7 +481,9 @@ with the envelope entry recording it. Fire → `append` of `{:elapsed, tag}`
 (dedup_key `"elapsed:" <> tag_key <> ":" <> schedule_id`). `cancel_timer`
 cargo removes the envelope entry and best-effort-cancels the job — a fire
 that races the cancel appends an elapsed whose tag is no longer pending:
-dropped by the in-fold dedup, never seen by `handle/2`. Live-key lifetime:
+the machinery consumes it as a dead letter (`dead_reason: :stale_elapsed`),
+never seen by `handle/2` and never silently dropped — the race stays
+observable in dead-letter telemetry (invariant 11). Live-key lifetime:
 a fired or cancelled tag is immediately re-armable (the watcher's `:poll`
 is legal). Timers of terminal loops dead-letter on arrival with
 `dead_reason: :terminal` — distinguishable noise.
@@ -684,7 +695,7 @@ decisions, not surprises:
 | L3 | Appends race each other and the wake | append's atomic insert+wake+enqueue; claim CAS | one step drains all, FIFO commit-visibility order |
 | L4 | Append lands between drain and park | park's in-commit pending re-check → downgrade to continue | never parked with pending inputs; `:wake_pending` backstops imperfect substrates |
 | L5 | Fast child completes during crash window; replay re-drains spawn + completion | in-fold dedup | replayed spawn re-records the tag before its completion is judged: delivered once, dropped never |
-| L6 | Timer fires against a never-committed schedule / after cancel | schedule is cargo (cannot precede its envelope entry); in-fold dedup for cancel races | no wedge; no ghost elapsed to `handle/2` |
+| L6 | Timer fires against a never-committed schedule / after cancel | schedule is cargo (cannot precede its envelope entry); stale elapses dead-letter (`:stale_elapsed`) | no wedge; no ghost elapsed to `handle/2`; the race observable in dead-letter telemetry |
 | L7 | Poison input, including VM-killing payloads | drain-time attempts bump (committed) + head blame + batch-1 degrade + K dead-letter + non-recursive `{:input_failed}` | mailbox never jams; innocents never dead-letter; decision layer informed |
 | L8 | Loop cancelled with children in flight | kind-aware flag + machinery cascade | children terminal first (their own belts guarantee it), loop terminal last, terminal sweep leaves nothing behind |
 | L9 | Halt with children in flight / inputs behind the halt | cascade + terminal sweep in the finish's atomic unit | drained-to-terminals; leftovers dead-lettered with reasons, never silently retained |
