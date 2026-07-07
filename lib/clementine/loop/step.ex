@@ -30,7 +30,9 @@ defmodule Clementine.Loop.Step do
   already counted it, so deterministic violations walk the poison path —
   head-of-batch blame, batch-1 degrade, dead-letter at the threshold with
   a synthesized `{:input_failed, ref, error}` — and the mailbox never jams
-  (matrix row L7).
+  (matrix row L7). The threshold step itself consults none of the app's
+  doors: even a loop whose `init/1`, `load/1`, or `dump/1` is the
+  deterministic failure still commits its poison mark.
 
   Cascade mode (facts cancel flag, or a pending halt in the envelope)
   never invokes `handle/2`, `load/1`, or `dump/1`: completions are
@@ -89,9 +91,12 @@ defmodule Clementine.Loop.Step do
     (default #{@default_dead_letter_after}); the head gets exactly that many
     executions, the Oban `max_attempts` analog.
 
-  Cascade plans never bump: `handle/2` never runs, so nothing can poison.
-  The synthesized `{:input_failed}` is itself subject to the same
-  threshold but never re-synthesizes — poison evidence does not recurse.
+  Cascade plans never bump (`handle/2` never runs, so nothing can
+  poison), and completions fill their batch regardless of position —
+  non-completions are never consumable mid-cascade, so letting them
+  occupy batch slots would starve the fold behind a long backlog. The
+  synthesized `{:input_failed}` is itself subject to the same threshold
+  but never re-synthesizes — poison evidence does not recurse.
   """
   @spec plan(Envelope.t() | nil, [StoredInput.t()], keyword()) :: Plan.t()
   def plan(envelope, pending, opts \\ []) do
@@ -100,8 +105,14 @@ defmodule Clementine.Loop.Step do
     threshold = Keyword.get(opts, :dead_letter_after, @default_dead_letter_after)
 
     if cancel != nil or (envelope && Envelope.cascading?(envelope)) do
-      {batch, rest} = Enum.split(pending, batch_cap)
-      %Plan{mode: :cascade, cancel: cancel, batch: batch, rest: rest}
+      # A cascade acts on completions alone — non-completions stay
+      # unconsumed until the terminal sweep — so completions fill the
+      # batch regardless of how many skippable inputs sit ahead of them
+      # in FIFO. Splitting positionally would let a backlog longer than
+      # the cap starve the fold and livelock the cascade.
+      {completions, others} = Enum.split_with(pending, &(&1.input.kind == :completed))
+      {batch, overflow} = Enum.split(completions, batch_cap)
+      %Plan{mode: :cascade, cancel: cancel, batch: batch, rest: overflow ++ others}
     else
       plan_normal(pending, batch_cap, threshold)
     end
@@ -200,21 +211,53 @@ defmodule Clementine.Loop.Step do
   ## Normal mode
 
   defp drain_normal(module, envelope, plan, loop_ref, epoch, loop_args) do
-    vocab = module.__loop__(:vocabulary)
-    declared = module.__loop__(:state_version)
+    if plan.dead != [] do
+      {:ok, threshold_commit(plan, loop_ref, epoch)}
+    else
+      vocab = module.__loop__(:vocabulary)
+      declared = module.__loop__(:state_version)
 
-    with {:ok, fold} <- initial_fold(module, envelope, loop_args, vocab, plan, loop_ref) do
-      fold = fold_batch(module, fold, plan.batch, vocab)
+      with {:ok, fold} <- initial_fold(module, envelope, loop_args, vocab, plan, loop_ref) do
+        fold = fold_batch(module, fold, plan.batch, vocab)
 
-      commit =
-        if fold.halted do
-          halt_commit(module, fold, plan, loop_ref, epoch, vocab, declared)
-        else
-          steady_commit(module, fold, plan, loop_ref, epoch, vocab, declared)
-        end
+        commit =
+          if fold.halted do
+            halt_commit(module, fold, plan, loop_ref, epoch, vocab, declared)
+          else
+            steady_commit(module, fold, plan, loop_ref, epoch, vocab, declared)
+          end
 
-      {:ok, commit}
+        {:ok, commit}
+      end
     end
+  end
+
+  # A threshold step commits no app decision — only the poison mark, its
+  # synthesized evidence, and the transition — so it consults none of the
+  # app's doors: when init/load/dump are themselves the deterministic
+  # failure that burned the head's attempts (or a deploy left the state
+  # version unloadable), this commit still lands and the mailbox never
+  # jams (L7; inputs are innocent of deploys, and deploys don't block
+  # input hygiene). The envelope is untouched: :envelope is absent from
+  # set, and absent means leave the stored value alone.
+  defp threshold_commit(plan, loop_ref, epoch) do
+    {op, set, recheck} =
+      if plan.synthesize != [] or plan.rest != [] do
+        {:continue, continue_set(), nil}
+      else
+        {:park, park_set(loop_ref, epoch), :any}
+      end
+
+    %StepCommit{
+      loop_ref: loop_ref,
+      op: op,
+      expect: %{status: :running, epoch: epoch},
+      set: set,
+      park_recheck: recheck,
+      marks: plan.dead,
+      appends: plan.synthesize,
+      meta: %{mode: plan.mode, batch: 0}
+    }
   end
 
   # The first claim runs init — state and actions land in the same commit
@@ -464,19 +507,10 @@ defmodule Clementine.Loop.Step do
     envelope = build_envelope(module, fold, vocab, declared)
 
     if fold.appends != [] or plan.rest != [] do
-      commit(
-        fold,
-        plan,
-        loop_ref,
-        epoch,
-        :continue,
-        continue_set(envelope, declared),
-        nil,
-        nil,
-        false
-      )
+      set = with_envelope(continue_set(), envelope, declared)
+      commit(fold, plan, loop_ref, epoch, :continue, set, nil, nil, false)
     else
-      set = park_set(envelope, declared, loop_ref, epoch)
+      set = with_envelope(park_set(loop_ref, epoch), envelope, declared)
       commit(fold, plan, loop_ref, epoch, :park, set, :any, nil, false)
     end
   end
@@ -612,45 +646,45 @@ defmodule Clementine.Loop.Step do
   # in the window skip the park entirely.
   defp cascade_park_or_continue(fold, plan, loop_ref, epoch, envelope, state_version, window) do
     if Enum.any?(window, &(&1.input.kind == :completed)) do
-      set = continue_set(envelope, state_version)
+      set = with_envelope(continue_set(), envelope, state_version)
       commit(fold, plan, loop_ref, epoch, :continue, set, nil, nil, false)
     else
-      set = park_set(envelope, state_version, loop_ref, epoch)
+      set = with_envelope(park_set(loop_ref, epoch), envelope, state_version)
       commit(fold, plan, loop_ref, epoch, :park, set, :completions, nil, false)
     end
   end
 
   ## Transition sets — `Transition` semantics: absent key untouched,
-  ## present nil writes NULL, :now resolves on the storage clock.
+  ## present nil writes NULL, :now resolves on the storage clock. The
+  ## threshold path uses the bare sets: its commit leaves the envelope,
+  ## state_version, and usage untouched by omission.
 
-  defp park_set(envelope, state_version, loop_ref, epoch) do
+  defp park_set(loop_ref, epoch) do
     token = %ResumeToken{run_ref: loop_ref, epoch: epoch, reason_type: :external}
 
     %{
       status: :waiting,
-      envelope: envelope,
-      state_version: state_version,
       suspension: %Suspension{reason: {:external, :loop}, checkpoint: nil, token: token},
       executor_id: nil,
       deadline: nil,
       heartbeat_at: nil,
-      queued_at: :now,
-      usage: envelope.usage
+      queued_at: :now
     }
   end
 
-  defp continue_set(envelope, state_version) do
+  defp continue_set do
     %{
       status: :queued,
-      envelope: envelope,
-      state_version: state_version,
       suspension: nil,
       executor_id: nil,
       deadline: nil,
       heartbeat_at: nil,
-      queued_at: :now,
-      usage: envelope.usage
+      queued_at: :now
     }
+  end
+
+  defp with_envelope(set, envelope, state_version) do
+    Map.merge(set, %{envelope: envelope, state_version: state_version, usage: envelope.usage})
   end
 
   defp finish_set(envelope, state_version, result) do

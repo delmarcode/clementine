@@ -17,7 +17,9 @@ defmodule Clementine.Loop.StepCommit do
   absent key = leave untouched, present `nil` = write NULL, timestamps
   symbolic (`:now`), resolved against the storage clock. Two loop-only
   keys ride alongside the facts: `:envelope` (an `Envelope` struct the
-  host encodes via `Envelope.encode/1`) and `:state_version`.
+  host encodes via `Envelope.encode/1`) and `:state_version`. A
+  threshold poison commit omits both (and `:usage`) — it changes no app
+  state, so the stored values ride along untouched.
 
   When `op` is `:park`, the host re-verifies *inside the same unit* that
   no unconsumed inputs in `park_recheck` scope exist, downgrading the park
@@ -92,7 +94,11 @@ defmodule Clementine.Loop.StepCommit do
   @spec dead_reasons() :: [dead_reason()]
   def dead_reasons, do: @dead_reasons
 
-  @doc "The envelope this commit writes."
-  @spec envelope(t()) :: Envelope.t()
+  @doc """
+  The envelope this commit writes, or nil when the commit leaves the
+  stored envelope untouched (threshold poison steps).
+  """
+  @spec envelope(t()) :: Envelope.t() | nil
   def envelope(%__MODULE__{set: %{envelope: %Envelope{} = envelope}}), do: envelope
+  def envelope(%__MODULE__{}), do: nil
 end

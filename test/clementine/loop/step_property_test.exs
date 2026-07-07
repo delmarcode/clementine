@@ -58,21 +58,21 @@ defmodule Clementine.Loop.StepPropertyTest do
 
           unaccounted = batch_refs -- (commit.consumed ++ mark_refs)
 
+          envelope = commit.set[:envelope]
+
           cond do
             # Terminal: the in-unit sweep dead-letters every remaining row.
             commit.op == :finish ->
               assert commit.terminal_sweep
 
-            # Mid-cascade: exactly the non-completions wait for the sweep.
-            plan.mode == :cascade or commit.set.envelope.pending_halt != nil ->
-              skipped =
-                plan.batch
-                |> Enum.filter(&(&1.ref in unaccounted))
-                |> Enum.map(& &1.input.kind)
+            # Cascade batches hold only completions, and every completion
+            # is consumed (live) or marked (unknown tag) — nothing skips.
+            plan.mode == :cascade ->
+              assert unaccounted == []
 
-              if plan.mode == :cascade do
-                assert Enum.all?(skipped, &(&1 != :completed))
-              end
+            # Halt-mid-batch: the leftovers wait for the post-cascade sweep.
+            envelope && envelope.pending_halt != nil ->
+              :ok
 
             # Steady state: everything in the batch is accounted for.
             true ->
@@ -171,9 +171,18 @@ defmodule Clementine.Loop.StepPropertyTest do
             {:cont, %{sim | pending: bump(pending, plan.bump), next_ref: next_ref}}
 
           {{:ok, commit}, false} ->
-            # The committed envelope must survive its storage round trip.
-            {:ok, envelope} = commit.set.envelope |> Envelope.encode() |> Envelope.decode()
-            assert envelope == commit.set.envelope
+            # The committed envelope must survive its storage round trip; a
+            # threshold commit omits it, leaving the stored one in place.
+            envelope =
+              case commit.set[:envelope] do
+                nil ->
+                  sim.envelope
+
+                written ->
+                  {:ok, decoded} = written |> Envelope.encode() |> Envelope.decode()
+                  assert decoded == written
+                  decoded
+              end
 
             if commit.op == :finish do
               {:cont, %{sim | finished: true}}

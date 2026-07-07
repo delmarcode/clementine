@@ -81,12 +81,15 @@ defmodule Clementine.Loop.StepTest do
       assert plan.synthesize == []
     end
 
-    test "a cancel flag plans a cascade: no bump, cap-bounded batch" do
+    test "a cancel flag plans a cascade: no bump, completions fill the batch past any backlog" do
       pending = [msg(1, %{}, 5), completed(2, {:reply, 1})]
       plan = Step.plan(nil, pending, cancel: :user_request)
 
       assert %Step.Plan{mode: :cascade, cancel: :user_request, bump: []} = plan
-      assert length(plan.batch) == 2
+      # Only completions are consumable mid-cascade, so only they occupy
+      # batch slots; the message waits for the terminal sweep.
+      assert [%StoredInput{ref: 2}] = plan.batch
+      assert [%StoredInput{ref: 1}] = plan.rest
     end
 
     test "a pending halt in the envelope plans a cascade without any flag" do
@@ -404,6 +407,60 @@ defmodule Clementine.Loop.StepTest do
       assert commit.appends == []
     end
 
+    test "a threshold step consults no app doors: init that always raises still dead-letters (review: mailbox never jams)" do
+      defmodule RaisingInitLoop do
+        use Clementine.Loop
+        def init(_args), do: raise("init boom")
+        def handle(_input, state), do: {:ok, state, []}
+      end
+
+      # Below the threshold the raising init is the failure being counted.
+      below = Step.plan(nil, [msg(1, %{}, 2), msg(2, %{})])
+
+      assert_raise RuntimeError, "init boom", fn ->
+        Step.drain(RaisingInitLoop, nil, below, @opts)
+      end
+
+      # At the threshold the poison mark must land without touching init.
+      at = Step.plan(nil, [msg(1, %{}, 3), msg(2, %{})])
+      {:ok, commit} = Step.drain(RaisingInitLoop, nil, at, @opts)
+
+      assert commit.op == :continue
+      assert [%{ref: 1, reason: :poison}] = commit.marks
+      assert [%Input{kind: :input_failed, input_ref: 1}] = commit.appends
+
+      # The commit changes no app state: envelope, state_version, and
+      # usage are absent — the stored values ride along untouched.
+      refute Map.has_key?(commit.set, :envelope)
+      refute Map.has_key?(commit.set, :state_version)
+      refute Map.has_key?(commit.set, :usage)
+    end
+
+    test "a threshold step bypasses load and the version check: a deploy never blocks input hygiene" do
+      defmodule RaisingLoadLoop do
+        use Clementine.Loop
+        def init(_args), do: {:ok, %{}, []}
+        def handle(_input, state), do: {:ok, state, []}
+        def load(_state), do: raise("load boom")
+      end
+
+      envelope = scripted_envelope()
+      at = Step.plan(envelope, [msg(1, %{}, 3)])
+
+      assert {:ok, %{op: :continue, marks: [%{ref: 1, reason: :poison}]}} =
+               Step.drain(RaisingLoadLoop, envelope, at, @opts)
+
+      # Same with a state_version the current code cannot load: the
+      # normal drain refuses, the threshold commit still lands.
+      stale = %Envelope{state_version: 1, state: %{}}
+
+      assert {:error, {:incompatible_state, _detail}} =
+               Step.drain(VersionedLoop, stale, Step.plan(stale, [msg(1, %{})]), @opts)
+
+      assert {:ok, %{marks: [%{ref: 1, reason: :poison}]}} =
+               Step.drain(VersionedLoop, stale, Step.plan(stale, [msg(1, %{}, 3)]), @opts)
+    end
+
     test "the synthesized {:input_failed} reaches handle/2 as an ordinary input" do
       evidence = stored(9, Input.input_failed(1, %Clementine.Error{code: :input_dead_lettered}))
       envelope = scripted_envelope()
@@ -637,6 +694,33 @@ defmodule Clementine.Loop.StepTest do
       # init never ran: no state was ever created.
       assert commit.set.envelope.state == nil
       assert commit.consumed == []
+    end
+
+    test "a cascade folds a completion behind a backlog longer than the batch cap (review: no livelock)" do
+      # Three queued messages sit ahead of the last child's completion,
+      # with batch_cap 2. Positional batching would drain nothing forever;
+      # completion-first batching folds it and finishes the cascade.
+      envelope =
+        scripted_envelope(
+          children: %{key({:reply, 1}) => 901},
+          pending_halt: %{result: Result.cancelled(:user_request)}
+        )
+
+      pending = [
+        msg(1, %{"id" => "a"}),
+        msg(2, %{"id" => "b"}),
+        msg(3, %{"id" => "c"}),
+        completed(4, {:reply, 1})
+      ]
+
+      plan = Step.plan(envelope, pending, batch_cap: 2)
+      assert [%StoredInput{ref: 4}] = plan.batch
+
+      commit = drain!(ScriptedLoop, envelope, plan)
+      assert commit.op == :finish
+      assert commit.terminal_sweep
+      assert commit.consumed == [4]
+      assert %Result.Cancelled{reason: :user_request} = commit.result
     end
 
     test "matrix row L2 (cancellability): an :incompatible_state loop still cascades — no load, no dump, no handle" do
