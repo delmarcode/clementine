@@ -28,9 +28,10 @@ defmodule Clementine.Lifecycle.Ephemeral do
   @doc """
   Seeds a fresh queued run in this process and returns `{run_ref, ctx}`.
 
-  `:forward_to` names the `{pid, tag}` destination `Clementine.Events.Forwarder`
-  mails stamped events to (the streaming facade — the tag pins delivery to
-  one stream enumerable); `nil` means no forwarding.
+  `:forward_to` names the `{pid, tag}` destination the internal
+  Clementine.Events.Forwarder sink mails stamped events to (the streaming
+  facade — the tag pins delivery to one stream enumerable); `nil` means no
+  forwarding.
   """
   @spec create(keyword()) :: {reference(), ctx()}
   def create(opts \\ []) do

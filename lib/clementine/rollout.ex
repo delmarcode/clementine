@@ -174,10 +174,12 @@ defmodule Clementine.Rollout do
     never a bare atom.
   - `:emit` - a `Clementine.Events.Stamper` for execution events; omitted
     means no events.
-  - `:cancel?` - zero-arity closure over `Protocol.cancellation/1`, polled
+  - `:cancel?` - zero-arity closure over
+    `Clementine.Lifecycle.Protocol.cancellation/1`, polled
     at iteration boundaries (before each gather, which is also after each
     tool batch).
-  - `:mark_effects` - zero-arity closure over `Protocol.mark_effects/1`,
+  - `:mark_effects` - zero-arity closure over
+    `Clementine.Lifecycle.Protocol.mark_effects/1`,
     called once, before the first tool batch containing a tool whose
     `retry` metadata is not `:safe` (`:unknown` is `:unsafe`). Batches of
     only `:safe` tools leave the fence down: nothing external can happen,
