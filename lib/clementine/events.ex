@@ -6,7 +6,7 @@ defmodule Clementine.Events do
   observes while animating a rollout, typed by the closed taxonomy in
   `Clementine.Event` — flow through this behaviour, stamped `{epoch, seq}`
   by the runner's stamper. Lifecycle transitions travel the other road:
-  every transition flows through the host's `Clementine.Lifecycle.apply/2`,
+  every transition flows through the host's `c:Clementine.Lifecycle.apply/2`,
   and hosts broadcast the resulting facts post-commit as transition
   notifications (the Ecto adapter exposes an `after_transition/3` hook for
   exactly this). Notifications need no sequence numbers — a notification
