@@ -34,7 +34,7 @@ defmodule Clementine.LifecycleCase.Battery do
     ref = create!(h)
     facts = fetch!(h, ref)
 
-    assert %Facts{status: :queued, epoch: 0, effects?: false} = facts
+    assert %Facts{kind: :rollout, status: :queued, epoch: 0, effects?: false} = facts
     assert facts.ref == ref
     assert %DateTime{} = facts.queued_at
 
@@ -613,6 +613,42 @@ defmodule Clementine.LifecycleCase.Battery do
     # The suspension's token now points at a terminal run.
     assert {:error, :run_not_waiting} =
              Protocol.resume(h.lifecycle, token, {:approved, %{by: 1}}, h.ctx)
+  end
+
+  def cancel_refuses_loop_kind(h) do
+    # The probe would surface a projection fired by a refused cancel; the
+    # refusal must write nothing at all.
+    queued = create!(h, kind: :loop, projection: {:raise_on, :cancelled})
+    queued_facts = fetch!(h, queued)
+
+    assert queued_facts.kind == :loop,
+           "create_run.(kind: :loop) must insert a loop-kind run " <>
+             "(see the create_run contract in Clementine.LifecycleCase)"
+
+    # Direct-terminal flavor (unowned run): the flavor that would orphan a
+    # loop's children.
+    assert {:error, :loop_run} = Protocol.request_cancel(h.lifecycle, queued, :stop, h.ctx)
+
+    facts = fetch!(h, queued)
+    assert facts.status == :queued
+    assert facts.cancel == nil
+    assert facts.finished_at == nil
+
+    # Flag flavor (owned run): refused before the flag lands — the rollout
+    # boundary poll that would honor it never runs in a step.
+    running = create!(h, kind: :loop)
+    claim!(h, running)
+
+    assert {:error, :loop_run} = Protocol.request_cancel(h.lifecycle, running, :stop, h.ctx)
+
+    facts = fetch!(h, running)
+    assert facts.status == :running
+    assert facts.cancel == nil
+
+    # Rollout behavior is unchanged by the amendment: same statuses, same
+    # request, shipped flavors.
+    rollout = create!(h)
+    assert {:ok, :finished} = Protocol.request_cancel(h.lifecycle, rollout, :stop, h.ctx)
   end
 
   ## requeue

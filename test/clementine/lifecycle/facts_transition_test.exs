@@ -41,6 +41,13 @@ defmodule Clementine.Lifecycle.FactsTransitionTest do
     end
   end
 
+  describe "Facts kinds" do
+    test "the kind universe is closed and defaults to :rollout — amendment A1" do
+      assert Facts.kinds() == [:rollout, :loop]
+      assert %Facts{ref: "run_1"}.kind == :rollout
+    end
+  end
+
   describe "Facts observation order" do
     defp facts(status, epoch), do: %Facts{ref: "run_1", status: status, epoch: epoch}
 

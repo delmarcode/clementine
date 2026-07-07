@@ -19,7 +19,15 @@ defmodule Clementine.Test.Ecto.Factory do
         {:raise_on, variant} -> "raise:#{variant}"
       end
 
-    run = TestRepo.insert!(%Run{scope_id: System.unique_integer([:positive]), label: label})
+    kind = attrs |> Keyword.get(:kind, :rollout) |> Atom.to_string()
+
+    run =
+      TestRepo.insert!(%Run{
+        scope_id: System.unique_integer([:positive]),
+        label: label,
+        kind: kind
+      })
+
     run.id
   end
 

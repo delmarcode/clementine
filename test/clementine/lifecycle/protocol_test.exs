@@ -1,7 +1,7 @@
 defmodule Clementine.Lifecycle.ProtocolTest do
   use ExUnit.Case, async: true
 
-  alias Clementine.Lifecycle.Protocol
+  alias Clementine.Lifecycle.{Facts, Protocol}
   alias Clementine.Pending.ToolApproval
   alias Clementine.Result
   alias Clementine.Test.{FlakyLifecycle, MemoryLifecycle}
@@ -323,6 +323,59 @@ defmodule Clementine.Lifecycle.ProtocolTest do
 
       assert {:error, :already_terminal} =
                Protocol.request_cancel(MemoryLifecycle, "r1", :late, store)
+    end
+
+    test "matrix L8 support: refuses a live loop-kind run in both flavors — amendment A2",
+         %{store: store} do
+      # Direct-terminal flavor, unowned queued run: the flavor that would
+      # orphan a loop's children.
+      MemoryLifecycle.seed_queued(store, "queued_loop", kind: :loop)
+
+      assert {:error, :loop_run} =
+               Protocol.request_cancel(MemoryLifecycle, "queued_loop", :stop, store)
+
+      facts = MemoryLifecycle.facts!(store, "queued_loop")
+      assert facts.status == :queued
+      assert facts.finished_at == nil
+
+      # Direct-terminal flavor, parked run: a loop spends its life waiting.
+      MemoryLifecycle.seed(store, %Facts{
+        ref: "waiting_loop",
+        kind: :loop,
+        status: :waiting,
+        epoch: 3,
+        queued_at: DateTime.utc_now()
+      })
+
+      assert {:error, :loop_run} =
+               Protocol.request_cancel(MemoryLifecycle, "waiting_loop", :stop, store)
+
+      assert MemoryLifecycle.facts!(store, "waiting_loop").status == :waiting
+
+      # Flag flavor, owned run: refused before the flag lands — no rollout
+      # boundary poll runs in a step to honor it.
+      MemoryLifecycle.seed_queued(store, "running_loop", kind: :loop)
+      claim!(store, "running_loop")
+
+      assert {:error, :loop_run} =
+               Protocol.request_cancel(MemoryLifecycle, "running_loop", :stop, store)
+
+      facts = MemoryLifecycle.facts!(store, "running_loop")
+      assert facts.status == :running
+      assert facts.cancel == nil
+
+      # No refusal fired a projection.
+      assert MemoryLifecycle.projections(store) == []
+    end
+
+    test "a terminal loop run answers already_terminal — dead ends outrank kind",
+         %{store: store} do
+      MemoryLifecycle.seed_queued(store, "done_loop", kind: :loop)
+      lease = claim!(store, "done_loop")
+      {:ok, _} = Protocol.finish(lease, Result.completed())
+
+      assert {:error, :already_terminal} =
+               Protocol.request_cancel(MemoryLifecycle, "done_loop", :late, store)
     end
   end
 

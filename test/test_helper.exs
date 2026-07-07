@@ -1,7 +1,13 @@
 # Ecto adapter tests need a reachable Postgres; without one, :postgres-tagged
-# tests are excluded so the rest of the suite still runs.
+# tests are excluded so the rest of the suite still runs. The dedicated test
+# database is recreated from scratch each run — a change to the column
+# recipe must reach a database migrated before it, and the migration's own
+# down/0 can't reverse a definition the old table never had.
+repo_config = Clementine.TestRepo.config()
+_ = Ecto.Adapters.Postgres.storage_down(repo_config)
+
 postgres? =
-  case Ecto.Adapters.Postgres.storage_up(Clementine.TestRepo.config()) do
+  case Ecto.Adapters.Postgres.storage_up(repo_config) do
     :ok ->
       true
 

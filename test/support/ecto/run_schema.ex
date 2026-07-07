@@ -11,6 +11,7 @@ defmodule Clementine.Test.Ecto.Run do
     field(:scope_id, :integer)
     field(:label, :string)
 
+    field(:kind, :string, default: "rollout")
     field(:status, :string, default: "queued")
     field(:lease_epoch, :integer, default: 0)
     field(:executor_id, :string)

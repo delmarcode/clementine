@@ -40,6 +40,18 @@ defmodule Clementine.Lifecycle.Ecto.CodecTest do
     end
   end
 
+  describe "kind" do
+    test "round-trips every kind" do
+      for kind <- Facts.kinds() do
+        assert kind |> Codec.encode_kind() |> Codec.decode_kind() == kind
+      end
+    end
+
+    test "rejects unknown atoms" do
+      assert_raise ArgumentError, fn -> Codec.encode_kind(:cron) end
+    end
+  end
+
   describe "term codec" do
     test "JSON-exact values stay inspectable JSON" do
       for value <- ["text", 42, 1.5, true, nil, [1, "two"], %{"k" => [%{"n" => 1}]}] do
@@ -226,6 +238,7 @@ defmodule Clementine.Lifecycle.Ecto.CodecTest do
     test "builds facts from a row map" do
       row = %{
         id: 7,
+        kind: "loop",
         status: "running",
         lease_epoch: 2,
         executor_id: "oban:1:node",
@@ -246,6 +259,7 @@ defmodule Clementine.Lifecycle.Ecto.CodecTest do
 
       assert %Facts{
                ref: 7,
+               kind: :loop,
                status: :running,
                epoch: 2,
                executor_id: "oban:1:node",

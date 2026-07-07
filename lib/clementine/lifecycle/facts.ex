@@ -12,13 +12,21 @@ defmodule Clementine.Lifecycle.Facts do
   Terminal-detail fields are split by variant: `error` holds the normalized
   `Clementine.Error` for `:failed` runs; `interrupt` holds the
   `Clementine.InterruptReason` for `:interrupted` runs.
+
+  `kind` discriminates what the run *is* (LOOP_RFC amendment A1): a
+  `:rollout` run's executions are Gather → Act rollouts; a `:loop` run's
+  executions are steps. The reaper's sweep, the cancel path, billing
+  queries, and single-active indexes discriminate on it; the protocol's
+  state machine does not — same facts, same CAS grain, same fencing.
   """
 
   @statuses [:queued, :running, :waiting, :completed, :failed, :cancelled, :interrupted]
   @terminal [:completed, :failed, :cancelled, :interrupted]
   @active [:queued, :running, :waiting]
+  @kinds [:rollout, :loop]
 
   defstruct ref: nil,
+            kind: :rollout,
             status: :queued,
             epoch: 0,
             executor_id: nil,
@@ -37,8 +45,11 @@ defmodule Clementine.Lifecycle.Facts do
   @type status ::
           :queued | :running | :waiting | :completed | :failed | :cancelled | :interrupted
 
+  @type kind :: :rollout | :loop
+
   @type t :: %__MODULE__{
           ref: term(),
+          kind: kind(),
           status: status(),
           epoch: non_neg_integer(),
           executor_id: String.t() | nil,
@@ -57,6 +68,9 @@ defmodule Clementine.Lifecycle.Facts do
 
   @spec statuses() :: [status()]
   def statuses, do: @statuses
+
+  @spec kinds() :: [kind()]
+  def kinds, do: @kinds
 
   @spec terminal_statuses() :: [status()]
   def terminal_statuses, do: @terminal

@@ -42,6 +42,7 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
   # Facts key -> recipe column name. `ref` defaults to the schema's primary
   # key and is resolved by the adapter, not listed here.
   @field_defaults [
+    kind: :kind,
     status: :status,
     epoch: :lease_epoch,
     executor_id: :executor_id,
@@ -59,6 +60,7 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
   ]
 
   @statuses Map.new(Facts.statuses(), fn status -> {Atom.to_string(status), status} end)
+  @kinds Map.new(Facts.kinds(), fn kind -> {Atom.to_string(kind), kind} end)
   @interrupt_codes Map.new(InterruptReason.codes(), fn code -> {Atom.to_string(code), code} end)
   @error_kinds Map.new([:provider, :tool, :rollout, :runtime], &{Atom.to_string(&1), &1})
   @providers Map.new([:anthropic, :openai], &{Atom.to_string(&1), &1})
@@ -91,6 +93,7 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
 
     %Facts{
       ref: read.(:ref),
+      kind: decode_kind(read.(:kind)),
       status: decode_status(read.(:status)),
       epoch: read.(:epoch),
       executor_id: read.(:executor_id),
@@ -114,6 +117,7 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
   against the storage clock before (or instead of) encoding.
   """
   @spec encode_value(atom(), term()) :: term()
+  def encode_value(:kind, kind), do: encode_kind(kind)
   def encode_value(:status, status), do: encode_status(status)
   def encode_value(:cancel, cancel), do: encode_cancel(cancel)
   def encode_value(:suspension, suspension), do: encode_suspension(suspension)
@@ -138,6 +142,22 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
 
   @spec decode_status(String.t()) :: Facts.status()
   def decode_status(text), do: Map.fetch!(@statuses, text)
+
+  ## Kind
+
+  @spec encode_kind(Facts.kind()) :: String.t()
+  def encode_kind(kind) when is_atom(kind) do
+    text = Atom.to_string(kind)
+
+    if is_map_key(@kinds, text) do
+      text
+    else
+      raise ArgumentError, "unknown run kind: #{inspect(kind)}"
+    end
+  end
+
+  @spec decode_kind(String.t()) :: Facts.kind()
+  def decode_kind(text), do: Map.fetch!(@kinds, text)
 
   ## Cancel
 

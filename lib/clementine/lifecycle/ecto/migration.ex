@@ -18,9 +18,10 @@ if Code.ensure_loaded?(Ecto.Migration) do
     The recipe adds exactly the columns `Clementine.Lifecycle.Facts`
     demands, so `fetch` round-trips facts exactly:
 
-        status        text                     lease_epoch  bigint default 0
-        executor_id   text                     heartbeat_at timestamptz
-        deadline      timestamptz              queued_at    timestamptz
+        kind          text default 'rollout'   status       text
+        lease_epoch   bigint default 0         executor_id  text
+        heartbeat_at  timestamptz              deadline     timestamptz
+        queued_at     timestamptz
         cancel        jsonb   (reason, requested_at)
         suspension    jsonb   (reason, checkpoint, token)
         resume        jsonb   (payload, resumed_at)
@@ -33,6 +34,21 @@ if Code.ensure_loaded?(Ecto.Migration) do
     free — the reaper's claim-timeout check counts from it. Apps wanting an
     indexable denormalization (an `error_code` text column, say) add their
     own generated column; the recipe's columns are the contract.
+
+    ## Backfill for existing adopters
+
+    `kind` arrived with LOOP_RFC amendment A1; tables migrated before it
+    add the column in one line, and the default *is* the backfill — every
+    pre-loop row is a rollout run:
+
+        alter table(:conversation_runs) do
+          add(:kind, :text, null: false, default: "rollout")
+        end
+
+    (On Postgres 11+ a constant default backfills without a table
+    rewrite.) The reaper's rollout sweep, billing queries, and any scoped
+    index should discriminate on the column from then on — see
+    `Clementine.Reconciler` for the sweep exclusion.
 
     Write-load note: steady state is one small `UPDATE` per active run per
     heartbeat interval — HOT-update friendly, since the recipe keeps hot
@@ -65,6 +81,7 @@ if Code.ensure_loaded?(Ecto.Migration) do
     """
     @spec run_columns() :: :ok
     def run_columns do
+      add(:kind, :text, null: false, default: "rollout")
       add(:status, :text, null: false, default: "queued")
       add(:lease_epoch, :bigint, null: false, default: 0)
       add(:executor_id, :text)

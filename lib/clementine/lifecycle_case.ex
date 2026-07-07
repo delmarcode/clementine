@@ -61,8 +61,8 @@ defmodule Clementine.LifecycleCase do
   fresh scope). The row should stamp `queued_at` the way production
   enqueue does (the column recipe defaults it to `now()`).
 
-  The suite passes one documented key, and the host's projection must
-  honor it for the projection battery to run:
+  The suite passes two documented keys. The host's projection must honor
+  the first for the projection battery to run:
 
     * `projection: :raise` — the returned run's projection raises on
       every invocation.
@@ -70,11 +70,17 @@ defmodule Clementine.LifecycleCase do
       `:completed | :failed | :cancelled | :interrupted` — the projection
       raises exactly when invoked with that `Clementine.Result` variant.
 
-  The convention costs a marker column (or any equivalent) the projection
-  can read; wiring it is fiddly exactly once, in this file's factory. The
-  probes are how a storage-agnostic suite observes projections: an aborted
-  commit proves the projection ran inside the atomic unit and received
-  precisely that result variant — no message passing, no adapter hooks.
+  And the second for the per-kind cancellation battery:
+
+    * `kind: :loop` — the returned run is loop-kind (the factory writes
+      the recipe's `kind` column); omitted means `:rollout`.
+
+  The projection convention costs a marker column (or any equivalent) the
+  projection can read; wiring it is fiddly exactly once, in this file's
+  factory. The probes are how a storage-agnostic suite observes
+  projections: an aborted commit proves the projection ran inside the
+  atomic unit and received precisely that result variant — no message
+  passing, no adapter hooks.
 
   ## Racing writers and `Ecto.Adapters.SQL.Sandbox`
 
@@ -136,6 +142,10 @@ defmodule Clementine.LifecycleCase do
       stale-token error variant (matrix row 7).
     * Cancel racing suspend, both orders, converging to `cancelled` and
       never stranding a flagged run in `waiting` (matrix row 17).
+    * Cancel refusal per kind — `request_cancel` refuses a live loop-kind
+      run with `{:error, :loop_run}` in both flavors, writing nothing
+      (LOOP_RFC amendment A2, matrix L8 support); rollout runs keep the
+      shipped flavors.
     * Requeue — `:effects_present` refusal (matrix row 18's guard),
       `queued_at` stamping, epoch untouched until the next claim.
     * Field hygiene after suspend and requeue — no `executor_id`,
@@ -311,6 +321,10 @@ defmodule Clementine.LifecycleCase do
 
         test "matrix row 17: a cancel arriving after suspend takes the direct flavor" do
           Battery.cancel_racing_suspend_suspend_first(__conformance__())
+        end
+
+        test "matrix L8 support: request_cancel refuses a live loop-kind run in both flavors" do
+          Battery.cancel_refuses_loop_kind(__conformance__())
         end
       end
 
