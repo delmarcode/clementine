@@ -21,9 +21,9 @@ defmodule Clementine.RunnerTest do
   }
 
   alias Clementine.Lifecycle.{Facts, Protocol}
-  alias Clementine.LLM.Message.{Content, ToolResultMessage, UserMessage}
+  alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
   alias Clementine.Test.{CollectingSink, FlakyLifecycle, MemoryLifecycle}
-  alias Clementine.Test.Tools.{Crash, Echo, SafePush, Slow, UnsafeSlow}
+  alias Clementine.Test.Tools.{Crash, Echo, GatedDeploy, SafeEcho, SafePush, Slow, UnsafeSlow}
 
   setup :verify_on_exit!
 
@@ -357,13 +357,18 @@ defmodule Clementine.RunnerTest do
       assert %Error{code: :incompatible_checkpoint} = facts.error
     end
 
-    test "matrix row 8: a pending operation this engine cannot resolve is not understood",
+    test "matrix row 8: a pending tool the rollout no longer carries fails cleanly, never crashes",
          %{store: store, ref: ref} do
-      # Pending resolution arrives with gated tools (SKUNK-134); until then a
-      # pending checkpoint is exactly "content no longer understood".
+      # The deploy removed the tool between suspend and resume: the
+      # checkpoint is well-formed, but its pending call no longer resolves
+      # against this rollout's toolset.
       checkpoint = %Checkpoint{
         rollout_id: "r1",
         iteration: 1,
+        messages: [
+          UserMessage.new("go"),
+          %AssistantMessage{content: [%Content.ToolUse{id: "tu_1", name: "deploy", input: %{}}]}
+        ],
         pending: %Pending.ToolApproval{tool_use_id: "tu_1", tool_name: "deploy"}
       }
 
@@ -371,6 +376,9 @@ defmodule Clementine.RunnerTest do
 
       assert {:finished, %Facts{status: :failed} = facts} = execute(build_run(ref), store)
       assert %Error{code: :incompatible_checkpoint} = facts.error
+
+      assert [{^ref, %Result.Failed{error: %Error{code: :incompatible_checkpoint}}}] =
+               MemoryLifecycle.projections(store)
     end
   end
 
@@ -606,6 +614,95 @@ defmodule Clementine.RunnerTest do
 
       assert {:discard, :lost_lease} =
                execute(build_run(ref), store, rollout_execute: requeue_then_suspend)
+    end
+  end
+
+  describe "approval round trip (end to end)" do
+    test "a gated tool parks the run through the real engine and an approval resumes it to completion",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      expect_stream([
+        {:tool_use_start, "tu_1", "gated_deploy"},
+        {:input_json_delta, "tu_1", Jason.encode!(%{"env" => "prod"})},
+        {:content_block_stop, 0},
+        {:tool_use_start, "tu_2", "safe_echo"},
+        {:input_json_delta, "tu_2", Jason.encode!(%{"message" => "staged"})},
+        {:content_block_stop, 1},
+        {:message_delta, %{"stop_reason" => "tool_use"},
+         %{"input_tokens" => 5, "output_tokens" => 2}}
+      ])
+
+      run = build_run(ref, [tools: [GatedDeploy, SafeEcho]], context: %{notify: self()})
+
+      assert {:suspended, token} = execute(run, store, events: CollectingSink)
+
+      # Parked, not finished: the ungated sibling settled into the durable
+      # checkpoint, only the gated call pends, and the gated tool never ran.
+      facts = MemoryLifecycle.facts!(store, ref)
+      assert facts.status == :waiting
+
+      assert %Pending.ToolApproval{tool_use_id: "tu_1", completed_results: completed} =
+               facts.suspension.checkpoint.pending
+
+      assert %{"tu_2" => %Clementine.ToolResult{content: "Echo: staged"}} = completed
+      refute_received {:deployed, _args}
+      assert MemoryLifecycle.projections(store) == []
+
+      # The advisory approval event followed the durable park, token-free.
+      assert_received {:clementine_event, %Event{type: :approval_requested} = event}
+
+      assert event.payload == %{
+               tool_use_id: "tu_1",
+               name: "gated_deploy",
+               args: %{"env" => "prod"}
+             }
+
+      # The app authorizes its caller, resumes, and re-enqueues — here, a
+      # second execute of the same run.
+      {:ok, _facts} = Protocol.resume(MemoryLifecycle, token, {:approved, %{by: "u1"}}, store)
+      expect_stream(text_events("Shipped."))
+
+      assert {:finished, %Facts{status: :completed, epoch: 2}} = execute(run, store)
+
+      assert_received {:deployed, %{env: "prod"}}
+
+      assert [{^ref, %Result.Completed{output: "Shipped."} = result}] =
+               MemoryLifecycle.projections(store)
+
+      # The settled batch returns in tool-use order; the sibling's
+      # checkpointed result rode through without re-executing.
+      assert [_assistant, %ToolResultMessage{content: [first, second]}, _final] = result.messages
+
+      assert %Content.ToolResult{tool_use_id: "tu_1", content: "deployed prod", is_error: false} =
+               first
+
+      assert %Content.ToolResult{tool_use_id: "tu_2", content: "Echo: staged"} = second
+    end
+
+    test "a denial resumes the run with the approver's message; the tool never executes",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_stream(tool_events("tu_1", "gated_deploy", %{"env" => "prod"}))
+      run = build_run(ref, [tools: [GatedDeploy]], context: %{notify: self()})
+
+      assert {:suspended, token} = execute(run, store)
+
+      {:ok, _facts} =
+        Protocol.resume(MemoryLifecycle, token, {:denied, %{message: "not in prod"}}, store)
+
+      expect_stream(text_events("Understood."))
+
+      assert {:finished, %Facts{status: :completed}} = execute(run, store)
+      refute_received {:deployed, _args}
+
+      assert [{^ref, %Result.Completed{messages: messages}}] =
+               MemoryLifecycle.projections(store)
+
+      assert [_assistant, %ToolResultMessage{content: [denial]}, _final] = messages
+
+      assert %Content.ToolResult{tool_use_id: "tu_1", content: "not in prod", is_error: true} =
+               denial
     end
   end
 

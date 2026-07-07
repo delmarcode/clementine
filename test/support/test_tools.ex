@@ -206,6 +206,51 @@ defmodule Clementine.Test.Tools do
     end
   end
 
+  defmodule GatedDeploy do
+    @moduledoc "An approval-gated deploy; notifies `context.notify` when it runs"
+    use Clementine.Tool,
+      name: "gated_deploy",
+      description: "Deploys somewhere consequential; requires human approval",
+      approval: :required,
+      parameters: [
+        env: [type: :string, required: false, description: "Target environment"]
+      ]
+
+    @impl true
+    def run(args, context) do
+      if notify = context[:notify], do: send(notify, {:deployed, args})
+      {:ok, "deployed #{args[:env] || "somewhere"}"}
+    end
+  end
+
+  defmodule SafeGatedLookup do
+    @moduledoc "Approval-gated but declared effect-free"
+    use Clementine.Tool,
+      name: "safe_gated_lookup",
+      description: "A gated read: requires approval, causes no effect",
+      approval: :required,
+      retry: :safe,
+      parameters: []
+
+    @impl true
+    def run(_args, _context), do: {:ok, "42"}
+  end
+
+  defmodule PolicyGated do
+    @moduledoc "Declares the reserved {:policy, _} approval shape"
+    use Clementine.Tool,
+      name: "policy_gated",
+      description: "Gated by a reserved policy shape",
+      approval: {:policy, :prod_only},
+      parameters: []
+
+    @impl true
+    def run(_args, context) do
+      if notify = context[:notify], do: send(notify, :policy_ran)
+      {:ok, "ran"}
+    end
+  end
+
   defmodule UnsafeSlow do
     @moduledoc "An explicitly retry: :unsafe tool: sleeps, then reports its effect done"
     use Clementine.Tool,
