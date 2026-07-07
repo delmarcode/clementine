@@ -2,9 +2,20 @@
 # tests are excluded so the rest of the suite still runs. The dedicated test
 # database is recreated from scratch each run — a change to the column
 # recipe must reach a database migrated before it, and the migration's own
-# down/0 can't reverse a definition the old table never had.
+# down/0 can't reverse a definition the old table never had. Only a database
+# named disposable by convention (suffixed "_test") is ever dropped:
+# PGDATABASE may point anywhere, and a schema refresh must not cost anyone
+# a real database.
 repo_config = Clementine.TestRepo.config()
-_ = Ecto.Adapters.Postgres.storage_down(repo_config)
+
+if String.ends_with?(repo_config[:database], "_test") do
+  _ = Ecto.Adapters.Postgres.storage_down(repo_config)
+else
+  IO.warn(
+    "database #{inspect(repo_config[:database])} lacks the \"_test\" suffix; skipping " <>
+      "recreation — :postgres tests may run against a stale schema"
+  )
+end
 
 postgres? =
   case Ecto.Adapters.Postgres.storage_up(repo_config) do

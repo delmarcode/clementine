@@ -474,6 +474,21 @@ defmodule Clementine.Lifecycle.EctoAdapterTest do
 
       assert %Run{} = insert_run!(scope_id: 1000)
     end
+
+    test "a loop-kind run neither occupies nor contends for the rollout slot — amendment A1" do
+      # A loop is permanently active by design: without the kind
+      # discrimination in the predicate, one loop would block every rollout
+      # insert in its scope forever.
+      insert_run!(scope_id: 1001, kind: "loop")
+      assert %Run{} = insert_run!(scope_id: 1001)
+
+      # Single-flight for rollouts is intact in that same scope.
+      assert_raise Ecto.ConstraintError, fn -> insert_run!(scope_id: 1001) end
+
+      # And the reverse order: an active rollout does not block the loop.
+      insert_run!(scope_id: 1002)
+      assert %Run{} = insert_run!(scope_id: 1002, kind: "loop")
+    end
   end
 
   describe "set semantics" do

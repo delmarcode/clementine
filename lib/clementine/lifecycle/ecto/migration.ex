@@ -48,7 +48,10 @@ if Code.ensure_loaded?(Ecto.Migration) do
     (On Postgres 11+ a constant default backfills without a table
     rewrite.) The reaper's rollout sweep, billing queries, and any scoped
     index should discriminate on the column from then on — see
-    `Clementine.Reconciler` for the sweep exclusion.
+    `Clementine.Reconciler` for the sweep exclusion, and recreate a
+    single-active index built before the column existed with
+    `single_active_index/2` so its predicate gains the kind
+    discrimination.
 
     Write-load note: steady state is one small `UPDATE` per active run per
     heartbeat interval — HOT-update friendly, since the recipe keeps hot
@@ -60,15 +63,21 @@ if Code.ensure_loaded?(Ecto.Migration) do
 
     ## The single-active index, and its product consequence
 
-    `single_active_index/2` enforces one active run per scope — the
-    single-flight guard (failure matrix row 6: a double-send's second run
-    is uninsertable at enqueue). By default "active" means
+    `single_active_index/2` enforces one active *rollout* run per scope —
+    the single-flight guard (failure matrix row 6: a double-send's second
+    run is uninsertable at enqueue). By default "active" means
     `queued`, `running`, **and `waiting`** — and that default is a product
     decision made deliberately: a run parked in `waiting` for days blocks
     new runs in its scope. A product that wants "chat continues while an
     approval is parked" passes `statuses: [:queued, :running]` and owns the
     resulting concurrency (two runs of the same conversation may then
     interleave when the parked one resumes).
+
+    The predicate covers rollout-kind rows only (amendment A1: scoped
+    indexes discriminate on `kind`): a loop is permanently active by
+    design, so an undiscriminated index would let one loop block every
+    rollout insert in its scope forever. Loop-kind dedup is its own
+    mechanism — the `(loop_ref, tag_key)` index, amendment A6.
     """
 
     import Ecto.Migration
@@ -100,8 +109,9 @@ if Code.ensure_loaded?(Ecto.Migration) do
     end
 
     @doc """
-    Creates the partial unique index enforcing one active run per scope.
-    Call at the migration's top level, after the columns exist.
+    Creates the partial unique index enforcing one active rollout run per
+    scope. Call at the migration's top level, after the columns exist
+    (the predicate reads both the status and the kind column).
 
     Options:
 
@@ -112,6 +122,8 @@ if Code.ensure_loaded?(Ecto.Migration) do
         consequence before narrowing it.
       * `:status_column` — defaults to `:status`; override to match a
         `fields:` override on the adapter.
+      * `:kind_column` — defaults to `:kind`; override to match a
+        `fields:` override on the adapter.
       * `:name` — index name; defaults to
         `<table>_single_active_run_index`.
     """
@@ -120,6 +132,7 @@ if Code.ensure_loaded?(Ecto.Migration) do
       scope = opts |> Keyword.fetch!(:scope) |> List.wrap()
       statuses = Keyword.get(opts, :statuses, [:queued, :running, :waiting])
       status_column = Keyword.get(opts, :status_column, :status)
+      kind_column = Keyword.get(opts, :kind_column, :kind)
       name = Keyword.get(opts, :name, "#{table}_single_active_run_index")
 
       case statuses -- Facts.active_statuses() do
@@ -137,7 +150,7 @@ if Code.ensure_loaded?(Ecto.Migration) do
         index(table, scope,
           unique: true,
           name: name,
-          where: "#{status_column} IN (#{in_list})"
+          where: "#{status_column} IN (#{in_list}) AND #{kind_column} = 'rollout'"
         )
       )
     end
