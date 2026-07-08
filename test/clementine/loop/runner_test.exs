@@ -67,7 +67,7 @@ defmodule Clementine.Loop.RunnerTest do
     defdelegate apply_step(commit, ctx), to: MemoryLoopHost
     defdelegate enqueue_step(ref, ctx), to: MemoryLoopHost
 
-    def pending(loop_ref, limit, store) do
+    def pending(loop_ref, limit, scope, store) do
       Agent.update(store, fn state ->
         put_in(
           state.runs[loop_ref].cancel,
@@ -75,7 +75,7 @@ defmodule Clementine.Loop.RunnerTest do
         )
       end)
 
-      MemoryLoopHost.pending(loop_ref, limit, store)
+      MemoryLoopHost.pending(loop_ref, limit, scope, store)
     end
   end
 
@@ -90,10 +90,53 @@ defmodule Clementine.Loop.RunnerTest do
     defdelegate apply_step(commit, ctx), to: MemoryLoopHost
     defdelegate enqueue_step(ref, ctx), to: MemoryLoopHost
 
-    def pending(loop_ref, limit, store) do
+    def pending(loop_ref, limit, scope, store) do
       {:ok, facts} = MemoryLoopHost.fetch(loop_ref, store)
       {:ok, _} = LifecycleProtocol.requeue(MemoryLoopHost, facts, :lease_expired, store)
-      MemoryLoopHost.pending(loop_ref, limit, store)
+      MemoryLoopHost.pending(loop_ref, limit, scope, store)
+    end
+  end
+
+  defmodule FlagAfterLoad do
+    @moduledoc """
+    The incompatible park's racing-cancel window: the flag lands after
+    the post-claim load read it as nil, before the park commits — where a
+    concurrent `cancel/3` against a running row leaves only the flag. The
+    fuse fires after the second load (the post-claim one) so the claim
+    still reads a clean flag.
+    """
+
+    alias Clementine.Test.MemoryLoopHost
+
+    defdelegate pending(ref, limit, scope, ctx), to: MemoryLoopHost
+    defdelegate bump_attempts(refs, ctx), to: MemoryLoopHost
+    defdelegate apply_step(commit, ctx), to: MemoryLoopHost
+    defdelegate enqueue_step(ref, ctx), to: MemoryLoopHost
+
+    def arm, do: Process.put({__MODULE__, :fuse}, 2)
+
+    def load(loop_ref, store) do
+      result = MemoryLoopHost.load(loop_ref, store)
+
+      case Process.get({__MODULE__, :fuse}) do
+        1 ->
+          Process.delete({__MODULE__, :fuse})
+
+          Agent.update(store, fn state ->
+            put_in(
+              state.runs[loop_ref].cancel,
+              %{reason: :mid_park, requested_at: DateTime.utc_now()}
+            )
+          end)
+
+        n when is_integer(n) ->
+          Process.put({__MODULE__, :fuse}, n - 1)
+
+        nil ->
+          :ok
+      end
+
+      result
     end
   end
 
@@ -641,6 +684,71 @@ defmodule Clementine.Loop.RunnerTest do
       rollout_ref = Host.seed(store, kind: :rollout)
       assert {:error, :rollout_run} = LoopProtocol.cancel(Host, rollout_ref, :nope, ctx: store)
       assert {:error, :not_found} = LoopProtocol.cancel(Host, 424_242, :ghost, ctx: store)
+    end
+
+    test "a cascade absorbs completions parked behind a backlog longer than the batch window",
+         %{store: store} do
+      ref = create!(store, ScriptedLoop, policy: %{"batch_cap" => 2})
+      assert {:parked, _} = step!(store, ref)
+      append!(store, ref, %{"id" => "w", "actions" => [{:run, {:reply, 1}, %{}}]})
+      assert {:parked, _} = step!(store, ref)
+
+      # A backlog longer than the window queues ahead of where the
+      # child's completion will land.
+      for i <- 1..4, do: append!(store, ref, %{"id" => "backlog-#{i}"})
+
+      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :stop, ctx: store)
+
+      # Cascade step: the queued child terminalizes in-unit, its
+      # completion appending BEHIND the backlog; the re-check sees it.
+      assert {:continued, _} = step!(store, ref)
+
+      # The completions-scoped read surfaces it past the skipped backlog:
+      # this step finishes — it must not park-and-rewake forever.
+      assert {:finished, %Facts{status: :cancelled}} = step!(store, ref)
+      assert Enum.all?(Host.inbox!(store, ref), &(&1.dead_reason == :terminal_sweep))
+    end
+
+    test "a cancel racing an :incompatible_state park wakes it into the cascade — never stranded",
+         %{store: store} do
+      ref = create!(store, ScriptedLoop)
+      append!(store, ref, %{"id" => "w"})
+      assert {:parked, _} = step!(store, ref)
+
+      Host.rewrite_module!(store, ref, "Clementine.Test.VersionedLoop")
+      append!(store, ref, %{"id" => "stuck"})
+
+      # The flag lands after the post-claim load read it as nil and
+      # before the incompatible park commits — its wake no-oped against
+      # the running row, and this park bypasses the host's re-check.
+      FlagAfterLoad.arm()
+      assert {:continued, %Facts{status: :queued}} = step!(store, ref, FlagAfterLoad)
+
+      # The woken step cascades (never loads state) and finishes.
+      assert {:finished, %Facts{status: :cancelled}} = step!(store, ref)
+      assert store |> Host.inbox!(ref) |> Enum.all?(&(&1.dead_reason == :terminal_sweep))
+    end
+
+    test "a cancel racing an :incompatible_spec park stays parked — waking a loop the cascade cannot run would spin",
+         %{store: store} do
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      Host.rewrite_module!(store, ref, "Meli.Gone.Agent")
+      append!(store, ref, %{"id" => "x"})
+
+      FlagAfterLoad.arm()
+      assert {:parked, %Facts{cancel: %{reason: :mid_park}}} = step!(store, ref, FlagAfterLoad)
+
+      # Durable flag, no spin — and the documented remedy works: after
+      # the healing deploy, a re-cancel wakes the loop and the cascade
+      # finishes under the first cause.
+      Host.rewrite_module!(store, ref, "Clementine.Test.ScriptedLoop")
+      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :again, ctx: store)
+      assert {:finished, %Facts{status: :cancelled}} = step!(store, ref)
+
+      assert {_, %Result.Cancelled{reason: :mid_park}} =
+               store |> Host.projections() |> List.last()
     end
 
     test "an :incompatible_state loop is still cancellable — the cascade never loads state", %{

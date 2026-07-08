@@ -107,8 +107,17 @@ defmodule Clementine.Loop.Host do
   FIFO (commit-visibility) order, decoded per row — a payload the current
   code cannot decode comes back with `StoredInput.decode_error` set rather
   than failing the fetch or poisoning its neighbors.
+
+  `scope` mirrors the park re-check's: `:any` is the ordinary drain;
+  `:completions` returns completion inputs only, skipping any
+  non-completion backlog ahead of them — the cascade's read. Completions
+  are all a cascade can consume, and a FIFO-limited `:any` window would
+  never surface one parked behind a backlog longer than the cap: the
+  cascade would park empty, the `:completions` re-check would downgrade,
+  and the loop would spin without absorbing the child terminal.
   """
-  @callback pending(loop_ref(), limit :: pos_integer(), ctx()) :: [StoredInput.t()]
+  @callback pending(loop_ref(), limit :: pos_integer(), scope :: :any | :completions, ctx()) ::
+              [StoredInput.t()]
 
   @doc """
   The drain-time attempts bump: one small committed write, outside both

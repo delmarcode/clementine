@@ -835,7 +835,25 @@ defmodule Clementine.Loop.EctoHostTest do
 
   ## The seam's reads
 
-  describe "pending/3 and bump_attempts/2" do
+  describe "pending/4 and bump_attempts/2" do
+    test "the :completions scope reads past skipped non-completion backlog — the cascade's window" do
+      loop = parked_loop!()
+
+      for i <- 1..3 do
+        assert {:ok, :appended} = LoopHost.append(loop.ref, message(i), "b:#{i}", nil)
+      end
+
+      completion = Input.completed({:reply, 9}, Result.completed(output: "done"))
+      assert {:ok, :appended} = LoopHost.append(loop.ref, completion, "c:9", nil)
+
+      # A FIFO :any window shorter than the backlog never surfaces the
+      # completion; the :completions scope skips straight to it.
+      assert [%StoredInput{input: %Input{kind: :message}}] =
+               LoopHost.pending(loop.ref, 1, :any, nil)
+
+      assert [%StoredInput{input: ^completion}] = LoopHost.pending(loop.ref, 1, :completions, nil)
+    end
+
     test "recipes round-trip codec-encoded payloads: tuple tags, vocabulary atoms, maps, structs" do
       loop = parked_loop!()
 
@@ -967,7 +985,7 @@ defmodule Clementine.Loop.EctoHostTest do
     lease = claim!(ref)
     row = TestRepo.get!(Run, ref)
     envelope = stored_envelope(ref)
-    window = LoopHost.pending(ref, Keyword.get(opts, :limit, 20), nil)
+    window = LoopHost.pending(ref, Keyword.get(opts, :limit, 20), :any, nil)
     plan = Step.plan(envelope, window, Keyword.get(opts, :plan, []))
     :ok = LoopHost.bump_attempts(plan.bump, nil)
 
@@ -1039,7 +1057,7 @@ defmodule Clementine.Loop.EctoHostTest do
     end
   end
 
-  defp pending!(ref), do: LoopHost.pending(ref, 50, nil)
+  defp pending!(ref, scope \\ :any), do: LoopHost.pending(ref, 50, scope, nil)
 
   defp inbox_rows(loop_ref) do
     TestRepo.all(

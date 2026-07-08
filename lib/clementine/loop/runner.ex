@@ -166,9 +166,13 @@ defmodule Clementine.Loop.Runner do
     with {:ok, loaded} <- load_leased(host, lease, ctx),
          {:ok, module} <- resolve_module(lease, loaded),
          {:ok, envelope} <- decode_envelope(lease, loaded),
-         :ok <- check_state_version(lease, loaded, module, envelope) do
+         :ok <- check_state_version(host, lease, ctx, loaded, module, envelope) do
       drain_and_commit(host, lease, ctx, loaded, module, envelope, started)
     end
+  end
+
+  defp cascade_mode?(loaded, envelope) do
+    cancel_reason(loaded.facts) != nil or (envelope != nil and Envelope.cascading?(envelope))
   end
 
   # Phase 2's version check runs before phase 3's bump (LOOP_RFC §The
@@ -177,22 +181,24 @@ defmodule Clementine.Loop.Runner do
   # step would walk an innocent input toward the poison threshold. The
   # drain re-checks (its own contract), redundantly here. Cascade mode is
   # exempt: it never loads state, which is what keeps an
-  # `:incompatible_state` loop cancellable (row L2's host-chosen end).
-  defp check_state_version(lease, loaded, module, envelope) do
-    cascade? =
-      cancel_reason(loaded.facts) != nil or (envelope != nil and Envelope.cascading?(envelope))
-
+  # `:incompatible_state` loop cancellable (row L2's host-chosen end) —
+  # and is also why this park alone wakes on a racing cancel flag (see
+  # `incompatible_park`).
+  defp check_state_version(host, lease, ctx, loaded, module, envelope) do
     declared = module.__loop__(:state_version)
 
     cond do
-      cascade? or envelope == nil or envelope.state_version == declared ->
+      cascade_mode?(loaded, envelope) or envelope == nil or
+          envelope.state_version == declared ->
         :ok
 
       true ->
-        incompatible_park(lease, :incompatible_state, %{
-          state_version: envelope.state_version,
-          declared: declared
-        })
+        incompatible_park(
+          lease,
+          :incompatible_state,
+          %{state_version: envelope.state_version, declared: declared},
+          wake_on_cancel: {host, ctx}
+        )
     end
   end
 
@@ -245,8 +251,14 @@ defmodule Clementine.Loop.Runner do
 
     # One past the cap: a full window means backlog remains, so the plan
     # continues instead of parking — backlog detection must not lean on
-    # the park re-check, whose job is closing races.
-    pending = host.pending(lease.run_ref, batch_cap + 1, ctx)
+    # the park re-check, whose job is closing races. A cascade reads
+    # completions only: they are all it can consume, and a FIFO window
+    # would never surface one parked behind a backlog longer than the
+    # cap — the cascade would park empty, the `:completions` re-check
+    # would downgrade, and the loop would spin without ever absorbing
+    # the child terminal.
+    scope = if cascade_mode?(loaded, envelope), do: :completions, else: :any
+    pending = host.pending(lease.run_ref, batch_cap + 1, scope, ctx)
 
     plan =
       Step.plan(envelope, pending,
@@ -342,7 +354,17 @@ defmodule Clementine.Loop.Runner do
   # deploy. Fresh appends and the reaper's `:wake_pending` verdict re-wake
   # it once compatible code ships; a cancel cascade (which never loads
   # state) can end it.
-  defp incompatible_park(%Lease{} = lease, code, detail) do
+  #
+  # A cancel flag that raced this park (committed before the park's CAS
+  # took the row, so its own wake saw `running` and no-oped) is visible in
+  # the returned facts. `wake_on_cancel` wakes it — but ONLY the
+  # state-version park sets it, because only there does the flag change
+  # the next step's path (the cascade skips the state check). A spec or
+  # envelope-decode park would re-park under the flag whatever the mode —
+  # the cascade needs the module's vocabulary and a decodable envelope —
+  # so waking it would spin; it stays parked, the flag durable, until the
+  # healing deploy or an admin `Protocol.interrupt/4`.
+  defp incompatible_park(%Lease{} = lease, code, detail, opts \\ []) do
     token = %ResumeToken{run_ref: lease.run_ref, epoch: lease.epoch, reason_type: :external}
     suspension = %Suspension{reason: {:external, {code, detail}}, checkpoint: nil, token: token}
 
@@ -368,13 +390,39 @@ defmodule Clementine.Loop.Runner do
             "deploy compatible code, or cancel the loop"
         )
 
-        {:parked, facts}
+        case Keyword.get(opts, :wake_on_cancel) do
+          {host, ctx} when facts.cancel != nil -> wake_flagged_park(host, lease, ctx, facts)
+          _ -> {:parked, facts}
+        end
 
       {:error, :stale} ->
         {:discard, :lost_lease}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # The park committed with the flag already on the row: hand the loop to
+  # the cascade the flag asked for (CAS `waiting -> queued` + step job).
+  # A stale CAS means a racing wake — cancel/4's own, seeing `waiting` —
+  # already moved it and enqueued; either way the cancellation proceeds.
+  defp wake_flagged_park(host, %Lease{} = lease, ctx, %Facts{} = parked_facts) do
+    transition = %Transition{
+      op: :requeue,
+      run_ref: lease.run_ref,
+      expect: %{status: :waiting, epoch: lease.epoch},
+      set: %{status: :queued, suspension: nil, queued_at: :now},
+      meta: %{reason: :cancelled_incompatible_park}
+    }
+
+    case lease.lifecycle.apply(transition, lease.ctx) do
+      {:ok, %Facts{} = facts} ->
+        :ok = host.enqueue_step(lease.run_ref, ctx)
+        {:continued, facts}
+
+      {:error, _} ->
+        {:parked, parked_facts}
     end
   end
 

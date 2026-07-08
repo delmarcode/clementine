@@ -259,12 +259,13 @@ defmodule Clementine.Test.MemoryLoopHost do
   end
 
   @impl Clementine.Loop.Host
-  def pending(loop_ref, limit, store) do
+  def pending(loop_ref, limit, scope, store) when scope in [:any, :completions] do
     Agent.get(store, fn state ->
       state.inbox
       |> Map.get(loop_ref, [])
       |> Enum.reverse()
       |> Enum.reject(& &1.dead_reason)
+      |> Enum.filter(fn row -> scope == :any or row.input.kind == :completed end)
       |> Enum.take(limit)
       |> Enum.map(fn row ->
         %StoredInput{

@@ -211,8 +211,8 @@ if Code.ensure_loaded?(Ecto.Query) do
         end
 
         @impl Clementine.Loop.Host
-        def pending(loop_ref, limit, ctx) do
-          Clementine.Loop.Ecto.pending(__MODULE__, loop_ref, limit, ctx)
+        def pending(loop_ref, limit, scope, ctx) do
+          Clementine.Loop.Ecto.pending(__MODULE__, loop_ref, limit, scope, ctx)
         end
 
         @impl Clementine.Loop.Host
@@ -795,20 +795,27 @@ if Code.ensure_loaded?(Ecto.Query) do
     ## pending / bump_attempts
 
     @doc false
-    def pending(module, loop_ref, limit, _ctx) when is_integer(limit) and limit > 0 do
+    def pending(module, loop_ref, limit, scope, _ctx)
+        when is_integer(limit) and limit > 0 and scope in [:any, :completions] do
       config = module.__clementine_loop_config__()
       vocab = loop_vocabulary(config, loop_ref)
 
-      rows =
-        config.repo.all(
-          from(i in config.inbox,
-            where: i.loop_ref == type(^loop_ref, ^ref_type(config)),
-            where: is_nil(i.dead_at),
-            order_by: [asc: i.id],
-            limit: ^limit,
-            select: %{id: i.id, kind: i.kind, payload: i.payload, attempts: i.attempts}
-          )
+      query =
+        from(i in config.inbox,
+          where: i.loop_ref == type(^loop_ref, ^ref_type(config)),
+          where: is_nil(i.dead_at),
+          order_by: [asc: i.id],
+          limit: ^limit,
+          select: %{id: i.id, kind: i.kind, payload: i.payload, attempts: i.attempts}
         )
+
+      query =
+        case scope do
+          :completions -> where(query, [i], i.kind == "completed")
+          :any -> query
+        end
+
+      rows = config.repo.all(query)
 
       Enum.map(rows, fn row ->
         case Codec.decode_input(row.kind, row.payload, vocabulary: vocab) do
