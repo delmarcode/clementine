@@ -19,7 +19,7 @@ defmodule Clementine.Loop.EctoHostTest do
   alias Clementine.Lifecycle.{Protocol, Transition}
   alias Clementine.Loop.Ecto.Codec, as: InboxCodec
   alias Clementine.Loop.Protocol, as: LoopProtocol
-  alias Clementine.Loop.{Codec, Envelope, Input, Step, StepCommit, StoredInput}
+  alias Clementine.Loop.{Codec, Envelope, Input, Runner, Step, StepCommit, StoredInput}
   alias Clementine.Test.Ecto.{Job, Lifecycle, LoopHost, Run}
   alias Clementine.Test.ScriptedLoop
   alias Clementine.TestRepo
@@ -257,6 +257,149 @@ defmodule Clementine.Loop.EctoHostTest do
 
       log = loop_log(loop.ref)
       assert Enum.count(log, &String.starts_with?(&1, "message:")) == 32
+    end
+  end
+
+  ## The step runner's read
+
+  describe "load/2" do
+    test "returns facts plus the persisted spec and stored envelope; refuses rollout-kind and missing refs" do
+      loop = parked_loop!()
+
+      assert {:ok, loaded} = LoopHost.load(loop.ref, nil)
+      assert loaded.facts.ref == loop.ref
+      assert loaded.facts.kind == :loop
+      assert loaded.facts.status == :waiting
+      assert loaded.module == "Clementine.Test.ScriptedLoop"
+      assert loaded.args == %{}
+      assert loaded.policy == %{}
+      assert {:ok, %Envelope{}} = Envelope.decode(loaded.envelope)
+
+      rollout = insert_run!(status: "queued")
+      assert {:error, :rollout_run} = LoopHost.load(rollout.id, nil)
+      assert {:error, :not_found} = LoopHost.load(-1, nil)
+    end
+  end
+
+  ## Loop-owned cancellation (LOOP_RFC §Cancellation And Halt)
+
+  describe "cancel/4" do
+    test "a parked loop's cancel is flag + wake + step job in one unit; idempotent, first cause wins" do
+      loop = parked_loop!()
+      jobs = length(step_jobs(loop.ref))
+
+      assert {:ok, :flagged} = LoopHost.cancel(loop.ref, :operator_stop, nil)
+
+      row = TestRepo.get!(Run, loop.ref)
+      assert row.status == "queued"
+      assert row.suspension == nil
+      assert length(step_jobs(loop.ref)) == jobs + 1
+
+      # Idempotent re-cancel: the first cause stands; the queued row needs
+      # no second wake.
+      assert {:ok, :flagged} = LoopHost.cancel(loop.ref, :second_thoughts, nil)
+      assert length(step_jobs(loop.ref)) == jobs + 1
+
+      {:ok, facts} = Lifecycle.fetch(loop.ref, nil)
+      assert facts.cancel.reason == :operator_stop
+    end
+
+    test "guards: rollout-kind refused, missing rows not found, terminal loops already terminal" do
+      rollout = insert_run!(status: "queued")
+      assert {:error, :rollout_run} = LoopHost.cancel(rollout.id, :nope, nil)
+      assert {:error, :not_found} = LoopHost.cancel(-1, :ghost, nil)
+
+      loop = parked_loop!()
+      assert {:ok, :flagged} = LoopProtocol.cancel(LoopHost, loop.ref, :stop)
+      assert {:finished, finished} = runner_step(loop.ref)
+      assert finished.status == :cancelled
+      assert finished.cancel == nil
+
+      assert {:error, :already_terminal} = LoopProtocol.cancel(LoopHost, loop.ref, :again)
+    end
+
+    test "matrix row L8 (flag races park): a cancel landing mid-step downgrades the park in-unit — never stranded" do
+      loop = parked_loop!()
+      {:ok, :appended} = LoopHost.append(loop.ref, message(1), nil, nil)
+
+      # The step drains the window down to a park intent...
+      commit = build_commit!(loop.ref)
+      assert commit.op == :park
+      jobs = length(step_jobs(loop.ref))
+
+      # ...the race: the cancel lands after the claim read the flag as
+      # nil. The loop is running, so only the flag lands — cancel/4's
+      # wake has nothing to wake yet.
+      assert {:ok, :flagged} = LoopHost.cancel(loop.ref, :late_stop, nil)
+      assert TestRepo.get!(Run, loop.ref).status == "running"
+      assert length(step_jobs(loop.ref)) == jobs
+
+      # The park's in-unit re-check sees the flag and downgrades: queued
+      # plus the step job the wake could not deliver.
+      assert {:ok, facts} = LoopHost.apply_step(commit, nil)
+      assert facts.status == :queued
+      assert length(step_jobs(loop.ref)) == jobs + 1
+
+      # The next claim reads the flag and the cascade finishes cancelled.
+      assert {:finished, finished} = runner_step(loop.ref)
+      assert finished.status == :cancelled
+    end
+  end
+
+  ## The step runner against the real seam
+
+  describe "Loop.Runner.step/2 through the Ecto host" do
+    test "end-to-end: creation, init's first step, child spawn, cascade cancel, terminal sweep" do
+      {:ok, created} = LoopProtocol.create(LoopHost, spec([]))
+
+      assert {:parked, parked} = runner_step(created.ref)
+      assert parked.status == :waiting
+      assert loop_log(created.ref) == ["init"]
+
+      {:ok, :appended} =
+        LoopHost.append(
+          created.ref,
+          Input.message(%{"id" => "w", "actions" => [{:run, {:reply, 1}, %{"input" => "go"}}]}),
+          nil,
+          nil
+        )
+
+      assert {:parked, _} = runner_step(created.ref)
+      [child_ref] = Map.values(stored_envelope(created.ref).children)
+
+      assert {:ok, :flagged} = LoopProtocol.cancel(LoopHost, created.ref, :e2e_stop)
+
+      # The cascade cancels the queued child as cargo; its terminal
+      # projection appends the completion inside the same unit, so the
+      # park re-check downgrades to continue.
+      assert {:continued, _} = runner_step(created.ref)
+      assert TestRepo.get!(Run, child_ref).status == "cancelled"
+
+      assert {:finished, finished} = runner_step(created.ref)
+      assert finished.status == :cancelled
+      assert finished.cancel == nil
+      assert inbox_rows(created.ref) |> Enum.all?(&(&1.dead_at != nil))
+    end
+
+    test "matrix row L2 through the runner: a deploy-shaped mismatch parks with the detail round-tripping storage" do
+      loop = parked_loop!()
+
+      TestRepo.update_all(from(r in Run, where: r.id == ^loop.ref),
+        set: [loop_module: "Meli.Gone.Agent"]
+      )
+
+      {:ok, :appended} = LoopHost.append(loop.ref, message(1), nil, nil)
+
+      assert {:parked, parked} = runner_step(loop.ref)
+      assert {:external, {:incompatible_spec, %{reason: :not_a_loop}}} = parked.suspension.reason
+
+      # The stored suspension survives the storage codec (A4: nil
+      # checkpoint, open reason term) and the input was never bumped —
+      # inputs are innocent of deploys.
+      {:ok, fetched} = Lifecycle.fetch(loop.ref, nil)
+      assert {:external, {:incompatible_spec, _}} = fetched.suspension.reason
+      assert fetched.suspension.checkpoint == nil
+      assert [%StoredInput{attempts: 0}] = pending!(loop.ref)
     end
   end
 
@@ -813,6 +956,11 @@ defmodule Clementine.Loop.EctoHostTest do
   defp run_step!(ref, opts \\ []) do
     {:ok, facts} = LoopHost.apply_step(build_commit!(ref, opts), Keyword.get(opts, :ctx))
     facts
+  end
+
+  # The actual step runner against the actual seam.
+  defp runner_step(ref) do
+    Runner.step(ref, host: LoopHost, lifecycle: Lifecycle, executor_id: "e2e-runner", ctx: nil)
   end
 
   defp build_commit!(ref, opts \\ []) do

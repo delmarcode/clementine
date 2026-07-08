@@ -26,7 +26,11 @@ defmodule Clementine.Loop.StepCommit do
   to a continue when they do (Governing Invariant 5b). The scope is `:any`
   for ordinary parks; a cascade park re-checks `:completions` only —
   non-completion inputs legitimately sit unconsumed until the terminal
-  sweep, and an `:any` re-check would downgrade forever.
+  sweep, and an `:any` re-check would downgrade forever. The `:any`
+  re-check also covers the cancel flag: a flag that landed mid-step is a
+  wake the claim never saw, and parking over it would strand the
+  cancellation (`Clementine.Loop.Host` states the full interleaving). A
+  cascade park deliberately ignores the flag — the cascade is its handler.
 
   Dead-letter reasons are closed and observable (Governing Invariant 11):
   `:poison` (head attempts exhausted), `:unknown_tag` (completion for no

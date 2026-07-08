@@ -137,6 +137,30 @@ defmodule Clementine.Telemetry do
     `detail` is the verdict's payload: the evidence reason, the strand
     list, or the `InterruptReason`
 
+  ### `[:clementine, :loop, :step]`
+
+  One step committed (LOOP_RFC §The Step). Emitted by
+  `Clementine.Loop.Runner.step/2` after — never before — the host's
+  `apply_step` unit commits; the outcome names the committed facts, so a
+  park the host downgraded inside its unit reports `:continued`.
+
+  - Measurements: `%{duration: native}` — claim to commit
+  - Metadata: `%{loop_ref: term, epoch: pos_integer, outcome: :parked | :continued | :finished, mode: :normal | :cascade, batch: non_neg_integer}` —
+    `batch` is the drained input count (0 for a threshold poison step)
+
+  ### `[:clementine, :loop, :step_failed]`
+
+  An in-step exception was rescued and resolved down the attempts path —
+  requeue plus re-enqueue, never terminal `finish(failed)`: the loop
+  analog of two-tier failure (LOOP_RFC matrix rows L1/L7). Step duration
+  and per-input attempts pressure live here; the poison threshold's
+  dead-letter shows up in dead-letter telemetry, not this event.
+
+  - Measurements: `%{}`
+  - Metadata: `%{loop_ref: term, epoch: pos_integer, error: Clementine.Error.t(), requeued: boolean}` —
+    `requeued: false` means the requeue could not commit and the reaper
+    will requeue on the stale claim stamp instead (A3a)
+
   ## LLM Events
 
   Emitted by the engine around each provider call. The engine always
@@ -289,6 +313,15 @@ defmodule Clementine.Telemetry do
         event_name: [:clementine, :loop, :verdict],
         measurement: fn _measurements -> 1 end,
         tags: [:verdict]
+      ),
+      summary("clementine.loop.step.duration",
+        unit: {:native, :millisecond},
+        tags: [:outcome, :mode]
+      ),
+      counter("clementine.loop.step_failed.count",
+        event_name: [:clementine, :loop, :step_failed],
+        measurement: fn _measurements -> 1 end,
+        tags: [:requeued]
       ),
 
       # LLM

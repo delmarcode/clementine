@@ -13,10 +13,21 @@ defmodule Clementine.Loop.Host do
      appends, child rows *and their jobs*, sends, timer jobs and
      cancellations, terminal sweep — **in one atomic unit**, and when the
      commit's intent is park, it re-verifies inside that unit that no
-     unconsumed inputs in `park_recheck` scope exist, downgrading the park
-     to a continue (status `queued` plus `enqueue_step/2`) when they do.
+     unconsumed inputs in `park_recheck` scope exist — nor, for the `:any`
+     scope, a set cancel flag — downgrading the park to a continue (status
+     `queued` plus `enqueue_step/2`) when either does.
   2. `append/4` commits the input row, the wake (a CAS `waiting -> queued`
      that no-ops stale), and the step-job enqueue **in one atomic unit**.
+
+  The cancel flag joins the `:any` re-check because a flag landing while a
+  step runs is a wake the step cannot have read at claim: `cancel/3`'s own
+  wake no-ops against a `running` row, so the park's in-unit re-check is
+  the other half of the lock that closes the interleaving — flag-first
+  downgrades the park, park-first makes `cancel/3` see `waiting` and take
+  the wake itself. A cascade park (`:completions` scope) is exempt by
+  design: mid-cascade the flag is *expected* set — the cascade is its
+  handler — and a flag-downgrade would spin the loop hot until its
+  children finished.
 
   On Postgres both are one transaction (Oban jobs are rows; the run-row
   CAS serializes append against park). Substrates that cannot honor
@@ -39,8 +50,10 @@ defmodule Clementine.Loop.Host do
   `create/2` is the storage half of `Clementine.Loop.Protocol.create/3`
   (LOOP_RFC §Creation): insert-or-get, idempotent on the host's scope key,
   the row landing `queued` with the spec persisted. The RFC's contract
-  block lists the six step-machinery callbacks; creation needs the same
-  seam, so it lives here too.
+  block lists the six step-machinery callbacks; creation, the step
+  runner's read (`load/2`), and loop-owned cancellation (`cancel/3`, the
+  storage half of `Clementine.Loop.Protocol.cancel/4`) need the same
+  seam, so they live here too.
 
   ## Append return contract
 
@@ -126,4 +139,54 @@ defmodule Clementine.Loop.Host do
   """
   @callback create(spec :: map(), ctx()) ::
               {:ok, Facts.t()} | {:ok, :already_exists, Facts.t()} | {:error, term()}
+
+  @doc """
+  The step runner's read: current lifecycle facts plus the persisted loop
+  spec and the stored (encoded) envelope, from one row read.
+
+  The runner calls it twice per step — before the claim for the policy the
+  claim's deadline is minted from (spec columns are create-time-stable),
+  and again after the claim for the envelope and cancel flag, which only
+  the claim's fence makes safe to trust (a pre-claim envelope could be
+  superseded by a commit that raced the claim).
+
+  Refuses rollout-kind rows with `{:error, :rollout_run}` — the same
+  kind guard as `append/4`.
+  """
+  @callback load(loop_ref(), ctx()) ::
+              {:ok,
+               %{
+                 facts: Facts.t(),
+                 module: module() | String.t() | nil,
+                 args: map(),
+                 policy: map(),
+                 envelope: map() | nil
+               }}
+              | {:error, :not_found}
+              | {:error, :rollout_run}
+              | {:error, term()}
+
+  @doc """
+  Loop-owned cancellation's storage half (LOOP_RFC §Cancellation And
+  Halt), reached through `Clementine.Loop.Protocol.cancel/4`: set the
+  kind-aware cancel flag and, when the loop is parked, wake it (the CAS
+  `waiting -> queued` plus `enqueue_step/2`) — in one atomic unit where
+  the substrate allows, serialized against a concurrent step's park on
+  the same lock as `append/4`. A flag landing against a `running` row
+  needs no wake here: the park's `:any` re-check (atomicity sentence 1)
+  or the next claim honors it.
+
+  Idempotent on the flag — a second cancel returns `{:ok, :flagged}`
+  without replacing the first reason (first cause wins, same doctrine as
+  the cascade's pending halt). Terminal loops answer
+  `{:error, :already_terminal}`; rollout-kind rows are refused with
+  `{:error, :rollout_run}` — `Lifecycle.Protocol.request_cancel/4` is the
+  rollout verb, and amendment A2 splits the two by kind.
+  """
+  @callback cancel(loop_ref(), reason :: term(), ctx()) ::
+              {:ok, :flagged}
+              | {:error, :already_terminal}
+              | {:error, :rollout_run}
+              | {:error, :not_found}
+              | {:error, term()}
 end
