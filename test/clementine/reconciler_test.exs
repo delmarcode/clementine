@@ -3,7 +3,7 @@ defmodule Clementine.ReconcilerTest do
 
   alias Clementine.Lifecycle.{Facts, Protocol}
   alias Clementine.Reconciler
-  alias Clementine.Reconciler.Policy
+  alias Clementine.Reconciler.{LoopEvidence, Policy}
   alias Clementine.Test.MemoryLifecycle
 
   alias Clementine.{
@@ -25,6 +25,46 @@ defmodule Clementine.ReconcilerTest do
       %Facts{ref: "r", status: :running, epoch: 1, executor_id: "x", heartbeat_at: @now},
       overrides
     )
+  end
+
+  defp loop_running(overrides) do
+    struct!(
+      %Facts{
+        ref: "l",
+        kind: :loop,
+        status: :running,
+        epoch: 1,
+        executor_id: "x",
+        heartbeat_at: @now
+      },
+      overrides
+    )
+  end
+
+  defp loop_queued(overrides) do
+    struct!(%Facts{ref: "l", kind: :loop, status: :queued, epoch: 3, queued_at: @now}, overrides)
+  end
+
+  defp loop_waiting(overrides \\ []) do
+    struct!(%Facts{ref: "l", kind: :loop, status: :waiting, epoch: 3, queued_at: @now}, overrides)
+  end
+
+  defp child(tag_key, overrides \\ []) do
+    Map.merge(
+      %{
+        tag_key: tag_key,
+        child_ref: "run-" <> tag_key,
+        terminal?: false,
+        completion_present?: false
+      },
+      Map.new(overrides)
+    )
+  end
+
+  # Async siblings (the property battery) also emit verdict events, so the
+  # telemetry assertions pin a per-test unique ref.
+  defp unique_loop(status, overrides) do
+    struct!(%Facts{ref: make_ref(), kind: :loop, status: status, epoch: 7}, overrides)
   end
 
   describe "judge/3 on running runs" do
@@ -162,6 +202,300 @@ defmodule Clementine.ReconcilerTest do
     end
   end
 
+  describe "judge/3 forks by kind (amendment A3)" do
+    test "matrix row L16: a stale 1000-epoch loop requeues under the default policy — longevity is not a death sentence" do
+      stale = loop_running(heartbeat_at: ago(121_000), epoch: 1000)
+
+      # retry: :never and no max_claims headroom anywhere in sight: the
+      # rollout gates are not consulted for loop-kind facts.
+      assert Reconciler.judge(stale, @now) == {:requeue, :lease_expired}
+
+      assert Reconciler.judge(stale, @now, Policy.new(retry: {:requeue, max_claims: 3})) ==
+               {:requeue, :lease_expired}
+
+      # The same evidence at the same epoch interrupts a rollout: the cap
+      # is spent. That is exactly the verdict a loop must never receive.
+      rollout = running(heartbeat_at: ago(121_000), epoch: 1000)
+
+      assert {:interrupt, %InterruptReason{code: :lease_expired}} =
+               Reconciler.judge(rollout, @now, Policy.new(retry: {:requeue, max_claims: 3}))
+    end
+
+    test "the effect fence is rollout vocabulary — a nonconforming fence-set loop still requeues" do
+      # No loop step ever calls mark_effects; a set fence is a host bug.
+      # The verdict must not convert that bug into a dead loop.
+      stale = loop_running(heartbeat_at: ago(121_000), effects?: true)
+
+      assert Reconciler.judge(stale, @now) == {:requeue, :lease_expired}
+    end
+
+    test "a running loop with no heartbeat stamp requeues rather than interrupts" do
+      assert Reconciler.judge(loop_running(heartbeat_at: nil), @now) ==
+               {:requeue, :lease_expired}
+    end
+
+    test "a fresh heartbeat inside the threshold is healthy for loops too" do
+      assert Reconciler.judge(loop_running(heartbeat_at: ago(119_000)), @now) == :healthy
+    end
+
+    test "the fresh-heartbeat deadline belt is unamended: a live-wedged step still interrupts" do
+      # Steps are short by construction; a fresh heartbeat past
+      # deadline + grace is a live-wedged step runner, the one failure a
+      # requeue cannot heal — without this belt it would hold the lease,
+      # and the loop, forever.
+      wedged = loop_running(heartbeat_at: @now, deadline: ago(121_000))
+
+      assert {:interrupt, %InterruptReason{code: :deadline_exceeded}} =
+               Reconciler.judge(wedged, @now)
+
+      assert Reconciler.judge(loop_running(heartbeat_at: @now, deadline: ago(119_000)), @now) ==
+               :healthy
+
+      # Stale evidence outranks the deadline, exactly as for rollouts —
+      # and for a loop that means requeue, not death.
+      dead = loop_running(heartbeat_at: ago(200_000), deadline: ago(300_000))
+      assert Reconciler.judge(dead, @now) == {:requeue, :lease_expired}
+    end
+
+    test "matrix row L15: a queued loop past the claim timeout reenqueues — it never dies of :claim_timeout" do
+      lost = loop_queued(queued_at: ago(901_000))
+
+      assert Reconciler.judge(lost, @now) == {:reenqueue, :claim_timeout}
+      assert Reconciler.judge(loop_queued(queued_at: ago(899_000)), @now) == :healthy
+
+      # A missing stamp is nonconforming; the answer is still never
+      # terminal on claim evidence.
+      assert Reconciler.judge(loop_queued(queued_at: nil), @now) ==
+               {:reenqueue, :claim_timeout}
+    end
+
+    test "matrix row L15: the reenqueue verdict is not a transition — the row is untouched and the next claim just works" do
+      store = MemoryLifecycle.start_store()
+      MemoryLifecycle.seed_queued(store, "loop", kind: :loop, queued_at: ago(901_000))
+      observed = MemoryLifecycle.facts!(store, "loop")
+
+      assert Reconciler.judge(observed, @now) == {:reenqueue, :claim_timeout}
+
+      # The host's whole action is re-inserting the step job; when that
+      # job runs, the ordinary claim is the recovery.
+      assert MemoryLifecycle.facts!(store, "loop") == observed
+      assert {:ok, lease} = Protocol.claim(MemoryLifecycle, "loop", executor: "e", ctx: store)
+      assert lease.epoch == observed.epoch + 1
+    end
+
+    test "waiting loops are exempt from max_wait — parked is the ground state, not an overdue suspension" do
+      policy = Policy.new(max_wait: :timer.hours(24))
+      month = 30 * 24 * 60 * 60 * 1000
+      parked = loop_waiting(queued_at: ago(month))
+
+      assert Reconciler.judge(parked, @now, policy) == :healthy
+
+      # The identical facts as a rollout expire: the exemption is the fork.
+      overdue = struct!(parked, kind: :rollout)
+
+      assert {:interrupt, %InterruptReason{code: :suspension_expired}} =
+               Reconciler.judge(overdue, @now, policy)
+    end
+
+    test "terminal loops are healthy — nothing left to judge" do
+      for status <- Facts.terminal_statuses() do
+        facts = %Facts{ref: "l", kind: :loop, status: status, epoch: 40, queued_at: ago(1)}
+        assert Reconciler.judge(facts, @now) == :healthy
+      end
+    end
+  end
+
+  describe "judge_loop/4 on parked loops (amendment A3c)" do
+    test "matrix row L13: a terminal child with no completion input is a strand — the sweep synthesizes what delivery lost" do
+      evidence = %LoopEvidence{
+        children: [
+          child("turn-1", terminal?: true),
+          child("turn-2"),
+          child("turn-3", terminal?: true, completion_present?: true)
+        ]
+      }
+
+      assert Reconciler.judge_loop(loop_waiting(), evidence, @now, Policy.new()) ==
+               {:reconcile_children, [%{tag_key: "turn-1", child_ref: "run-turn-1"}]}
+    end
+
+    test "matrix row L13 (the Postgres-normal case): every terminal child's completion is present — healthy, the alarm stays silent" do
+      # completion_present? covers pending, consumed-but-marked, and
+      # dead-lettered rows alike: a retained poison completion is present,
+      # and re-synthesizing it would only re-poison.
+      evidence = %LoopEvidence{
+        children: [
+          child("turn-1", terminal?: true, completion_present?: true),
+          child("turn-2")
+        ]
+      }
+
+      assert Reconciler.judge_loop(loop_waiting(), evidence, @now, Policy.new()) == :healthy
+    end
+
+    test "matrix row L4 backstop: unconsumed inputs older than the threshold wake a parked loop" do
+      policy = Policy.new(wake_pending_after: :timer.minutes(5))
+
+      stale = %LoopEvidence{oldest_pending_at: ago(:timer.minutes(5) + 1)}
+
+      assert Reconciler.judge_loop(loop_waiting(), stale, @now, policy) ==
+               {:wake_pending, :stale_inputs}
+
+      # The boundary itself is healthy — strictly beyond, like every age
+      # check in this module.
+      boundary = %LoopEvidence{oldest_pending_at: ago(:timer.minutes(5))}
+      assert Reconciler.judge_loop(loop_waiting(), boundary, @now, policy) == :healthy
+
+      assert Reconciler.judge_loop(loop_waiting(), %LoopEvidence{}, @now, policy) == :healthy
+    end
+
+    test "reconcile outranks wake_pending — reconciliation's append wakes the loop anyway" do
+      evidence = %LoopEvidence{
+        children: [child("turn-1", terminal?: true)],
+        oldest_pending_at: ago(:timer.hours(2))
+      }
+
+      assert {:reconcile_children, _strands} =
+               Reconciler.judge_loop(loop_waiting(), evidence, @now, Policy.new())
+    end
+
+    test "no evidence gathered means no evidence verdicts" do
+      assert Reconciler.judge_loop(loop_waiting(), nil, @now, Policy.new()) == :healthy
+    end
+
+    test "running and queued loops ignore evidence — their checks read facts alone" do
+      evidence = %LoopEvidence{
+        children: [child("turn-1", terminal?: true)],
+        oldest_pending_at: ago(:timer.hours(2))
+      }
+
+      stale = loop_running(heartbeat_at: ago(121_000))
+
+      assert Reconciler.judge_loop(stale, evidence, @now, Policy.new()) ==
+               {:requeue, :lease_expired}
+
+      lost = loop_queued(queued_at: ago(901_000))
+
+      assert Reconciler.judge_loop(lost, evidence, @now, Policy.new()) ==
+               {:reenqueue, :claim_timeout}
+    end
+
+    test "judge_loop refuses rollout facts — the loop sweep is kind-scoped by contract" do
+      assert_raise FunctionClauseError, fn ->
+        Reconciler.judge_loop(running(heartbeat_at: @now), nil, @now, Policy.new())
+      end
+    end
+  end
+
+  describe "matrix row L16, acted through the protocol" do
+    test "matrix row L16: a 1000-epoch loop crash requeues and reclaims — the epoch is a lifetime, not a budget" do
+      store = MemoryLifecycle.start_store()
+      MemoryLifecycle.seed_queued(store, "loop", kind: :loop)
+
+      # A thousand executions, each crashing without a terminal write:
+      # claim, go stale, get judged, requeue. Default policy throughout.
+      for expected_epoch <- 1..1000 do
+        {:ok, lease} = Protocol.claim(MemoryLifecycle, "loop", executor: "e", ctx: store)
+        assert lease.epoch == expected_epoch
+
+        observed = MemoryLifecycle.facts!(store, "loop")
+        sweep_now = DateTime.add(observed.heartbeat_at, 180_000, :millisecond)
+
+        assert {:requeue, :lease_expired} = Reconciler.judge(observed, sweep_now)
+        {:ok, _requeued} = Protocol.requeue(MemoryLifecycle, observed, :lease_expired, store)
+      end
+
+      # The 1001st claim mints as readily as the first, and no terminal
+      # projection ever fired: the loop lived through every crash.
+      {:ok, lease} = Protocol.claim(MemoryLifecycle, "loop", executor: "e", ctx: store)
+      assert lease.epoch == 1001
+      assert MemoryLifecycle.projections(store) == []
+    end
+  end
+
+  describe "loop verdict telemetry (the firing-rate seam)" do
+    setup do
+      handler_id = "reconciler-test-#{inspect(self())}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:clementine, :loop, :verdict],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:verdict_event, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      :ok
+    end
+
+    test "every non-healthy loop verdict emits [:clementine, :loop, :verdict] with the verdict and its detail" do
+      stale = unique_loop(:running, heartbeat_at: ago(121_000))
+      assert {:requeue, :lease_expired} = Reconciler.judge(stale, @now)
+      ref = stale.ref
+
+      assert_receive {:verdict_event, [:clementine, :loop, :verdict], %{},
+                      %{loop_ref: ^ref, epoch: 7, verdict: :requeue, detail: :lease_expired}}
+
+      lost = unique_loop(:queued, queued_at: ago(901_000))
+      assert {:reenqueue, :claim_timeout} = Reconciler.judge(lost, @now)
+      ref = lost.ref
+
+      assert_receive {:verdict_event, _, %{},
+                      %{loop_ref: ^ref, verdict: :reenqueue, detail: :claim_timeout}}
+
+      stranded = unique_loop(:waiting, queued_at: @now)
+      evidence = %LoopEvidence{children: [child("turn-1", terminal?: true)]}
+      strands = [%{tag_key: "turn-1", child_ref: "run-turn-1"}]
+
+      assert {:reconcile_children, ^strands} =
+               Reconciler.judge_loop(stranded, evidence, @now, Policy.new())
+
+      ref = stranded.ref
+
+      assert_receive {:verdict_event, _, %{},
+                      %{loop_ref: ^ref, verdict: :reconcile_children, detail: ^strands}}
+
+      parked = unique_loop(:waiting, queued_at: @now)
+      pending = %LoopEvidence{oldest_pending_at: ago(:timer.hours(1))}
+
+      assert {:wake_pending, :stale_inputs} =
+               Reconciler.judge_loop(parked, pending, @now, Policy.new())
+
+      ref = parked.ref
+
+      assert_receive {:verdict_event, _, %{},
+                      %{loop_ref: ^ref, verdict: :wake_pending, detail: :stale_inputs}}
+
+      wedged = unique_loop(:running, heartbeat_at: @now, deadline: ago(121_000))
+      assert {:interrupt, reason} = Reconciler.judge(wedged, @now)
+      ref = wedged.ref
+
+      assert_receive {:verdict_event, _, %{},
+                      %{loop_ref: ^ref, verdict: :interrupt, detail: ^reason}}
+    end
+
+    test "healthy loop judgments emit nothing" do
+      healthy = unique_loop(:waiting, queued_at: ago(:timer.hours(720)))
+      ref = healthy.ref
+
+      assert Reconciler.judge(healthy, @now) == :healthy
+      assert Reconciler.judge_loop(healthy, %LoopEvidence{}, @now, Policy.new()) == :healthy
+
+      refute_receive {:verdict_event, _, _, %{loop_ref: ^ref}}, 50
+    end
+
+    test "rollout verdicts never ride the loop event — their rates ride the commit events" do
+      rollout = %Facts{ref: make_ref(), status: :running, epoch: 1, heartbeat_at: ago(121_000)}
+      ref = rollout.ref
+
+      assert {:interrupt, _reason} = Reconciler.judge(rollout, @now)
+      refute_receive {:verdict_event, _, _, %{loop_ref: ^ref}}, 50
+    end
+  end
+
   describe "Policy.new/1" do
     test "defaults are Meli's production posture" do
       policy = Policy.new()
@@ -172,6 +506,13 @@ defmodule Clementine.ReconcilerTest do
       assert policy.claim_timeout == :timer.minutes(15)
       assert policy.max_wait == nil
       assert policy.retry == :never
+    end
+
+    test "loop defaults: a slower sweep and a generous wake backstop" do
+      policy = Policy.new()
+
+      assert policy.loop_sweep_interval == :timer.minutes(5)
+      assert policy.wake_pending_after == :timer.minutes(5)
     end
 
     test "validates the retry shape eagerly" do
@@ -187,6 +528,8 @@ defmodule Clementine.ReconcilerTest do
       assert_raise ArgumentError, fn -> Policy.new(stale_after: 0) end
       assert_raise ArgumentError, fn -> Policy.new(claim_timeout: -5) end
       assert_raise ArgumentError, fn -> Policy.new(max_wait: 0) end
+      assert_raise ArgumentError, fn -> Policy.new(loop_sweep_interval: 0) end
+      assert_raise ArgumentError, fn -> Policy.new(wake_pending_after: -1) end
       assert_raise KeyError, fn -> Policy.new(stale_threshold: 1) end
     end
   end

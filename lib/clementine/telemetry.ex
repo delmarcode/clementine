@@ -115,6 +115,28 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{}`
   - Metadata: `%{run_ref: term, epoch: non_neg_integer, code: Clementine.InterruptReason.code()}`
 
+  ## Loop Events
+
+  The loop layer owns the `:loop` prefix the engine rename vacated.
+
+  ### `[:clementine, :loop, :verdict]`
+
+  Reconciliation judged a loop-kind run and the verdict was not
+  `:healthy` (LOOP_RFC amendment A3). Emitted at judgment time by
+  `Clementine.Reconciler.judge_loop/4` and by the Oban cross-check's
+  loop-kind verdicts (`Clementine.Lifecycle.Ecto.Oban.judge_job/2`):
+  three of the four loop verdicts are host actions with no lifecycle
+  commit to ride, so the judgment is the one seam every firing crosses.
+  Nonzero
+  `:reconcile_children` / `:wake_pending` rates on a transactional
+  substrate (Postgres) are the alarm condition — the sweep is healing
+  strands that atomic delivery glue should make impossible.
+
+  - Measurements: `%{}`
+  - Metadata: `%{loop_ref: term, epoch: non_neg_integer, verdict: :requeue | :reenqueue | :reconcile_children | :wake_pending | :interrupt, detail: term}` —
+    `detail` is the verdict's payload: the evidence reason, the strand
+    list, or the `InterruptReason`
+
   ## LLM Events
 
   Emitted by the engine around each provider call. The engine always
@@ -259,6 +281,14 @@ defmodule Clementine.Telemetry do
         measurement: fn _measurements -> 1 end,
         tags: [:code],
         tag_values: &reaped_tag_values/1
+      ),
+
+      # Loops — alert on nonzero reconcile_children/wake_pending rates
+      # where the substrate is transactional (LOOP_RFC §Operations).
+      counter("clementine.loop.verdict.count",
+        event_name: [:clementine, :loop, :verdict],
+        measurement: fn _measurements -> 1 end,
+        tags: [:verdict]
       ),
 
       # LLM

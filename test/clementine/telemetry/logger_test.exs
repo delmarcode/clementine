@@ -28,7 +28,8 @@ defmodule Clementine.Telemetry.LoggerTest do
             [:clementine, :tool, :exception],
             [:clementine, :run, :claimed],
             [:clementine, :run, :finished],
-            [:clementine, :run, :reaped]
+            [:clementine, :run, :reaped],
+            [:clementine, :loop, :verdict]
           ] do
         handlers = :telemetry.list_handlers(event)
         assert Enum.any?(handlers, fn h -> h.id == "clementine-logger" end)
@@ -327,6 +328,52 @@ defmodule Clementine.Telemetry.LoggerTest do
 
       assert log =~ "[Clementine] Run requeued"
       assert log =~ "reason=:drain"
+    end
+
+    test "the self-healing loop verdicts log as warnings — the alarm pair" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :loop, :verdict],
+            %{},
+            %{
+              loop_ref: "loop-7",
+              epoch: 40,
+              verdict: :reconcile_children,
+              detail: [%{tag_key: "turn-1", child_ref: "run-9"}]
+            }
+          )
+
+          :telemetry.execute(
+            [:clementine, :loop, :verdict],
+            %{},
+            %{loop_ref: "loop-7", epoch: 40, verdict: :wake_pending, detail: :stale_inputs}
+          )
+        end)
+
+      assert log =~ "[warning]"
+      assert log =~ "[Clementine] Loop verdict"
+      assert log =~ "verdict=reconcile_children"
+      assert log =~ "verdict=wake_pending"
+      assert log =~ ~s(tag_key: "turn-1")
+    end
+
+    test "routine loop verdicts log at the configured level" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :loop, :verdict],
+            %{},
+            %{loop_ref: "loop-7", epoch: 40, verdict: :reenqueue, detail: :claim_timeout}
+          )
+        end)
+
+      assert log =~ "[info]"
+      assert log =~ "verdict=reenqueue detail=:claim_timeout"
     end
   end
 

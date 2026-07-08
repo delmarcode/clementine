@@ -41,7 +41,8 @@ defmodule Clementine.Telemetry.Logger do
     [:clementine, :run, :finished],
     [:clementine, :run, :requeued],
     [:clementine, :run, :lease_lost],
-    [:clementine, :run, :reaped]
+    [:clementine, :run, :reaped],
+    [:clementine, :loop, :verdict]
   ]
 
   @doc """
@@ -188,6 +189,19 @@ defmodule Clementine.Telemetry.Logger do
     end)
 
     _ = config
+  end
+
+  # The self-healing pair is the alarm condition (should be ~zero on a
+  # transactional substrate), so it logs at :warning regardless of level.
+  def handle_event([:clementine, :loop, :verdict], _measurements, metadata, config) do
+    level =
+      if metadata.verdict in [:reconcile_children, :wake_pending],
+        do: :warning,
+        else: config.level
+
+    Logger.log(level, fn ->
+      "[Clementine] Loop verdict loop=#{inspect(metadata.loop_ref)} epoch=#{metadata.epoch} verdict=#{metadata.verdict} detail=#{inspect(metadata.detail)}"
+    end)
   end
 
   defp run_summary(metadata, measurements \\ %{}) do

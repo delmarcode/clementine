@@ -1,8 +1,9 @@
 defmodule Clementine.Reconciler do
   @moduledoc """
-  Reaper judgment: the pure, status-scoped half of stale-run
-  reconciliation. The host owns the sweep query (its table, its rows); the
-  library owns the verdict and the transition it becomes:
+  Reaper judgment: the deterministic, kind- and status-scoped half of
+  stale-run reconciliation — no fetch, no write. The host owns the sweep
+  query (its table, its rows); the library owns the verdict and the
+  transition it becomes:
 
       lifecycle = MyApp.ClementineLifecycle
       now = MyApp.Runs.db_now!()          # storage clock — same source the stamps use
@@ -23,16 +24,67 @@ defmodule Clementine.Reconciler do
         end
       end
 
-  This judgment is *rollout* judgment, and the sweep query must exclude
-  loop-kind rows in SQL (`WHERE kind = 'rollout'`), not by filtering
-  fetched facts: a parked loop is a permanently `waiting` row *by design*
-  (LOOP_RFC §Operations — "hibernation" is what `waiting` already is), so
-  at fleet scale an unscoped sweep pays for every dormant loop on every
-  cadence. Loop-kind rows get their own policy fork and verdicts (LOOP_RFC
-  amendment A3), on their own slower cadence over loop rows only — this
-  module's rules would judge them wrongly (the epoch-as-attempt-cap gate
-  alone would terminally interrupt a long-lived loop on its first crashed
-  step).
+  Judgment forks by `Facts.kind` (LOOP_RFC amendment A3). A loop is a
+  standing entity: its epoch counts lifetime claims, so the
+  epoch-as-attempt-cap gate would terminally interrupt a long-lived loop
+  on its first crashed step, and a `:claim_timeout` interrupt would kill
+  it over one lost enqueue. Loop-kind facts therefore get their own
+  verdicts through the same entry points — `judge/3` forks internally, so
+  a sweep that forgets its kind scope still judges loops correctly. The
+  rollout sweep should exclude loop-kind rows in SQL
+  (`WHERE kind = 'rollout'`) all the same: a parked loop is a permanently
+  `waiting` row *by design* (LOOP_RFC §Operations — "hibernation" is what
+  `waiting` already is), so at fleet scale an unscoped sweep pays for
+  every dormant loop on every cadence. The scoping is a cost story; the
+  kind fork is the correctness story.
+
+  The loop sweep runs on its own slower cadence over loop rows only
+  (`policy.loop_sweep_interval`), gathering per-row evidence the facts
+  cannot carry and calling `judge_loop/4`:
+
+      # The loop sweep: active AND kind = 'loop', both in SQL.
+      for facts <- MyApp.Runs.active_loop_run_facts() do
+        # For waiting rows: envelope children joined to child run statuses
+        # and inbox rows; oldest unconsumed input stamp. Nil otherwise.
+        evidence = MyApp.Runs.loop_evidence(facts)
+
+        case Clementine.Reconciler.judge_loop(facts, evidence, now, policy) do
+          :healthy ->
+            :ok
+
+          {:requeue, reason} ->
+            Clementine.Lifecycle.Protocol.requeue(lifecycle, facts, reason)
+            # then insert the step job, exactly as after a wake
+
+          {:reenqueue, _reason} ->
+            # the run row is already queued; only the job is missing
+            MyApp.Runs.insert_step_job(facts.ref)
+
+          {:reconcile_children, strands} ->
+            # for each strand: synthesize {:completed, tag, result} from the
+            # child's terminal row and append it with the canonical dedup key
+            # ("completed:" <> tag_key <> ":" <> child_ref, LOOP_RFC
+            # §Children) so a racing real delivery no-ops; append wakes.
+            MyApp.Runs.reconcile_children(facts, strands)
+
+          {:wake_pending, _reason} ->
+            # append's wake half alone: CAS waiting -> queued + step job,
+            # one atomic unit
+            MyApp.Runs.wake(facts.ref)
+
+          {:interrupt, reason} ->
+            Clementine.Lifecycle.Protocol.interrupt(lifecycle, facts, reason)
+        end
+      end
+
+  Every non-`:healthy` loop verdict emits `[:clementine, :loop, :verdict]`
+  at judgment time — three of the four loop verdicts commit nothing
+  through the lifecycle, so the judgment is the one seam every firing
+  crosses. The Oban cross-check's loop verdicts record through the same
+  seam (`Clementine.Lifecycle.Ecto.Oban.judge_job/2`). Nonzero
+  `:reconcile_children`/`:wake_pending` rates on a transactional
+  substrate (Postgres) are the alarm condition: the sweep is healing
+  strands that atomic delivery glue should make impossible.
 
   `now` must come from the storage clock — the same source that stamped
   the facts — or be compared in the database; a node-local
@@ -45,7 +97,7 @@ defmodule Clementine.Reconciler do
   reaper, loses cleanly (`{:error, :stale}`) and that is correct.
 
   Judgment is status-scoped; each check applies only where its evidence
-  means something:
+  means something. For rollout-kind facts:
 
     * `running` — a stale heartbeat is `:lease_expired` (or a
       `{:requeue, _}` verdict when policy opts in, the effect fence is
@@ -64,6 +116,33 @@ defmodule Clementine.Reconciler do
       no heartbeat, no deadline, and no executor *by design*.
     * terminal — `:healthy`; nothing left to judge.
 
+  For loop-kind facts (amendment A3 — every strand class self-healing,
+  never invisible, and no verdict terminal except the deadline belt):
+
+    * `running` — the same stale evidence is `{:requeue, :lease_expired}`
+      **always**: no `retry` opt-in, no `epoch < max_claims` gate (capping
+      lifetime claims kills loops *for having lived*; poison protection is
+      the dead-letter machinery's job, LOOP_RFC L7/L16), and no effect
+      fence (rollout vocabulary — a step is replayable by construction,
+      Governing Invariant 4). The fresh-heartbeat deadline belt is
+      unamended: a live-wedged step runner past `deadline + grace` is
+      still `:deadline_exceeded` — the one terminal verdict a loop keeps.
+    * `queued` — the same claim-timeout evidence is
+      `{:reenqueue, :claim_timeout}`: the run row is fine, the step job is
+      lost, and the host re-inserts it (LOOP_RFC L15). A standing entity
+      must not die from one lost enqueue, so this verdict re-fires every
+      sweep until a claim lands — self-healing with an observable rate,
+      never terminal.
+    * `waiting` — exempt from `max_wait` (parked is the ground state, not
+      an overdue suspension) and judged instead on `LoopEvidence` by
+      `judge_loop/4`: a live child whose run is terminal with no
+      completion input in the inbox is a strand,
+      `{:reconcile_children, strands}` (LOOP_RFC L13); otherwise
+      unconsumed inputs older than `policy.wake_pending_after` with the
+      loop parked are `{:wake_pending, :stale_inputs}` (LOOP_RFC L4).
+      These two replace the backstop the `max_wait` exemption removes.
+    * terminal — `:healthy`; nothing left to judge.
+
   For Oban hosts, `Clementine.Lifecycle.Ecto.Oban.judge_job/2` is the
   companion executor cross-check, scoped the same way.
   """
@@ -79,23 +158,39 @@ defmodule Clementine.Reconciler do
     no `max_wait` ceiling: a suspension leaves `waiting` only by explicit
     policy, never by accident.
 
-    `sweep_interval` is not read by `judge/3`; it is the documented
-    default cadence the host's scheduler applies.
+    `sweep_interval` and `loop_sweep_interval` are not read by judgment;
+    they are the documented default cadences the host's scheduler applies —
+    the loop sweep deliberately slower (LOOP_RFC §Operations), because its
+    waiting rows need per-row evidence queries and its verdicts backstop
+    races measured in minutes, not liveness measured in heartbeats.
+
+    `retry`, `max_claims`, and `max_wait` govern rollout-kind runs only;
+    loop-kind judgment ignores all three (amendment A3).
+    `wake_pending_after` is the loop-kind backstop threshold: how long
+    unconsumed inputs may sit against a parked loop before the sweep wakes
+    it. The default is deliberately generous — on a substrate honoring the
+    append atomicity sentence the verdict never fires, and a nonzero rate
+    is an alarm, so the threshold only bounds healing latency on
+    substrates that need it.
     """
 
     defstruct sweep_interval: :timer.seconds(60),
+              loop_sweep_interval: :timer.minutes(5),
               stale_after: :timer.minutes(2),
               deadline_grace: :timer.minutes(2),
               claim_timeout: :timer.minutes(15),
               max_wait: nil,
+              wake_pending_after: :timer.minutes(5),
               retry: :never
 
     @type t :: %__MODULE__{
             sweep_interval: pos_integer(),
+            loop_sweep_interval: pos_integer(),
             stale_after: pos_integer(),
             deadline_grace: pos_integer(),
             claim_timeout: pos_integer(),
             max_wait: pos_integer() | nil,
+            wake_pending_after: pos_integer(),
             retry: :never | {:requeue, [{:max_claims, pos_integer()}]}
           }
 
@@ -110,7 +205,14 @@ defmodule Clementine.Reconciler do
       validate_retry!(policy.retry)
 
       for {field, value} <-
-            Map.take(policy, [:sweep_interval, :stale_after, :deadline_grace, :claim_timeout]) do
+            Map.take(policy, [
+              :sweep_interval,
+              :loop_sweep_interval,
+              :stale_after,
+              :deadline_grace,
+              :claim_timeout,
+              :wake_pending_after
+            ]) do
         unless is_integer(value) and value > 0 do
           raise ArgumentError,
                 "#{field} must be a positive integer of milliseconds, got: #{inspect(value)}"
@@ -145,14 +247,87 @@ defmodule Clementine.Reconciler do
     end
   end
 
-  @type verdict :: :healthy | {:interrupt, InterruptReason.t()} | {:requeue, term()}
+  defmodule LoopEvidence do
+    @moduledoc """
+    What the loop sweep gathered beyond the facts for one parked loop —
+    the evidence behind the two self-healing verdicts (LOOP_RFC amendment
+    A3c). Judgment stays pure; the host owns the queries.
+
+    `children` mirrors the envelope's live-children map, one entry per
+    `tag_key => child_ref`, joined to two host lookups: `terminal?` (the
+    child run reached a dead-end status) and `completion_present?` (an
+    inbox row for this child's completion exists **at all** — pending,
+    consumed-but-marked, or dead-lettered; dead letters are retained
+    evidence, so a poison completion that already dead-lettered is
+    *present*, and re-synthesizing it would only re-poison). A terminal
+    child with no completion row is a strand: the exactly-once-at-source
+    append was lost.
+
+    `oldest_pending_at` is the storage-clock insert stamp of the oldest
+    unconsumed input, nil when the inbox holds none. Stamps must come from
+    the same clock as `now` — the facts' own discipline.
+
+    Gathering need not be one snapshot: a step committing mid-gather can
+    at worst make the sweep synthesize a completion whose child the
+    envelope already retired, and that append dead-letters as
+    `:unknown_tag` or no-ops on its dedup key — observable noise, never
+    double delivery (Governing Invariants 7 and 11).
+    """
+
+    defstruct children: [], oldest_pending_at: nil
+
+    @type child :: %{
+            tag_key: String.t(),
+            child_ref: term(),
+            terminal?: boolean(),
+            completion_present?: boolean()
+          }
+
+    @type t :: %__MODULE__{
+            children: [child()],
+            oldest_pending_at: DateTime.t() | nil
+          }
+  end
+
+  @typedoc """
+  One lost child-completion delivery: the envelope lists the child as
+  live, its run is terminal, and no completion input exists in the inbox.
+  The host synthesizes `{:completed, tag, result}` from the child's
+  terminal row and appends it under the canonical dedup key.
+  """
+  @type strand :: %{tag_key: String.t(), child_ref: term()}
+
+  @typedoc """
+  `:reenqueue`, `:reconcile_children`, and `:wake_pending` are loop-kind
+  verdicts (amendment A3); rollout-kind facts never produce them. All
+  three are host actions with no lifecycle transition — the run row is
+  already in the right status; what is missing lives beside it (a step
+  job, a completion input, a wake).
+  """
+  @type verdict ::
+          :healthy
+          | {:interrupt, InterruptReason.t()}
+          | {:requeue, term()}
+          | {:reenqueue, term()}
+          | {:reconcile_children, [strand()]}
+          | {:wake_pending, :stale_inputs}
 
   @doc """
-  Judges one run's facts against the storage clock. Pure: no fetch, no
-  write — the caller turns the verdict into a guarded transition.
+  Judges one run's facts against the storage clock. No fetch, no write —
+  the caller turns the verdict into a guarded transition (or, for the
+  loop-kind verdicts, the host action beside the row).
+
+  Forks on `Facts.kind`: loop-kind facts are judged by the loop rules —
+  with no evidence, so only the checks the facts can answer — even when a
+  mis-scoped rollout sweep is the caller. The loop sweep proper calls
+  `judge_loop/4` with gathered evidence.
   """
   @spec judge(Facts.t(), DateTime.t(), Policy.t()) :: verdict()
   def judge(facts, now, policy \\ Policy.new())
+
+  def judge(%Facts{kind: :loop} = facts, %DateTime{} = now, %Policy{} = policy) do
+    judge_loop(facts, nil, now, policy)
+  end
 
   def judge(%Facts{status: :running} = facts, %DateTime{} = now, %Policy{} = policy) do
     stale_for = age(now, facts.heartbeat_at)
@@ -162,11 +337,7 @@ defmodule Clementine.Reconciler do
         stale_verdict(facts, stale_for, policy)
 
       overdue(now, facts.deadline) > policy.deadline_grace ->
-        {:interrupt,
-         InterruptReason.new(
-           :deadline_exceeded,
-           "running #{ms(overdue(now, facts.deadline))} past its deadline with a fresh heartbeat"
-         )}
+        deadline_exceeded(now, facts.deadline)
 
       true ->
         :healthy
@@ -213,6 +384,114 @@ defmodule Clementine.Reconciler do
     :healthy
   end
 
+  @doc """
+  Judges one loop-kind run's facts plus the sweep's gathered evidence
+  (nil when none was gathered — running and queued rows need none).
+  Judgment is deterministic over its arguments; every non-`:healthy`
+  verdict additionally emits `[:clementine, :loop, :verdict]` so firing
+  rates stay observable no matter which host glue acts on them — the
+  loop verdicts have no lifecycle commit to ride the way `:requeued` and
+  `:reaped` do.
+
+  Verdict order within `waiting`: strands first — reconciliation's append
+  wakes the loop anyway, so it subsumes a pending `:wake_pending`.
+  """
+  @spec judge_loop(Facts.t(), LoopEvidence.t() | nil, DateTime.t(), Policy.t()) :: verdict()
+  def judge_loop(facts, evidence, now, policy \\ Policy.new())
+
+  def judge_loop(%Facts{kind: :loop} = facts, evidence, %DateTime{} = now, %Policy{} = policy)
+      when is_struct(evidence, LoopEvidence) or is_nil(evidence) do
+    record_loop_verdict(facts, loop_verdict(facts, evidence || %LoopEvidence{}, now, policy))
+  end
+
+  @doc false
+  # The one seam every loop-verdict firing crosses, whichever judge
+  # produced it — `judge_loop/4` here, or the Oban cross-check's loop
+  # clauses (`Clementine.Lifecycle.Ecto.Oban.judge_job/2`), whose
+  # reenqueues would otherwise heal invisibly: a dead step job is judged
+  # and re-inserted long before claim_timeout lets the facts-judge see it.
+  @spec record_loop_verdict(Facts.t(), verdict()) :: verdict()
+  def record_loop_verdict(%Facts{}, :healthy), do: :healthy
+
+  def record_loop_verdict(%Facts{} = facts, {verdict, detail} = full_verdict) do
+    :telemetry.execute(
+      [:clementine, :loop, :verdict],
+      %{},
+      %{loop_ref: facts.ref, epoch: facts.epoch, verdict: verdict, detail: detail}
+    )
+
+    full_verdict
+  end
+
+  # A3a: the same stale evidence that interrupts (or policy-requeues) a
+  # rollout requeues a loop unconditionally. The retry opt-in, the
+  # epoch-as-attempt-cap, and the effect fence are all rollout vocabulary:
+  # a loop's epoch counts its lifetime claims, its steps are replayable by
+  # construction, and poison protection lives in the dead-letter
+  # machinery. The fresh-heartbeat deadline belt is deliberately
+  # unamended — a live-wedged step runner is the one failure a requeue
+  # cannot heal, and holding the lease forever would be invisible.
+  defp loop_verdict(%Facts{status: :running} = facts, _evidence, now, policy) do
+    stale_for = age(now, facts.heartbeat_at)
+
+    cond do
+      stale_for == :no_stamp or stale_for > policy.stale_after ->
+        {:requeue, :lease_expired}
+
+      overdue(now, facts.deadline) > policy.deadline_grace ->
+        deadline_exceeded(now, facts.deadline)
+
+      true ->
+        :healthy
+    end
+  end
+
+  # A3b: claim-timeout evidence means the step job is lost, not that the
+  # loop should die — the host re-inserts the job (duplicates no-op on the
+  # claim CAS). A missing stamp is nonconforming, but the answer is the
+  # same: never terminal on claim evidence.
+  defp loop_verdict(%Facts{status: :queued} = facts, _evidence, now, policy) do
+    case age(now, facts.queued_at) do
+      :no_stamp -> {:reenqueue, :claim_timeout}
+      waited when waited > policy.claim_timeout -> {:reenqueue, :claim_timeout}
+      _fresh -> :healthy
+    end
+  end
+
+  # A3c: parked is the ground state, so `max_wait` never applies; the two
+  # evidence verdicts replace the backstop that exemption removes.
+  defp loop_verdict(%Facts{status: :waiting}, %LoopEvidence{} = evidence, now, policy) do
+    strands =
+      for child <- evidence.children,
+          child.terminal? and not child.completion_present? do
+        %{tag_key: child.tag_key, child_ref: child.child_ref}
+      end
+
+    cond do
+      strands != [] ->
+        {:reconcile_children, strands}
+
+      stale_pending?(evidence, now, policy) ->
+        {:wake_pending, :stale_inputs}
+
+      true ->
+        :healthy
+    end
+  end
+
+  defp loop_verdict(%Facts{} = facts, _evidence, _now, _policy) do
+    true = Facts.terminal?(facts)
+    :healthy
+  end
+
+  # Strictly beyond the threshold, like every age check here: the
+  # boundary itself is healthy.
+  defp stale_pending?(%LoopEvidence{oldest_pending_at: nil}, _now, _policy), do: false
+
+  defp stale_pending?(%LoopEvidence{oldest_pending_at: oldest}, now, policy) do
+    age(now, oldest) > policy.wake_pending_after
+  end
+
   # Stale evidence reads the same for interrupt and requeue; policy, the
   # fence, and the claim cap pick which. The epoch counts claims, so it is
   # the attempt counter — no extra field.
@@ -236,6 +515,14 @@ defmodule Clementine.Reconciler do
 
   defp interrupt_stale(stale_for) do
     {:interrupt, InterruptReason.new(:lease_expired, "no heartbeat for #{ms(stale_for)}")}
+  end
+
+  defp deadline_exceeded(now, deadline) do
+    {:interrupt,
+     InterruptReason.new(
+       :deadline_exceeded,
+       "running #{ms(overdue(now, deadline))} past its deadline with a fresh heartbeat"
+     )}
   end
 
   defp age(_now, nil), do: :no_stamp
