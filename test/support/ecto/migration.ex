@@ -23,3 +23,32 @@ defmodule Clementine.Test.Ecto.CreateRuns do
     )
   end
 end
+
+defmodule Clementine.Test.Ecto.AddLoopSupport do
+  @moduledoc """
+  The loop-adoption migration, exercised for real (LOOP_RFC amendment A6):
+  an existing run table gains the loop and child columns, the scope and
+  dedup indexes, and the inbox — plus a plain jobs table standing in for
+  Oban, so tests prove job rows commit atomically with their units.
+  """
+
+  use Ecto.Migration
+
+  def change do
+    alter table(:clementine_test_runs) do
+      Clementine.Loop.Ecto.Migration.loop_columns()
+      Clementine.Loop.Ecto.Migration.child_columns()
+    end
+
+    Clementine.Loop.Ecto.Migration.loop_scope_index(:clementine_test_runs)
+    Clementine.Loop.Ecto.Migration.child_dedup_index(:clementine_test_runs)
+    Clementine.Loop.Ecto.Migration.create_inbox(:clementine_test_loop_inbox)
+
+    create table(:clementine_test_jobs) do
+      add(:run_ref, :bigint)
+      add(:kind, :text, null: false)
+      add(:args, :map)
+      add(:inserted_at, :timestamptz, null: false, default: fragment("now()"))
+    end
+  end
+end
