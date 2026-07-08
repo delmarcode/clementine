@@ -106,5 +106,49 @@ defmodule Clementine.Lifecycle.Ecto.ObanTest do
         assert Oban.judge_job(loop_facts(status), job) == :healthy
       end
     end
+
+    test "loop verdicts here record through the firing-rate seam — a dead step job heals visibly" do
+      # The cross-check is the judge that sees a dead job BEFORE the claim
+      # timeout ages, so without this emission the reenqueue self-healing
+      # would never reach [:clementine, :loop, :verdict]. Unique refs pin
+      # the assertions against async siblings emitting the same event.
+      handler_id = "oban-test-#{inspect(self())}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:clementine, :loop, :verdict],
+        fn _event, _measurements, metadata, _config -> send(parent, {:verdict, metadata}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      lost = %Facts{ref: make_ref(), kind: :loop, status: :queued, epoch: 40}
+      assert Oban.judge_job(lost, job("cancelled")) == {:reenqueue, :job_cancelled}
+      ref = lost.ref
+
+      assert_receive {:verdict,
+                      %{loop_ref: ^ref, epoch: 40, verdict: :reenqueue, detail: :job_cancelled}}
+
+      crashed = %Facts{ref: make_ref(), kind: :loop, status: :running, epoch: 41}
+      assert Oban.judge_job(crashed, nil) == {:requeue, :job_missing}
+      ref = crashed.ref
+
+      assert_receive {:verdict, %{loop_ref: ^ref, verdict: :requeue, detail: :job_missing}}
+
+      # Healthy loop judgments and rollout verdicts stay off the seam —
+      # rollout rates ride the :reaped/:requeued commit events.
+      healthy = %Facts{ref: make_ref(), kind: :loop, status: :queued, epoch: 42}
+      assert Oban.judge_job(healthy, job("available")) == :healthy
+
+      rollout = %Facts{ref: make_ref(), status: :queued, epoch: 1}
+      assert {:interrupt, _reason} = Oban.judge_job(rollout, nil)
+
+      healthy_ref = healthy.ref
+      rollout_ref = rollout.ref
+      refute_receive {:verdict, %{loop_ref: ^healthy_ref}}, 50
+      refute_receive {:verdict, %{loop_ref: ^rollout_ref}}, 50
+    end
   end
 end

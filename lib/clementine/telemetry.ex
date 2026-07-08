@@ -122,10 +122,12 @@ defmodule Clementine.Telemetry do
   ### `[:clementine, :loop, :verdict]`
 
   Reconciliation judged a loop-kind run and the verdict was not
-  `:healthy` (LOOP_RFC amendment A3). Emitted by
-  `Clementine.Reconciler.judge_loop/4` at judgment time: three of the
-  four loop verdicts are host actions with no lifecycle commit to ride,
-  so the judgment is the one seam every firing crosses. Nonzero
+  `:healthy` (LOOP_RFC amendment A3). Emitted at judgment time by
+  `Clementine.Reconciler.judge_loop/4` and by the Oban cross-check's
+  loop-kind verdicts (`Clementine.Lifecycle.Ecto.Oban.judge_job/2`):
+  three of the four loop verdicts are host actions with no lifecycle
+  commit to ride, so the judgment is the one seam every firing crosses.
+  Nonzero
   `:reconcile_children` / `:wake_pending` rates on a transactional
   substrate (Postgres) are the alarm condition — the sweep is healing
   strands that atomic delivery glue should make impossible.

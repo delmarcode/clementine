@@ -14,6 +14,7 @@ defmodule Clementine.Lifecycle.Ecto.Oban do
 
   alias Clementine.InterruptReason
   alias Clementine.Lifecycle.Facts
+  alias Clementine.Reconciler
 
   @doc """
   Judges a run's facts against its Oban job (or `nil` when the job row is
@@ -48,6 +49,14 @@ defmodule Clementine.Lifecycle.Ecto.Oban do
   step `continue`'s fresh row briefly points at the legitimately
   completed previous step job.
 
+  Loop-kind verdicts here record through the same
+  `[:clementine, :loop, :verdict]` seam as the facts-judge, so the firing
+  rate counts the Oban path too — the cross-check is precisely the judge
+  that sees a dead step job *before* the claim timeout ages. Consult the
+  cross-check only for rows the facts-judge passed (the natural wiring —
+  job evidence adds nothing once the facts convicted) and each firing
+  counts exactly once.
+
   The verdict is evidence, not action: the reaper turns `{:interrupt, _}`
   into `Clementine.Lifecycle.Protocol.interrupt/4` guarded by these exact
   facts, so a racing live finish wins cleanly — and `{:requeue, _}` into
@@ -60,18 +69,26 @@ defmodule Clementine.Lifecycle.Ecto.Oban do
           | {:reenqueue, InterruptReason.code()}
   def judge_job(%Facts{status: :waiting}, _job), do: :healthy
 
-  def judge_job(%Facts{kind: :loop, status: :running}, nil), do: {:requeue, :job_missing}
-
-  def judge_job(%Facts{kind: :loop, status: :running}, %{state: state})
-      when state in ["cancelled", "discarded", "completed"] do
-    {:requeue, job_code(state)}
+  # Loop verdicts record through the same telemetry seam as the
+  # facts-judge: a dead step job is judged and re-inserted long before
+  # claim_timeout lets `Reconciler.judge/3` see it, so without the
+  # emission here those self-healings would never reach the firing rate.
+  def judge_job(%Facts{kind: :loop, status: :running} = facts, nil) do
+    Reconciler.record_loop_verdict(facts, {:requeue, :job_missing})
   end
 
-  def judge_job(%Facts{kind: :loop, status: :queued}, nil), do: {:reenqueue, :job_missing}
+  def judge_job(%Facts{kind: :loop, status: :running} = facts, %{state: state})
+      when state in ["cancelled", "discarded", "completed"] do
+    Reconciler.record_loop_verdict(facts, {:requeue, job_code(state)})
+  end
 
-  def judge_job(%Facts{kind: :loop, status: :queued}, %{state: state})
+  def judge_job(%Facts{kind: :loop, status: :queued} = facts, nil) do
+    Reconciler.record_loop_verdict(facts, {:reenqueue, :job_missing})
+  end
+
+  def judge_job(%Facts{kind: :loop, status: :queued} = facts, %{state: state})
       when state in ["cancelled", "discarded"] do
-    {:reenqueue, job_code(state)}
+    Reconciler.record_loop_verdict(facts, {:reenqueue, job_code(state)})
   end
 
   def judge_job(%Facts{status: :running}, nil) do

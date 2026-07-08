@@ -80,9 +80,11 @@ defmodule Clementine.Reconciler do
   Every non-`:healthy` loop verdict emits `[:clementine, :loop, :verdict]`
   at judgment time — three of the four loop verdicts commit nothing
   through the lifecycle, so the judgment is the one seam every firing
-  crosses. Nonzero `:reconcile_children`/`:wake_pending` rates on a
-  transactional substrate (Postgres) are the alarm condition: the sweep is
-  healing strands that atomic delivery glue should make impossible.
+  crosses. The Oban cross-check's loop verdicts record through the same
+  seam (`Clementine.Lifecycle.Ecto.Oban.judge_job/2`). Nonzero
+  `:reconcile_children`/`:wake_pending` rates on a transactional
+  substrate (Postgres) are the alarm condition: the sweep is healing
+  strands that atomic delivery glue should make impossible.
 
   `now` must come from the storage clock — the same source that stamped
   the facts — or be compared in the database; a node-local
@@ -399,9 +401,26 @@ defmodule Clementine.Reconciler do
 
   def judge_loop(%Facts{kind: :loop} = facts, evidence, %DateTime{} = now, %Policy{} = policy)
       when is_struct(evidence, LoopEvidence) or is_nil(evidence) do
-    verdict = loop_verdict(facts, evidence || %LoopEvidence{}, now, policy)
-    record_loop_verdict(facts, verdict)
-    verdict
+    record_loop_verdict(facts, loop_verdict(facts, evidence || %LoopEvidence{}, now, policy))
+  end
+
+  @doc false
+  # The one seam every loop-verdict firing crosses, whichever judge
+  # produced it — `judge_loop/4` here, or the Oban cross-check's loop
+  # clauses (`Clementine.Lifecycle.Ecto.Oban.judge_job/2`), whose
+  # reenqueues would otherwise heal invisibly: a dead step job is judged
+  # and re-inserted long before claim_timeout lets the facts-judge see it.
+  @spec record_loop_verdict(Facts.t(), verdict()) :: verdict()
+  def record_loop_verdict(%Facts{}, :healthy), do: :healthy
+
+  def record_loop_verdict(%Facts{} = facts, {verdict, detail} = full_verdict) do
+    :telemetry.execute(
+      [:clementine, :loop, :verdict],
+      %{},
+      %{loop_ref: facts.ref, epoch: facts.epoch, verdict: verdict, detail: detail}
+    )
+
+    full_verdict
   end
 
   # A3a: the same stale evidence that interrupts (or policy-requeues) a
@@ -471,16 +490,6 @@ defmodule Clementine.Reconciler do
 
   defp stale_pending?(%LoopEvidence{oldest_pending_at: oldest}, now, policy) do
     age(now, oldest) > policy.wake_pending_after
-  end
-
-  defp record_loop_verdict(_facts, :healthy), do: :ok
-
-  defp record_loop_verdict(%Facts{} = facts, {verdict, detail}) do
-    :telemetry.execute(
-      [:clementine, :loop, :verdict],
-      %{},
-      %{loop_ref: facts.ref, epoch: facts.epoch, verdict: verdict, detail: detail}
-    )
   end
 
   # Stale evidence reads the same for interrupt and requeue; policy, the
