@@ -45,9 +45,18 @@ defmodule Clementine.Loop.Step do
   alias Clementine.{Error, Result, ResumeToken, Suspension, Usage}
 
   # Both defaults are RFC non-final policy knobs (LOOP_RFC §Non-Final);
-  # hosts override per loop via loop_policy.
+  # hosts override per loop via loop_policy, which the step runner
+  # interprets — the public accessors below are its one source of truth.
   @default_batch_cap 20
   @default_dead_letter_after 3
+
+  @doc "Default max inputs folded per step, absent a `loop_policy` override."
+  @spec default_batch_cap() :: pos_integer()
+  def default_batch_cap, do: @default_batch_cap
+
+  @doc "Default head attempts at which poison dead-letters, absent a `loop_policy` override."
+  @spec default_dead_letter_after() :: pos_integer()
+  def default_dead_letter_after, do: @default_dead_letter_after
 
   defmodule Plan do
     @moduledoc """
@@ -687,12 +696,16 @@ defmodule Clementine.Loop.Step do
     Map.merge(set, %{envelope: envelope, state_version: state_version, usage: envelope.usage})
   end
 
+  # The flag survives crashes, parks, and continues; only the finish
+  # clears it (LOOP_RFC §Cancellation And Halt) — cascade completion is
+  # the flag's fulfillment, and a terminal row claims no pending intent.
   defp finish_set(envelope, state_version, result) do
     %{
       status: Result.status(result),
       envelope: envelope,
       state_version: state_version,
       suspension: nil,
+      cancel: nil,
       finished_at: :now,
       usage: envelope.usage
     }

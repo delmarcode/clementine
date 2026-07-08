@@ -42,9 +42,10 @@ if Code.ensure_loaded?(Ecto.Query) do
     cancels, sends, the park re-check, the filled envelope write, the
     terminal projection, and the terminal sweep. A park re-verifies
     pending-emptiness *inside the unit* — after every in-unit append, so
-    its own writes count — and downgrades to continue (status `queued` +
-    `enqueue_step/2`) when inputs exist: the append's run-row lock
-    serializes the racing cases (matrix rows L3/L4).
+    its own writes count — and, for the `:any` scope, that no cancel flag
+    is set, downgrading to continue (status `queued` + `enqueue_step/2`)
+    when either holds: the append's and `cancel/4`'s run-row lock
+    serializes the racing cases (matrix rows L3/L4, L8).
 
     `append/4` is one transaction: `SELECT ... FOR UPDATE` on the loop's
     run row — the serialization point against a concurrent park's CAS —
@@ -210,8 +211,8 @@ if Code.ensure_loaded?(Ecto.Query) do
         end
 
         @impl Clementine.Loop.Host
-        def pending(loop_ref, limit, ctx) do
-          Clementine.Loop.Ecto.pending(__MODULE__, loop_ref, limit, ctx)
+        def pending(loop_ref, limit, scope, ctx) do
+          Clementine.Loop.Ecto.pending(__MODULE__, loop_ref, limit, scope, ctx)
         end
 
         @impl Clementine.Loop.Host
@@ -222,6 +223,16 @@ if Code.ensure_loaded?(Ecto.Query) do
         @impl Clementine.Loop.Host
         def create(spec, ctx) do
           Clementine.Loop.Ecto.create(__MODULE__, spec, ctx)
+        end
+
+        @impl Clementine.Loop.Host
+        def load(loop_ref, ctx) do
+          Clementine.Loop.Ecto.load(__MODULE__, loop_ref, ctx)
+        end
+
+        @impl Clementine.Loop.Host
+        def cancel(loop_ref, reason, ctx) do
+          Clementine.Loop.Ecto.cancel(__MODULE__, loop_ref, reason, ctx)
         end
 
         @impl Clementine.Loop.Ecto
@@ -340,7 +351,7 @@ if Code.ensure_loaded?(Ecto.Query) do
            :ok <- cancel_children(config, commit, children, ctx),
            :ok <- execute_sends(module, config, row, commit, ctx),
            :ok <- write_envelope(config, commit, children, timers),
-           :ok <- settle_transition(module, config, commit, ctx),
+           :ok <- settle_transition(module, config, row, commit, ctx),
            :ok <- project_finish(config, commit, ctx),
            :ok <- terminal_sweep(config, commit) do
         {:ok, final_facts(config, commit.loop_ref)}
@@ -599,12 +610,14 @@ if Code.ensure_loaded?(Ecto.Query) do
     # sends-to-self, cascade completions), so its own writes count. A
     # downgrade that matches zero rows lost to an in-unit wake that
     # already queued the row and enqueued the job — nothing left to do.
-    defp settle_transition(module, _config, %StepCommit{op: :continue} = commit, ctx) do
+    defp settle_transition(module, _config, _row, %StepCommit{op: :continue} = commit, ctx) do
       :ok = module.enqueue_step(commit.loop_ref, ctx)
     end
 
-    defp settle_transition(module, config, %StepCommit{op: :park} = commit, ctx) do
-      if pending_exists?(config, commit.loop_ref, commit.park_recheck || :any) do
+    defp settle_transition(module, config, row, %StepCommit{op: :park} = commit, ctx) do
+      scope = commit.park_recheck || :any
+
+      if pending_exists?(config, commit.loop_ref, scope) or cancel_pending?(config, row, scope) do
         case downgrade_to_continue(config, commit.loop_ref) do
           1 -> :ok = module.enqueue_step(commit.loop_ref, ctx)
           0 -> :ok
@@ -614,7 +627,21 @@ if Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp settle_transition(_module, _config, %StepCommit{op: :finish}, _ctx), do: :ok
+    defp settle_transition(_module, _config, _row, %StepCommit{op: :finish}, _ctx), do: :ok
+
+    # The `:any` re-check covers the cancel flag: a flag that landed
+    # mid-step saw `running` and could not wake, so parking over it would
+    # strand the cancellation — flag-first the CAS row carries it here and
+    # the park downgrades; park-first the flag write's own CAS fails stale
+    # and `cancel/4` re-routes to the wake. Cascade parks (`:completions`)
+    # are exempt: mid-cascade the flag is expected set — the cascade is
+    # its handler — and a flag downgrade would spin the loop hot until its
+    # children finished.
+    defp cancel_pending?(config, row, :any) do
+      Map.fetch!(row, config.fields[:cancel]) != nil
+    end
+
+    defp cancel_pending?(_config, _row, :completions), do: false
 
     defp pending_exists?(config, loop_ref, scope) do
       query =
@@ -768,20 +795,27 @@ if Code.ensure_loaded?(Ecto.Query) do
     ## pending / bump_attempts
 
     @doc false
-    def pending(module, loop_ref, limit, _ctx) when is_integer(limit) and limit > 0 do
+    def pending(module, loop_ref, limit, scope, _ctx)
+        when is_integer(limit) and limit > 0 and scope in [:any, :completions] do
       config = module.__clementine_loop_config__()
       vocab = loop_vocabulary(config, loop_ref)
 
-      rows =
-        config.repo.all(
-          from(i in config.inbox,
-            where: i.loop_ref == type(^loop_ref, ^ref_type(config)),
-            where: is_nil(i.dead_at),
-            order_by: [asc: i.id],
-            limit: ^limit,
-            select: %{id: i.id, kind: i.kind, payload: i.payload, attempts: i.attempts}
-          )
+      query =
+        from(i in config.inbox,
+          where: i.loop_ref == type(^loop_ref, ^ref_type(config)),
+          where: is_nil(i.dead_at),
+          order_by: [asc: i.id],
+          limit: ^limit,
+          select: %{id: i.id, kind: i.kind, payload: i.payload, attempts: i.attempts}
         )
+
+      query =
+        case scope do
+          :completions -> where(query, [i], i.kind == "completed")
+          :any -> query
+        end
+
+      rows = config.repo.all(query)
 
       Enum.map(rows, fn row ->
         case Codec.decode_input(row.kind, row.payload, vocabulary: vocab) do
@@ -887,6 +921,88 @@ if Code.ensure_loaded?(Ecto.Query) do
       |> case do
         {:ok, {:created, facts}} -> {:ok, facts}
         {:ok, {:existing, facts}} -> {:ok, :already_exists, facts}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    ## load — the step runner's read
+
+    @doc false
+    def load(module, loop_ref, _ctx) do
+      config = module.__clementine_loop_config__()
+
+      case config.repo.get(config.schema, loop_ref) do
+        nil ->
+          {:error, :not_found}
+
+        row ->
+          if loop_row?(config, row) do
+            {:ok,
+             %{
+               facts: LifecycleCodec.to_facts(row, config.fields),
+               module: Map.get(row, config.fields[:loop_module]),
+               args: Map.get(row, config.fields[:loop_args]) || %{},
+               policy: Map.get(row, config.fields[:loop_policy]) || %{},
+               envelope: Map.get(row, config.fields[:envelope])
+             }}
+          else
+            {:error, :rollout_run}
+          end
+      end
+    end
+
+    ## cancel — the loop-owned flag + wake (LOOP_RFC §Cancellation And Halt)
+
+    # One transaction on the same lock as append/4: flag, wake, and
+    # step-job enqueue commit together, serialized against a concurrent
+    # step's park. Against a `running` row only the flag lands — the
+    # park's `:any` re-check (or the next claim) is the wake's other
+    # half. The flag write is idempotent and first-cause-wins; a
+    # re-cancel of a parked loop still wakes it. No telemetry and no
+    # notification: flag writes are the protocol's deliberate silent
+    # pair, and wakes are notification-silent by design.
+    @doc false
+    def cancel(module, loop_ref, reason, ctx) do
+      config = module.__clementine_loop_config__()
+
+      config.repo.transaction(fn ->
+        case lock_run(config, loop_ref) do
+          nil ->
+            config.repo.rollback(:not_found)
+
+          row ->
+            unless loop_row?(config, row), do: config.repo.rollback(:rollout_run)
+
+            status = row |> Map.fetch!(config.fields[:status]) |> LifecycleCodec.decode_status()
+
+            if Facts.terminal?(status), do: config.repo.rollback(:already_terminal)
+
+            if Map.fetch!(row, config.fields[:cancel]) == nil do
+              flag =
+                LifecycleCodec.encode_cancel(%{
+                  reason: reason,
+                  requested_at: storage_now(config.repo)
+                })
+
+              {1, _} =
+                config.repo.update_all(
+                  from(r in config.schema,
+                    where: field(r, ^config.fields[:ref]) == ^loop_ref
+                  ),
+                  set: [{config.fields[:cancel], flag}]
+                )
+            end
+
+            if status == :waiting do
+              1 = downgrade_to_continue(config, loop_ref)
+              :ok = module.enqueue_step(loop_ref, ctx)
+            end
+
+            :flagged
+        end
+      end)
+      |> case do
+        {:ok, :flagged} -> {:ok, :flagged}
         {:error, reason} -> {:error, reason}
       end
     end

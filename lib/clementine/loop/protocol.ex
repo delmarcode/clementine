@@ -4,8 +4,8 @@ defmodule Clementine.Loop.Protocol do
   the `Clementine.Loop.Host` seam — the loop layer's analog of
   `Clementine.Lifecycle.Protocol`.
 
-  V1 carries creation; the send verb and cancellation land with their own
-  epics on the same seam.
+  V1 carries creation and cancellation; the send verb lands with its own
+  epic on the same seam.
   """
 
   alias Clementine.Lifecycle.Facts
@@ -72,5 +72,43 @@ defmodule Clementine.Loop.Protocol do
               "loop creation requires a :scope string — the idempotency key create " <>
                 "is insert-or-get on; got: #{inspect(Map.get(spec, :scope))}"
     end
+  end
+
+  @doc """
+  Requests cancellation of a loop — the loop-owned verb that
+  `Lifecycle.Protocol.request_cancel/4` refuses loop-kind runs in favor
+  of (LOOP_RFC §Cancellation And Halt, amendment A2). Sets the
+  kind-aware cancel flag and wakes a parked loop, so the next step
+  enters cascade mode — ahead of every queued input by design (a "stop"
+  must not wait behind fifty messages; the flag reads at claim, not
+  through the FIFO).
+
+  `{:ok, :flagged}` is a delivery promise, not an outcome promise. The
+  step machinery — never `handle/2` — runs the cascade: it
+  `request_cancel`s live children as commit cargo, absorbs their
+  completions between parks, and finishes last with `Result.Cancelled`
+  and the terminal inbox sweep, children's terminals preceding the
+  loop's at every level (matrix row L8). Two races resolve against the
+  flag, both deliberately: a halt already mid-cascade keeps its own
+  result (first cause wins), and a finish already committing wins
+  outright — the completed work stands, exactly the shipped
+  `request_cancel` posture. The flag survives crashes and parks; only
+  the finish clears it.
+
+  Cancelling a loop that has never stepped short-circuits its queued
+  inputs: the first step enters the cascade with no children and
+  finishes immediately, sweeping the inbox to dead-letters — nothing
+  silently lost, nothing handled after the operator said stop.
+
+  Options: `:ctx` — the opaque host context (default `nil`).
+  """
+  @spec cancel(module(), Clementine.Loop.Host.loop_ref(), term(), keyword()) ::
+          {:ok, :flagged}
+          | {:error, :already_terminal}
+          | {:error, :rollout_run}
+          | {:error, :not_found}
+          | {:error, term()}
+  def cancel(host, loop_ref, reason, opts \\ []) do
+    host.cancel(loop_ref, reason, Keyword.get(opts, :ctx))
   end
 end
