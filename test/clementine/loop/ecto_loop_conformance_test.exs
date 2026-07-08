@@ -10,6 +10,7 @@ defmodule Clementine.Loop.EctoLoopConformanceTest do
     host: Clementine.Test.Ecto.LoopHost,
     lifecycle: Clementine.Test.Ecto.Lifecycle,
     create_loop: &Clementine.Test.Ecto.Factory.create_loop/1,
+    step_jobs: &Clementine.Test.Ecto.Factory.step_jobs/1,
     nonexistent_ref: -1,
     moduletag: :postgres
 

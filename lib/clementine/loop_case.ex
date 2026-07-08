@@ -21,6 +21,7 @@ defmodule Clementine.LoopCase do
           host: Meli.LoopHost,
           lifecycle: Meli.ClementineLifecycle,
           create_loop: &Meli.Factory.create_loop/1,
+          step_jobs: &Meli.Factory.step_job_count/1,
           nonexistent_ref: -1,
           moduletag: :postgres
 
@@ -51,6 +52,16 @@ defmodule Clementine.LoopCase do
     * `:ctx` (optional, default `nil`) — the host context threaded through
       every seam call. A literal term, or a zero-arity function evaluated
       per test.
+    * `:step_jobs` (optional) — an arity-1 function receiving a loop
+      reference and returning how many step jobs the host has recorded
+      for it (for the Ecto pairing, a count over the job table; a
+      monotonic ledger is fine — the battery asserts deltas). Enables the
+      enqueue-observation battery: the step-job half of the atomic units
+      (create's first job, append's wake, the park downgrade, cancel's
+      wake) is host storage the seam cannot read, so without this hook
+      those enqueues go unobserved — a host that forgets them still
+      passes, stranding loops until the reaper's `:reenqueue` verdict
+      heals each one at claim-timeout latency.
     * `:nonexistent_ref` (optional) — a reference guaranteed to match no
       run (for integer keys, `-1`). Enables the `:not_found` tests; not
       generated when omitted.
@@ -148,12 +159,16 @@ defmodule Clementine.LoopCase do
       and `:wake_pending` wakes a park stranded over pending inputs, the
       backstop for substrates that cannot honor sentence 1's re-check
       (L4's degraded half).
+    * With `:step_jobs`, the enqueue half of the atomic units: create's
+      first step job, the append wake's job (exactly one under a pending
+      wake), the park downgrade's, and cancel's.
   """
 
   defmacro __using__(opts) do
     host = Keyword.fetch!(opts, :host)
     lifecycle = Keyword.fetch!(opts, :lifecycle)
     create_loop = Keyword.fetch!(opts, :create_loop)
+    step_jobs = Keyword.get(opts, :step_jobs)
     nonexistent_ref = Keyword.fetch(opts, :nonexistent_ref)
     ctx = Keyword.get(opts, :ctx)
     async = Keyword.get(opts, :async, false)
@@ -162,6 +177,7 @@ defmodule Clementine.LoopCase do
     [
       prelude(host, lifecycle, create_loop, ctx, async, moduletags),
       battery(),
+      step_jobs_battery(step_jobs),
       not_found_battery(nonexistent_ref)
     ]
     |> Enum.reject(&is_nil/1)
@@ -321,6 +337,18 @@ defmodule Clementine.LoopCase do
   # per test; the generated `__loop_conformance__/0` resolves it here.
   def resolve_ctx(fun) when is_function(fun, 0), do: fun.()
   def resolve_ctx(term), do: term
+
+  defp step_jobs_battery(nil), do: nil
+
+  defp step_jobs_battery(step_jobs) do
+    quote do
+      describe "loop conformance: step-job enqueues" do
+        test "create, the append wake, the park downgrade, and cancel each enqueue the step job inside their units" do
+          Battery.step_job_enqueues(__loop_conformance__(), unquote(step_jobs))
+        end
+      end
+    end
+  end
 
   defp not_found_battery(:error), do: nil
 

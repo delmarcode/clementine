@@ -249,12 +249,15 @@ defmodule Clementine.LoopCase.Battery do
     Task.await_many(appenders, 30_000)
     quiesce!(h, ref)
 
-    # The invariant every interleaving must land on: parked means empty.
+    # The invariant every interleaving must land on: parked means empty —
+    # and every append delivered exactly once: the logged ids match the
+    # sent set (a bare count would tolerate one lost and one doubled).
     assert fetch!(h, ref).status == :waiting
     assert pending!(h, ref) == []
 
-    assert Enum.count(log!(h, ref), &String.starts_with?(&1, "message:")) ==
-             writers * per_writer
+    delivered = for "message:" <> id <- log!(h, ref), do: id
+    sent = for t <- 1..writers, i <- 1..per_writer, do: "#{t}:#{i}"
+    assert Enum.sort(delivered) == Enum.sort(sent)
   end
 
   ## wrong-state calls
@@ -749,6 +752,48 @@ defmodule Clementine.LoopCase.Battery do
     quiesce!(h, ref)
     assert Enum.count(log!(h, ref), &(&1 == "completed:{:reply, 2}")) == 1
     assert envelope!(h, ref).children == %{}
+  end
+
+  def step_job_enqueues(h, step_jobs) do
+    # Creation enqueues the first step job inside its unit; insert-or-get
+    # does not enqueue a second — a host that lands the queued row but
+    # forgets the job would strand every new loop until the reaper's
+    # :reenqueue verdict noticed.
+    token = "jobs-#{System.unique_integer([:positive])}"
+    ref = create!(h, scope_token: token)
+    assert step_jobs.(ref) == 1
+    assert create!(h, scope_token: token) == ref
+    assert step_jobs.(ref) == 1
+
+    assert {:parked, _} = step!(h, ref)
+    base = step_jobs.(ref)
+
+    # Atomicity sentence 2: the append carries the wake AND the step-job
+    # enqueue in one unit...
+    append!(h, ref, message(1))
+    assert step_jobs.(ref) == base + 1
+
+    # ...and exactly one: an append against the already-queued loop rides
+    # the pending wake instead of enqueueing again.
+    append!(h, ref, message(2))
+    assert step_jobs.(ref) == base + 1
+
+    # A park the in-unit re-check downgrades enqueues the continue's job —
+    # the downgrade would otherwise leave a queued row nobody claims.
+    lease = claim!(h, ref)
+    commit = commit!(h, ref, lease)
+    assert commit.op == :park
+    append!(h, ref, message(3))
+    before_downgrade = step_jobs.(ref)
+    assert {:ok, %Facts{status: :queued}} = h.host.apply_step(commit, h.ctx)
+    assert step_jobs.(ref) == before_downgrade + 1
+
+    assert {:parked, _} = step!(h, ref)
+
+    # Cancelling a parked loop wakes it with its job in the same unit.
+    before_cancel = step_jobs.(ref)
+    assert {:ok, :flagged} = LoopProtocol.cancel(h.host, ref, :stop, ctx: h.ctx)
+    assert step_jobs.(ref) == before_cancel + 1
   end
 
   def wake_pending_backstop(h) do

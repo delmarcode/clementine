@@ -67,6 +67,17 @@ defmodule Clementine.Test.Ecto.Factory do
     end
   end
 
+  @doc "The LoopCase step-job observation hook: jobs are ledger rows, so a plain count."
+  @spec step_jobs(integer()) :: non_neg_integer()
+  def step_jobs(loop_ref) do
+    import Ecto.Query, only: [from: 2]
+
+    TestRepo.aggregate(
+      from(j in Clementine.Test.Ecto.Job, where: j.run_ref == ^loop_ref and j.kind == "step"),
+      :count
+    )
+  end
+
   @doc "The storage clock — inside a sandbox checkout, the transaction timestamp."
   @spec db_now!() :: DateTime.t()
   def db_now! do
