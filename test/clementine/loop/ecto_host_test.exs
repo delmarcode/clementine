@@ -16,14 +16,14 @@ defmodule Clementine.Loop.EctoHostTest do
   import Clementine.EctoCase, only: [insert_run!: 1]
   import Ecto.Query
 
-  alias Clementine.Lifecycle.Protocol
+  alias Clementine.Lifecycle.{Protocol, Transition}
   alias Clementine.Loop.Ecto.Codec, as: InboxCodec
   alias Clementine.Loop.Protocol, as: LoopProtocol
-  alias Clementine.Loop.{Codec, Envelope, Input, Step, StoredInput}
+  alias Clementine.Loop.{Codec, Envelope, Input, Step, StepCommit, StoredInput}
   alias Clementine.Test.Ecto.{Job, Lifecycle, LoopHost, Run}
   alias Clementine.Test.ScriptedLoop
   alias Clementine.TestRepo
-  alias Clementine.{Error, Result, Usage}
+  alias Clementine.{Error, Result, ResumeToken, Suspension, Usage}
 
   @inbox "clementine_test_loop_inbox"
 
@@ -180,6 +180,24 @@ defmodule Clementine.Loop.EctoHostTest do
       assert_raise ArgumentError, ~r/vocabulary/, fn ->
         LoopHost.append(loop.ref, Input.message(%{"oops" => :undeclared_atom}), nil, nil)
       end
+    end
+
+    test "refuses rollout-kind rows (A2's mirror): a parked approval survives a miswired ref" do
+      rollout = insert_run!(status: "waiting", suspension: %{"marker" => true})
+
+      assert {:error, :rollout_run} = LoopHost.append(rollout.id, message(1), nil, nil)
+
+      row = TestRepo.get!(Run, rollout.id)
+      assert row.status == "waiting"
+      assert row.suspension == %{"marker" => true}
+      assert inbox_rows(rollout.id) == []
+      assert step_jobs(rollout.id) == []
+
+      # The wake helpers carry the same belt: no wake path may ever clear
+      # a parked rollout's suspension.
+      assert :ok = Clementine.Loop.Ecto.wake(LoopHost, rollout.id, nil)
+      assert TestRepo.get!(Run, rollout.id).status == "waiting"
+      assert step_jobs(rollout.id) == []
     end
   end
 
@@ -386,7 +404,13 @@ defmodule Clementine.Loop.EctoHostTest do
       assert facts.status == :completed
       assert %DateTime{} = facts.finished_at
 
-      assert_received {:projected, %Result.Completed{output: "done"}, _row}
+      # The projection sees the freshly updated row — terminal status and
+      # the final envelope, not the CAS row whose envelope write follows
+      # the cargo fill.
+      assert_received {:projected, %Result.Completed{output: "done"}, projected_row}
+      assert projected_row.status == "completed"
+      assert projected_row.envelope != nil
+      assert projected_row.envelope == TestRepo.get!(Run, loop.ref).envelope
 
       # The halt's input consumed; everything behind it swept, retained,
       # and reasoned — nothing silently kept.
@@ -406,16 +430,21 @@ defmodule Clementine.Loop.EctoHostTest do
       jobs = length(step_jobs(loop.ref))
       commit = build_commit!(loop.ref, plan: [cancel: :user_stop])
       assert commit.cancel_children == [child.tag_key]
-      assert {:ok, facts} = LoopHost.apply_step(commit, nil)
+      assert {:ok, facts} = LoopHost.apply_step(commit, self())
 
       # The queued child direct-terminalized inside the unit, its terminal
-      # projection appended the completion, and the in-unit wake (or the
-      # park re-check) turned the cascade park into a continue.
+      # projection appended the completion, and the park re-check turned
+      # the cascade park into a continue.
       assert TestRepo.get!(Run, child.id).status == "cancelled"
       assert [completion] = Enum.filter(inbox_rows(loop.ref), &(&1.kind == "completed"))
       assert completion.dedup_key == InboxCodec.completion_dedup_key(child.tag_key, child.id)
       assert facts.status == :queued
       assert length(step_jobs(loop.ref)) == jobs + 1
+
+      # The child cancel's post-commit hook deferred to the unit and fired
+      # once it committed.
+      child_id = child.id
+      assert_received {:transition, %{status: :cancelled}, %Transition{run_ref: ^child_id}}
 
       # The next step folds the completion and finishes last, cancelled.
       final = run_step!(loop.ref, ctx: self())
@@ -447,6 +476,48 @@ defmodule Clementine.Loop.EctoHostTest do
 
       assert [%StoredInput{input: %Input{kind: :message, payload: %{"hello" => true}}}] =
                pending!(target.ref)
+    end
+
+    test "cascade hooks defer to the unit: a rolled-back commit leaks no child-cancel notification" do
+      loop = parked_loop!()
+      spawn_child!(loop.ref, {:reply, 1})
+      [child] = TestRepo.all(from(r in Run, where: r.loop_ref == ^loop.ref))
+      :ok = Clementine.Loop.Ecto.wake(LoopHost, loop.ref, nil)
+      lease = claim!(loop.ref)
+      envelope = stored_envelope(loop.ref)
+
+      # A cascade-shaped commit whose send cargo fails after the child
+      # cancel: hand-built, because a real cascade never runs handle/2 and
+      # so never carries sends.
+      token = %ResumeToken{run_ref: loop.ref, epoch: lease.epoch, reason_type: :external}
+
+      commit = %StepCommit{
+        loop_ref: loop.ref,
+        op: :park,
+        expect: %{status: :running, epoch: lease.epoch},
+        set: %{
+          status: :waiting,
+          suspension: %Suspension{reason: {:external, :loop}, checkpoint: nil, token: token},
+          executor_id: nil,
+          deadline: nil,
+          heartbeat_at: nil,
+          queued_at: :now,
+          envelope: %{envelope | pending_halt: %{result: Result.cancelled(:user_stop)}},
+          state_version: 1,
+          usage: envelope.usage
+        },
+        park_recheck: :completions,
+        cancel_children: Map.keys(envelope.children),
+        sends: [%{target: -1, payload: %{}, dedup_key: "send:test:leak:0"}]
+      }
+
+      assert {:error, {:send_target_not_found, -1}} = LoopHost.apply_step(commit, self())
+
+      # The child's cancel rolled back with the unit — and no observer was
+      # told of the transition that never happened.
+      assert TestRepo.get!(Run, child.id).status == "queued"
+      child_id = child.id
+      refute_received {:transition, %{status: :cancelled}, %Transition{run_ref: ^child_id}}
     end
 
     test "a send to a terminal target dead-letters as evidence; a missing target fails the whole commit" do

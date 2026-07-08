@@ -177,6 +177,12 @@ if Code.ensure_loaded?(Ecto.Query) do
     reach observers only through here — no executor was alive to announce
     them) and where terminal notifications close RunView folds. Failures
     are logged and swallowed. The default implementation is a no-op.
+
+    Post-commit means the *outermost* commit: a transition applied inside
+    an enclosing atomic unit (the loop adapter's `apply_step/2` cancelling
+    children as cargo) defers this hook and the cancel push until that
+    unit commits, and drops them if it rolls back — no observer hears of
+    a transition that never happened.
     """
     @callback after_transition(Facts.t(), Transition.t(), ctx :: term()) :: any()
 
@@ -282,7 +288,9 @@ if Code.ensure_loaded?(Ecto.Query) do
 
       case cas_update(config, transition, nil) do
         {:ok, row} ->
-          notify(module, Codec.to_facts(row, fields), transition, ctx)
+          facts = Codec.to_facts(row, fields)
+          emit(fn -> notify(module, facts, transition, ctx) end)
+          {:ok, facts}
 
         {:error, :stale} ->
           {:error, :stale}
@@ -308,11 +316,57 @@ if Code.ensure_loaded?(Ecto.Query) do
       end)
       |> case do
         {:ok, row} ->
-          push_cancel(config, transition)
-          notify(module, Codec.to_facts(row, fields), transition, ctx)
+          facts = Codec.to_facts(row, fields)
+
+          emit(fn ->
+            push_cancel(config, transition)
+            notify(module, facts, transition, ctx)
+          end)
+
+          {:ok, facts}
 
         {:error, reason} ->
           {:error, reason}
+      end
+    end
+
+    # Post-commit emissions defer while an enclosing atomic unit collects
+    # them (see after_transition/3's doc). The stash is process-local
+    # because the enclosing transaction is: Ecto transactions live on the
+    # calling process's connection.
+    @deferred_emissions :clementine_lifecycle_deferred_emissions
+
+    @doc false
+    def begin_deferred_emissions do
+      Process.put(@deferred_emissions, [])
+      :ok
+    end
+
+    @doc false
+    def flush_deferred_emissions do
+      case Process.delete(@deferred_emissions) do
+        nil -> :ok
+        stashed -> stashed |> Enum.reverse() |> Enum.each(& &1.())
+      end
+
+      :ok
+    end
+
+    @doc false
+    def drop_deferred_emissions do
+      Process.delete(@deferred_emissions)
+      :ok
+    end
+
+    defp emit(fun) do
+      case Process.get(@deferred_emissions) do
+        nil ->
+          fun.()
+          :ok
+
+        stashed ->
+          Process.put(@deferred_emissions, [fun | stashed])
+          :ok
       end
     end
 

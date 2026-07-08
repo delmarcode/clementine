@@ -75,12 +75,18 @@ defmodule Clementine.Loop.Host do
   `dedup_key` is nullable; when present it is unique per loop for live and
   dead rows alike (the provider message id for webhooks, machinery-derived
   keys for completions, elapses, and sends).
+
+  Refuses rollout-kind rows with `{:error, :rollout_run}` — amendment A2's
+  mirror: run kinds discriminate the verbs that may touch them, and a
+  miswired ref must not grow a mailbox or have its suspension cleared by
+  a wake.
   """
   @callback append(loop_ref(), Input.t(), dedup_key :: String.t() | nil, ctx()) ::
               {:ok, :appended}
               | {:ok, :duplicate}
               | {:ok, :dead_lettered}
               | {:error, :not_found}
+              | {:error, :rollout_run}
               | {:error, term()}
 
   @doc """

@@ -68,9 +68,10 @@ if Code.ensure_loaded?(Ecto.Query) do
     decode under the *receiver's* at its own drain — a sender's atom the
     receiver never declared surfaces as that input's `decode_error`,
     walking the receiver's poison path as observable evidence rather than
-    failing anyone's fetch. A send whose target row does not exist fails
-    the whole commit: the step retries and the causing input walks the
-    sender's poison path — informed, never silently dropped.
+    failing anyone's fetch. A send whose target row does not exist — or is
+    not a loop — fails the whole commit: the step retries and the causing
+    input walks the sender's poison path — informed, never silently
+    dropped.
 
     ## Child-terminal projection glue
 
@@ -89,6 +90,13 @@ if Code.ensure_loaded?(Ecto.Query) do
     completion); Postgres resolves the deadlock by aborting one side, and
     both sides are safe to retry by construction — the step by
     replayability, the terminal by its bounded retry posture.
+
+    Child cancels execute as cargo inside `apply_step/2`'s unit, so their
+    post-commit emissions (`after_transition/3`, the cancel push) defer to
+    the unit itself: fired after it commits, dropped if it rolls back — no
+    observer hears of a transition that never happened. The wake such a
+    hook would have delivered is not needed for correctness; the park
+    re-check sees the in-unit completion rows and downgrades.
     """
 
     import Ecto.Query
@@ -254,12 +262,26 @@ if Code.ensure_loaded?(Ecto.Query) do
     def apply_step(module, %StepCommit{} = commit, ctx) do
       config = module.__clementine_loop_config__()
 
-      config.repo.transaction(fn ->
-        case do_apply_step(module, config, commit, ctx) do
-          {:ok, facts} -> facts
-          {:error, reason} -> config.repo.rollback(reason)
-        end
-      end)
+      # Child cancels are cargo: their lifecycle transitions commit with
+      # this unit, so their post-commit emissions (after_transition, the
+      # cancel push) must too — fired only if the unit commits, dropped if
+      # it rolls back.
+      Clementine.Lifecycle.Ecto.begin_deferred_emissions()
+
+      try do
+        config.repo.transaction(fn ->
+          case do_apply_step(module, config, commit, ctx) do
+            {:ok, facts} -> facts
+            {:error, reason} -> config.repo.rollback(reason)
+          end
+        end)
+        |> tap(fn
+          {:ok, _facts} -> Clementine.Lifecycle.Ecto.flush_deferred_emissions()
+          {:error, _reason} -> :ok
+        end)
+      after
+        Clementine.Lifecycle.Ecto.drop_deferred_emissions()
+      end
     end
 
     defp do_apply_step(module, config, %StepCommit{} = commit, ctx) do
@@ -274,7 +296,7 @@ if Code.ensure_loaded?(Ecto.Query) do
            :ok <- execute_sends(module, config, row, commit, ctx),
            :ok <- write_envelope(config, commit, children, timers),
            :ok <- settle_transition(module, config, commit, ctx),
-           :ok <- project_finish(config, commit, row, ctx),
+           :ok <- project_finish(config, commit, ctx),
            :ok <- terminal_sweep(config, commit) do
         {:ok, final_facts(config, commit.loop_ref)}
       end
@@ -485,12 +507,16 @@ if Code.ensure_loaded?(Ecto.Query) do
                 {:halt, {:error, {:send_target_not_found, send.target}}}
 
               target ->
-                deliver_locked(module, config, target, kind, payload, send.dedup_key,
-                  wake?: true,
-                  ctx: ctx
-                )
+                if loop_row?(config, target) do
+                  deliver_locked(module, config, target, kind, payload, send.dedup_key,
+                    wake?: true,
+                    ctx: ctx
+                  )
 
-                {:cont, :ok}
+                  {:cont, :ok}
+                else
+                  {:halt, {:error, {:send_target_not_a_loop, send.target}}}
+                end
             end
         end
       end)
@@ -561,12 +587,15 @@ if Code.ensure_loaded?(Ecto.Query) do
       config.repo.exists?(query)
     end
 
+    # The kind predicate is the belt under wake/3 and wake_parent/3: no
+    # wake path may ever clear a parked rollout's suspension.
     defp downgrade_to_continue(config, loop_ref) do
       {count, _} =
         config.repo.update_all(
           from(r in config.schema,
             where: field(r, ^config.fields[:ref]) == ^loop_ref,
             where: field(r, ^config.fields[:status]) == "waiting",
+            where: field(r, ^config.fields[:kind]) == "loop",
             update: [set: ^wake_set(config)]
           ),
           []
@@ -575,14 +604,23 @@ if Code.ensure_loaded?(Ecto.Query) do
       count
     end
 
+    defp loop_row?(config, row) do
+      Map.fetch!(row, config.fields[:kind]) == "loop"
+    end
+
     # The loop's own terminal fires the host projection exactly like every
     # rollout terminal — inside the unit; a raise aborts the whole commit.
-    defp project_finish(config, %StepCommit{op: :finish, result: result}, row, ctx) do
+    # Re-fetched, not the CAS row: the CAS deliberately omits the envelope
+    # (written post-cargo, refs filled), and the projection contract is
+    # the freshly updated row — a host reading row.envelope must see the
+    # terminal value, not the pre-step one.
+    defp project_finish(config, %StepCommit{op: :finish, result: result} = commit, ctx) do
+      row = config.repo.get!(config.schema, commit.loop_ref)
       config.lifecycle.project(result, row, ctx)
       :ok
     end
 
-    defp project_finish(_config, _commit, _row, _ctx), do: :ok
+    defp project_finish(_config, _commit, _ctx), do: :ok
 
     defp terminal_sweep(_config, %StepCommit{terminal_sweep: false}), do: :ok
 
@@ -618,6 +656,11 @@ if Code.ensure_loaded?(Ecto.Query) do
             config.repo.rollback(:not_found)
 
           row ->
+            # A2's mirror: the inbox verbs refuse rollout-kind rows the way
+            # request_cancel refuses loop-kind ones — a miswired ref must
+            # not grow a mailbox or have its suspension cleared by a wake.
+            unless loop_row?(config, row), do: config.repo.rollback(:rollout_run)
+
             {kind, payload} = Codec.encode_input(input, vocabulary: vocabulary_of(row, config))
             deliver_locked(module, config, row, kind, payload, dedup_key, wake?: true, ctx: ctx)
         end
@@ -834,10 +877,17 @@ if Code.ensure_loaded?(Ecto.Query) do
             )
 
           row ->
-            deliver_locked(host, config, row, "completed", payload, dedup_key,
-              wake?: false,
-              ctx: nil
-            )
+            if loop_row?(config, row) do
+              deliver_locked(host, config, row, "completed", payload, dedup_key,
+                wake?: false,
+                ctx: nil
+              )
+            else
+              Logger.warning(
+                "child #{inspect(child_ref)} (#{tag_key}) names a non-loop parent " <>
+                  "#{inspect(loop_ref)}; dropping completion"
+              )
+            end
         end
       end
 
