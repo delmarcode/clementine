@@ -153,6 +153,38 @@ defmodule Clementine.Lifecycle.Ecto.CodecTest do
       })
     end
 
+    test "amendment A4: round-trips a checkpoint-less external park — the loop park shape" do
+      assert_exact(:suspension, %Suspension{
+        reason: {:external, :loop},
+        checkpoint: nil,
+        token: %ResumeToken{run_ref: 12, epoch: 3, reason_type: :external}
+      })
+    end
+
+    test "amendment A4: refuses to store approval and until suspensions without a checkpoint" do
+      approval = %Suspension{
+        reason:
+          {:approval,
+           %ApprovalRequest{tool_use_id: "tu_1", tool_name: "delete_records", args: %{}}},
+        checkpoint: nil,
+        token: %ResumeToken{run_ref: 1, epoch: 1, reason_type: :approval}
+      }
+
+      assert_raise ArgumentError, ~r/approval suspension requires a checkpoint/, fn ->
+        Codec.encode_suspension(approval)
+      end
+
+      until = %Suspension{
+        reason: {:until, ~U[2026-07-08 09:00:00Z]},
+        checkpoint: nil,
+        token: %ResumeToken{run_ref: 1, epoch: 1, reason_type: :until}
+      }
+
+      assert_raise ArgumentError, ~r/until suspension requires a checkpoint/, fn ->
+        Codec.encode_suspension(until)
+      end
+    end
+
     test "keeps the raw envelope when the embedded checkpoint no longer decodes" do
       suspension = %Suspension{
         reason: {:external, :tag},

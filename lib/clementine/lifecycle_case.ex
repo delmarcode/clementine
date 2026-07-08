@@ -70,7 +70,8 @@ defmodule Clementine.LifecycleCase do
       `:completed | :failed | :cancelled | :interrupted` — the projection
       raises exactly when invoked with that `Clementine.Result` variant.
 
-  And the second for the per-kind cancellation battery:
+  And the second for the per-kind batteries (cancel refusal, external
+  park):
 
     * `kind: :loop` — the returned run is loop-kind (the factory writes
       the recipe's `kind` column); omitted means `:rollout`.
@@ -140,6 +141,9 @@ defmodule Clementine.LifecycleCase do
       interrupt, and direct cancel.
     * Suspension round-trip (checkpoint stored bit-for-bit) and every
       stale-token error variant (matrix row 7).
+    * External-park round-trip — a checkpoint-less `{:external, _}`
+      suspension (the loop park shape) stores `nil` exactly and resumes
+      by token (LOOP_RFC amendment A4).
     * Cancel racing suspend, both orders, converging to `cancelled` and
       never stranding a flagged run in `waiting` (matrix row 17).
     * Cancel refusal per kind — `request_cancel` refuses a live loop-kind
@@ -283,6 +287,10 @@ defmodule Clementine.LifecycleCase do
 
         test "resume validates the token, stamps the payload, and the next claim restores the checkpoint" do
           Battery.resume_round_trip(__conformance__())
+        end
+
+        test "amendment A4: a checkpoint-less external park round-trips and resumes by reference" do
+          Battery.external_park_round_trip(__conformance__())
         end
 
         test "matrix row 7: a resume token fires once — replay dies with :already_resumed" do

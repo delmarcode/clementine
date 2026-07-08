@@ -25,6 +25,9 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
   `fetch` must stay total — a run with an unreadable checkpoint is still
   cancellable and inspectable — and the rollout's resume path is where
   `:incompatible_checkpoint` surfaces, per the RFC's snapshot doctrine.
+  Distinct from that escape: an `{:external, _}` park may carry no
+  checkpoint at all (LOOP_RFC amendment A4) — `nil` round-trips as `nil`,
+  and any other reason without a checkpoint is refused at encode.
   """
 
   alias Clementine.Lifecycle.Facts
@@ -180,7 +183,7 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
   def encode_suspension(%Suspension{} = suspension) do
     %{
       "reason" => encode_reason(suspension.reason),
-      "checkpoint" => Checkpoint.encode(suspension.checkpoint),
+      "checkpoint" => encode_checkpoint(suspension),
       "token" => encode_token(suspension.token)
     }
   end
@@ -194,6 +197,24 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
       token: decode_token(token)
     }
   end
+
+  defp encode_checkpoint(%Suspension{checkpoint: %Checkpoint{} = checkpoint}) do
+    Checkpoint.encode(checkpoint)
+  end
+
+  # LOOP_RFC amendment A4: only an {:external, _} park may store no
+  # checkpoint — its durable state is the loop envelope, in its own recipe
+  # column. An approval or until park without one is a mid-rollout park
+  # with no way to continue, so the write door refuses.
+  defp encode_checkpoint(%Suspension{reason: {:external, _}, checkpoint: nil}), do: nil
+
+  defp encode_checkpoint(%Suspension{reason: reason, checkpoint: nil}) do
+    raise ArgumentError,
+          "a #{Suspension.reason_type(reason)} suspension requires a checkpoint; " <>
+            "only {:external, _} parks may store none (LOOP_RFC amendment A4)"
+  end
+
+  defp decode_checkpoint(nil), do: nil
 
   defp decode_checkpoint(data) do
     case Checkpoint.decode(data) do

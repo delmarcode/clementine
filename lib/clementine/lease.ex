@@ -11,7 +11,9 @@ defmodule Clementine.Lease do
   when a write returns stale.
 
   When the claimed facts held a suspension and a resume payload, `resume`
-  carries `{checkpoint, payload}` for the runner to hand to the rollout.
+  carries `{checkpoint, payload}` for the runner to hand to the rollout —
+  the checkpoint half nil when the park stored none (a checkpoint-less
+  `{:external, _}` park, LOOP_RFC amendment A4).
   """
 
   @enforce_keys [:run_ref, :epoch, :executor_id, :lifecycle]
@@ -24,7 +26,7 @@ defmodule Clementine.Lease do
             ctx: nil,
             claimed_at: nil
 
-  @type resume :: nil | {Clementine.Checkpoint.t(), payload :: term()}
+  @type resume :: nil | {Clementine.Checkpoint.t() | nil, payload :: term()}
   @type t :: %__MODULE__{
           run_ref: term(),
           epoch: pos_integer(),

@@ -474,6 +474,49 @@ defmodule Clementine.LifecycleCase.Battery do
     assert checkpoint.pending == request.pending
   end
 
+  def external_park_round_trip(h) do
+    ref = create!(h, kind: :loop)
+    lease = claim!(h, ref)
+
+    # The loop park's transition shape (LOOP_RFC amendment A4): the token
+    # machinery — resume by reference — with no rollout checkpoint. The
+    # loop's durable state is the envelope, which lives in its own recipe
+    # column; the suspension column stores checkpoint: nil exactly.
+    token = %ResumeToken{run_ref: ref, epoch: lease.epoch, reason_type: :external}
+
+    park = %Transition{
+      op: :suspend,
+      run_ref: ref,
+      expect: %{status: :running, epoch: lease.epoch},
+      set: %{
+        status: :waiting,
+        suspension: %Suspension{reason: {:external, :loop}, checkpoint: nil, token: token},
+        executor_id: nil,
+        deadline: nil,
+        heartbeat_at: nil,
+        queued_at: :now
+      }
+    }
+
+    assert {:ok, %Facts{status: :waiting}} = h.lifecycle.apply(park, h.ctx)
+
+    facts = fetch!(h, ref)
+    assert facts.status == :waiting
+
+    assert facts.suspension ==
+             %Suspension{reason: {:external, :loop}, checkpoint: nil, token: token}
+
+    # The park's whole point: the stored token resumes the run by
+    # reference, exactly like an approval token would.
+    {:ok, resumed} = Protocol.resume(h.lifecycle, token, :wake, h.ctx)
+    assert resumed.status == :queued
+
+    # The next claim hands back what was parked — the checkpoint half nil.
+    lease2 = claim!(h, ref)
+    assert lease2.epoch == lease.epoch + 1
+    assert lease2.resume == {nil, :wake}
+  end
+
   def resume_already_resumed(h) do
     ref = create!(h)
     {:ok, token} = Protocol.suspend(claim!(h, ref), suspension_request(), cursor: {1, 0})
