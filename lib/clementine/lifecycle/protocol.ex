@@ -408,15 +408,26 @@ defmodule Clementine.Lifecycle.Protocol do
   ## Cancel request
 
   @doc """
-  Requests cancellation. Two flavors by ownership: a `running` run gets the
-  cooperative flag (`{:ok, :flagged}` — a *delivery* promise, not an
-  outcome promise: the run terminates as cancelled, or reaches the terminal
-  it was already committing); an unowned `queued`/`waiting` run resolves
-  directly as terminal `cancelled` with the projection firing
-  (`{:ok, :finished}`). Racing movement re-routes between the flavors.
+  Requests cancellation of a rollout run. Two flavors by ownership: a
+  `running` run gets the cooperative flag (`{:ok, :flagged}` — a *delivery*
+  promise, not an outcome promise: the run terminates as cancelled, or
+  reaches the terminal it was already committing); an unowned
+  `queued`/`waiting` run resolves directly as terminal `cancelled` with the
+  projection firing (`{:ok, :finished}`). Racing movement re-routes between
+  the flavors.
+
+  Live loop-kind runs are refused with `{:error, :loop_run}` (LOOP_RFC
+  amendment A2), before either flavor: the direct-terminal flavor would
+  orphan a loop's children, and the flag this operation sets is honored by
+  rollout boundary polls, not step machinery. Loop cancellation is
+  loop-owned — a kind-aware flag plus wake whose cascade cancels children
+  first and finishes last. A terminal run answers `:already_terminal`
+  whatever its kind: dead ends have nothing left to protect.
   """
   @spec request_cancel(module(), term(), term(), term()) ::
-          {:ok, :flagged} | {:ok, :finished} | {:error, :already_terminal | :not_found | term()}
+          {:ok, :flagged}
+          | {:ok, :finished}
+          | {:error, :already_terminal | :loop_run | :not_found | term()}
   def request_cancel(lifecycle, run_ref, reason, ctx \\ nil) do
     do_request_cancel(lifecycle, run_ref, reason, ctx, 3)
   end
@@ -428,6 +439,9 @@ defmodule Clementine.Lifecycle.Protocol do
       cond do
         Facts.terminal?(facts) ->
           {:error, :already_terminal}
+
+        facts.kind == :loop ->
+          {:error, :loop_run}
 
         facts.status == :running ->
           transition = %Transition{

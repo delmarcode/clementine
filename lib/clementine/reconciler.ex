@@ -8,7 +8,8 @@ defmodule Clementine.Reconciler do
       now = MyApp.Runs.db_now!()          # storage clock — same source the stamps use
       policy = Clementine.Reconciler.Policy.new(retry: {:requeue, max_claims: 3})
 
-      for facts <- MyApp.Runs.active_run_facts() do
+      # The rollout sweep: active AND kind = 'rollout', both in SQL.
+      for facts <- MyApp.Runs.active_rollout_run_facts() do
         case Clementine.Reconciler.judge(facts, now, policy) do
           :healthy ->
             :ok
@@ -21,6 +22,17 @@ defmodule Clementine.Reconciler do
             # then re-enqueue the job, exactly as after a resume
         end
       end
+
+  This judgment is *rollout* judgment, and the sweep query must exclude
+  loop-kind rows in SQL (`WHERE kind = 'rollout'`), not by filtering
+  fetched facts: a parked loop is a permanently `waiting` row *by design*
+  (LOOP_RFC §Operations — "hibernation" is what `waiting` already is), so
+  at fleet scale an unscoped sweep pays for every dormant loop on every
+  cadence. Loop-kind rows get their own policy fork and verdicts (LOOP_RFC
+  amendment A3), on their own slower cadence over loop rows only — this
+  module's rules would judge them wrongly (the epoch-as-attempt-cap gate
+  alone would terminally interrupt a long-lived loop on its first crashed
+  step).
 
   `now` must come from the storage clock — the same source that stamped
   the facts — or be compared in the database; a node-local
