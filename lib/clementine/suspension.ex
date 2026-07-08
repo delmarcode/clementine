@@ -1,7 +1,7 @@
 defmodule Clementine.Suspension do
   @moduledoc """
-  The durable fact that a run is parked: a checkpoint, a reason, and the
-  resume contract.
+  The durable fact that a run is parked: a reason, the resume contract,
+  and — for mid-rollout parks — a checkpoint.
 
   Assembly is split by who knows what. The rollout produces a `Request`
   (it knows loop state and never sees the lease); the runner completes the
@@ -10,12 +10,18 @@ defmodule Clementine.Suspension do
   computed at that moment, not separately stored — it lives inside the
   suspension it authorizes.
 
-  Reason scope for this epic: rollouts produce only `{:approval, _}` (gated
-  tools). `{:external, tag}` is reserved for host- and loop-initiated
-  waits; `{:until, t}` for scheduled waits, whose wake-up is host-scheduled
-  resume — nothing in Clementine owns a timer. The reaper's
-  `:suspension_expired` is the policy ceiling over all waits, distinct from
-  any wake-up path.
+  `checkpoint` is nilable for `{:external, _}` reasons only (LOOP_RFC
+  amendment A4): a loop park needs the token machinery — resume by
+  reference — but has no rollout checkpoint; its durable state is the
+  envelope, which lives in its own recipe column. `{:approval, _}` and
+  `{:until, _}` parks are mid-rollout by definition and always carry one —
+  the Ecto codec refuses to store them without it.
+
+  Reason scope: rollouts produce only `{:approval, _}` (gated tools).
+  `{:external, tag}` is for host- and loop-initiated waits; `{:until, t}`
+  for scheduled waits, whose wake-up is host-scheduled resume — nothing in
+  Clementine owns a timer. The reaper's `:suspension_expired` is the
+  policy ceiling over all waits, distinct from any wake-up path.
   """
 
   alias Clementine.{ApprovalRequest, Checkpoint, ResumeToken}
@@ -30,7 +36,7 @@ defmodule Clementine.Suspension do
 
   @type t :: %__MODULE__{
           reason: reason(),
-          checkpoint: Checkpoint.t(),
+          checkpoint: Checkpoint.t() | nil,
           token: ResumeToken.t()
         }
 
