@@ -38,7 +38,10 @@ defmodule Clementine.Test.Ecto.Lifecycle do
   A5): the projection appends a loop child's completion inside the
   terminal transaction — before the probes, so a probe raise proves the
   append rolls back with the terminal — and `after_transition/3` is
-  wake-only. Both no-op for rows that are not loop children.
+  wake-only. Both no-op for rows that are not loop children. A row
+  carrying `Clementine.Test.Ecto.LoopHost.drop_glue_label/0` skips the
+  append — the `Clementine.LoopCase` lost-glue probe (the row L13 strand
+  a conforming substrate cannot otherwise produce).
   """
 
   use Clementine.Lifecycle.Ecto,
@@ -47,7 +50,10 @@ defmodule Clementine.Test.Ecto.Lifecycle do
 
   @impl Clementine.Lifecycle.Ecto
   def project(result, row, ctx) do
-    Clementine.Loop.Ecto.append_completion(Clementine.Test.Ecto.LoopHost, result, row, ctx)
+    unless row.label == Clementine.Test.Ecto.LoopHost.drop_glue_label() do
+      Clementine.Loop.Ecto.append_completion(Clementine.Test.Ecto.LoopHost, result, row, ctx)
+    end
+
     if row.label == "boom", do: raise("projection boom")
     Clementine.Test.Ecto.ProjectionProbe.check!(row.label, result)
     if is_pid(ctx), do: send(ctx, {:projected, result, row})
