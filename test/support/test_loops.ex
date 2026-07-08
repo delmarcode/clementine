@@ -7,9 +7,15 @@ defmodule Clementine.Test.ScriptedLoop do
   JSON-safe `"log"` in state, which assertions read back out of the
   committed envelope. `{:elapsed, :poll}` re-arms itself — the watcher's
   live-key lifetime.
+
+  The action-verb atoms sit in the vocabulary so scripted payloads survive
+  the inbox codec — host-seam tests deliver their scripts through real
+  storage.
   """
 
-  use Clementine.Loop, state_version: 1, vocabulary: [:poll, :reply, :retry, :note]
+  use Clementine.Loop,
+    state_version: 1,
+    vocabulary: [:poll, :reply, :retry, :note, :run, :timer, :cancel_timer, :send]
 
   alias Clementine.Result
 

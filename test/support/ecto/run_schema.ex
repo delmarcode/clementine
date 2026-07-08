@@ -26,5 +26,14 @@ defmodule Clementine.Test.Ecto.Run do
     field(:error, :map)
     field(:interrupt, :map)
     field(:finished_at, :utc_datetime_usec)
+
+    field(:loop_module, :string)
+    field(:loop_args, :map)
+    field(:loop_policy, :map)
+    field(:envelope, :map)
+    field(:state_version, :integer)
+    field(:loop_scope, :string)
+    field(:loop_ref, :integer)
+    field(:tag_key, :string)
   end
 end

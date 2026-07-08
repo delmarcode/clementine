@@ -665,8 +665,14 @@ defmodule Clementine.Lifecycle.Protocol do
 
   ## Internals
 
+  # Telemetry describes committed state, so it rides the emission seam: a
+  # protocol operation executed inside an enclosing atomic unit (the loop
+  # adapter cancelling children as cargo) defers its events to that unit's
+  # commit and loses them to its rollback. Immediate everywhere else.
   defp emit(event, measurements, metadata) do
-    :telemetry.execute([:clementine, :run, event], measurements, metadata)
+    Clementine.Emissions.emit(fn ->
+      :telemetry.execute([:clementine, :run, event], measurements, metadata)
+    end)
   end
 
   # A terminal write by a live lease measures its execution, claim to

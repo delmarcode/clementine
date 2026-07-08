@@ -6,7 +6,9 @@ defmodule Clementine.LoopTest do
   describe "use Clementine.Loop" do
     test "declares state_version and vocabulary, with defaults" do
       assert ScriptedLoop.__loop__(:state_version) == 1
-      assert ScriptedLoop.__loop__(:vocabulary) == [:poll, :reply, :retry, :note]
+
+      assert ScriptedLoop.__loop__(:vocabulary) ==
+               [:poll, :reply, :retry, :note, :run, :timer, :cancel_timer, :send]
 
       assert DoorLoop.__loop__(:state_version) == 1
       assert DoorLoop.__loop__(:vocabulary) == []

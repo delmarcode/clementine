@@ -177,6 +177,12 @@ if Code.ensure_loaded?(Ecto.Query) do
     reach observers only through here — no executor was alive to announce
     them) and where terminal notifications close RunView folds. Failures
     are logged and swallowed. The default implementation is a no-op.
+
+    Post-commit means the *outermost* commit: a transition applied inside
+    an enclosing atomic unit (the loop adapter's `apply_step/2` cancelling
+    children as cargo) defers this hook and the cancel push until that
+    unit commits, and drops them if it rolls back — no observer hears of
+    a transition that never happened.
     """
     @callback after_transition(Facts.t(), Transition.t(), ctx :: term()) :: any()
 
@@ -282,7 +288,9 @@ if Code.ensure_loaded?(Ecto.Query) do
 
       case cas_update(config, transition, nil) do
         {:ok, row} ->
-          notify(module, Codec.to_facts(row, fields), transition, ctx)
+          facts = Codec.to_facts(row, fields)
+          emit(fn -> notify(module, facts, transition, ctx) end)
+          {:ok, facts}
 
         {:error, :stale} ->
           {:error, :stale}
@@ -308,12 +316,29 @@ if Code.ensure_loaded?(Ecto.Query) do
       end)
       |> case do
         {:ok, row} ->
-          push_cancel(config, transition)
-          notify(module, Codec.to_facts(row, fields), transition, ctx)
+          facts = Codec.to_facts(row, fields)
+
+          emit(fn ->
+            push_cancel(config, transition)
+            notify(module, facts, transition, ctx)
+          end)
+
+          {:ok, facts}
 
         {:error, reason} ->
           {:error, reason}
       end
+    end
+
+    # Post-commit emissions route through the shared seam (see
+    # after_transition/3's doc): immediate normally, deferred to the
+    # enclosing unit's commit while one is bracketed.
+    defp emit(fun), do: Clementine.Emissions.emit(fun)
+
+    @doc false
+    def notify_transition(module, %Facts{} = facts, %Transition{} = transition, ctx) do
+      notify(module, facts, transition, ctx)
+      :ok
     end
 
     defp cas_update(%{repo: repo, schema: schema, fields: fields}, %Transition{} = t, now) do
