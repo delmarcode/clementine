@@ -92,17 +92,29 @@ if Code.ensure_loaded?(Ecto.Query) do
     replayability, the terminal by its bounded retry posture.
 
     Child cancels execute as cargo inside `apply_step/2`'s unit, so their
-    post-commit emissions (`after_transition/3`, the cancel push) defer to
-    the unit itself: fired after it commits, dropped if it rolls back — no
-    observer hears of a transition that never happened. The wake such a
-    hook would have delivered is not needed for correctness; the park
-    re-check sees the in-unit completion rows and downgrades.
+    post-commit emissions (`after_transition/3`, the cancel push, protocol
+    telemetry) defer to the unit itself: fired after it commits, dropped
+    if it rolls back — no observer, metric, or push hears of a transition
+    that never happened. The wake such a hook would have delivered is not
+    needed for correctness; the park re-check sees the in-unit completion
+    rows and downgrades.
+
+    The loop's own committed transition then reaches the host's
+    `after_transition/3` — after the flushed child emissions, so
+    children's terminals precede the loop's at every level — as a
+    `Transition` in the shipped vocabulary: a park notifies as `:suspend`,
+    a continue (or downgraded park) as `:requeue`, a finish as `:finish`
+    with the `Result` attached. Wakes stay notification-silent by design
+    (amendment A5 demotes that path to wake-only); observers tolerate the
+    gap because facts order themselves. Step-level telemetry rides the
+    step runner, not this adapter.
     """
 
     import Ecto.Query
 
     require Logger
 
+    alias Clementine.Lifecycle.Ecto, as: LifecycleEcto
     alias Clementine.Lifecycle.Ecto.Codec, as: LifecycleCodec
     alias Clementine.Lifecycle.{Facts, Protocol, Transition}
     alias Clementine.Loop
@@ -264,9 +276,9 @@ if Code.ensure_loaded?(Ecto.Query) do
 
       # Child cancels are cargo: their lifecycle transitions commit with
       # this unit, so their post-commit emissions (after_transition, the
-      # cancel push) must too — fired only if the unit commits, dropped if
-      # it rolls back.
-      Clementine.Lifecycle.Ecto.begin_deferred_emissions()
+      # cancel push, protocol telemetry) must too — fired only if the unit
+      # commits, dropped if it rolls back.
+      Clementine.Emissions.begin_deferral()
 
       try do
         config.repo.transaction(fn ->
@@ -276,12 +288,45 @@ if Code.ensure_loaded?(Ecto.Query) do
           end
         end)
         |> tap(fn
-          {:ok, _facts} -> Clementine.Lifecycle.Ecto.flush_deferred_emissions()
-          {:error, _reason} -> :ok
+          {:ok, facts} ->
+            Clementine.Emissions.flush()
+            notify_step(config, commit, facts, ctx)
+
+          {:error, _reason} ->
+            :ok
         end)
       after
-        Clementine.Lifecycle.Ecto.drop_deferred_emissions()
+        Clementine.Emissions.drop()
       end
+    end
+
+    # The loop's own committed transition reaches the host's
+    # after_transition/3 exactly like every lifecycle transition — the
+    # universal observation point where notifications fan out and terminal
+    # notifications close RunView folds. Fired after the flushed child
+    # emissions, so children's terminals precede the loop's own facts at
+    # every level. The op names the state movement in the shipped
+    # vocabulary — park is a suspend, continue (and a downgraded park) is
+    # a requeue, finish is a finish — read from the committed facts, not
+    # the commit's intent.
+    defp notify_step(config, %StepCommit{} = commit, %Facts{} = facts, ctx) do
+      op =
+        case facts.status do
+          :waiting -> :suspend
+          :queued -> :requeue
+          _terminal -> :finish
+        end
+
+      transition = %Transition{
+        op: op,
+        run_ref: commit.loop_ref,
+        expect: commit.expect,
+        set: Map.drop(commit.set, [:envelope, :state_version]),
+        result: commit.result,
+        meta: commit.meta
+      }
+
+      LifecycleEcto.notify_transition(config.lifecycle, facts, transition, ctx)
     end
 
     defp do_apply_step(module, config, %StepCommit{} = commit, ctx) do

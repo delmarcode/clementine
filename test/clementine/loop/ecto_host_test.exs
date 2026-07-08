@@ -419,10 +419,34 @@ defmodule Clementine.Loop.EctoHostTest do
       assert swept.dead_reason == "terminal_sweep"
     end
 
+    test "apply_step notifies the committed loop transition post-commit: park, continue, finish" do
+      loop = parked_loop!()
+      loop_ref = loop.ref
+
+      {:ok, :appended} = LoopHost.append(loop_ref, message(1), nil, nil)
+      assert run_step!(loop_ref, ctx: self()).status == :waiting
+
+      assert_received {:transition, %{status: :waiting, ref: ^loop_ref},
+                       %Transition{op: :suspend, result: nil}}
+
+      for i <- 2..4, do: {:ok, :appended} = LoopHost.append(loop_ref, message(i), nil, nil)
+      assert run_step!(loop_ref, limit: 2, ctx: self()).status == :queued
+
+      assert_received {:transition, %{status: :queued, ref: ^loop_ref},
+                       %Transition{op: :requeue, result: nil}}
+
+      {:ok, :appended} = LoopHost.append(loop_ref, Input.message(%{"halt" => "done"}), nil, nil)
+      assert run_step!(loop_ref, ctx: self()).status == :completed
+
+      assert_received {:transition, %{status: :completed, ref: ^loop_ref},
+                       %Transition{op: :finish, result: %Result.Completed{output: "done"}}}
+    end
+
     test "cascade cancel cargo: children cancelled in-unit; a queued child's completion lands in this very commit" do
       loop = parked_loop!()
       spawn_child!(loop.ref, {:reply, 1})
       [child] = TestRepo.all(from(r in Run, where: r.loop_ref == ^loop.ref))
+      attach_finished_probe!()
 
       # Loop cancel is flag + wake; the plan's :cancel stands in for the
       # persisted flag until the cancel verb lands with the step runner.
@@ -441,10 +465,12 @@ defmodule Clementine.Loop.EctoHostTest do
       assert facts.status == :queued
       assert length(step_jobs(loop.ref)) == jobs + 1
 
-      # The child cancel's post-commit hook deferred to the unit and fired
-      # once it committed.
+      # The child cancel's post-commit emissions — the notification hook
+      # and the protocol's finished telemetry — deferred to the unit and
+      # fired once it committed.
       child_id = child.id
       assert_received {:transition, %{status: :cancelled}, %Transition{run_ref: ^child_id}}
+      assert_received {:run_finished, ^child_id, :cancelled}
 
       # The next step folds the completion and finishes last, cancelled.
       final = run_step!(loop.ref, ctx: self())
@@ -482,6 +508,7 @@ defmodule Clementine.Loop.EctoHostTest do
       loop = parked_loop!()
       spawn_child!(loop.ref, {:reply, 1})
       [child] = TestRepo.all(from(r in Run, where: r.loop_ref == ^loop.ref))
+      attach_finished_probe!()
       :ok = Clementine.Loop.Ecto.wake(LoopHost, loop.ref, nil)
       lease = claim!(loop.ref)
       envelope = stored_envelope(loop.ref)
@@ -513,11 +540,12 @@ defmodule Clementine.Loop.EctoHostTest do
 
       assert {:error, {:send_target_not_found, -1}} = LoopHost.apply_step(commit, self())
 
-      # The child's cancel rolled back with the unit — and no observer was
-      # told of the transition that never happened.
+      # The child's cancel rolled back with the unit — and no observer,
+      # hook or telemetry, was told of the transition that never happened.
       assert TestRepo.get!(Run, child.id).status == "queued"
       child_id = child.id
       refute_received {:transition, %{status: :cancelled}, %Transition{run_ref: ^child_id}}
+      refute_received {:run_finished, ^child_id, _terminal}
     end
 
     test "a send to a terminal target dead-letters as evidence; a missing target fails the whole commit" do
@@ -803,6 +831,25 @@ defmodule Clementine.Loop.EctoHostTest do
       )
 
     commit
+  end
+
+  # Forwards [:clementine, :run, :finished] telemetry to the test process —
+  # the probe for emissions that must ride, or roll back with, a unit.
+  defp attach_finished_probe! do
+    pid = self()
+    id = "finished-probe-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:clementine, :run, :finished],
+        fn _event, _measurements, meta, _config ->
+          send(pid, {:run_finished, meta.run_ref, meta.terminal})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(id) end)
   end
 
   defp spawn_child!(loop_ref, tag) do

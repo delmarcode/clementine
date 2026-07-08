@@ -330,44 +330,15 @@ if Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    # Post-commit emissions defer while an enclosing atomic unit collects
-    # them (see after_transition/3's doc). The stash is process-local
-    # because the enclosing transaction is: Ecto transactions live on the
-    # calling process's connection.
-    @deferred_emissions :clementine_lifecycle_deferred_emissions
+    # Post-commit emissions route through the shared seam (see
+    # after_transition/3's doc): immediate normally, deferred to the
+    # enclosing unit's commit while one is bracketed.
+    defp emit(fun), do: Clementine.Emissions.emit(fun)
 
     @doc false
-    def begin_deferred_emissions do
-      Process.put(@deferred_emissions, [])
+    def notify_transition(module, %Facts{} = facts, %Transition{} = transition, ctx) do
+      notify(module, facts, transition, ctx)
       :ok
-    end
-
-    @doc false
-    def flush_deferred_emissions do
-      case Process.delete(@deferred_emissions) do
-        nil -> :ok
-        stashed -> stashed |> Enum.reverse() |> Enum.each(& &1.())
-      end
-
-      :ok
-    end
-
-    @doc false
-    def drop_deferred_emissions do
-      Process.delete(@deferred_emissions)
-      :ok
-    end
-
-    defp emit(fun) do
-      case Process.get(@deferred_emissions) do
-        nil ->
-          fun.()
-          :ok
-
-        stashed ->
-          Process.put(@deferred_emissions, [fun | stashed])
-          :ok
-      end
     end
 
     defp cas_update(%{repo: repo, schema: schema, fields: fields}, %Transition{} = t, now) do
