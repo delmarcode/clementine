@@ -488,10 +488,21 @@ defmodule Clementine.TelemetryTest do
   end
 
   describe "metrics/0" do
-    test "speaks :rollout and :run, never :loop" do
+    test "the engine speaks :rollout — the :loop prefix belongs to the loop layer now" do
       metrics = Clementine.Telemetry.metrics()
 
-      refute Enum.any?(metrics, fn metric -> :loop in metric.event_name end)
+      # No metric still reads the pre-RFC engine events: the vacated
+      # prefix carries only the loop layer's own vocabulary.
+      refute Enum.any?(metrics, fn metric ->
+               match?(
+                 [:clementine, :loop, event] when event in [:start, :stop, :exception],
+                 metric.event_name
+               )
+             end)
+
+      assert Enum.any?(metrics, fn metric ->
+               metric.event_name == [:clementine, :loop, :verdict]
+             end)
 
       assert Enum.any?(metrics, fn metric ->
                metric.event_name == [:clementine, :rollout, :stop]

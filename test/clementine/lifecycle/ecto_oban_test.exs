@@ -6,6 +6,7 @@ defmodule Clementine.Lifecycle.Ecto.ObanTest do
   alias Clementine.Lifecycle.Facts
 
   defp facts(status), do: %Facts{ref: 1, status: status, epoch: 1}
+  defp loop_facts(status), do: %Facts{ref: 1, kind: :loop, status: status, epoch: 1}
   defp job(state, id \\ 77), do: %{id: id, state: state}
 
   describe "waiting (matrix row 10, the load-bearing line)" do
@@ -71,6 +72,38 @@ defmodule Clementine.Lifecycle.Ecto.ObanTest do
       for status <- Facts.terminal_statuses() do
         assert Oban.judge_job(facts(status), nil) == :healthy
         assert Oban.judge_job(facts(status), job("completed")) == :healthy
+      end
+    end
+  end
+
+  describe "loop-kind runs (amendment A3: the cross-check must not kill a standing entity)" do
+    test "matrix row L16: dead-job evidence under a running loop requeues — the step is replayable by construction" do
+      assert Oban.judge_job(loop_facts(:running), nil) == {:requeue, :job_missing}
+      assert Oban.judge_job(loop_facts(:running), job("cancelled")) == {:requeue, :job_cancelled}
+      assert Oban.judge_job(loop_facts(:running), job("discarded")) == {:requeue, :job_discarded}
+
+      assert Oban.judge_job(loop_facts(:running), job("completed")) ==
+               {:requeue, :job_completed_without_terminal}
+
+      assert Oban.judge_job(loop_facts(:running), job("executing")) == :healthy
+    end
+
+    test "matrix row L15: dead-job evidence under a queued loop reenqueues — the row is fine, only the job is lost" do
+      assert Oban.judge_job(loop_facts(:queued), nil) == {:reenqueue, :job_missing}
+      assert Oban.judge_job(loop_facts(:queued), job("cancelled")) == {:reenqueue, :job_cancelled}
+      assert Oban.judge_job(loop_facts(:queued), job("discarded")) == {:reenqueue, :job_discarded}
+
+      assert Oban.judge_job(loop_facts(:queued), job("available")) == :healthy
+    end
+
+    test "a queued loop's completed job is healthy — a step continue briefly correlates to the previous step's job" do
+      assert Oban.judge_job(loop_facts(:queued), job("completed")) == :healthy
+    end
+
+    test "waiting and terminal loops are healthy whatever the job looks like" do
+      for status <- [:waiting | Facts.terminal_statuses()],
+          job <- [nil, job("cancelled"), job("discarded"), job("completed")] do
+        assert Oban.judge_job(loop_facts(status), job) == :healthy
       end
     end
   end
