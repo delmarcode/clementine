@@ -58,14 +58,14 @@ defmodule Clementine.LLM.Anthropic do
         {:ok, parse_response(resp_body)}
 
       {:ok, %{status: status}} when status in [429, 529] and attempt < max_attempts ->
-        Process.sleep(calculate_backoff(attempt))
+        retry_sleep(calculate_backoff(attempt))
         do_call_with_retry(body, headers, max_attempts, attempt + 1)
 
       {:ok, %{status: status, body: resp_body}} ->
         {:error, {:api_error, status, resp_body}}
 
       {:error, _reason} when attempt < max_attempts ->
-        Process.sleep(calculate_backoff(attempt))
+        retry_sleep(calculate_backoff(attempt))
         do_call_with_retry(body, headers, max_attempts, attempt + 1)
 
       {:error, reason} ->
@@ -80,6 +80,14 @@ defmodule Clementine.LLM.Anthropic do
 
     delay = (base_delay * :math.pow(2, attempt - 1)) |> round()
     min(delay, max_delay)
+  end
+
+  # Every retry backoff sleeps through this seam so tests can observe the
+  # requested durations instead of asserting on the wall clock (the
+  # budget-cap test's flake class). Default is the real sleep.
+  defp retry_sleep(ms) do
+    sleeper = Application.get_env(:clementine, :retry_sleep, &Process.sleep/1)
+    sleeper.(ms)
   end
 
   @doc """
@@ -199,7 +207,7 @@ defmodule Clementine.LLM.Anthropic do
 
     if remaining > 0 do
       send(parent, {ref, :retry_reset})
-      Process.sleep(min(calculate_backoff(attempt), remaining))
+      retry_sleep(min(calculate_backoff(attempt), remaining))
       do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, attempt + 1)
     else
       send(parent, {ref, fail_message})
