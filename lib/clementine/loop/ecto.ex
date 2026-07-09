@@ -74,6 +74,18 @@ if Code.ensure_loaded?(Ecto.Query) do
     input walks the sender's poison path — informed, never silently
     dropped.
 
+    ## The child worker
+
+    `build_child_run/4` is the child worker's door: from the job's
+    durable identifiers (the child run ref and the JSON-safe `child_args`
+    the step committed) to a ready-to-execute `Clementine.Run`, invoking
+    the host's `build_child/4` with the child's facts and the decoded
+    tag. Construction happens here, at spawn execution time — history by
+    cursor, never transcripts in envelopes (LOOP_RFC §Children) — and the
+    worker maps `Clementine.Runner.execute/2` exactly like the shipped
+    run worker pattern. Completion delivery is not the worker's job: the
+    child's terminal projection appends it (below).
+
     ## Child-terminal projection glue
 
     `append_completion/4` runs inside the child's terminal transaction —
@@ -81,10 +93,18 @@ if Code.ensure_loaded?(Ecto.Query) do
     `{:completed, tag, result}` to the parent's inbox with the
     replay-stable dedup key `"completed:" <> tag_key <> ":" <> child_ref`:
     exactly-once at source, because terminals are dead ends (matrix row
-    L12). `wake_parent/3` is the post-commit half — call it from
-    `after_transition/3` — a wake and nothing else: best-effort by design,
-    backstopped by the reaper's `:wake_pending` verdict, acceptable
-    because delivery was durable before it.
+    L12). Reaper-interrupted children take the identical path — the
+    interrupt is a terminal transition with a projection, `Result` and
+    usage attached. `wake_parent/3` is the post-commit half — call it
+    from `after_transition/3` — a wake and nothing else: best-effort by
+    design, backstopped by the reaper's `:wake_pending` verdict,
+    acceptable because delivery was durable before it.
+
+    As completions fold, the step core aggregates the children's usage
+    into the loop's envelope and terminal `Result` — so billing queries
+    over the run table must exclude loop-kind rows or count every token
+    twice (`Clementine.Loop.Ecto.Migration`'s Billing section shows the
+    grain).
 
     Mutual cancellation is the one place lock ordering can cross (a parent
     step cancelling a child while that child's terminal appends its
@@ -121,6 +141,7 @@ if Code.ensure_loaded?(Ecto.Query) do
     alias Clementine.Loop
     alias Clementine.Loop.Ecto.Codec
     alias Clementine.Loop.{Envelope, Input, StepCommit, StoredInput}
+    alias Clementine.{Rollout, Run}
 
     @loop_field_defaults [
       loop_module: :loop_module,
@@ -1004,6 +1025,97 @@ if Code.ensure_loaded?(Ecto.Query) do
       |> case do
         {:ok, :flagged} -> {:ok, :flagged}
         {:error, reason} -> {:error, reason}
+      end
+    end
+
+    ## The child worker
+
+    @doc """
+    The child worker's door (LOOP_RFC §Children): reads the child run row,
+    decodes its tag from the stored `tag_key` under the parent loop's
+    declared vocabulary, invokes the host's `build_child/4` with the
+    child's `Clementine.Lifecycle.Facts`, and wraps the rollout in a
+    `Clementine.Run` ready for `Clementine.Runner.execute/2`. The run's
+    `metadata` carries `:loop_ref` and `:tag` for the worker's own
+    logging and telemetry.
+
+    Rollout construction happens here, at spawn execution time, from the
+    durable JSON-safe args alone — the args say "messages through N", the
+    host's `build_child/4` loads them: one source of truth, no envelope
+    transcripts, no drift.
+
+        defmodule MyApp.ChildRunWorker do
+          use Oban.Worker, queue: :agents, max_attempts: 1
+
+          @impl Oban.Worker
+          def perform(%Oban.Job{args: %{"run_id" => run_id, "args" => child_args}}) do
+            with {:ok, run} <-
+                   Clementine.Loop.Ecto.build_child_run(MyApp.LoopHost, run_id, child_args) do
+              case Clementine.Runner.execute(run,
+                     lifecycle: MyApp.ClementineLifecycle,
+                     executor_id: "oban:child:\#{run_id}"
+                   ) do
+                {:finished, %{status: :queued} = facts} -> MyApp.Runs.re_enqueue!(facts)
+                {:finished, _facts} -> :ok
+                {:suspended, _token} -> :ok
+                {:discard, reason} -> {:cancel, inspect(reason)}
+                {:error, reason} -> {:cancel, inspect(reason)}
+              end
+            end
+          end
+        end
+
+    The worker never reports back to the parent — the child's terminal
+    projection appends the completion (`append_completion/4`), whatever
+    terminalized it. A cascade-cancelled child may reach its terminal
+    before its job fires; `Clementine.Runner.execute/2`'s claim discards
+    it (`{:not_claimable, status}`) — ack, nothing to run.
+
+    `{:error, :not_found}` for a vanished row; `{:error, :not_loop_child}`
+    for a row that is not a loop's child (loop-kind, or no `loop_ref`) —
+    the kind-guard doctrine of `append/4` and `load/2`, worker-side.
+    Errors from the host's own `build_child/4` pass through. A stored tag
+    the parent's current vocabulary cannot decode raises, exactly like the
+    drain's poison posture: the job queue's retry-then-discard makes the
+    deploy drift observable rather than silently misread.
+    """
+    @spec build_child_run(module(), term(), map(), term()) ::
+            {:ok, Run.t()} | {:error, :not_found | :not_loop_child | term()}
+    def build_child_run(host, child_ref, child_args, ctx \\ nil) when is_map(child_args) do
+      config = host.__clementine_loop_config__()
+
+      case config.repo.get(config.schema, child_ref) do
+        nil ->
+          {:error, :not_found}
+
+        row ->
+          loop_ref = Map.get(row, config.fields[:loop_ref])
+
+          if loop_row?(config, row) or loop_ref == nil do
+            {:error, :not_loop_child}
+          else
+            tag_key = Map.fetch!(row, config.fields[:tag_key])
+            tag = Codec.decode_tag(tag_key, vocabulary: loop_vocabulary(config, loop_ref))
+            facts = LifecycleCodec.to_facts(row, config.fields)
+
+            case host.build_child(facts, tag, child_args, ctx) do
+              {:ok, %Rollout{} = rollout} ->
+                {:ok,
+                 Run.new(
+                   ref: child_ref,
+                   rollout: rollout,
+                   metadata: %{loop_ref: loop_ref, tag: tag}
+                 )}
+
+              {:error, reason} ->
+                {:error, reason}
+
+              other ->
+                raise ArgumentError,
+                      "build_child/4 must return {:ok, %Clementine.Rollout{}} | " <>
+                        "{:error, term}, got: #{inspect(other)}"
+            end
+          end
       end
     end
 
