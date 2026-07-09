@@ -2,15 +2,13 @@ defmodule Clementine.Loop.Protocol do
   @moduledoc """
   Host-facing loop operations, implemented once in the library on top of
   the `Clementine.Loop.Host` seam — the loop layer's analog of
-  `Clementine.Lifecycle.Protocol`.
-
-  V1 carries creation, cancellation, and the child-ref correlation
-  lookup; the send verb lands with its own epic on the same seam.
+  `Clementine.Lifecycle.Protocol`: creation, cancellation, the send verb,
+  and the child-ref correlation lookup.
   """
 
   alias Clementine.Lifecycle.Facts
   alias Clementine.Loop
-  alias Clementine.Loop.{Codec, Envelope}
+  alias Clementine.Loop.{Codec, Envelope, Input}
 
   @doc """
   Creates a loop, insert-or-get, idempotent on the host's scope key
@@ -110,6 +108,51 @@ defmodule Clementine.Loop.Protocol do
           | {:error, term()}
   def cancel(host, loop_ref, reason, opts \\ []) do
     host.cancel(loop_ref, reason, Keyword.get(opts, :ctx))
+  end
+
+  @doc """
+  Sends a message to a loop — the host-caller half of LOOP_RFC
+  §Loop-To-Loop Messaging, sugar over `append/4`: the payload wraps as a
+  `{:message, payload}` input and rides append's atomic unit (row, wake,
+  step-job enqueue). A step's `{:send, target, payload}` action never
+  comes here — it is StepCommit cargo, delivered inside `apply_step/2`'s
+  unit under the machinery's replay-stable causal key
+  (`"send:" <> sender <> ":" <> causal_input <> ":" <> action_index`).
+
+  `:dedup_key` is the caller's idempotency key, caller-supplied today
+  (LOOP_RFC §Non-Final): a webhook passes the provider's message id; a
+  cross-substrate transport passes the causal key that traveled with the
+  message, so the far inbox enforces the sender's exactly-once-in-effect
+  (Governing Invariant 12) — a re-dispatched or redelivered send lands
+  `{:ok, :duplicate}` while its row lives. Omitted, nothing dedups.
+
+  Addressing, authorization, and transport across trust boundaries are
+  host meaning: `loop_ref` is whatever the host's directory resolved, and
+  this verb trusts it — an MCP send_message tool wrapping it is the
+  accounting-agent-to-CRM-agent story. The append return contract makes
+  outcomes observable to the sender: `{:ok, :dead_lettered}` says the
+  target is terminal and the message was retained as evidence, never to
+  be consumed (matrix row L10) — react or alert, nothing was lost
+  silently. `{:error, :rollout_run}` refuses miswired refs (amendment
+  A2's mirror).
+
+  Options: `:dedup_key` (default `nil`), `:ctx` — the opaque host
+  context (default `nil`).
+  """
+  @spec send(module(), Clementine.Loop.Host.loop_ref(), term(), keyword()) ::
+          {:ok, :appended}
+          | {:ok, :duplicate}
+          | {:ok, :dead_lettered}
+          | {:error, :not_found}
+          | {:error, :rollout_run}
+          | {:error, term()}
+  def send(host, loop_ref, payload, opts \\ []) do
+    host.append(
+      loop_ref,
+      Input.message(payload),
+      Keyword.get(opts, :dedup_key),
+      Keyword.get(opts, :ctx)
+    )
   end
 
   @doc """

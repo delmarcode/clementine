@@ -191,6 +191,20 @@ defmodule Clementine.LoopCase.Battery do
     # Dedup covers dead rows too: the retried dead append is a duplicate
     # of retained evidence.
     assert {:ok, :duplicate} = h.host.append(ref, message("late"), "late:1", h.ctx)
+
+    # The send verb rides the same door: a sender's host — or the far
+    # side of a cross-substrate hop — observes the terminal outcome too.
+    assert {:ok, :dead_lettered} =
+             LoopProtocol.send(h.host, ref, %{"id" => "late-send"},
+               dedup_key: "late:2",
+               ctx: h.ctx
+             )
+
+    assert {:ok, :duplicate} =
+             LoopProtocol.send(h.host, ref, %{"id" => "late-send"},
+               dedup_key: "late:2",
+               ctx: h.ctx
+             )
   end
 
   def concurrent_appends(h) do
@@ -270,6 +284,10 @@ defmodule Clementine.LoopCase.Battery do
     # miswired ref every loop verb must refuse (amendment A2's mirror),
     # writing nothing.
     assert {:error, :rollout_run} = h.host.append(child_ref, message(1), nil, h.ctx)
+
+    assert {:error, :rollout_run} =
+             LoopProtocol.send(h.host, child_ref, %{"id" => "s"}, ctx: h.ctx)
+
     assert {:error, :rollout_run} = h.host.load(child_ref, h.ctx)
     assert {:error, :rollout_run} = h.host.cancel(child_ref, :nope, h.ctx)
     assert {:discard, :rollout_run} = step!(h, child_ref)
@@ -322,6 +340,10 @@ defmodule Clementine.LoopCase.Battery do
 
   def not_found(h, missing_ref) do
     assert {:error, :not_found} = h.host.append(missing_ref, message(1), nil, h.ctx)
+
+    assert {:error, :not_found} =
+             LoopProtocol.send(h.host, missing_ref, %{"id" => "s"}, ctx: h.ctx)
+
     assert {:error, :not_found} = h.host.load(missing_ref, h.ctx)
     assert {:error, :not_found} = h.host.cancel(missing_ref, :ghost, h.ctx)
     assert {:discard, :not_found} = step!(h, missing_ref)
@@ -402,6 +424,69 @@ defmodule Clementine.LoopCase.Battery do
     assert [{_tag_key, child_ref}] = Map.to_list(envelope!(h, ref).children)
     assert %Facts{kind: :rollout} = fetch!(h, child_ref)
     assert pending!(h, ref) == []
+  end
+
+  # The send halves of rows L1 and L11 (SKUNK-153's F5 interleaving,
+  # draft-v1 numbering): the causal key is what survives the substrates
+  # the fence cannot reach. In-substrate the CAS fences a zombie's whole
+  # commit, sends included; a degraded substrate that leaks dispatch past
+  # its fence, or a cross-substrate transport redelivering, re-presents
+  # the SAME key — replay-stable by construction — and the target's inbox
+  # answers :duplicate (Governing Invariant 12).
+  def send_redispatch_dedup(h) do
+    target = parked!(h)
+    ref = parked!(h)
+    payload = %{"id" => "note"}
+
+    append!(h, ref, Input.message(%{"id" => "cause", "actions" => [{:send, target, payload}]}))
+
+    # The doomed execution: claim, drain, compute the commit — and die
+    # before applying it. Dispatch is cargo, so nothing reached the
+    # target.
+    lost = claim!(h, ref)
+    lost_commit = commit!(h, ref, lost)
+    assert [%{target: ^target, dedup_key: send_key}] = lost_commit.sends
+    assert pending!(h, target) == []
+
+    # A3a requeue; the replay recomputes the IDENTICAL send spec — same
+    # causal input, same pure decision, same action index, same key. The
+    # zombie's cargo and the replay's are equal by construction, which is
+    # exactly why one :duplicate answer covers both re-dispatch stories.
+    {:ok, _} = Protocol.requeue(h.lifecycle, fetch!(h, ref), :lease_expired, h.ctx)
+    successor = claim!(h, ref)
+    replay_commit = commit!(h, ref, successor)
+    assert replay_commit.sends == lost_commit.sends
+
+    # The replay's commit delivers — exactly once, waking the target.
+    assert {:ok, %Facts{status: :waiting}} = h.host.apply_step(replay_commit, h.ctx)
+    assert [%StoredInput{input: %Input{kind: :message, payload: ^payload}}] = pending!(h, target)
+
+    # The zombie's own commit is fenced whole, its send included: the
+    # target never hears from it (L11's in-substrate half).
+    assert {:error, :stale} = h.host.apply_step(lost_commit, h.ctx)
+    assert [%StoredInput{}] = pending!(h, target)
+
+    # The re-dispatched send itself — the far door is the send verb, the
+    # traveled key in hand: :duplicate, and the target's inbox is
+    # unchanged. Delivered once, in effect.
+    assert {:ok, :duplicate} =
+             LoopProtocol.send(h.host, target, payload, dedup_key: send_key, ctx: h.ctx)
+
+    assert [%StoredInput{}] = pending!(h, target)
+    quiesce!(h, target)
+    assert Enum.count(log!(h, target), &(&1 == "message:note")) == 1
+
+    # A genuine re-send is a NEW causal input: fresh key, fresh delivery —
+    # unique across genuine re-sends is the key's other half.
+    append!(h, ref, Input.message(%{"id" => "again", "actions" => [{:send, target, payload}]}))
+    resend = claim!(h, ref)
+    resend_commit = commit!(h, ref, resend)
+    assert [%{dedup_key: fresh_key}] = resend_commit.sends
+    refute fresh_key == send_key
+
+    assert {:ok, %Facts{status: :waiting}} = h.host.apply_step(resend_commit, h.ctx)
+    quiesce!(h, target)
+    assert Enum.count(log!(h, target), &(&1 == "message:note")) == 2
   end
 
   def cancel_flag_racing_park(h) do

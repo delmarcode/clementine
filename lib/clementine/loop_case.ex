@@ -139,6 +139,13 @@ defmodule Clementine.LoopCase do
       precedes the commit; the replay produces one child, one send, one
       delivery (L1). Zombie commits are fenced on both guard halves and
       write nothing (L11).
+    * Loop-to-loop send dedup (L1/L11's send half): the causal key is
+      replay-stable — a re-dispatched send (crash replay, a zombie's
+      leaked dispatch, a cross-substrate transport's redelivery carrying
+      the traveled key) lands `:duplicate` at the target while its row
+      lives, and a genuine re-send (new causal input) mints a fresh key
+      and delivers. The send verb answers exactly like `append/4` on
+      terminal, rollout-kind, and unknown targets.
     * Append semantics: FIFO commit-visibility order, codec round-trips,
       per-loop `dedup_key` uniqueness over live and dead rows,
       `:dead_lettered` for post-terminal appends (L10), the atomic wake
@@ -290,6 +297,10 @@ defmodule Clementine.LoopCase do
           Battery.zombie_step_fenced(__loop_conformance__())
         end
 
+        test "matrix rows L1/L11 (send half): a re-dispatched send — crash replay or zombie — lands :duplicate at the target" do
+          Battery.send_redispatch_dedup(__loop_conformance__())
+        end
+
         test "a cancel flag landing between drain and park downgrades the park in its own commit — never stranded" do
           Battery.cancel_flag_racing_park(__loop_conformance__())
         end
@@ -399,7 +410,7 @@ defmodule Clementine.LoopCase do
   defp not_found_battery({:ok, missing_ref}) do
     quote do
       describe "loop conformance: unknown references" do
-        test "append, load, cancel, and the step runner report :not_found" do
+        test "append, send, load, cancel, and the step runner report :not_found" do
           Battery.not_found(__loop_conformance__(), unquote(missing_ref))
         end
       end
