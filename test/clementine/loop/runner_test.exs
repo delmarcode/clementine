@@ -638,6 +638,49 @@ defmodule Clementine.Loop.RunnerTest do
     end
   end
 
+  describe "the send verb (Loop.Protocol.send/4)" do
+    test "sugar over append: the payload arrives as {:message, payload}, the caller's key dedups, the wake rides the unit",
+         %{store: store} do
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      assert {:ok, :appended} =
+               LoopProtocol.send(Host, ref, %{"id" => "hi"}, dedup_key: "wh:1", ctx: store)
+
+      assert Host.facts!(store, ref).status == :queued
+
+      assert {:ok, :duplicate} =
+               LoopProtocol.send(Host, ref, %{"id" => "hi"}, dedup_key: "wh:1", ctx: store)
+
+      # No key, no dedup — the default for callers without an idempotency
+      # source of their own.
+      assert {:ok, :appended} = LoopProtocol.send(Host, ref, %{"id" => "hi"}, ctx: store)
+
+      assert {:parked, _} = step!(store, ref)
+      assert state!(store, ref)["log"] == ["init", "message:hi", "message:hi"]
+    end
+
+    test "terminal targets answer :dead_lettered; miswired and unknown refs are refused", %{
+      store: store
+    } do
+      ref = create!(store, ScriptedLoop)
+      append!(store, ref, %{"halt" => "done"})
+      assert {:finished, _} = step!(store, ref)
+
+      # The sender is TOLD — retained evidence it can react to (L10), and
+      # a transport's retry is a duplicate of that evidence.
+      assert {:ok, :dead_lettered} =
+               LoopProtocol.send(Host, ref, %{"id" => "late"}, dedup_key: "l:1", ctx: store)
+
+      assert {:ok, :duplicate} =
+               LoopProtocol.send(Host, ref, %{"id" => "late"}, dedup_key: "l:1", ctx: store)
+
+      rollout_ref = Host.seed(store, kind: :rollout)
+      assert {:error, :rollout_run} = LoopProtocol.send(Host, rollout_ref, %{}, ctx: store)
+      assert {:error, :not_found} = LoopProtocol.send(Host, 424_242, %{}, ctx: store)
+    end
+  end
+
   describe "cancellation races and short-circuits" do
     test "a cancel flag landing mid-step downgrades the park in-unit — the cancellation is never stranded",
          %{store: store} do
