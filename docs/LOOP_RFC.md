@@ -855,6 +855,18 @@ already permits.
   "while its row lives"); the pattern — durable host receipt beside the
   append — is what webhook adopters should copy, and the acceptance
   test drives both timings.
+- **Migration helpers are version-coupled (found post-merge, by fresh
+  CI replay).** A1's change to `single_active_index/2`'s emitted DDL
+  broke fresh-database replay of a host migration shipped against the
+  pre-A1 output — the new predicate references a column that does not
+  exist at that point in history. Resolved two ways: Meli (the only
+  host, a sandbox with no history to protect) rewrote its adoption
+  migrations to the current-version form, and the recipe modules now
+  state an **append-only helper stability policy** (see
+  `Clementine.Lifecycle.Ecto.Migration`, "Helper stability"): emitted
+  DDL never changes under an existing name — semantic changes arrive
+  as new names or default-preserving options, with release-note
+  callouts.
 
 ### Row graduation
 
