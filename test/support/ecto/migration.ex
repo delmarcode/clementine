@@ -52,3 +52,42 @@ defmodule Clementine.Test.Ecto.AddLoopSupport do
     end
   end
 end
+
+defmodule Clementine.Test.Ecto.CreateUuidRuns do
+  @moduledoc """
+  The same recipe on a uuid-keyed host table — the key shape Meli's
+  adoption runs (binary_id primary keys), which the integer-keyed table
+  cannot regress: refs cross the schemaless inbox boundary as UUID
+  strings and must dump through the adapter.
+  """
+
+  use Ecto.Migration
+
+  def change do
+    create table(:clementine_test_uuid_runs, primary_key: false) do
+      add(:id, :uuid, primary_key: true, default: fragment("gen_random_uuid()"))
+      add(:scope_id, :bigint)
+      add(:label, :text)
+    end
+
+    alter table(:clementine_test_uuid_runs) do
+      Clementine.Lifecycle.Ecto.Migration.run_columns()
+      Clementine.Loop.Ecto.Migration.loop_columns()
+      Clementine.Loop.Ecto.Migration.child_columns(type: :binary_id)
+    end
+
+    Clementine.Loop.Ecto.Migration.loop_scope_index(:clementine_test_uuid_runs)
+    Clementine.Loop.Ecto.Migration.child_dedup_index(:clementine_test_uuid_runs)
+
+    Clementine.Loop.Ecto.Migration.create_inbox(:clementine_test_uuid_loop_inbox,
+      loop_ref_type: :binary_id
+    )
+
+    create table(:clementine_test_uuid_jobs) do
+      add(:run_ref, :uuid)
+      add(:kind, :text, null: false)
+      add(:args, :map)
+      add(:inserted_at, :timestamptz, null: false, default: fragment("now()"))
+    end
+  end
+end

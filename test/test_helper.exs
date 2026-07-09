@@ -34,6 +34,7 @@ if postgres? do
   {:ok, _} = Clementine.TestRepo.start_link()
   Ecto.Migrator.up(Clementine.TestRepo, 20_260_705_000_001, Clementine.Test.Ecto.CreateRuns)
   Ecto.Migrator.up(Clementine.TestRepo, 20_260_708_000_001, Clementine.Test.Ecto.AddLoopSupport)
+  Ecto.Migrator.up(Clementine.TestRepo, 20_260_709_000_001, Clementine.Test.Ecto.CreateUuidRuns)
   Ecto.Adapters.SQL.Sandbox.mode(Clementine.TestRepo, :manual)
 end
 

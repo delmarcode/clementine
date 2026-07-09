@@ -198,3 +198,33 @@ defmodule Clementine.Test.Ecto.HandWrittenLifecycle do
     now
   end
 end
+
+defmodule Clementine.Test.Ecto.UuidLifecycle do
+  @moduledoc """
+  `Clementine.Test.Ecto.Lifecycle`'s uuid-keyed twin, paired with
+  `Clementine.Test.Ecto.UuidLoopHost` — the loop glue wired identically,
+  against the table whose refs are UUID strings.
+  """
+
+  use Clementine.Lifecycle.Ecto,
+    repo: Clementine.TestRepo,
+    schema: Clementine.Test.Ecto.UuidRun
+
+  @impl Clementine.Lifecycle.Ecto
+  def project(result, row, ctx) do
+    unless row.label == Clementine.Test.Ecto.LoopHost.drop_glue_label() do
+      Clementine.Loop.Ecto.append_completion(Clementine.Test.Ecto.UuidLoopHost, result, row, ctx)
+    end
+
+    Clementine.Test.Ecto.ProjectionProbe.check!(row.label, result)
+    if is_pid(ctx), do: send(ctx, {:projected, result, row})
+    :ok
+  end
+
+  @impl Clementine.Lifecycle.Ecto
+  def after_transition(facts, transition, ctx) do
+    Clementine.Loop.Ecto.wake_parent(Clementine.Test.Ecto.UuidLoopHost, transition, ctx)
+    if is_pid(ctx), do: send(ctx, {:transition, facts, transition})
+    :ok
+  end
+end

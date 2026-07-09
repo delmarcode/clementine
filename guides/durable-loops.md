@@ -724,7 +724,7 @@ defmodule MyApp.Runs.LoopEvidenceQueries do
       "completed" -> Result.completed(usage: usage)
       "failed" -> Result.failed(%Clementine.Error{message: "child failed"}, usage)
       "cancelled" -> Result.cancelled(:reconciled, usage)
-      "interrupted" -> Result.interrupted(:worker_lost, usage)
+      "interrupted" -> Result.interrupted({:app, :reconciled}, usage)
     end
   end
 

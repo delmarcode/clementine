@@ -95,4 +95,59 @@ defmodule Clementine.Test.Ecto.Factory do
     %{rows: [[%DateTime{} = now]]} = TestRepo.query!("SELECT now()")
     now
   end
+
+  ## The uuid-keyed twin (Meli's key shape) — same conventions against
+  ## Clementine.Test.Ecto.UuidLoopHost.
+
+  @spec create_uuid_loop(keyword()) :: String.t()
+  def create_uuid_loop(attrs) do
+    scope =
+      case Keyword.get(attrs, :scope_token) do
+        nil -> "conformance:#{System.unique_integer([:positive])}"
+        token -> "conformance:#{token}"
+      end
+
+    row_attrs =
+      case Keyword.get(attrs, :completion_glue) do
+        :dropped -> %{label: Clementine.Test.Ecto.LoopHost.drop_glue_label()}
+        nil -> %{}
+      end
+
+    spec = %{
+      module: Keyword.fetch!(attrs, :module),
+      scope: scope,
+      args: Keyword.fetch!(attrs, :args),
+      policy: Keyword.fetch!(attrs, :policy),
+      attrs: row_attrs
+    }
+
+    case Clementine.Loop.Protocol.create(Clementine.Test.Ecto.UuidLoopHost, spec) do
+      {:ok, facts} -> facts.ref
+      {:ok, :already_exists, facts} -> facts.ref
+    end
+  end
+
+  @spec uuid_step_jobs(String.t()) :: non_neg_integer()
+  def uuid_step_jobs(loop_ref) do
+    import Ecto.Query, only: [from: 2]
+
+    TestRepo.aggregate(
+      from(j in Clementine.Test.Ecto.UuidJob,
+        where: j.run_ref == ^loop_ref and j.kind == "step"
+      ),
+      :count
+    )
+  end
+
+  @spec uuid_timer_schedules(String.t()) :: non_neg_integer()
+  def uuid_timer_schedules(loop_ref) do
+    import Ecto.Query, only: [from: 2]
+
+    TestRepo.aggregate(
+      from(j in Clementine.Test.Ecto.UuidJob,
+        where: j.run_ref == ^loop_ref and j.kind == "timer"
+      ),
+      :count
+    )
+  end
 end

@@ -1,6 +1,7 @@
 # RFC: Clementine Durable Loops
 
-Status: draft v2 (post-cold-read revision)  
+Status: adopted — validated against Meli (SKUNK-156, 2026-07-09); see
+the Adoption Report at the end of this document  
 Scope: the outer control primitive reserved by the durable execution RFC  
 Builds on: `docs/DURABLE_EXECUTION_RFC.md` (v2.2, fully implemented — SKUNK-124)  
 Origin: the vocabulary reserved in that RFC, the suspend-versus-complete
@@ -775,3 +776,108 @@ decisions, not surprises:
 11. **Meli validation**: conversations-as-loops per the Adoption Path —
     including the queue-vs-reject product decision made explicitly — and
     the email agent on the same module; graduate this RFC's designed rows.
+
+## Adoption Report (SKUNK-156, 2026-07-09)
+
+The validation pass that closes the epic: Meli's conversations run as
+loops on `Meli.ThreadAgent`, the email thread agent rides the same
+module behind an inbound webhook, and every designed row below either
+graduated as written or is recorded here as revised. Meli's shape:
+uuid-keyed `conversation_runs` (binary_id), Oban queues
+`loop_steps`/`agents`/`loop_timers`, the loop sweep on the existing
+reconciler GenServer's second cadence rather than an Oban cron — same
+verdicts, different scheduler, an equivalence the sweep contract
+already permits.
+
+### The Adoption Path, as landed
+
+- **Same table, kind-discriminated** — as specified. The single-active
+  index dropped; its jobs moved exactly where the RFC said (scope key +
+  `(loop_ref, tag_key)` dedup; one-turn-at-a-time in `handle/2`). The
+  pre-flip guard is an application-level active-run check; during a
+  rolling deploy old pods briefly lose index protection against
+  double-sends — accepted: the failure mode is a duplicate concurrent
+  turn for minutes, not corruption.
+- **Busy-ness is queueing** — the chosen default, shipped and tested
+  ("two messages answer in order — queueing, never rejection").
+  Rejection survives only as the unflipped conversation's guard.
+- **History by cursor** — as specified, with one host-boundary rule the
+  RFC did not spell out: under queueing, a turn's history must exclude
+  *queued-but-unanswered* user prompts (they wait for their own turns)
+  while keeping later tool-result rows and replies. The loop cannot
+  carry this in its actions — a same-batch message queues *after* the
+  spawn action was emitted — so it is `build_child/4`'s rule: exclude
+  normal user messages positioned after the prompt. Deterministic given
+  the rows, replay-stable.
+- **Mutations re-map** — `sendMessage` returns loop ref + turn tag;
+  `cancelRun` resolves a loop ref to its current child and
+  `request_cancel` refuses loop rows (A2, asserted in production
+  shape). **Revision**: Meli has no sync `sendMessage`, so "sync
+  sendMessage awaits the completion notification" graduates as
+  host-optional — the correlation it needs (`child_ref/4` + the child's
+  terminal notification) is shipped and exercised, but no Meli surface
+  awaits inline.
+- **Deletion** — cancel → cascade → sweep → purge, asynchronous, as
+  specified; the purge enqueue rides the loop's terminal
+  `after_transition` (post-commit, best-effort), so the loop sweep
+  carries a deletion re-drive for the crash window. Both paths tested.
+- **Cutover on quiescence** — as specified: active old-path runs
+  (parked approvals included) block the flip; the old enqueue path
+  survives only for runs in flight across the deploy.
+- **Billing** — no usage aggregation existed in Meli yet, so the
+  adoption ships the canonical kind-scoped read (`billable_usage/1`)
+  with the double-count test the recipe's Billing section demands.
+
+### Findings against the shipped layer
+
+- **A5 implementation gap, fixed here**: the Ecto adapter's schemaless
+  inbox *insert* passed refs raw; binary_id hosts (uuid-string refs)
+  were refused by the driver. Query-side `type/2` casts were already
+  correct. Refs now dump through `Ecto.Type.adapter_dump` at the
+  insert, and the LoopCase battery runs against a uuid-keyed twin host
+  so the key shape cannot regress (29/32 battery tests fail without the
+  fix).
+- **Guide defect, fixed here**: the durable-loops guide's synthesized
+  interrupted completion used `Result.interrupted(:worker_lost, _)` —
+  not an `InterruptReason` code; it raises. Corrected to the
+  `{:app, _}` escape hatch.
+- **Recipe note**: loop creation is a machinery insert, not a
+  changeset, so host tables with NOT NULL timestamp columns must supply
+  them through creation's `:attrs` (host product columns) — the
+  sanctioned channel, but worth knowing before the first insert fails.
+- **Webhook dedup has two timings, and the inbox covers one.** The
+  inbox `dedup_key` is unique among *live* rows and consumed rows
+  delete, so it collapses redelivery only while the input is
+  in-flight. A provider redelivery arriving after the turn completed
+  needs a receipt that outlives consumption: Meli uses the message
+  row's idempotency key, committed in the same transaction as the
+  append. This is the intended division (the RFC's send contract says
+  "while its row lives"); the pattern — durable host receipt beside the
+  append — is what webhook adopters should copy, and the acceptance
+  test drives both timings.
+
+### Row graduation
+
+Verification lives in three layers: the library's property tests and
+LoopCase battery on the integer-keyed and uuid-keyed conformance hosts
+(rows L1, L3–L11, L13, L15, plus the reconciler's L16 judgment), the
+same generated battery against Meli's production host and database, and
+Meli-shape integration tests where the row names a production story.
+
+| Row | Verdict | Where |
+|---|---|---|
+| L1 | graduated | battery (both hosts + Meli's); Meli "pod death mid-turn" — interrupted child's completion delivers, retry loses nothing |
+| L2 | graduated | library step-runner tests (`:incompatible_state`/`:incompatible_spec` parks); not yet exercised by a real Meli deploy — ThreadAgent is still `state_version: 1` |
+| L3–L5 | graduated | battery leads with them, on all three hosts |
+| L6 | graduated | battery crash-window + stale-fire tests; Meli wires the Oban schedule/fire doors, retry-timer decisions unit-tested |
+| L7 | graduated | battery poison path; ThreadAgent's `{:input_failed, _}` clause |
+| L8/L9 | graduated | battery cascade rows; Meli deletion test drives cancel → cascade → sweep → purge against real rows |
+| L10 | graduated | battery append-to-terminal; the webhook's `:dead_lettered` branch acks-and-alerts |
+| L11 | graduated | battery zombie fencing, both guard halves |
+| L12 | graduated | Meli "pod death mid-turn": reaper interrupt → terminal projection → completion, exactly-once |
+| L13 | graduated | battery lost-glue probe, run against Meli's real projection wiring |
+| L14 | graduated | battery batch/continue; Meli runs library defaults |
+| L15 | graduated | battery + Meli "lost step job re-enqueues" |
+| L16 | graduated | reconciler judgment tests + Meli "crashed step requeues at epoch 40" |
+| L17 | graduated | battery unknown-tag dead-letter |
+| L18 | doctrine | purity is the app's contract; the library's replay properties assume it, Meli's loop honors it |

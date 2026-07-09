@@ -899,7 +899,12 @@ if Code.ensure_loaded?(Ecto.Query) do
     # Every inbox row's birth emits exactly one deferred event: :input for
     # a pending row (or a dedup hit), :dead_letter for a row born dead.
     defp insert_input(config, loop_ref, kind, payload, dedup_key, opts \\ []) do
-      row = %{loop_ref: loop_ref, kind: kind, payload: payload, dedup_key: dedup_key}
+      row = %{
+        loop_ref: dump_ref!(config, loop_ref),
+        kind: kind,
+        payload: payload,
+        dedup_key: dedup_key
+      }
 
       row =
         case opts[:dead] do
@@ -1606,6 +1611,22 @@ if Code.ensure_loaded?(Ecto.Query) do
 
     defp ref_type(config) do
       config.schema.__schema__(:type, config.fields[:ref])
+    end
+
+    # The inbox is schemaless, so query-side refs cast through type/2 —
+    # but insert_all skips the adapter's dumpers entirely, and a
+    # :binary_id host's ref (a UUID string) must cross pre-dumped or the
+    # driver refuses it. Resolved against the repo's adapter, so integer
+    # and uuid key shapes both pass through correctly.
+    defp dump_ref!(config, ref) do
+      case Ecto.Type.adapter_dump(config.repo.__adapter__(), ref_type(config), ref) do
+        {:ok, dumped} ->
+          dumped
+
+        :error ->
+          raise ArgumentError,
+                "cannot dump loop ref #{inspect(ref)} as #{inspect(ref_type(config))}"
+      end
     end
 
     defp storage_now(repo) do
