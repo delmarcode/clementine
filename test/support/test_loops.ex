@@ -114,6 +114,68 @@ defmodule Clementine.Test.ChildGlueLoop do
   defp log(state, entry), do: Map.update!(state, "log", &(&1 ++ [entry]))
 end
 
+defmodule Clementine.Test.JudgeLoop do
+  @moduledoc """
+  The judge loop from LOOP_RFC §Worked Examples — Verifier's durable,
+  final form: run → judge (a pure function of the completion) → re-run
+  with feedback args after a retry timer, `{:halt, result}` on pass or
+  attempts exhausted. The trace rides the halt output (`"log"` joined),
+  so determinism and production-trace equality assert on the result
+  alone, whatever substrate animated the loop.
+  """
+
+  use Clementine.Loop, state_version: 1, vocabulary: [:attempt, :retry]
+
+  alias Clementine.Result
+
+  def init(%{"prompt" => prompt} = args) do
+    state = %{
+      "prompt" => prompt,
+      "max" => Map.get(args, "max_attempts", 3),
+      "log" => ["spawn:1"]
+    }
+
+    {:ok, state, [{:run, {:attempt, 1}, %{"prompt" => prompt, "attempt" => 1}}]}
+  end
+
+  def handle({:completed, {:attempt, n}, %Result.Completed{output: output}}, state) do
+    if judge_pass?(output) do
+      state = log(state, "pass:#{n}")
+      {:halt, Result.completed(output: trace(state)), state}
+    else
+      {:ok, log(state, "fail:#{n}"), [{:timer, {:retry, n}, :timer.minutes(5)}]}
+    end
+  end
+
+  def handle({:completed, {:attempt, n}, _failed_or_interrupted}, state) do
+    {:ok, log(state, "child_error:#{n}"), [{:timer, {:retry, n}, :timer.minutes(5)}]}
+  end
+
+  def handle({:elapsed, {:retry, n}}, state) do
+    next = n + 1
+
+    if next > state["max"] do
+      state = log(state, "exhausted:#{n}")
+      error = %Clementine.Error{message: trace(state), code: :attempts_exhausted}
+      {:halt, Result.failed(error), state}
+    else
+      args = %{
+        "prompt" => state["prompt"],
+        "attempt" => next,
+        "feedback" => "attempt #{n} was judged a fail; try again"
+      }
+
+      {:ok, log(state, "spawn:#{next}"), [{:run, {:attempt, next}, args}]}
+    end
+  end
+
+  # The judge: pure over the completion, as the RFC prescribes.
+  defp judge_pass?(output), do: is_binary(output) and String.contains?(output, "pass")
+
+  defp log(state, entry), do: Map.update!(state, "log", &(&1 ++ [entry]))
+  defp trace(state), do: Enum.join(state["log"], ",")
+end
+
 defmodule Clementine.Test.DoorLoop do
   @moduledoc """
   State is a MapSet — not JSON — proving the `dump/1`/`load/1` doors:

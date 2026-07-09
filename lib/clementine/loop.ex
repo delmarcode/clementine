@@ -90,6 +90,59 @@ defmodule Clementine.Loop do
     end
   end
 
+  @doc """
+  Runs one loop from `init(args)` to its halt result, in-process — the
+  script path (LOOP_RFC §Worked Examples): production shape simulated by
+  an in-memory host, deterministic for evals, animating the same
+  behaviour module production runs.
+
+      {:ok, result} = Clementine.Loop.run_local(JudgeLoop, %{"prompt" => "..."})
+
+  Three simulations make script and production ordering agree:
+
+  - **The inbox** is in-memory with identical FIFO/consumption semantics,
+    every input round-tripping the production value codec — a payload
+    outside the declared vocabulary fails here as it would against real
+    storage.
+  - **The hop is modeled**: children are real rollout-runs executed by
+    `Clementine.Runner.execute/2` (in spawn order, in the caller's
+    process), and their completions are *enqueued as inputs* by the
+    terminal projection glue, never handed to `handle/2` inline.
+  - **Timers ride a virtual clock** that jumps to the next deadline when
+    the loop is otherwise idle — a five-minute retry timer costs nothing
+    and fires in order.
+
+  ## Options
+
+  - `:messages` — payloads appended in order as `{:message, payload}`
+    inputs before the first step: the input script (default `[]`).
+  - `:build_child` — `fn tag, child_args -> {:ok, %Clementine.Rollout{}}
+    end`, the host boundary where JSON-safe args become rollouts
+    (`Clementine.Loop.Host.build_child/4`'s local stand-in). Required if
+    the loop emits `{:run, ...}`; `{:error, term}` from it raises.
+  - `:policy` — the `loop_policy` map the step runner interprets (batch
+    cap, dead-letter threshold; default `%{}`).
+  - `:max_steps` — step budget guarding never-halting loops, a watcher
+    on a virtual clock being the canonical one (default `1000`).
+
+  ## Returns
+
+  - `{:ok, result}` — the halt result, whatever `Clementine.Result`
+    variant the loop chose (a judge halting `Failed` on exhausted
+    attempts is a halt, not a machinery error).
+  - `{:error, {:parked, facts}}` — the loop parked with nothing in
+    flight, no timers pending, and the script spent: production would
+    wait for the world; a script has no world left to wait for.
+  - `{:error, {:max_steps, n}}` — the budget elapsed first.
+  - `{:error, term()}` — a step failed structurally (e.g. a `{:send, ...}`
+    to a target that does not exist locally).
+  """
+  @spec run_local(module(), map(), keyword()) ::
+          {:ok, Result.t()} | {:error, term()}
+  def run_local(module, args, opts \\ []) when is_atom(module) and is_map(args) do
+    Clementine.Loop.Local.run(module, args, opts)
+  end
+
   @doc "True when the module was compiled with `use Clementine.Loop`."
   @spec loop?(module()) :: boolean()
   def loop?(module) when is_atom(module) do
