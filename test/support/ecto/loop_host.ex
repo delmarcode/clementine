@@ -20,6 +20,12 @@ defmodule Clementine.Test.Ecto.LoopHost do
   lifecycle and the recipe inbox, with jobs as `Clementine.Test.Ecto.Job`
   rows. `cancel_timer/4` reports to the `ctx` pid when one is given, so
   tests observe the best-effort cancellation seam.
+
+  `child_attrs/4` propagates the `Clementine.LoopCase` lost-glue probe:
+  children of a loop labeled `drop_glue_label/0` inherit the label, and
+  `Clementine.Test.Ecto.Lifecycle.project/3` skips the completion-append
+  glue for labeled rows — the manufactured row L13 strand. One constant,
+  three readers (factory, this host, the projection).
   """
 
   use Clementine.Loop.Ecto,
@@ -30,6 +36,16 @@ defmodule Clementine.Test.Ecto.LoopHost do
 
   alias Clementine.Test.Ecto.Job
   alias Clementine.TestRepo
+
+  @drop_glue_label "drop_completions"
+
+  @doc "The LoopCase lost-glue probe label — see the moduledoc."
+  def drop_glue_label, do: @drop_glue_label
+
+  @impl Clementine.Loop.Ecto
+  def child_attrs(loop_row, _tag_key, _child_args, _ctx) do
+    if loop_row.label == @drop_glue_label, do: %{label: @drop_glue_label}, else: %{}
+  end
 
   @impl Clementine.Loop.Host
   def build_child(_facts, _tag, child_args, _ctx) do
