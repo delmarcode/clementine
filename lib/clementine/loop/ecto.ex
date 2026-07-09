@@ -97,11 +97,11 @@ if Code.ensure_loaded?(Ecto.Query) do
               )
             )
 
-          {:ok, %{"job_id" => job.id}}
+          {:ok, %{"schedule_id" => job.id}}
         end
 
         @impl Clementine.Loop.Ecto
-        def cancel_timer(_loop_row, _tag_key, %{"job_id" => job_id}, _ctx) do
+        def cancel_timer(_loop_row, _tag_key, %{"schedule_id" => job_id}, _ctx) do
           Oban.cancel_job(job_id)
           :ok
         end
@@ -124,10 +124,15 @@ if Code.ensure_loaded?(Ecto.Query) do
 
     `Oban.insert/2` inside the unit commits with it (jobs are rows);
     `Oban.cancel_job/1` is exactly the best-effort cancel the contract
-    asks for. The races resolve as LOOP_RFC §Timers states them: a fire
-    that outran its cancel appends an elapsed the next drain consumes as
-    a dead letter (`:stale_elapsed`) — never `handle/2`'s, never
-    dropped; a fire against a terminal loop is answered
+    asks for. `"schedule_id"` is the meta's one reserved key: the job id
+    the worker will fire with, which makes the envelope entry the
+    schedule's retained identity — `fire_timer/5` compares it under the
+    run-row lock, so a fire redelivered after its row was consumed, or
+    out-raced by a cancel + re-arm of the same tag, dead-letters at the
+    door instead of masquerading as the fresh schedule's elapse. The
+    races resolve as LOOP_RFC §Timers states them: a stale fire is
+    consumed as a dead letter (`:stale_elapsed`) — never `handle/2`'s,
+    never dropped; a fire against a terminal loop is answered
     `{:ok, :dead_lettered}` (`dead_reason: :terminal`) — distinguishable
     noise the worker acks.
 
@@ -241,6 +246,12 @@ if Code.ensure_loaded?(Ecto.Query) do
     relative form against the storage clock (`fire_at/2`). The fired
     job's door is `fire_timer/5`; the moduledoc's Timers section shows
     the full Oban wiring.
+
+    One meta key is reserved: `"schedule_id"` — the id the worker will
+    pass to `fire_timer/5`. Include it and the envelope entry becomes
+    the schedule's retained identity, giving fires schedule-granular
+    dedup that survives the fired row's consumption; omit it and the
+    door degrades to tag-level liveness (the drain's own grain).
     """
     @callback schedule_timer(
                 loop_row :: Ecto.Schema.t(),
@@ -251,9 +262,10 @@ if Code.ensure_loaded?(Ecto.Query) do
 
     @doc """
     Best-effort cancellation of a scheduled timer job — a fire that races
-    the cancel is legal: its append lands, and the next drain consumes it
-    as a `:stale_elapsed` dead letter, never `handle/2`'s. Invoked inside
-    `apply_step/2`'s atomic unit. Defaults to `:ok`.
+    the cancel is legal: it is consumed as a `:stale_elapsed` dead letter
+    (at `fire_timer/5`'s door once the cancel committed, or at the next
+    drain when the append got there first), never `handle/2`'s. Invoked
+    inside `apply_step/2`'s atomic unit. Defaults to `:ok`.
     """
     @callback cancel_timer(
                 loop_row :: Ecto.Schema.t(),
@@ -1284,17 +1296,34 @@ if Code.ensure_loaded?(Ecto.Query) do
     consulted, so the fire survives any deploy — a renamed loop module
     parks `:incompatible_spec` with its elapses queued, never lost.
 
+    Exactly-once per schedule rides two belts that meet under the run-row
+    lock (the same lock that serializes `apply_step/2`): while the fired
+    row lives, the inbox dedup key answers a scheduler's retry with
+    `:duplicate`; once a drain consumes the row (freeing its key), the
+    envelope's timer meta is the retained schedule identity — an absent
+    entry, or a reserved `"schedule_id"` meta key that does not match,
+    is proof the schedule was spent, cancelled, or superseded by a
+    re-arm, and the fire dead-letters at the door (`:stale_elapsed`)
+    without ever waking the loop. The lock leaves no seam between the
+    belts: a redelivered or out-raced fire is never delivered to
+    `handle/2` as a live elapse — not even attributed to a re-armed
+    tag's fresh schedule. Only *provable* staleness diverts: a meta
+    without the reserved key degrades to tag-level liveness, and an
+    undecodable envelope (a deploy mid-park) stays live for the drain to
+    re-judge — inputs are innocent of deploys.
+
     The scheduler cannot know what raced it, and does not need to:
 
-    - `{:ok, :appended}` — durable; the next drain consumes it, as the
-      live elapse or (when a cancel or retire won the race) as a
-      `:stale_elapsed` dead letter — never `handle/2`'s, never silently
-      dropped (matrix row L6).
-    - `{:ok, :duplicate}` — this schedule already fired (the worker's own
-      retry); nothing changed.
-    - `{:ok, :dead_lettered}` — the loop is terminal; the row is retained
-      as evidence (`dead_reason: :terminal`) — distinguishable noise, ack
-      it.
+    - `{:ok, :appended}` — durable and pending; the next drain consumes
+      it, as the live elapse or (when a cancel or retire lands between
+      this append and that drain) as a `:stale_elapsed` dead letter —
+      never `handle/2`'s, never silently dropped (matrix row L6).
+    - `{:ok, :duplicate}` — this schedule's fire is already recorded,
+      live or dead (the worker's own retry); nothing changed.
+    - `{:ok, :dead_lettered}` — retained as evidence, never to be
+      consumed: the loop is terminal (`dead_reason: :terminal`) or the
+      schedule is provably stale (`dead_reason: :stale_elapsed`) — the
+      row's reason keeps the two distinguishable. Ack it.
     - `{:error, :not_found}` / `{:error, :rollout_run}` — a vanished row
       or a miswired ref; nothing written.
     """
@@ -1318,12 +1347,62 @@ if Code.ensure_loaded?(Ecto.Query) do
           row ->
             unless loop_row?(config, row), do: config.repo.rollback(:rollout_run)
 
-            deliver_locked(host, config, row, "elapsed", payload, dedup_key,
-              wake?: true,
-              ctx: ctx
-            )
+            status = row |> Map.fetch!(config.fields[:status]) |> LifecycleCodec.decode_status()
+
+            cond do
+              # Terminal wins the reason: the RFC's "timers of terminal
+              # loops" clause, whatever else the schedule raced.
+              Facts.terminal?(status) ->
+                deliver_locked(host, config, row, "elapsed", payload, dedup_key,
+                  wake?: true,
+                  ctx: ctx
+                )
+
+              stale_fire?(config, row, tag_key, schedule_id) ->
+                ref = Map.fetch!(row, config.fields[:ref])
+
+                if insert_input(config, ref, "elapsed", payload, dedup_key, dead: "stale_elapsed") do
+                  :dead_lettered
+                else
+                  :duplicate
+                end
+
+              true ->
+                deliver_locked(host, config, row, "elapsed", payload, dedup_key,
+                  wake?: true,
+                  ctx: ctx
+                )
+            end
         end
       end)
+    end
+
+    # The door's staleness judgment, made under the row lock that
+    # serializes it against apply_step — so "the envelope" is never a
+    # half-superseded read: a consuming commit either landed (its meta
+    # is visible here) or is blocked on this lock (and then the original
+    # fired row still holds the dedup key, which answers instead). A nil
+    # envelope column is provably schedule-free — schedules are cargo,
+    # so nothing can be pending before the first commit (L6's
+    # never-committed clause).
+    defp stale_fire?(config, row, tag_key, schedule_id) do
+      case Map.fetch!(row, config.fields[:envelope]) do
+        nil ->
+          true
+
+        data ->
+          case Envelope.decode(data) do
+            {:ok, %Envelope{timers: timers}} ->
+              case Map.get(timers, tag_key) do
+                nil -> true
+                %{"schedule_id" => id} -> Codec.ref_string(id) != Codec.ref_string(schedule_id)
+                _meta -> false
+              end
+
+            {:error, _} ->
+              false
+          end
+      end
     end
 
     @doc """
