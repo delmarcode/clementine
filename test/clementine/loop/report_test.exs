@@ -274,6 +274,51 @@ defmodule Clementine.Loop.ReportTest do
       assert inspect!(store, ref).strands |> Enum.map(& &1.class) == [:parked_with_pending]
     end
 
+    test "diagnosis reads the :completions window past a backlog longer than :limit", %{
+      store: store
+    } do
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      {:ok, :appended} =
+        Host.append(
+          ref,
+          Input.message(%{"id" => "w", "actions" => [{:run, {:reply, 1}, %{}}]}),
+          nil,
+          store
+        )
+
+      assert {:parked, _} = step!(store, ref)
+      {:ok, child} = LoopProtocol.child_ref(Host, ref, {:reply, 1}, ctx: store)
+
+      {:ok, _lease} = Clementine.Lifecycle.Protocol.claim(Host, child, executor: "w", ctx: store)
+      {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :tester, ctx: store)
+      assert {:parked, _} = step!(store, ref)
+
+      # The child reached its terminal and its completion WAS delivered —
+      # but two messages sit ahead of it in FIFO, so a limit-1 :any
+      # window sees only backlog and only the :completions window reaches
+      # the completion.
+      Agent.update(store, fn state ->
+        update_in(state.runs[child], &%{&1 | status: :cancelled})
+      end)
+
+      forge_row!(store, ref, Input.message(%{"id" => "noise-1"}), ref: 20_001)
+      forge_row!(store, ref, Input.message(%{"id" => "noise-2"}), ref: 20_002)
+
+      forge_row!(store, ref, Input.completed({:reply, 1}, Result.completed(output: "ok")),
+        ref: 20_003
+      )
+
+      report = inspect!(store, ref, limit: 1)
+      assert [%StoredInput{input: %Input{kind: :message}}] = report.pending
+
+      # The delivered completion strands the cascade park (it is
+      # consumable and unconsumed) — and its terminal child must NOT read
+      # as :stranded_completion, because the completion exists.
+      assert [%{class: :parked_with_pending, detail: %{pending: 1}}] = report.strands
+    end
+
     test "L15: a queued loop past :stale_after diagnoses :stale_queued", %{store: store} do
       ref =
         Host.seed(store,

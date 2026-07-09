@@ -25,16 +25,19 @@ defmodule Clementine.Loop.Report do
     inputs sit unconsumed (row L4): the park re-check or append wake was
     lost; `:wake_pending` is the healing verdict. Mid-cascade, only
     pending *completions* count — non-completion backlog legitimately
-    waits for the terminal sweep.
+    waits for the terminal sweep — judged from the host's `:completions`
+    window (the cascade's own read), so a completion parked behind a
+    backlog longer than `:limit` still strands.
   - `:parked_with_cancel` — the loop is `waiting` with the cancel flag
     set but no cascade underway (row L8's lost-wake interleaving); the
     next wake enters the cascade.
   - `:stranded_completion` — the envelope lists a live child whose run
-    is terminal and whose completion input exists nowhere in the fetched
-    windows (row L13): the exactly-once-at-source append was lost;
-    `:reconcile_children` is the healing verdict. Detected only when a
-    `:lifecycle` is given, and bounded by `:limit` — a completion row
-    beyond the fetched windows reads as stranded.
+    is terminal and whose completion input exists nowhere (row L13): the
+    exactly-once-at-source append was lost; `:reconcile_children` is the
+    healing verdict. Presence reads the `:completions` window plus the
+    dead letters, each bounded by `:limit` — completions only, so a
+    non-completion backlog of any length cannot hide a delivered one.
+    Detected only when a `:lifecycle` is given.
   - `:stale_queued` — the loop has sat `queued` past `:stale_after`
     (row L15): its step job is likely lost; `:reenqueue` is the healing
     verdict.
@@ -127,7 +130,14 @@ defmodule Clementine.Loop.Report do
         now: DateTime.utc_now()
       }
 
-      {:ok, %{report | strands: strands(report, vocab, stale_after)}}
+      # The diagnosis window for completions is the runner's own cascade
+      # read: a completion parked behind a FIFO backlog longer than the
+      # limit never surfaces in the :any window, and judging from that
+      # window alone would miss a stranded cascade — or call a delivered
+      # completion stranded.
+      completions = host.pending(loop_ref, limit, :completions, ctx)
+
+      {:ok, %{report | strands: strands(report, completions, vocab, stale_after)}}
     end
   end
 
@@ -197,16 +207,16 @@ defmodule Clementine.Loop.Report do
 
   ## Strand diagnosis
 
-  defp strands(%__MODULE__{} = report, vocab, stale_after) do
+  defp strands(%__MODULE__{} = report, completions, vocab, stale_after) do
     [
       spec_strand(report),
       state_strand(report),
-      parked_with_pending(report),
+      parked_with_pending(report, completions),
       parked_with_cancel(report),
       stale_queued(report, stale_after)
     ]
     |> Enum.reject(&is_nil/1)
-    |> Enum.concat(stranded_completions(report, vocab))
+    |> Enum.concat(stranded_completions(report, completions, vocab))
   end
 
   defp spec_strand(%{module: {:error, {:incompatible_spec, detail}}}),
@@ -224,13 +234,12 @@ defmodule Clementine.Loop.Report do
   defp state_strand(_report), do: nil
 
   # Mid-cascade only completions are consumable, so only they strand a
-  # park; everywhere else any pending input against a waiting row means a
-  # lost wake (the append's atomic unit makes the state unreachable).
-  defp parked_with_pending(%{facts: %Facts{status: :waiting}} = report) do
-    consumable =
-      if cascading?(report),
-        do: Enum.filter(report.pending, &(&1.input.kind == :completed)),
-        else: report.pending
+  # park — judged from the :completions window, which sees past any
+  # non-completion backlog. Everywhere else any pending input against a
+  # waiting row means a lost wake (the append's atomic unit makes the
+  # state unreachable).
+  defp parked_with_pending(%{facts: %Facts{status: :waiting}} = report, completions) do
+    consumable = if cascading?(report), do: completions, else: report.pending
 
     case consumable do
       [] ->
@@ -244,7 +253,7 @@ defmodule Clementine.Loop.Report do
     end
   end
 
-  defp parked_with_pending(_report), do: nil
+  defp parked_with_pending(_report, _completions), do: nil
 
   defp parked_with_cancel(%{facts: %Facts{status: :waiting, cancel: cancel}} = report)
        when cancel != nil do
@@ -268,12 +277,14 @@ defmodule Clementine.Loop.Report do
   # LoopEvidence's grain: a live child whose run is terminal strands only
   # when its completion exists nowhere — pending or dead-lettered rows
   # both count as present (a poison completion that dead-lettered must
-  # not be re-synthesized).
-  defp stranded_completions(%{children: children} = report, vocab) do
+  # not be re-synthesized). Presence reads the :completions window, never
+  # the :any one: a delivered completion parked behind a backlog longer
+  # than the limit must not read as stranded.
+  defp stranded_completions(%{children: children} = report, completions, vocab) do
     children
     |> Enum.filter(fn child ->
       child.status not in [:unknown, :missing] and Facts.terminal?(child.status) and
-        not completion_present?(report, child.tag_key, vocab)
+        not completion_present?(report, completions, child.tag_key, vocab)
     end)
     |> Enum.map(fn child ->
       %{
@@ -283,8 +294,8 @@ defmodule Clementine.Loop.Report do
     end)
   end
 
-  defp completion_present?(report, tag_key, vocab) do
-    rows = report.pending ++ if(is_list(report.dead_letters), do: report.dead_letters, else: [])
+  defp completion_present?(report, completions, tag_key, vocab) do
+    rows = completions ++ if(is_list(report.dead_letters), do: report.dead_letters, else: [])
 
     Enum.any?(rows, fn %StoredInput{input: input, decode_error: decode_error} ->
       decode_error == nil and input.kind == :completed and
