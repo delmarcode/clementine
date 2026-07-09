@@ -858,6 +858,132 @@ defmodule Clementine.LoopCase.Battery do
     assert pending!(h, ref) == []
   end
 
+  ## timers (the scheduler seam)
+
+  def timer_fire_delivers_and_rearms(h) do
+    ref = parked!(h)
+    poll_key = tag_key(:poll)
+
+    # The schedule and the envelope entry recording it are one commit.
+    append!(h, ref, Input.message(%{"id" => "arm", "actions" => [{:timer, :poll, 60_000}]}))
+    assert {:parked, _} = step!(h, ref)
+    assert Map.has_key?(envelope!(h, ref).timers, poll_key)
+
+    # The fire is the scheduler's append under the machinery key (LOOP_RFC
+    # §Timers); its wake rides the append's atomic unit.
+    fire = InboxCodec.elapsed_dedup_key(poll_key, "s1")
+    assert {:ok, :appended} = h.host.append(ref, Input.elapsed(:poll), fire, h.ctx)
+    assert fetch!(h, ref).status == :queued
+
+    # A worker retry of the same schedule is a duplicate — exactly-once
+    # per schedule, whatever the job queue's delivery guarantees.
+    assert {:ok, :duplicate} = h.host.append(ref, Input.elapsed(:poll), fire, h.ctx)
+
+    # Delivered once — and the watcher's handle re-arms the same tag in
+    # the very fold that consumed the fire: live-key lifetime.
+    assert {:parked, _} = step!(h, ref)
+    assert Enum.count(log!(h, ref), &(&1 == "elapsed::poll")) == 1
+    assert Map.has_key?(envelope!(h, ref).timers, poll_key)
+    assert pending!(h, ref) == []
+
+    # The re-arm is a new schedule with its own exactly-once grain: a
+    # fresh id lands where the spent one duplicates.
+    refire = InboxCodec.elapsed_dedup_key(poll_key, "s2")
+    assert {:ok, :appended} = h.host.append(ref, Input.elapsed(:poll), refire, h.ctx)
+    assert {:parked, _} = step!(h, ref)
+    assert Enum.count(log!(h, ref), &(&1 == "elapsed::poll")) == 2
+  end
+
+  def timer_fire_racing_cancel_dead_letters(h) do
+    ref = parked!(h)
+    tag = {:retry, 7}
+    key = tag_key(tag)
+
+    append!(h, ref, Input.message(%{"id" => "arm", "actions" => [{:timer, tag, 60_000}]}))
+    assert {:parked, _} = step!(h, ref)
+    assert Map.has_key?(envelope!(h, ref).timers, key)
+
+    append!(h, ref, Input.message(%{"id" => "cancel", "actions" => [{:cancel_timer, tag}]}))
+    assert {:parked, _} = step!(h, ref)
+    assert envelope!(h, ref).timers == %{}
+    log_before = log!(h, ref)
+
+    # The racing fire: the cancel was best-effort, so a schedule that
+    # already left the queue still appends — the appender cannot know,
+    # and lands `:appended`.
+    fire = InboxCodec.elapsed_dedup_key(key, "s1")
+    assert {:ok, :appended} = h.host.append(ref, Input.elapsed(tag), fire, h.ctx)
+
+    # The machinery consumes it as a dead letter: never `handle/2`'s,
+    # never left pending (matrix row L6, Governing Invariant 11).
+    assert {:parked, _} = step!(h, ref)
+    assert log!(h, ref) == log_before
+    assert pending!(h, ref) == []
+
+    # Never silently dropped: the mark retained the row, whose key still
+    # answers the worker's retry.
+    assert {:ok, :duplicate} = h.host.append(ref, Input.elapsed(tag), fire, h.ctx)
+
+    # A cancelled tag is immediately re-armable — live-key lifetime.
+    append!(h, ref, Input.message(%{"id" => "rearm", "actions" => [{:timer, tag, 60_000}]}))
+    assert {:parked, _} = step!(h, ref)
+    assert Map.has_key?(envelope!(h, ref).timers, key)
+  end
+
+  def timer_fire_against_terminal(h) do
+    ref = parked!(h)
+    poll_key = tag_key(:poll)
+
+    # Armed and never cancelled: the loop halts with the schedule still
+    # out there — the RFC's "timers of terminal loops" noise source.
+    append!(h, ref, Input.message(%{"id" => "arm", "actions" => [{:timer, :poll, 60_000}]}))
+    assert {:parked, _} = step!(h, ref)
+    append!(h, ref, Input.message(%{"halt" => "done"}))
+    assert {:finished, %Facts{status: :completed}} = step!(h, ref)
+
+    # The late fire is TOLD — retained evidence, distinguishable noise,
+    # never a wake and never a crash.
+    fire = InboxCodec.elapsed_dedup_key(poll_key, "s1")
+    assert {:ok, :dead_lettered} = h.host.append(ref, Input.elapsed(:poll), fire, h.ctx)
+    assert fetch!(h, ref).status == :completed
+    assert pending!(h, ref) == []
+
+    # Retained means retained: the worker's retry is a duplicate of
+    # evidence, not a second row.
+    assert {:ok, :duplicate} = h.host.append(ref, Input.elapsed(:poll), fire, h.ctx)
+  end
+
+  def timer_schedule_is_cargo(h, timer_schedules) do
+    ref = parked!(h)
+    poll_key = tag_key(:poll)
+    base = timer_schedules.(ref)
+
+    append!(h, ref, Input.message(%{"id" => "arm", "actions" => [{:timer, :poll, 60_000}]}))
+
+    # The crash window: the step claimed, drained the arm, and died before
+    # its commit. Nothing durable may exist — a schedule outliving its
+    # never-committed envelope entry is draft v1's permanently wedged
+    # watcher, the interleaving the cargo model deletes.
+    lost = claim!(h, ref)
+    lost_commit = commit!(h, ref, lost)
+    assert Enum.any?(lost_commit.timers, &(&1.tag_key == poll_key))
+    assert timer_schedules.(ref) == base
+    refute Map.has_key?(envelope!(h, ref).timers, poll_key)
+
+    # The reaper requeues (A3a); the zombie's late commit is fenced whole,
+    # schedule included.
+    {:ok, _} = Protocol.requeue(h.lifecycle, fetch!(h, ref), :lease_expired, h.ctx)
+    assert {:error, :stale} = h.host.apply_step(lost_commit, h.ctx)
+    assert timer_schedules.(ref) == base
+    refute Map.has_key?(envelope!(h, ref).timers, poll_key)
+
+    # The replay commits schedule and envelope entry as one unit — exactly
+    # one of each (L1's replay discipline, the timer flavor).
+    assert {:parked, _} = step!(h, ref)
+    assert timer_schedules.(ref) == base + 1
+    assert Map.has_key?(envelope!(h, ref).timers, poll_key)
+  end
+
   ## Harness helpers
 
   def create!(h, attrs \\ []) do

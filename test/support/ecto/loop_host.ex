@@ -81,12 +81,12 @@ defmodule Clementine.Test.Ecto.LoopHost do
         args: %{"tag_key" => timer_spec.tag_key}
       })
 
-    {:ok, %{"job_id" => job.id}}
+    {:ok, %{"schedule_id" => job.id}}
   end
 
   @impl Clementine.Loop.Ecto
   def cancel_timer(_loop_row, tag_key, meta, ctx) do
-    if job_id = meta["job_id"] do
+    if job_id = meta["schedule_id"] do
       TestRepo.delete_all(from(j in Job, where: j.id == ^job_id))
     end
 

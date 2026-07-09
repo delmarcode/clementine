@@ -60,7 +60,7 @@ if Code.ensure_loaded?(Ecto.Query) do
     repo so an in-unit call commits with the unit — `Oban.insert/2`
     against the configured repo does, because Ecto transactions are
     per-process. The timer seam raises by default until a scheduler is
-    wired (its Oban-backed implementation ships with the timers epic).
+    wired (see Timers On The Scheduler Seam below).
 
     ## Send cargo and vocabularies
 
@@ -73,6 +73,68 @@ if Code.ensure_loaded?(Ecto.Query) do
     not a loop — fails the whole commit: the step retries and the causing
     input walks the sender's poison path — informed, never silently
     dropped.
+
+    ## Timers on the scheduler seam
+
+    `schedule_timer/3` and `cancel_timer/4` are the schedule half —
+    invoked inside `apply_step/2`'s unit, so a schedule commits with the
+    envelope entry recording it or not at all (matrix row L6's crash
+    window: a job outliving its never-committed entry, draft v1's wedged
+    watcher, is structurally impossible). `fire_timer/5` is the fire
+    half: the timer worker's door, appending `{:elapsed, tag}` under the
+    machinery dedup key `"elapsed:" <> tag_key <> ":" <> schedule_id` —
+    per schedule, so a worker's retry collapses to `:duplicate` while a
+    re-armed tag's next fire (a fresh schedule) lands. The Oban wiring,
+    in full:
+
+        @impl Clementine.Loop.Ecto
+        def schedule_timer(loop_row, spec, _ctx) do
+          {:ok, job} =
+            Oban.insert(
+              MyApp.LoopTimerWorker.new(
+                %{"loop_ref" => loop_row.id, "tag_key" => spec.tag_key},
+                scheduled_at: Clementine.Loop.Ecto.fire_at(__MODULE__, spec.fire)
+              )
+            )
+
+          {:ok, %{"schedule_id" => job.id}}
+        end
+
+        @impl Clementine.Loop.Ecto
+        def cancel_timer(_loop_row, _tag_key, %{"schedule_id" => job_id}, _ctx) do
+          Oban.cancel_job(job_id)
+          :ok
+        end
+
+        def cancel_timer(_loop_row, _tag_key, _meta, _ctx), do: :ok
+
+        defmodule MyApp.LoopTimerWorker do
+          use Oban.Worker, queue: :loop_timers
+
+          @impl Oban.Worker
+          def perform(%Oban.Job{id: id, args: %{"loop_ref" => ref, "tag_key" => tag_key}}) do
+            case Clementine.Loop.Ecto.fire_timer(MyApp.LoopHost, ref, tag_key, id) do
+              {:ok, _outcome} -> :ok
+              {:error, :not_found} -> {:cancel, "loop row deleted"}
+              {:error, :rollout_run} -> {:cancel, "not a loop"}
+              {:error, reason} -> {:error, reason}
+            end
+          end
+        end
+
+    `Oban.insert/2` inside the unit commits with it (jobs are rows);
+    `Oban.cancel_job/1` is exactly the best-effort cancel the contract
+    asks for. `"schedule_id"` is the meta's one reserved key: the job id
+    the worker will fire with, which makes the envelope entry the
+    schedule's retained identity — `fire_timer/5` compares it under the
+    run-row lock, so a fire redelivered after its row was consumed, or
+    out-raced by a cancel + re-arm of the same tag, dead-letters at the
+    door instead of masquerading as the fresh schedule's elapse. The
+    races resolve as LOOP_RFC §Timers states them: a stale fire is
+    consumed as a dead letter (`:stale_elapsed`) — never `handle/2`'s,
+    never dropped; a fire against a terminal loop is answered
+    `{:ok, :dead_lettered}` (`dead_reason: :terminal`) — distinguishable
+    noise the worker acks.
 
     ## The child worker
 
@@ -181,7 +243,15 @@ if Code.ensure_loaded?(Ecto.Query) do
     meta (the schedule handle `cancel_timer/4` gets back). Invoked inside
     `apply_step/2`'s atomic unit. The spec's `fire` is
     `{:at, DateTime.t()}` or the symbolic `{:now_plus, ms}` — resolve the
-    relative form against the storage clock.
+    relative form against the storage clock (`fire_at/2`). The fired
+    job's door is `fire_timer/5`; the moduledoc's Timers section shows
+    the full Oban wiring.
+
+    One meta key is reserved: `"schedule_id"` — the id the worker will
+    pass to `fire_timer/5`. Include it and the envelope entry becomes
+    the schedule's retained identity, giving fires schedule-granular
+    dedup that survives the fired row's consumption; omit it and the
+    door degrades to tag-level liveness (the drain's own grain).
     """
     @callback schedule_timer(
                 loop_row :: Ecto.Schema.t(),
@@ -192,8 +262,10 @@ if Code.ensure_loaded?(Ecto.Query) do
 
     @doc """
     Best-effort cancellation of a scheduled timer job — a fire that races
-    the cancel is legal and dead-letters as `:stale_elapsed` on arrival.
-    Invoked inside `apply_step/2`'s atomic unit. Defaults to `:ok`.
+    the cancel is legal: it is consumed as a `:stale_elapsed` dead letter
+    (at `fire_timer/5`'s door once the cancel committed, or at the next
+    drain when the append got there first), never `handle/2`'s. Invoked
+    inside `apply_step/2`'s atomic unit. Defaults to `:ok`.
     """
     @callback cancel_timer(
                 loop_row :: Ecto.Schema.t(),
@@ -269,7 +341,8 @@ if Code.ensure_loaded?(Ecto.Query) do
         def schedule_timer(_loop_row, timer_spec, _ctx) do
           raise "#{inspect(__MODULE__)} armed timer #{inspect(timer_spec.tag)} but does not " <>
                   "implement schedule_timer/3 — override it to insert the timer job " <>
-                  "(the Oban-backed seam ships with the timers epic)"
+                  "(Timers On The Scheduler Seam in the Clementine.Loop.Ecto docs shows " <>
+                  "the Oban wiring)"
         end
 
         @impl Clementine.Loop.Ecto
@@ -1207,6 +1280,147 @@ if Code.ensure_loaded?(Ecto.Query) do
         end)
 
       :ok
+    end
+
+    ## The timer fire door
+
+    @doc """
+    The timer worker's door (LOOP_RFC §Timers): appends the loop's
+    `{:elapsed, tag}` input under the machinery dedup key
+    `"elapsed:" <> tag_key <> ":" <> schedule_id`, waking a parked loop
+    in the same unit — `append/4`'s exact semantics from the schedule's
+    durable halves (the job's stored `tag_key`, its own id as
+    `schedule_id`).
+
+    Works in `tag_key` space, never the tag term: no vocabulary is
+    consulted, so the fire survives any deploy — a renamed loop module
+    parks `:incompatible_spec` with its elapses queued, never lost.
+
+    Exactly-once per schedule rides two belts that meet under the run-row
+    lock (the same lock that serializes `apply_step/2`): while the fired
+    row lives, the inbox dedup key answers a scheduler's retry with
+    `:duplicate`; once a drain consumes the row (freeing its key), the
+    envelope's timer meta is the retained schedule identity — an absent
+    entry, or a reserved `"schedule_id"` meta key that does not match,
+    is proof the schedule was spent, cancelled, or superseded by a
+    re-arm, and the fire dead-letters at the door (`:stale_elapsed`)
+    without ever waking the loop. The lock leaves no seam between the
+    belts: a redelivered or out-raced fire is never delivered to
+    `handle/2` as a live elapse — not even attributed to a re-armed
+    tag's fresh schedule. Only *provable* staleness diverts: a meta
+    without the reserved key degrades to tag-level liveness, and an
+    undecodable envelope (a deploy mid-park) stays live for the drain to
+    re-judge — inputs are innocent of deploys.
+
+    The scheduler cannot know what raced it, and does not need to:
+
+    - `{:ok, :appended}` — durable and pending; the next drain consumes
+      it, as the live elapse or (when a cancel or retire lands between
+      this append and that drain) as a `:stale_elapsed` dead letter —
+      never `handle/2`'s, never silently dropped (matrix row L6).
+    - `{:ok, :duplicate}` — this schedule's fire is already recorded,
+      live or dead (the worker's own retry); nothing changed.
+    - `{:ok, :dead_lettered}` — retained as evidence, never to be
+      consumed: the loop is terminal (`dead_reason: :terminal`) or the
+      schedule is provably stale (`dead_reason: :stale_elapsed`) — the
+      row's reason keeps the two distinguishable. Ack it.
+    - `{:error, :not_found}` / `{:error, :rollout_run}` — a vanished row
+      or a miswired ref; nothing written.
+    """
+    @spec fire_timer(module(), term(), String.t(), term(), term()) ::
+            {:ok, :appended}
+            | {:ok, :duplicate}
+            | {:ok, :dead_lettered}
+            | {:error, :not_found}
+            | {:error, :rollout_run}
+            | {:error, term()}
+    def fire_timer(host, loop_ref, tag_key, schedule_id, ctx \\ nil) when is_binary(tag_key) do
+      config = host.__clementine_loop_config__()
+      payload = Codec.elapsed_payload(tag_key)
+      dedup_key = Codec.elapsed_dedup_key(tag_key, schedule_id)
+
+      config.repo.transaction(fn ->
+        case lock_run(config, loop_ref) do
+          nil ->
+            config.repo.rollback(:not_found)
+
+          row ->
+            unless loop_row?(config, row), do: config.repo.rollback(:rollout_run)
+
+            status = row |> Map.fetch!(config.fields[:status]) |> LifecycleCodec.decode_status()
+
+            cond do
+              # Terminal wins the reason: the RFC's "timers of terminal
+              # loops" clause, whatever else the schedule raced.
+              Facts.terminal?(status) ->
+                deliver_locked(host, config, row, "elapsed", payload, dedup_key,
+                  wake?: true,
+                  ctx: ctx
+                )
+
+              stale_fire?(config, row, tag_key, schedule_id) ->
+                ref = Map.fetch!(row, config.fields[:ref])
+
+                if insert_input(config, ref, "elapsed", payload, dedup_key, dead: "stale_elapsed") do
+                  :dead_lettered
+                else
+                  :duplicate
+                end
+
+              true ->
+                deliver_locked(host, config, row, "elapsed", payload, dedup_key,
+                  wake?: true,
+                  ctx: ctx
+                )
+            end
+        end
+      end)
+    end
+
+    # The door's staleness judgment, made under the row lock that
+    # serializes it against apply_step — so "the envelope" is never a
+    # half-superseded read: a consuming commit either landed (its meta
+    # is visible here) or is blocked on this lock (and then the original
+    # fired row still holds the dedup key, which answers instead). A nil
+    # envelope column is provably schedule-free — schedules are cargo,
+    # so nothing can be pending before the first commit (L6's
+    # never-committed clause).
+    defp stale_fire?(config, row, tag_key, schedule_id) do
+      case Map.fetch!(row, config.fields[:envelope]) do
+        nil ->
+          true
+
+        data ->
+          case Envelope.decode(data) do
+            {:ok, %Envelope{timers: timers}} ->
+              case Map.get(timers, tag_key) do
+                nil -> true
+                %{"schedule_id" => id} -> Codec.ref_string(id) != Codec.ref_string(schedule_id)
+                _meta -> false
+              end
+
+            {:error, _} ->
+              false
+          end
+      end
+    end
+
+    @doc """
+    Resolves a timer spec's fire position for the scheduler: `{:at, at}`
+    passes through; the symbolic `{:now_plus, ms}` resolves against the
+    storage clock — `Clementine.Loop.Action`'s contract, never this
+    node's — which inside `apply_step/2`'s unit is the transaction's own
+    timestamp. Accepts the whole `t:Clementine.Loop.StepCommit.timer_spec/0`
+    or its `fire` value.
+    """
+    @spec fire_at(module(), StepCommit.timer_spec() | Clementine.Loop.Action.fire()) ::
+            DateTime.t()
+    def fire_at(host, %{fire: fire}), do: fire_at(host, fire)
+    def fire_at(_host, {:at, %DateTime{} = at}), do: at
+
+    def fire_at(host, {:now_plus, ms}) when is_integer(ms) and ms >= 0 do
+      config = host.__clementine_loop_config__()
+      DateTime.add(storage_now(config.repo), ms, :millisecond)
     end
 
     ## Shared

@@ -78,6 +78,17 @@ defmodule Clementine.Test.Ecto.Factory do
     )
   end
 
+  @doc "The LoopCase timer-schedule observation hook: the loop's live timer job rows."
+  @spec timer_schedules(integer()) :: non_neg_integer()
+  def timer_schedules(loop_ref) do
+    import Ecto.Query, only: [from: 2]
+
+    TestRepo.aggregate(
+      from(j in Clementine.Test.Ecto.Job, where: j.run_ref == ^loop_ref and j.kind == "timer"),
+      :count
+    )
+  end
+
   @doc "The storage clock — inside a sandbox checkout, the transaction timestamp."
   @spec db_now!() :: DateTime.t()
   def db_now! do

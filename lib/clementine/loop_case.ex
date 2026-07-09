@@ -62,6 +62,13 @@ defmodule Clementine.LoopCase do
       those enqueues go unobserved — a host that forgets them still
       passes, stranding loops until the reaper's `:reenqueue` verdict
       heals each one at claim-timeout latency.
+    * `:timer_schedules` (optional) — an arity-1 function receiving a
+      loop reference and returning how many live timer schedules the
+      host's scheduler holds for it (for the Ecto pairing, a count over
+      the timer job rows). Enables matrix row L6's crash-window test:
+      the schedule half of the atomic unit is host storage the seam
+      cannot read, so without this hook a host that schedules outside
+      the unit — draft v1's wedged watcher — still passes.
     * `:nonexistent_ref` (optional) — a reference guaranteed to match no
       run (for integer keys, `-1`). Enables the `:not_found` tests; not
       generated when omitted.
@@ -118,8 +125,8 @@ defmodule Clementine.LoopCase do
 
   ## What the battery covers
 
-  Matrix rows L1, L3, L4, L5, L7–L11, L13, and L15 as named tests, plus
-  the wrong-state calls every operation must refuse:
+  Matrix rows L1, L3–L11, L13, and L15 as named tests, plus the
+  wrong-state calls every operation must refuse:
 
     * The park-vs-append interleaving — an append landing between drain
       and park never strands: the park re-check downgrades to continue in
@@ -152,6 +159,15 @@ defmodule Clementine.LoopCase do
       past a longer-than-cap backlog, and the terminal sweep leaves
       nothing consumable — retained as dead letters, never deleted
       (L8, L9).
+    * Timers on the scheduler seam: a fire — the scheduler's `append`
+      under the machinery dedup key — delivers `{:elapsed, tag}` exactly
+      once per schedule, retries collapsing to `:duplicate`, and the
+      fired tag re-arms immediately (live-key lifetime); a fire racing
+      its cancel is consumed as a dead letter, never `handle/2`'s and
+      never silently dropped; a fire against a terminal loop answers
+      `:dead_lettered`; and, with `:timer_schedules`, the crash-window
+      case — a schedule is cargo and cannot outlive its never-committed
+      envelope entry (L6).
     * The loop-kind reaper verdicts: `:reenqueue` re-inserts a lost step
       job and never terminalizes (L15), `:reconcile_children` synthesizes
       a lost completion under the canonical dedup key — healing the strand
@@ -169,6 +185,7 @@ defmodule Clementine.LoopCase do
     lifecycle = Keyword.fetch!(opts, :lifecycle)
     create_loop = Keyword.fetch!(opts, :create_loop)
     step_jobs = Keyword.get(opts, :step_jobs)
+    timer_schedules = Keyword.get(opts, :timer_schedules)
     nonexistent_ref = Keyword.fetch(opts, :nonexistent_ref)
     ctx = Keyword.get(opts, :ctx)
     async = Keyword.get(opts, :async, false)
@@ -178,6 +195,7 @@ defmodule Clementine.LoopCase do
       prelude(host, lifecycle, create_loop, ctx, async, moduletags),
       battery(),
       step_jobs_battery(step_jobs),
+      timer_schedules_battery(timer_schedules),
       not_found_battery(nonexistent_ref)
     ]
     |> Enum.reject(&is_nil/1)
@@ -312,6 +330,20 @@ defmodule Clementine.LoopCase do
         end
       end
 
+      describe "loop conformance: timers (the scheduler seam)" do
+        test "matrix row L6: a fire delivers {:elapsed, tag} exactly once per schedule; the fired tag re-arms immediately" do
+          Battery.timer_fire_delivers_and_rearms(__loop_conformance__())
+        end
+
+        test "matrix row L6: a fire racing its cancel is consumed as a dead letter — never seen by handle/2, never silently dropped" do
+          Battery.timer_fire_racing_cancel_dead_letters(__loop_conformance__())
+        end
+
+        test "matrix row L6 (terminal): a fire against a terminal loop answers :dead_lettered — distinguishable noise" do
+          Battery.timer_fire_against_terminal(__loop_conformance__())
+        end
+      end
+
       describe "loop conformance: reaper verdicts" do
         test "matrix row L15: a lost step enqueue never kills the loop — :reenqueue re-inserts the job standalone" do
           Battery.reenqueue_verdict(__loop_conformance__())
@@ -345,6 +377,18 @@ defmodule Clementine.LoopCase do
       describe "loop conformance: step-job enqueues" do
         test "create, the append wake, the park downgrade, and cancel each enqueue the step job inside their units" do
           Battery.step_job_enqueues(__loop_conformance__(), unquote(step_jobs))
+        end
+      end
+    end
+  end
+
+  defp timer_schedules_battery(nil), do: nil
+
+  defp timer_schedules_battery(timer_schedules) do
+    quote do
+      describe "loop conformance: timer schedules" do
+        test "matrix row L6 (crash window): a schedule is cargo — it cannot outlive its never-committed envelope entry" do
+          Battery.timer_schedule_is_cargo(__loop_conformance__(), unquote(timer_schedules))
         end
       end
     end

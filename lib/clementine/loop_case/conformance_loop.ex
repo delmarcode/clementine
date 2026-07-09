@@ -18,7 +18,7 @@ defmodule Clementine.LoopCase.ConformanceLoop do
 
   use Clementine.Loop,
     state_version: 1,
-    vocabulary: [:run, :send, :reply, :retry]
+    vocabulary: [:run, :send, :timer, :cancel_timer, :reply, :retry, :poll]
 
   alias Clementine.Result
 
@@ -40,6 +40,12 @@ defmodule Clementine.LoopCase.ConformanceLoop do
 
   def handle({:completed, tag, _result}, state) do
     {:ok, log(state, "completed:#{inspect(tag)}"), []}
+  end
+
+  # The watcher (LOOP_RFC §Worked Examples): the fired tag re-arms in the
+  # very fold that consumed it — live-key lifetime, the battery's L6 probe.
+  def handle({:elapsed, :poll}, state) do
+    {:ok, log(state, "elapsed::poll"), [{:timer, :poll, 60_000}]}
   end
 
   def handle({:elapsed, tag}, state) do

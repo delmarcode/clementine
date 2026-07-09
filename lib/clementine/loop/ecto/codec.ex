@@ -73,6 +73,30 @@ defmodule Clementine.Loop.Ecto.Codec do
     "completed:#{tag_key}:#{ref_string(child_ref)}"
   end
 
+  @doc """
+  The elapsed payload from its stored half — the timer fire door, where
+  only the schedule's durable `tag_key` exists.
+  """
+  @spec elapsed_payload(String.t()) :: map()
+  def elapsed_payload(tag_key) when is_binary(tag_key) do
+    %{"tag_key" => tag_key}
+  end
+
+  @doc """
+  The dedup key for a timer fire's elapsed append:
+  `"elapsed:" <> tag_key <> ":" <> schedule_id` (LOOP_RFC §Timers).
+
+  Per schedule, not per tag: a fire's redelivery (the scheduler retrying
+  its append) collapses to `:duplicate`, while a re-armed tag's next fire
+  carries a fresh schedule id and lands — dead letters are retained rows
+  that keep their keys, so a tag-only key would block every fire after
+  the first stale one.
+  """
+  @spec elapsed_dedup_key(String.t(), term()) :: String.t()
+  def elapsed_dedup_key(tag_key, schedule_id) when is_binary(tag_key) do
+    "elapsed:#{tag_key}:#{ref_string(schedule_id)}"
+  end
+
   @doc "Rebuilds the input from its `{kind, payload}` column pair."
   @spec decode_input(String.t(), map(), keyword()) :: {:ok, Input.t()} | {:error, Error.t()}
   def decode_input(kind, payload, opts) do
