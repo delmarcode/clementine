@@ -43,6 +43,27 @@ defmodule Clementine.Loop.LocalTest.TimerOrderLoop do
   end
 end
 
+defmodule Clementine.Loop.LocalTest.TimerChildLoop do
+  @moduledoc false
+  use Clementine.Loop, state_version: 1, vocabulary: [:wait, :job]
+
+  alias Clementine.Result
+
+  def init(_args), do: {:ok, %{}, [{:timer, :wait, :timer.hours(1)}]}
+
+  def handle({:elapsed, :wait}, state), do: {:ok, state, [{:run, {:job, 1}, %{}}]}
+
+  def handle({:completed, {:job, 1}, result}, state) do
+    output =
+      case result do
+        %Result.Completed{} -> "completed"
+        %Result.Failed{error: error} -> "failed:#{error.code}"
+      end
+
+    {:halt, Result.completed(output: output), state}
+  end
+end
+
 defmodule Clementine.Loop.LocalTest.SequenceLoop do
   @moduledoc false
   use Clementine.Loop, state_version: 1
@@ -135,6 +156,7 @@ defmodule Clementine.Loop.LocalTest do
     PoisonLoop,
     SelfSendLoop,
     SequenceLoop,
+    TimerChildLoop,
     TimerOrderLoop
   }
 
@@ -255,6 +277,38 @@ defmodule Clementine.Loop.LocalTest do
                  messages: messages,
                  policy: %{"batch_cap" => 1}
                )
+    end
+
+    test "a virtual jump does not slacken a child's max_duration belt" do
+      # The child spawns after an hour-long virtual jump. Its 50ms
+      # deadline is enforced by the rollout engine against wall time, so
+      # the boundary check after a 100ms first Gather must trip — a
+      # deadline minted off the virtual clock would sit an hour slack.
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        Process.sleep(100)
+
+        [
+          {:tool_use_start, "tu_1", "echo"},
+          {:input_json_delta, "tu_1", Jason.encode!(%{"message" => "hi"})},
+          {:content_block_stop, 0},
+          {:message_delta, %{"stop_reason" => "tool_use"},
+           %{"input_tokens" => 5, "output_tokens" => 2}}
+        ]
+      end)
+
+      build = fn {:job, 1}, _args ->
+        agent =
+          Clementine.Agent.new(
+            model: :claude_sonnet,
+            instructions: "answer",
+            tools: [Clementine.Test.Tools.Echo]
+          )
+
+        {:ok, Rollout.new(agent: agent, input: "go", limits: [max_duration: 50])}
+      end
+
+      assert {:ok, %Result.Completed{output: "failed:deadline_exceeded"}} =
+               Loop.run_local(TimerChildLoop, %{}, build_child: build)
     end
 
     test "a self-re-arming watcher is bounded by :max_steps" do

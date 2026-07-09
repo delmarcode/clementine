@@ -17,18 +17,21 @@ defmodule Clementine.Loop.Local do
     inputs* by the terminal projection glue — never handed to `handle/2`
     inline — so script and production ordering agree (the §Alternatives
     verdict on inline execution).
-  - **Timers ride a virtual clock.** The store's storage clock starts at
-    wall now and only ever jumps forward — to the next schedule's deadline,
-    and only when the loop is otherwise idle (no step to run, no child to
-    run). A five-minute retry timer costs nothing and fires in order.
+  - **Timers ride a virtual clock.** The loop's storage clock — loop-row
+    stamps, inbox rows, schedule deadlines — starts at wall now and only
+    ever jumps forward: to the next schedule's deadline, and only when the
+    loop is otherwise idle (no step to run, no child to run). A
+    five-minute retry timer costs nothing and fires in order. Child
+    rollout rows stamp on the wall clock instead: the rollout engine
+    enforces `max_duration` against `DateTime.utc_now/0`, and a virtual
+    jump must not slacken that belt.
 
   Everything above the store is the shipped machinery unmodified:
   `Clementine.Loop.Protocol.create/3`, `Clementine.Loop.Runner.step/2`, the
   pure step core, and the rollout runner. Determinism follows from
   single-threaded drive order (one FIFO job ledger: steps and children in
   commit order, timers only at idle) plus the loop contract's own purity;
-  the one wall-clock anchor is the virtual clock's start, chosen because
-  the rollout engine checks child deadlines against wall time.
+  timestamps are anchors, not ordering inputs.
 
   This is an eval harness, not a host: the loop lives exactly as long as
   the call, `{:send, ...}` can only target the loop itself, and there is no
@@ -266,9 +269,10 @@ defmodule Clementine.Loop.Local do
     {:ok, store} =
       Agent.start_link(fn ->
         %{
-          # The storage clock. Starts at wall now — the rollout engine
-          # checks child deadlines against wall time, and a virtual epoch
-          # would mint children born dead — and only ever jumps forward.
+          # The loop's storage clock (child rows stamp on wall time — see
+          # stamp_clock/2). Starts at wall now so `{:at, ...}` deadlines,
+          # wall-anchored by nature, mean what they say; only ever jumps
+          # forward.
           now: DateTime.utc_now(),
           runs: %{},
           loop: %{},
@@ -321,7 +325,7 @@ defmodule Clementine.Loop.Local do
         {:ok, %Facts{} = facts} ->
           if facts.status == transition.expect.status and
                facts.epoch == transition.expect.epoch do
-            new_facts = apply_set(facts, transition.set, state.now)
+            new_facts = apply_set(facts, transition.set, stamp_clock(facts, state))
             state = put_in(state.runs[transition.run_ref], new_facts)
             state = record_result(state, transition.run_ref, transition.result)
             {{:ok, new_facts}, state}
@@ -331,6 +335,14 @@ defmodule Clementine.Loop.Local do
       end
     end)
   end
+
+  # The loop's world stamps on the virtual clock; child rollout rows stamp
+  # on the wall clock. The split is load-bearing at one point: a child's
+  # claim resolves `{:now_plus, max_duration}` into the deadline the
+  # rollout engine compares to `DateTime.utc_now/0`, and a virtual jump
+  # ahead of wall time must not slacken that belt.
+  defp stamp_clock(%Facts{kind: :loop}, state), do: state.now
+  defp stamp_clock(%Facts{}, _state), do: DateTime.utc_now()
 
   # A terminal result of a loop child appends the parent's completion
   # input under the canonical dedup key and wakes a parked parent — the
@@ -604,7 +616,7 @@ defmodule Clementine.Loop.Local do
   defp spawn_children(state, %StepCommit{children: specs, loop_ref: loop_ref}) do
     Enum.reduce(specs, {state, %{}}, fn spec, {state, fills} ->
       {ref, state} = mint_ref(state)
-      child = %Facts{ref: ref, kind: :rollout, status: :queued, queued_at: state.now}
+      child = %Facts{ref: ref, kind: :rollout, status: :queued, queued_at: DateTime.utc_now()}
 
       state =
         state
@@ -676,7 +688,7 @@ defmodule Clementine.Loop.Local do
             | status: :cancelled,
               cancel: nil,
               suspension: nil,
-              finished_at: state.now
+              finished_at: DateTime.utc_now()
           })
           |> record_result(ref, result)
 
@@ -827,9 +839,9 @@ defmodule Clementine.Loop.Local do
   defp mint_ref(state), do: {state.next_ref, %{state | next_ref: state.next_ref + 1}}
 
   # Absent keys untouched; present keys written (nil writes NULL);
-  # symbolic stamps resolve against the virtual clock — the storage clock
-  # here, which is what makes `{:now_plus, ms}` deadlines and `queued_at`
-  # stamps deterministic relative to timer fires.
+  # symbolic stamps resolve against the caller's clock — the virtual
+  # storage clock for loop rows, the wall clock for child rollout rows
+  # (see stamp_clock/2).
   defp apply_set(%Facts{} = facts, set, now) do
     set
     |> Map.drop([:envelope, :state_version])
