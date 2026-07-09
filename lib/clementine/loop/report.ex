@@ -36,7 +36,10 @@ defmodule Clementine.Loop.Report do
     exactly-once-at-source append was lost; `:reconcile_children` is the
     healing verdict. Presence reads the `:completions` window plus the
     dead letters, each bounded by `:limit` — completions only, so a
-    non-completion backlog of any length cannot hide a delivered one.
+    non-completion backlog of any length cannot hide a delivered one —
+    and matches the canonical completion dedup key first, which is
+    vocabulary-free: a delivered completion whose payload no longer
+    decodes after a vocabulary-shrinking deploy still counts as present.
     Detected only when a `:lifecycle` is given.
   - `:stale_queued` — the loop has sat `queued` past `:stale_after`
     (row L15): its step job is likely lost; `:reenqueue` is the healing
@@ -50,6 +53,7 @@ defmodule Clementine.Loop.Report do
   alias Clementine.Lifecycle.Facts
   alias Clementine.Loop
   alias Clementine.Loop.{Codec, Envelope, StoredInput}
+  alias Clementine.Loop.Ecto.Codec, as: InboxCodec
 
   defstruct facts: nil,
             module: nil,
@@ -284,7 +288,7 @@ defmodule Clementine.Loop.Report do
     children
     |> Enum.filter(fn child ->
       child.status not in [:unknown, :missing] and Facts.terminal?(child.status) and
-        not completion_present?(report, completions, child.tag_key, vocab)
+        not completion_present?(report, completions, child, vocab)
     end)
     |> Enum.map(fn child ->
       %{
@@ -294,12 +298,20 @@ defmodule Clementine.Loop.Report do
     end)
   end
 
-  defp completion_present?(report, completions, tag_key, vocab) do
+  # The canonical dedup key is the primary match — the same
+  # vocabulary-free grain the reconcile glue queries by — so a delivered
+  # completion still counts when its payload no longer decodes under the
+  # current vocabulary (a shrinking deploy sets decode_error; delivery
+  # already happened). The decoded-tag match covers host-appended
+  # completions that never carried the machinery key.
+  defp completion_present?(report, completions, child, vocab) do
     rows = completions ++ if(is_list(report.dead_letters), do: report.dead_letters, else: [])
+    canonical = InboxCodec.completion_dedup_key(child.tag_key, child.ref)
 
-    Enum.any?(rows, fn %StoredInput{input: input, decode_error: decode_error} ->
-      decode_error == nil and input.kind == :completed and
-        safe_key(input.tag, vocab) == tag_key
+    Enum.any?(rows, fn %StoredInput{} = stored ->
+      stored.dedup_key == canonical or
+        (stored.decode_error == nil and stored.input.kind == :completed and
+           safe_key(stored.input.tag, vocab) == child.tag_key)
     end)
   end
 

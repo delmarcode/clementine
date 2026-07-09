@@ -961,6 +961,7 @@ if Code.ensure_loaded?(Ecto.Query) do
             kind: i.kind,
             payload: i.payload,
             attempts: i.attempts,
+            dedup_key: i.dedup_key,
             inserted_at: i.inserted_at
           }
         )
@@ -973,23 +974,17 @@ if Code.ensure_loaded?(Ecto.Query) do
 
       config.repo.all(query)
       |> Enum.map(fn row ->
-        case Codec.decode_input(row.kind, row.payload, vocabulary: vocab) do
-          {:ok, input} ->
-            %StoredInput{
-              ref: row.id,
-              input: input,
-              attempts: row.attempts,
-              inserted_at: row.inserted_at
-            }
+        stored = %StoredInput{
+          ref: row.id,
+          input: placeholder_input(row.kind),
+          attempts: row.attempts,
+          dedup_key: row.dedup_key,
+          inserted_at: row.inserted_at
+        }
 
-          {:error, error} ->
-            %StoredInput{
-              ref: row.id,
-              input: placeholder_input(row.kind),
-              attempts: row.attempts,
-              inserted_at: row.inserted_at,
-              decode_error: error
-            }
+        case Codec.decode_input(row.kind, row.payload, vocabulary: vocab) do
+          {:ok, input} -> %{stored | input: input}
+          {:error, error} -> %{stored | decode_error: error}
         end
       end)
     end
@@ -1011,6 +1006,7 @@ if Code.ensure_loaded?(Ecto.Query) do
               kind: i.kind,
               payload: i.payload,
               attempts: i.attempts,
+              dedup_key: i.dedup_key,
               inserted_at: i.inserted_at,
               dead_at: i.dead_at,
               dead_reason: i.dead_reason
@@ -1023,6 +1019,7 @@ if Code.ensure_loaded?(Ecto.Query) do
           ref: row.id,
           input: placeholder_input(row.kind),
           attempts: row.attempts,
+          dedup_key: row.dedup_key,
           inserted_at: row.inserted_at,
           dead_at: row.dead_at,
           dead_reason: Codec.decode_dead_reason(row.dead_reason)

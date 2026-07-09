@@ -505,6 +505,7 @@ defmodule Clementine.Loop.Local do
       ref: row.ref,
       input: placeholder_input(row.kind),
       attempts: row.attempts,
+      dedup_key: row.dedup_key,
       inserted_at: row.inserted_at,
       dead_at: row.dead_at,
       dead_reason: row.dead_reason

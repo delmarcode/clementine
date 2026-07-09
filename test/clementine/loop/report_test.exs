@@ -3,7 +3,7 @@ defmodule Clementine.Loop.ReportTest do
 
   alias Clementine.Lifecycle.Facts
   alias Clementine.Loop
-  alias Clementine.Loop.{Input, Report, Runner, StoredInput}
+  alias Clementine.Loop.{Codec, Input, Report, Runner, StoredInput}
   alias Clementine.Loop.Protocol, as: LoopProtocol
   alias Clementine.Result
   alias Clementine.Test.MemoryLoopHost, as: Host
@@ -45,11 +45,12 @@ defmodule Clementine.Loop.ReportTest do
       row = %{
         ref: Keyword.get(opts, :ref, System.unique_integer([:positive]) + 10_000),
         input: input,
-        dedup_key: nil,
+        dedup_key: Keyword.get(opts, :dedup_key),
         attempts: Keyword.get(opts, :attempts, 0),
         inserted_at: Keyword.get(opts, :inserted_at, DateTime.utc_now()),
         dead_at: nil,
-        dead_reason: nil
+        dead_reason: nil,
+        decode_error: Keyword.get(opts, :decode_error)
       }
 
       update_in(state.inbox[loop_ref], &[row | &1 || []])
@@ -317,6 +318,48 @@ defmodule Clementine.Loop.ReportTest do
       # consumable and unconsumed) — and its terminal child must NOT read
       # as :stranded_completion, because the completion exists.
       assert [%{class: :parked_with_pending, detail: %{pending: 1}}] = report.strands
+    end
+
+    test "a delivered completion undecodable after a vocabulary shrink is present by its dedup key",
+         %{store: store} do
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      {:ok, :appended} =
+        Host.append(
+          ref,
+          Input.message(%{"id" => "w", "actions" => [{:run, {:reply, 1}, %{}}]}),
+          nil,
+          store
+        )
+
+      assert {:parked, _} = step!(store, ref)
+      {:ok, child} = LoopProtocol.child_ref(Host, ref, {:reply, 1}, ctx: store)
+
+      Agent.update(store, fn state ->
+        update_in(state.runs[child], &%{&1 | status: :completed})
+      end)
+
+      # Control: terminal child, no completion row — a real strand.
+      assert Enum.any?(inspect!(store, ref).strands, &(&1.class == :stranded_completion))
+
+      # The completion WAS delivered under the machinery's canonical key,
+      # but a vocabulary-shrinking deploy left its payload undecodable.
+      # Delivery already happened: the doctor must not send operators to
+      # the reconcile path for it.
+      tag_key = Codec.key({:reply, 1}, vocabulary: [:reply])
+
+      forge_row!(store, ref, Input.completed({:reply, 1}, Result.completed(output: "ok")),
+        dedup_key: "completed:#{tag_key}:#{child}",
+        decode_error: %Clementine.Error{code: :undecodable_input, message: "vocab shrank"}
+      )
+
+      report = inspect!(store, ref)
+      refute Enum.any?(report.strands, &(&1.class == :stranded_completion))
+
+      # The undecodable row itself stays visible evidence: it is pending
+      # against a parked loop, which is the honest remaining strand.
+      assert [%{class: :parked_with_pending}] = report.strands
     end
 
     test "L15: a queued loop past :stale_after diagnoses :stale_queued", %{store: store} do
