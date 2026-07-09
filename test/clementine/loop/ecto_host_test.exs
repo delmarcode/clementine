@@ -759,6 +759,180 @@ defmodule Clementine.Loop.EctoHostTest do
     end
   end
 
+  ## The timer fire door
+
+  describe "fire_timer/5 and fire_at/2" do
+    test "matrix row L6 end-to-end: arm -> fire -> drain delivers the elapse once; the fired tag re-arms a fresh schedule" do
+      loop = parked_loop!()
+      poll_key = Codec.key(:poll, vocabulary: ScriptedLoop.__loop__(:vocabulary))
+
+      {:ok, :appended} =
+        LoopHost.append(
+          loop.ref,
+          Input.message(%{"id" => 1, "actions" => [{:timer, :poll, 60_000}]}),
+          nil,
+          nil
+        )
+
+      assert run_step!(loop.ref).status == :waiting
+      assert %{"job_id" => j1} = stored_envelope(loop.ref).timers[poll_key]
+      assert TestRepo.get!(Job, j1).args == %{"tag_key" => poll_key}
+      jobs = length(step_jobs(loop.ref))
+
+      # The fire: append under the machinery key, wake in the same unit.
+      assert {:ok, :appended} = Clementine.Loop.Ecto.fire_timer(LoopHost, loop.ref, poll_key, j1)
+
+      assert [fired] = Enum.filter(inbox_rows(loop.ref), &(&1.kind == "elapsed"))
+      assert fired.dedup_key == InboxCodec.elapsed_dedup_key(poll_key, j1)
+      assert fired.dedup_key == "elapsed:#{poll_key}:#{j1}"
+      assert fired.payload == %{"tag_key" => poll_key}
+      assert TestRepo.get!(Run, loop.ref).status == "queued"
+      assert length(step_jobs(loop.ref)) == jobs + 1
+
+      # The worker's retry of the same schedule collapses to :duplicate —
+      # exactly-once per schedule, whatever the job queue redelivers.
+      assert {:ok, :duplicate} = Clementine.Loop.Ecto.fire_timer(LoopHost, loop.ref, poll_key, j1)
+      assert [_one] = Enum.filter(inbox_rows(loop.ref), &(&1.kind == "elapsed"))
+
+      # Delivered once; the watcher's handle re-arms the tag in the very
+      # fold that consumed the fire — a NEW schedule under the same key.
+      assert run_step!(loop.ref).status == :waiting
+      assert Enum.count(loop_log(loop.ref), &(&1 == "elapsed::poll")) == 1
+      assert %{"job_id" => j2} = stored_envelope(loop.ref).timers[poll_key]
+      assert j2 != j1
+      assert TestRepo.get!(Job, j2).kind == "timer"
+
+      # The fresh schedule's own id lands where the spent one duplicates.
+      assert {:ok, :appended} = Clementine.Loop.Ecto.fire_timer(LoopHost, loop.ref, poll_key, j2)
+    end
+
+    test "matrix row L6: a fire racing its cancel dead-letters :stale_elapsed — retained evidence, never handle/2's" do
+      loop = parked_loop!()
+      poll_key = Codec.key(:poll, vocabulary: ScriptedLoop.__loop__(:vocabulary))
+
+      {:ok, :appended} =
+        LoopHost.append(
+          loop.ref,
+          Input.message(%{"id" => 1, "actions" => [{:timer, :poll, 60_000}]}),
+          nil,
+          nil
+        )
+
+      assert run_step!(loop.ref).status == :waiting
+      assert %{"job_id" => j1} = stored_envelope(loop.ref).timers[poll_key]
+
+      {:ok, :appended} =
+        LoopHost.append(
+          loop.ref,
+          Input.message(%{"id" => 2, "actions" => [{:cancel_timer, :poll}]}),
+          nil,
+          nil
+        )
+
+      assert run_step!(loop.ref).status == :waiting
+      assert stored_envelope(loop.ref).timers == %{}
+      log_before = loop_log(loop.ref)
+
+      # The job the best-effort cancel could not stop fires anyway: the
+      # append lands — the appender cannot know what raced it.
+      assert {:ok, :appended} = Clementine.Loop.Ecto.fire_timer(LoopHost, loop.ref, poll_key, j1)
+
+      # The drain consumes it as a dead letter: never handle/2's (no log
+      # entry, no re-arm), marked :stale_elapsed, retained.
+      assert run_step!(loop.ref).status == :waiting
+      assert loop_log(loop.ref) == log_before
+      assert stored_envelope(loop.ref).timers == %{}
+      assert pending!(loop.ref) == []
+
+      assert [stale] = Enum.filter(inbox_rows(loop.ref), &(&1.kind == "elapsed"))
+      assert stale.dead_reason == "stale_elapsed"
+      assert stale.dead_at != nil
+
+      # Retained evidence keeps its key: the worker's retry duplicates.
+      assert {:ok, :duplicate} = Clementine.Loop.Ecto.fire_timer(LoopHost, loop.ref, poll_key, j1)
+    end
+
+    test "matrix row L6 (terminal): a fire against a terminal loop answers :dead_lettered with dead_reason :terminal" do
+      loop = parked_loop!()
+      poll_key = Codec.key(:poll, vocabulary: ScriptedLoop.__loop__(:vocabulary))
+
+      {:ok, :appended} =
+        LoopHost.append(
+          loop.ref,
+          Input.message(%{"id" => 1, "actions" => [{:timer, :poll, 60_000}]}),
+          nil,
+          nil
+        )
+
+      assert run_step!(loop.ref).status == :waiting
+      assert %{"job_id" => j1} = stored_envelope(loop.ref).timers[poll_key]
+
+      {:ok, :appended} = LoopHost.append(loop.ref, Input.message(%{"halt" => "over"}), nil, nil)
+      assert run_step!(loop.ref).status == :completed
+      jobs = length(step_jobs(loop.ref))
+
+      # The schedule outlived its loop by design (no cancel cargo at the
+      # finish): the late fire is told, retained, and wakes nothing.
+      assert {:ok, :dead_lettered} =
+               Clementine.Loop.Ecto.fire_timer(LoopHost, loop.ref, poll_key, j1)
+
+      assert TestRepo.get!(Run, loop.ref).status == "completed"
+      assert length(step_jobs(loop.ref)) == jobs
+
+      assert [dead] = Enum.filter(inbox_rows(loop.ref), &(&1.kind == "elapsed"))
+      assert dead.dead_reason == "terminal"
+      assert dead.dedup_key == InboxCodec.elapsed_dedup_key(poll_key, j1)
+
+      assert {:ok, :duplicate} = Clementine.Loop.Ecto.fire_timer(LoopHost, loop.ref, poll_key, j1)
+    end
+
+    test "fire_timer refuses rollout-kind refs and reports :not_found, writing nothing" do
+      rollout = insert_run!(kind: "rollout")
+
+      assert {:error, :rollout_run} =
+               Clementine.Loop.Ecto.fire_timer(LoopHost, rollout.id, "\"x\"", 1)
+
+      assert {:error, :not_found} = Clementine.Loop.Ecto.fire_timer(LoopHost, -1, "\"x\"", 1)
+      assert inbox_rows(rollout.id) == []
+    end
+
+    test "matrix row L6 (crash window): the schedule commits with its unit or not at all" do
+      loop = parked_loop!()
+
+      # One commit carrying both a schedule and a send naming a vanished
+      # target: the send fails the unit AFTER the timer job inserted, and
+      # the rollback must take the job with it — the schedule is cargo,
+      # not a pre-commit phase.
+      {:ok, :appended} =
+        LoopHost.append(
+          loop.ref,
+          Input.message(%{"id" => 1, "actions" => [{:timer, :poll, 60_000}, {:send, -1, %{}}]}),
+          nil,
+          nil
+        )
+
+      commit = build_commit!(loop.ref)
+      assert [%{tag_key: _}] = commit.timers
+      assert {:error, {:send_target_not_found, -1}} = LoopHost.apply_step(commit, nil)
+
+      assert TestRepo.all(from(j in Job, where: j.run_ref == ^loop.ref and j.kind == "timer")) ==
+               []
+
+      assert stored_envelope(loop.ref).timers == %{}
+      assert Enum.any?(inbox_rows(loop.ref), &is_nil(&1.dead_at))
+    end
+
+    test "fire_at/2 passes {:at, dt} through and resolves {:now_plus, ms} on the storage clock" do
+      at = ~U[2030-01-01 12:00:00Z]
+      assert Clementine.Loop.Ecto.fire_at(LoopHost, {:at, at}) == at
+      assert Clementine.Loop.Ecto.fire_at(LoopHost, %{fire: {:at, at}}) == at
+
+      resolved = Clementine.Loop.Ecto.fire_at(LoopHost, {:now_plus, 60_000})
+      expected = DateTime.add(Clementine.Test.Ecto.Factory.db_now!(), 60_000, :millisecond)
+      assert abs(DateTime.diff(resolved, expected, :millisecond)) < 5_000
+    end
+  end
+
   ## Child-terminal projection glue
 
   describe "completion glue" do
