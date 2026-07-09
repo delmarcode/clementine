@@ -94,3 +94,84 @@ defmodule Clementine.Test.Ecto.LoopHost do
     :ok
   end
 end
+
+defmodule Clementine.Test.Ecto.UuidJob do
+  @moduledoc "The job ledger for the uuid-keyed host: run_ref is a uuid."
+
+  use Ecto.Schema
+
+  schema "clementine_test_uuid_jobs" do
+    field(:run_ref, Ecto.UUID)
+    field(:kind, :string)
+    field(:args, :map)
+  end
+end
+
+defmodule Clementine.Test.Ecto.UuidLoopHost do
+  @moduledoc """
+  `Clementine.Test.Ecto.LoopHost`'s uuid-keyed twin: the same adapter and
+  callbacks over `Clementine.Test.Ecto.UuidLifecycle` and the uuid inbox.
+  Exists so the conformance battery runs against both key shapes — refs
+  cross the schemaless inbox boundary as UUID strings here.
+  """
+
+  use Clementine.Loop.Ecto,
+    lifecycle: Clementine.Test.Ecto.UuidLifecycle,
+    inbox_table: "clementine_test_uuid_loop_inbox"
+
+  import Ecto.Query, only: [from: 2]
+
+  alias Clementine.Test.Ecto.UuidJob
+  alias Clementine.TestRepo
+
+  @impl Clementine.Loop.Ecto
+  def child_attrs(loop_row, _tag_key, _child_args, _ctx) do
+    if loop_row.label == Clementine.Test.Ecto.LoopHost.drop_glue_label() do
+      %{label: Clementine.Test.Ecto.LoopHost.drop_glue_label()}
+    else
+      %{}
+    end
+  end
+
+  @impl Clementine.Loop.Host
+  def build_child(facts, tag, child_args, ctx) do
+    if is_pid(ctx), do: send(ctx, {:build_child, facts, tag, child_args})
+
+    agent = Clementine.Agent.new(model: :claude_sonnet, instructions: "test child")
+    {:ok, Clementine.Rollout.new(agent: agent, input: Map.get(child_args, "input", "go"))}
+  end
+
+  @impl Clementine.Loop.Host
+  def enqueue_step(loop_ref, _ctx) do
+    TestRepo.insert!(%UuidJob{run_ref: loop_ref, kind: "step"})
+    :ok
+  end
+
+  @impl Clementine.Loop.Ecto
+  def enqueue_child(child_row, child_args, _ctx) do
+    TestRepo.insert!(%UuidJob{run_ref: child_row.id, kind: "child", args: child_args})
+    :ok
+  end
+
+  @impl Clementine.Loop.Ecto
+  def schedule_timer(loop_row, timer_spec, _ctx) do
+    job =
+      TestRepo.insert!(%UuidJob{
+        run_ref: loop_row.id,
+        kind: "timer",
+        args: %{"tag_key" => timer_spec.tag_key}
+      })
+
+    {:ok, %{"schedule_id" => job.id}}
+  end
+
+  @impl Clementine.Loop.Ecto
+  def cancel_timer(_loop_row, tag_key, meta, ctx) do
+    if job_id = meta["schedule_id"] do
+      TestRepo.delete_all(from(j in UuidJob, where: j.id == ^job_id))
+    end
+
+    if is_pid(ctx), do: send(ctx, {:timer_cancelled, tag_key, meta})
+    :ok
+  end
+end
