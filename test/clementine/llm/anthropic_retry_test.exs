@@ -118,16 +118,34 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       Agent.stop(counter)
     end
 
-    test "a spent receive_timeout budget stops the retry loop", %{bypass: bypass} do
-      # A backoff long enough that any uncapped sleep fails this test's
-      # elapsed bound: the budget must cap the sleep and then refuse the
-      # next retry, instead of dutifully burning attempts long past the
-      # window the runner granted.
+    # The receive_timeout budget contract, in two deterministic halves.
+    # Both observe the durations the retry loop *requests* through the
+    # sleep seam — the decision under test — rather than bounding
+    # wall-clock elapsed time, which flaked under CI load (connect time,
+    # scheduler oversleep, and Bypass latency all stretch; the decision
+    # does not).
+
+    test "backoff sleeps are capped to the remaining budget, never the configured delay",
+         %{bypass: bypass} do
+      # Backoff (60s) strictly larger than the whole budget (59s), so an
+      # uncapped sleep is unambiguous in the recording. The recorder
+      # returns instantly: the budget is never spent, every retry is
+      # granted, and attempts exhaust — which forces exactly two recorded
+      # backoffs, so a seam that stops being exercised fails loudly
+      # rather than passing vacuously.
       Application.put_env(:clementine, :retry,
         max_attempts: 3,
         base_delay: 60_000,
         max_delay: 60_000
       )
+
+      {:ok, sleeps} = Agent.start_link(fn -> [] end)
+
+      Application.put_env(:clementine, :retry_sleep, fn ms ->
+        Agent.update(sleeps, &[ms | &1])
+      end)
+
+      on_exit(fn -> Application.delete_env(:clementine, :retry_sleep) end)
 
       {:ok, counter} = Agent.start_link(fn -> 0 end)
 
@@ -141,22 +159,71 @@ defmodule Clementine.LLM.AnthropicRetryTest do
         )
       end)
 
-      started = System.monotonic_time(:millisecond)
+      budget = 59_000
 
       events =
         Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], [],
-          receive_timeout: 150
+          receive_timeout: budget
         )
         |> Enum.to_list()
 
-      # The failure surfaced (as the 429, or as a timeout if the budget
-      # expired mid-attempt), the third attempt never ran, and nothing
-      # slept a full backoff.
-      assert Enum.any?(events, &match?({:error, _}, &1))
-      assert Agent.get(counter, & &1) < 3
-      assert System.monotonic_time(:millisecond) - started < 5_000
+      assert Enum.any?(events, &match?({:error, {:api_error, 429, _}}, &1))
+      assert Agent.get(counter, & &1) == 3
+
+      # Two retries were granted, and each slept min(backoff, remaining):
+      # strictly under the budget, never the configured 60s.
+      assert [_, _] = requested = Agent.get(sleeps, & &1)
+      assert Enum.all?(requested, &(&1 <= budget))
 
       Agent.stop(counter)
+      Agent.stop(sleeps)
+    end
+
+    # A regression that stops honoring the spent budget makes this test
+    # sleep a real 60s backoff; the tag bounds how long that failure
+    # runs, far above the healthy path (~1s: the one granted,
+    # budget-capped sleep).
+    @tag timeout: 30_000
+    test "a spent receive_timeout budget stops the retry loop", %{bypass: bypass} do
+      Application.put_env(:clementine, :retry,
+        max_attempts: 3,
+        base_delay: 60_000,
+        max_delay: 60_000
+      )
+
+      {:ok, sleeps} = Agent.start_link(fn -> [] end)
+
+      Application.put_env(:clementine, :retry_sleep, fn ms ->
+        Agent.update(sleeps, &[ms | &1])
+        Process.sleep(ms)
+      end)
+
+      on_exit(fn -> Application.delete_env(:clementine, :retry_sleep) end)
+
+      # No server at all: every attempt fails in microseconds (connection
+      # refused), far inside the budget, so the first backoff is
+      # deterministically granted — and, capped to the remaining budget,
+      # sleeping it spends the whole window. The retry after it must find
+      # the budget spent and refuse.
+      Bypass.down(bypass)
+
+      budget = 1_000
+
+      events =
+        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], [],
+          receive_timeout: budget
+        )
+        |> Enum.to_list()
+
+      # The failure surfaced to the consumer — and with three attempts
+      # configured and every attempt failing, a loop that ignored the
+      # spent budget would have granted a second backoff: exactly one was
+      # granted, capped to the budget, and the retry after it was refused.
+      assert Enum.any?(events, &match?({:error, {:request_failed, _}}, &1))
+      assert [granted] = Agent.get(sleeps, & &1)
+      assert granted <= budget
+
+      Agent.stop(sleeps)
     end
 
     test "retries on network error and succeeds", %{bypass: bypass} do
