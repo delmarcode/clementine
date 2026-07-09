@@ -486,20 +486,34 @@ defmodule Clementine.Loop.Local do
     end)
   end
 
+  @impl Clementine.Loop.Host
+  def dead_letters(loop_ref, limit, store) when is_integer(limit) and limit > 0 do
+    Agent.get(store, fn state ->
+      state.inbox
+      |> Map.get(loop_ref, [])
+      |> Enum.filter(& &1.dead_reason)
+      |> Enum.reverse()
+      |> Enum.take(limit)
+      |> Enum.map(&decode_row(&1, state.vocabulary))
+    end)
+  end
+
   # The seam's per-row decode contract: an undecodable payload is poison
   # for that input, surfaced as decode_error, never a failed fetch.
   defp decode_row(row, vocab) do
-    case InboxCodec.decode_input(row.kind, row.payload, vocabulary: vocab) do
-      {:ok, input} ->
-        %StoredInput{ref: row.ref, input: input, attempts: row.attempts}
+    stored = %StoredInput{
+      ref: row.ref,
+      input: placeholder_input(row.kind),
+      attempts: row.attempts,
+      dedup_key: row.dedup_key,
+      inserted_at: row.inserted_at,
+      dead_at: row.dead_at,
+      dead_reason: row.dead_reason
+    }
 
-      {:error, error} ->
-        %StoredInput{
-          ref: row.ref,
-          input: placeholder_input(row.kind),
-          attempts: row.attempts,
-          decode_error: error
-        }
+    case InboxCodec.decode_input(row.kind, row.payload, vocabulary: vocab) do
+      {:ok, input} -> %{stored | input: input}
+      {:error, error} -> %{stored | decode_error: error}
     end
   end
 

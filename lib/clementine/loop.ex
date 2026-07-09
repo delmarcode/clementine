@@ -40,6 +40,10 @@ defmodule Clementine.Loop do
   the loop provides its own doors.
   """
 
+  # The doctor is inspect/2-3 by RFC name (§Operations); Kernel's
+  # auto-imported inspect/2 yields the arity.
+  import Kernel, except: [inspect: 2]
+
   alias Clementine.Loop.Input
   alias Clementine.Result
 
@@ -141,6 +145,47 @@ defmodule Clementine.Loop do
           {:ok, Result.t()} | {:error, term()}
   def run_local(module, args, opts \\ []) when is_atom(module) and is_map(args) do
     Clementine.Loop.Local.run(module, args, opts)
+  end
+
+  @doc """
+  The doctor (LOOP_RFC §Operations): one read of everything a frozen
+  loop's diagnosis needs — lifecycle facts, the persisted spec with its
+  version compatibility, the decoded envelope, live children with
+  statuses, the timer schedule, pending inputs with ages, retained dead
+  letters, and the diagnosed strands. Returns a
+  `Clementine.Loop.Report`; `Clementine.Loop.Report.render/1` prints it.
+
+      {:ok, report} =
+        Clementine.Loop.inspect(MyApp.LoopHost, loop_ref, lifecycle: MyApp.ClementineLifecycle)
+
+      report.strands
+      #=> [%{class: :parked_with_pending, detail: %{pending: 3, oldest_age_ms: 42_000}}]
+
+  Diagnosis-only: every read goes through the host seam (`load/2`,
+  `pending/4`, the optional `dead_letters/3`) and the lifecycle's
+  `fetch/2`; nothing is written and no lease is taken, so inspecting a
+  live loop is always safe.
+
+  ## Options
+
+  - `:lifecycle` — the `Clementine.Lifecycle` module the loop's children
+    live in (the same pairing `Clementine.Loop.Runner.step/2` takes).
+    Without it children report `status: :unknown` and stranded
+    completions are not detectable.
+  - `:limit` — max pending inputs and dead letters fetched (default
+    `50`); the strand diagnosis is bounded by the same windows.
+  - `:stale_after` — milliseconds a `queued` loop may wait before it is
+    diagnosed `:stale_queued` (default `:timer.minutes(5)`, the reaper
+    policy's `wake_pending_after` vocabulary).
+  - `:ctx` — the opaque host context (default `nil`).
+
+  Errors pass through from the host's `load/2`:
+  `{:error, :not_found | :rollout_run | term}`.
+  """
+  @spec inspect(module(), term(), keyword()) ::
+          {:ok, Clementine.Loop.Report.t()} | {:error, term()}
+  def inspect(host, loop_ref, opts \\ []) do
+    Clementine.Loop.Report.gather(host, loop_ref, opts)
   end
 
   @doc "True when the module was compiled with `use Clementine.Loop`."

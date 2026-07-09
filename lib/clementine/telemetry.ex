@@ -117,7 +117,30 @@ defmodule Clementine.Telemetry do
 
   ## Loop Events
 
-  The loop layer owns the `:loop` prefix the engine rename vacated.
+  The loop layer owns the `:loop` prefix the engine rename vacated. Two
+  emitters split the events by what they can honestly see: the **step
+  runner** emits everything derivable from a committed `StepCommit`
+  (`:step`, `:step_failed`, `:spawned`, `:cascade`) after — never
+  before — the host's atomic unit commits, and the **storage adapter**
+  (`Clementine.Loop.Ecto`) emits the inbox-side events (`:input`,
+  `:dead_letter`, `:inbox`) through the deferred-emission seam, so an
+  event describing an append or dead letter fires only when the
+  transaction that created it commits. Hand-written hosts get the runner
+  events for free; the inbox events are theirs to emit if they want the
+  same signals.
+
+  ### Paging signals (LOOP_RFC §Operations)
+
+  The operations story in one table — alert on these, drill down with
+  `Clementine.Loop.inspect/3`:
+
+  | Signal | Source |
+  |--------|--------|
+  | per-loop inbox depth / oldest-unconsumed-input age | `[:clementine, :loop, :inbox]` via `Clementine.Loop.Ecto.emit_inbox_depths/1` on a `:telemetry_poller` |
+  | dead-letter creation rate by reason | `[:clementine, :loop, :dead_letter]`, `reason` tag |
+  | appends-to-terminal rate | `[:clementine, :loop, :dead_letter]` with `reason: :terminal` |
+  | `:reconcile_children` / `:wake_pending` firing rates | `[:clementine, :loop, :verdict]`, `verdict` tag — ~zero on Postgres; nonzero is a substrate or glue bug surfacing safely |
+  | step duration and batch size | `[:clementine, :loop, :step]` |
 
   ### `[:clementine, :loop, :verdict]`
 
@@ -160,6 +183,66 @@ defmodule Clementine.Telemetry do
   - Metadata: `%{loop_ref: term, epoch: pos_integer, error: Clementine.Error.t(), requeued: boolean}` —
     `requeued: false` means the requeue could not commit and the reaper
     will requeue on the stale claim stamp instead (A3a)
+
+  ### `[:clementine, :loop, :spawned]`
+
+  One child rollout-run created as commit cargo (LOOP_RFC §Children).
+  Emitted by the step runner per child spec of the committed step, after
+  the atomic unit that inserted the child row and its job.
+
+  - Measurements: `%{}`
+  - Metadata: `%{loop_ref: term, epoch: pos_integer, tag: term, tag_key: String.t()}`
+
+  ### `[:clementine, :loop, :cascade]`
+
+  A committed step entered cascade mode (LOOP_RFC §Cancellation And
+  Halt): a halt landed with children in flight, or the cancel flag's
+  first drain — including the no-children short-circuit that finishes
+  immediately (`children: 0`). Exactly one event per entry: replays of a
+  crashed entry re-detect, but only one commit ever lands.
+
+  - Measurements: `%{}`
+  - Metadata: `%{loop_ref: term, epoch: pos_integer, trigger: :cancel | :halt, children: non_neg_integer}` —
+    `children` is the live-child count being cancelled as cargo
+
+  ### `[:clementine, :loop, :input]`
+
+  One input landed in a loop's inbox — durable and pending
+  (`outcome: :appended`), or recognized by its dedup key
+  (`outcome: :duplicate`: webhook retries, replayed sends, a scheduler's
+  redelivered fire). Emitted by the storage adapter inside whichever
+  atomic unit carried the append (a host `append/4`, a timer fire, a
+  child's terminal projection, step cargo), deferred to that unit's
+  commit. Appends retained as dead letters emit `:dead_letter` instead —
+  every inbox row's birth is exactly one event.
+
+  - Measurements: `%{}`
+  - Metadata: `%{loop_ref: term, kind: :message | :completed | :elapsed | :input_failed, outcome: :appended | :duplicate}`
+
+  ### `[:clementine, :loop, :dead_letter]`
+
+  Dead letters created — retained evidence that will never be consumed
+  (Governing Invariant 11). Emitted by the storage adapter with the
+  creating unit's commit: drain-time marks, the terminal sweep, and
+  born-dead appends (post-terminal arrivals, provably stale fires). The
+  rate by `reason` is a paging signal; `reason: :terminal` is the
+  appends-to-terminal rate.
+
+  - Measurements: `%{count: pos_integer}` — rows this creation covered
+    (marks group by reason; the terminal sweep is one event)
+  - Metadata: `%{loop_ref: term, reason: :poison | :unknown_tag | :stale_elapsed | :terminal_sweep | :terminal}`
+
+  ### `[:clementine, :loop, :inbox]`
+
+  The per-loop pending-inbox gauge — depth and oldest-unconsumed-input
+  age, the stuck detector. Not event-driven: emitted by
+  `Clementine.Loop.Ecto.emit_inbox_depths/1`, which the host wires onto
+  a `:telemetry_poller` (one aggregate query per poll; loops with empty
+  pending windows emit nothing).
+
+  - Measurements: `%{depth: non_neg_integer, oldest_age_ms: non_neg_integer}` —
+    both on the storage clock
+  - Metadata: `%{loop_ref: term}`
 
   ## LLM Events
 
@@ -318,11 +401,36 @@ defmodule Clementine.Telemetry do
         unit: {:native, :millisecond},
         tags: [:outcome, :mode]
       ),
+      summary("clementine.loop.step.batch",
+        event_name: [:clementine, :loop, :step],
+        measurement: fn _measurements, metadata -> metadata.batch end
+      ),
       counter("clementine.loop.step_failed.count",
         event_name: [:clementine, :loop, :step_failed],
         measurement: fn _measurements -> 1 end,
         tags: [:requeued]
       ),
+      counter("clementine.loop.input.count",
+        event_name: [:clementine, :loop, :input],
+        measurement: fn _measurements -> 1 end,
+        tags: [:kind, :outcome]
+      ),
+      counter("clementine.loop.spawned.count",
+        event_name: [:clementine, :loop, :spawned],
+        measurement: fn _measurements -> 1 end
+      ),
+      # The paging rate by reason; reason: :terminal is the
+      # appends-to-terminal rate.
+      sum("clementine.loop.dead_letter.count", tags: [:reason]),
+      counter("clementine.loop.cascade.count",
+        event_name: [:clementine, :loop, :cascade],
+        measurement: fn _measurements -> 1 end,
+        tags: [:trigger]
+      ),
+      # Fleet distributions per poll; per-loop drill-down is the doctor's
+      # job (a loop_ref tag would be unbounded label cardinality).
+      summary("clementine.loop.inbox.depth"),
+      summary("clementine.loop.inbox.oldest_age_ms", unit: :millisecond),
 
       # LLM
       summary("clementine.llm.stop.duration", unit: {:native, :millisecond}),

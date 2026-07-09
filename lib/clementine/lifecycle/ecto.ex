@@ -300,21 +300,37 @@ if Code.ensure_loaded?(Ecto.Query) do
     def apply_transition(module, %Transition{} = transition, ctx) do
       %{repo: repo, fields: fields} = config = module.__clementine_config__()
 
-      repo.transaction(fn ->
-        # now() in Postgres is the transaction timestamp: this value and the
-        # fragment("now()") the CAS update uses resolve identically.
-        now = if nested_stamps?(transition.set), do: storage_now(repo)
+      # Projection hooks run inside this transaction and may emit through
+      # the shared seam (the loop adapter's completion-append glue does);
+      # the bracket holds those emissions until the unit commits and
+      # discards them with its rollback.
+      token = Clementine.Emissions.begin_deferral()
 
-        case cas_update(config, transition, now) do
-          {:ok, row} ->
-            if transition.result, do: module.project(transition.result, row, ctx)
-            row
+      result =
+        try do
+          repo.transaction(fn ->
+            # now() in Postgres is the transaction timestamp: this value and the
+            # fragment("now()") the CAS update uses resolve identically.
+            now = if nested_stamps?(transition.set), do: storage_now(repo)
 
-          {:error, :stale} ->
-            repo.rollback(:stale)
+            case cas_update(config, transition, now) do
+              {:ok, row} ->
+                if transition.result, do: module.project(transition.result, row, ctx)
+                row
+
+              {:error, :stale} ->
+                repo.rollback(:stale)
+            end
+          end)
+          |> tap(fn
+            {:ok, _row} -> Clementine.Emissions.flush(token)
+            {:error, _reason} -> :ok
+          end)
+        after
+          Clementine.Emissions.drop(token)
         end
-      end)
-      |> case do
+
+      case result do
         {:ok, row} ->
           facts = Codec.to_facts(row, fields)
 

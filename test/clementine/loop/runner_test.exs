@@ -883,5 +883,125 @@ defmodule Clementine.Loop.RunnerTest do
       # The failed step's commit never happened: no :step event for epoch 2.
       refute_receive {[:clementine, :loop, :step], _, %{loop_ref: ^ref, epoch: 2}}, 10
     end
+
+    test "spawned fires per child of the committed step, after the commit", %{store: store} do
+      attach_loop_events()
+
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      append!(store, ref, %{
+        "id" => "fan",
+        "actions" => [{:run, {:reply, 1}, %{"n" => 1}}, {:run, {:reply, 2}, %{"n" => 2}}]
+      })
+
+      assert {:parked, _} = step!(store, ref)
+
+      assert_receive {[:clementine, :loop, :spawned], %{},
+                      %{loop_ref: ^ref, epoch: 2, tag: {:reply, 1}, tag_key: tag_key_1}}
+
+      assert_receive {[:clementine, :loop, :spawned], %{},
+                      %{loop_ref: ^ref, epoch: 2, tag: {:reply, 2}}}
+
+      assert tag_key_1 == Codec.key({:reply, 1}, vocabulary: [:reply])
+      # Qualified by loop_ref: other async tests' loops share the
+      # global handler space.
+      refute_receive {[:clementine, :loop, :spawned], _, %{loop_ref: ^ref}}, 10
+    end
+
+    test "spawned does not fire when apply_step never commits", %{store: store} do
+      attach_loop_events()
+
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      append!(store, ref, %{"id" => "fan", "actions" => [{:run, {:reply, 1}, %{}}]})
+
+      Host.inject_fault(store, :error, 3)
+      assert {:error, :storage_down} = step!(store, ref)
+      refute_receive {[:clementine, :loop, :spawned], _, %{loop_ref: ^ref}}, 10
+    end
+
+    test "cascade fires once on cancel entry, with the live-child count", %{store: store} do
+      attach_loop_events()
+
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      append!(store, ref, %{"id" => "spawn", "actions" => [{:run, {:reply, 1}, %{}}]})
+
+      assert {:parked, _} = step!(store, ref)
+
+      {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :operator_stop, ctx: store)
+
+      # The cancel cargo terminalizes the queued child in-unit and its
+      # completion glue appends inside the same unit, so the entry park
+      # downgrades to a continue — the re-check working, not a surprise.
+      assert {:continued, _} = step!(store, ref)
+
+      assert_receive {[:clementine, :loop, :cascade], %{},
+                      %{loop_ref: ^ref, epoch: 3, trigger: :cancel, children: 1}}
+
+      # Post-entry cascade steps are not entries: the child's completion
+      # (delivered by the cancel cargo's terminal glue) drains without a
+      # second event.
+      assert {:finished, _} = step!(store, ref)
+      refute_receive {[:clementine, :loop, :cascade], _, %{loop_ref: ^ref}}, 10
+    end
+
+    test "cascade fires on a halt with children in flight, trigger :halt", %{store: store} do
+      attach_loop_events()
+
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      append!(store, ref, %{"id" => "spawn", "actions" => [{:run, {:reply, 1}, %{}}]})
+
+      assert {:parked, _} = step!(store, ref)
+
+      append!(store, ref, %{"halt" => "done"})
+      assert {:continued, _} = step!(store, ref)
+
+      assert_receive {[:clementine, :loop, :cascade], %{},
+                      %{loop_ref: ^ref, epoch: 3, trigger: :halt, children: 1}}
+    end
+
+    test "cancel of a childless loop is a cascade entry with children: 0", %{store: store} do
+      attach_loop_events()
+
+      ref = create!(store, ScriptedLoop)
+      assert {:parked, _} = step!(store, ref)
+
+      {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :operator_stop, ctx: store)
+      assert {:finished, facts} = step!(store, ref)
+      assert facts.status == :cancelled
+
+      assert_receive {[:clementine, :loop, :cascade], %{},
+                      %{loop_ref: ^ref, epoch: 2, trigger: :cancel, children: 0}}
+    end
+
+    test "a plain halt with no children is a finish, never a cascade", %{store: store} do
+      attach_loop_events()
+
+      ref = create!(store, ScriptedLoop)
+      append!(store, ref, %{"halt" => "done"})
+      assert {:finished, _} = step!(store, ref)
+
+      refute_receive {[:clementine, :loop, :cascade], _, %{loop_ref: ^ref}}, 10
+    end
+  end
+
+  defp attach_loop_events do
+    handler = :"loop-events-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    :telemetry.attach_many(
+      handler,
+      [[:clementine, :loop, :spawned], [:clementine, :loop, :cascade]],
+      fn event, measurements, metadata, _ -> send(parent, {event, measurements, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
   end
 end

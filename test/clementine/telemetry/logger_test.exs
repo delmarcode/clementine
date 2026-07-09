@@ -375,6 +375,93 @@ defmodule Clementine.Telemetry.LoggerTest do
       assert log =~ "[info]"
       assert log =~ "verdict=reenqueue detail=:claim_timeout"
     end
+
+    test "loop steps, spawns, and cascades log at the configured level" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :loop, :step],
+            %{duration: System.convert_time_unit(42, :millisecond, :native)},
+            %{loop_ref: "loop-7", epoch: 3, outcome: :parked, mode: :normal, batch: 2}
+          )
+
+          :telemetry.execute(
+            [:clementine, :loop, :spawned],
+            %{},
+            %{loop_ref: "loop-7", epoch: 3, tag: {:reply, 5}, tag_key: "k"}
+          )
+
+          :telemetry.execute(
+            [:clementine, :loop, :cascade],
+            %{},
+            %{loop_ref: "loop-7", epoch: 4, trigger: :cancel, children: 2}
+          )
+        end)
+
+      assert log =~
+               "[Clementine] Loop step loop=\"loop-7\" epoch=3 outcome=parked mode=normal batch=2 duration=42ms"
+
+      assert log =~ "[Clementine] Loop spawned child loop=\"loop-7\" epoch=3 tag={:reply, 5}"
+
+      assert log =~
+               "[Clementine] Loop cascade entered loop=\"loop-7\" epoch=4 trigger=cancel children=2"
+    end
+
+    test "failed steps and dead letters log loudly regardless of level" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :loop, :step_failed],
+            %{},
+            %{
+              loop_ref: "loop-7",
+              epoch: 3,
+              error: %Clementine.Error{message: "boom"},
+              requeued: true
+            }
+          )
+
+          :telemetry.execute(
+            [:clementine, :loop, :dead_letter],
+            %{count: 3},
+            %{loop_ref: "loop-7", reason: :terminal_sweep}
+          )
+        end)
+
+      assert log =~ "[error]"
+
+      assert log =~
+               "[Clementine] Loop step failed loop=\"loop-7\" epoch=3 requeued=true error=boom"
+
+      assert log =~ "[warning]"
+      assert log =~ "[Clementine] Loop dead letter loop=\"loop-7\" reason=terminal_sweep count=3"
+    end
+
+    test "input arrivals and inbox gauges log at debug" do
+      TelemetryLogger.install(level: :debug)
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :loop, :input],
+            %{},
+            %{loop_ref: "loop-7", kind: :message, outcome: :appended}
+          )
+
+          :telemetry.execute(
+            [:clementine, :loop, :inbox],
+            %{depth: 4, oldest_age_ms: 1500},
+            %{loop_ref: "loop-7"}
+          )
+        end)
+
+      assert log =~ "[Clementine] Loop input loop=\"loop-7\" kind=message outcome=appended"
+      assert log =~ "[Clementine] Loop inbox loop=\"loop-7\" depth=4 oldest_age=1500ms"
+    end
   end
 
   describe "custom log level" do

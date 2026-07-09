@@ -42,7 +42,10 @@ defmodule Clementine.Test.MemoryLoopHost do
           jobs: [],
           projections: [],
           faults: %{},
-          next_ref: 1
+          # Globally unique across stores: async tests share the global
+          # telemetry handler space, and a colliding loop_ref would let
+          # one test's events satisfy another's assertions.
+          next_ref: System.unique_integer([:positive]) * 1_000_000
         }
       end)
 
@@ -267,15 +270,32 @@ defmodule Clementine.Test.MemoryLoopHost do
       |> Enum.reject(& &1.dead_reason)
       |> Enum.filter(fn row -> scope == :any or row.input.kind == :completed end)
       |> Enum.take(limit)
-      |> Enum.map(fn row ->
-        %StoredInput{
-          ref: row.ref,
-          input: row.input,
-          attempts: row.attempts,
-          decode_error: row[:decode_error]
-        }
-      end)
+      |> Enum.map(&to_stored/1)
     end)
+  end
+
+  @impl Clementine.Loop.Host
+  def dead_letters(loop_ref, limit, store) when is_integer(limit) and limit > 0 do
+    Agent.get(store, fn state ->
+      state.inbox
+      |> Map.get(loop_ref, [])
+      |> Enum.filter(& &1.dead_reason)
+      |> Enum.take(limit)
+      |> Enum.map(&to_stored/1)
+    end)
+  end
+
+  defp to_stored(row) do
+    %StoredInput{
+      ref: row.ref,
+      input: row.input,
+      attempts: row.attempts,
+      decode_error: row[:decode_error],
+      dedup_key: row.dedup_key,
+      inserted_at: row.inserted_at,
+      dead_at: row.dead_at,
+      dead_reason: row.dead_reason
+    }
   end
 
   @impl Clementine.Loop.Host

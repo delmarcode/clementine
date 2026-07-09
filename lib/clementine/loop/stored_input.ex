@@ -1,9 +1,14 @@
 defmodule Clementine.Loop.StoredInput do
   @moduledoc """
-  One pending inbox row as the host's `pending/3` returns it: the decoded
-  input, the host's row reference (what consumption, marks, and
-  `{:input_failed, ref, _}` name), and the attempts counter the head-blame
-  rule reads.
+  One inbox row as the host seam returns it: the decoded input, the
+  host's row reference (what consumption, marks, and
+  `{:input_failed, ref, _}` name), the attempts counter the head-blame
+  rule reads, the row's `dedup_key` (nilable; machinery-appended
+  completions and elapses always carry their canonical key, which the
+  doctor matches vocabulary-free), and the row's stamps — `inserted_at`
+  for age (the doctor's stuck detector reads it), plus
+  `dead_at`/`dead_reason` on rows the optional `dead_letters/3` callback
+  returns (always nil on `pending/4`'s live rows).
 
   Hosts should decode row payloads into `Clementine.Loop.Input` lazily and
   per-row: a payload the current code cannot decode is poison for *that*
@@ -18,15 +23,26 @@ defmodule Clementine.Loop.StoredInput do
   """
 
   alias Clementine.Error
-  alias Clementine.Loop.Input
+  alias Clementine.Loop.{Input, StepCommit}
 
   @enforce_keys [:ref, :input]
-  defstruct ref: nil, input: nil, attempts: 0, decode_error: nil
+  defstruct ref: nil,
+            input: nil,
+            attempts: 0,
+            decode_error: nil,
+            dedup_key: nil,
+            inserted_at: nil,
+            dead_at: nil,
+            dead_reason: nil
 
   @type t :: %__MODULE__{
           ref: term(),
           input: Input.t(),
           attempts: non_neg_integer(),
-          decode_error: Error.t() | nil
+          decode_error: Error.t() | nil,
+          dedup_key: String.t() | nil,
+          inserted_at: DateTime.t() | nil,
+          dead_at: DateTime.t() | nil,
+          dead_reason: StepCommit.dead_reason() | nil
         }
 end
