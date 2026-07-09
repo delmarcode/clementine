@@ -55,6 +55,24 @@ if Code.ensure_loaded?(Ecto.Migration) do
     head-blame rule, and `dead_at`/`dead_reason` for retained dead-letter
     evidence. Consumed rows delete; dead letters are always retained —
     TTL/GC (and the GDPR answer) belong to the host, which owns the rows.
+
+    ## Billing
+
+    Every token a loop's children spend is recorded twice on this table
+    by design: once on each child run row (its own terminal usage, the
+    shipped rollout grain) and once again in the parent loop's aggregate —
+    the step machinery folds completions' usage into the envelope and
+    keeps the loop row's `usage` column current commit by commit (LOOP_RFC
+    §Children). Billing queries must therefore discriminate on `kind`
+    (amendment A1) and exclude loop-kind rows, or they will count every
+    token twice:
+
+        SELECT sum((usage->>'input_tokens')::bigint)
+        FROM conversation_runs
+        WHERE kind = 'rollout'
+
+    The loop rows' aggregate is the *reporting* surface — per-agent
+    spend in one read, no join — never the billing one.
     """
 
     import Ecto.Migration

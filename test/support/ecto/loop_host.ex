@@ -26,6 +26,11 @@ defmodule Clementine.Test.Ecto.LoopHost do
   `Clementine.Test.Ecto.Lifecycle.project/3` skips the completion-append
   glue for labeled rows — the manufactured row L13 strand. One constant,
   three readers (factory, this host, the projection).
+
+  `build_child/4` builds a real (mock-streamed) rollout from the durable
+  args and, like `cancel_timer/4`, reports its invocation to a pid `ctx`,
+  so the child-glue tests assert what the worker seam handed the host:
+  the child's facts, the decoded tag, the args verbatim.
   """
 
   use Clementine.Loop.Ecto,
@@ -48,7 +53,9 @@ defmodule Clementine.Test.Ecto.LoopHost do
   end
 
   @impl Clementine.Loop.Host
-  def build_child(_facts, _tag, child_args, _ctx) do
+  def build_child(facts, tag, child_args, ctx) do
+    if is_pid(ctx), do: send(ctx, {:build_child, facts, tag, child_args})
+
     agent = Clementine.Agent.new(model: :claude_sonnet, instructions: "test child")
     {:ok, Clementine.Rollout.new(agent: agent, input: Map.get(child_args, "input", "go"))}
   end

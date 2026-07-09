@@ -4,13 +4,13 @@ defmodule Clementine.Loop.Protocol do
   the `Clementine.Loop.Host` seam — the loop layer's analog of
   `Clementine.Lifecycle.Protocol`.
 
-  V1 carries creation and cancellation; the send verb lands with its own
-  epic on the same seam.
+  V1 carries creation, cancellation, and the child-ref correlation
+  lookup; the send verb lands with its own epic on the same seam.
   """
 
   alias Clementine.Lifecycle.Facts
   alias Clementine.Loop
-  alias Clementine.Loop.Codec
+  alias Clementine.Loop.{Codec, Envelope}
 
   @doc """
   Creates a loop, insert-or-get, idempotent on the host's scope key
@@ -110,5 +110,62 @@ defmodule Clementine.Loop.Protocol do
           | {:error, term()}
   def cancel(host, loop_ref, reason, opts \\ []) do
     host.cancel(loop_ref, reason, Keyword.get(opts, :ctx))
+  end
+
+  @doc """
+  Resolves the live child run ref the loop's envelope records for `tag` —
+  the host correlation of LOOP_RFC §Children: a streaming UI attaches to
+  the child ref as the turn spawns; a sync await watches that ref for its
+  terminal notification.
+
+  The envelope's children map commits in the same atomic unit that
+  inserts the child row, so `{:ok, child_ref}` is exactly as durable as
+  the child itself — one lookup hop after the spawning step's commit,
+  dwarfed by model latency. `{:error, :no_child}` is a truthful read, not
+  a failure: the tag is not live — the spawning step has not committed
+  yet (poll; "as it spawns" is one commit away), or the child already
+  retired when its completion folded (live-key lifetime — the tag may be
+  re-armed by a later spawn).
+
+  Deploy-shaped problems return the loop layer's clean errors —
+  `{:error, {:incompatible_spec, _}}` when the persisted `loop_module`
+  cannot resolve (its vocabulary is what decodes `tag` to the envelope's
+  `tag_key`), `{:error, {:incompatible_state, _}}` when the stored
+  envelope cannot; `{:error, :rollout_run}` and `{:error, :not_found}`
+  pass through from `load/2`. A `tag` outside the loop's declared
+  vocabulary raises `ArgumentError` — the caller's contract violation,
+  loud at the call.
+
+  Options: `:ctx` — the opaque host context (default `nil`).
+  """
+  @spec child_ref(module(), Clementine.Loop.Host.loop_ref(), term(), keyword()) ::
+          {:ok, term()}
+          | {:error, :no_child}
+          | {:error, :not_found}
+          | {:error, :rollout_run}
+          | {:error, {:incompatible_state, map()} | {:incompatible_spec, map()}}
+          | {:error, term()}
+  def child_ref(host, loop_ref, tag, opts \\ []) do
+    with {:ok, loaded} <- host.load(loop_ref, Keyword.get(opts, :ctx)),
+         {:ok, module} <- Loop.resolve(loaded.module),
+         {:ok, envelope} <- decode_envelope(loaded.envelope) do
+      tag_key = Codec.key(tag, vocabulary: module.__loop__(:vocabulary))
+
+      case envelope && Map.get(envelope.children, tag_key) do
+        nil -> {:error, :no_child}
+        child_ref -> {:ok, child_ref}
+      end
+    end
+  end
+
+  # A loop that has never committed a step has no envelope — and no
+  # children — so nil decodes to nil rather than an error.
+  defp decode_envelope(nil), do: {:ok, nil}
+
+  defp decode_envelope(data) do
+    case Envelope.decode(data) do
+      {:ok, %Envelope{} = envelope} -> {:ok, envelope}
+      {:error, detail} -> {:error, detail}
+    end
   end
 end

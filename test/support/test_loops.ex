@@ -56,6 +56,64 @@ defmodule Clementine.Test.ScriptedLoop do
   defp log(state, entry), do: Map.update!(state, "log", &(&1 ++ [entry]))
 end
 
+defmodule Clementine.Test.ChildGlueLoop do
+  @moduledoc """
+  The thread-agent shape from LOOP_RFC §Worked Examples, sized for the
+  child-glue end-to-end battery: state holds a cursor (never a
+  transcript), a `%{"reply_to" => id}` message spawns `{:reply, id}` with
+  the cursor in the child args, a completion advances the cursor by the
+  child's real message count, and an interrupted child is retried as
+  `{:retry, id}` — the parent deciding, matrix row L12. Every callback
+  appends to the JSON-safe `"log"` so assertions read delivery out of
+  committed envelopes.
+  """
+
+  use Clementine.Loop, state_version: 1, vocabulary: [:reply, :retry]
+
+  alias Clementine.Result
+
+  def init(_args), do: {:ok, %{"cursor" => 0, "log" => ["init"]}, []}
+
+  def handle({:message, %{"reply_to" => id} = payload}, state) do
+    args = %{
+      "input" => Map.get(payload, "input", "go"),
+      "history_through" => state["cursor"]
+    }
+
+    {:ok, log(state, "spawn:#{id}"), [{:run, {:reply, id}, args}]}
+  end
+
+  def handle({:message, %{"halt" => output}}, state) do
+    {:halt, Result.completed(output: output), log(state, "halt")}
+  end
+
+  def handle({:completed, {:reply, id}, %Result.Completed{} = r}, state) do
+    state = %{state | "cursor" => state["cursor"] + length(r.messages)}
+    {:ok, log(state, "completed:#{id}:#{r.output}"), []}
+  end
+
+  def handle({:completed, {:reply, id}, %Result.Interrupted{}}, state) do
+    {:ok, log(state, "interrupted:#{id}"), [{:run, {:retry, id}, %{"input" => "retry"}}]}
+  end
+
+  def handle({:completed, {:retry, id}, %Result.Completed{} = r}, state) do
+    state = %{state | "cursor" => state["cursor"] + length(r.messages)}
+    {:ok, log(state, "retried:#{id}:#{r.output}"), []}
+  end
+
+  def handle({:completed, tag, _result}, state) do
+    {:ok, log(state, "completed:#{inspect(tag)}"), []}
+  end
+
+  def handle({:elapsed, tag}, state), do: {:ok, log(state, "elapsed:#{inspect(tag)}"), []}
+
+  def handle({:input_failed, _ref, error}, state) do
+    {:ok, log(state, "input_failed:#{error.code}"), []}
+  end
+
+  defp log(state, entry), do: Map.update!(state, "log", &(&1 ++ [entry]))
+end
+
 defmodule Clementine.Test.DoorLoop do
   @moduledoc """
   State is a MapSet — not JSON — proving the `dump/1`/`load/1` doors:
