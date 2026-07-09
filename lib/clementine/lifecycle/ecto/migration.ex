@@ -35,6 +35,29 @@ if Code.ensure_loaded?(Ecto.Migration) do
     indexable denormalization (an `error_code` text column, say) add their
     own generated column; the recipe's columns are the contract.
 
+    ## Helper stability (append-only)
+
+    A migration is a historical snapshot; these helpers are library code —
+    the one thing that must never happen is a helper silently changing the
+    DDL a *shipped* host migration replays on a fresh database. So the
+    recipe helpers (here and in `Clementine.Loop.Ecto.Migration`) are
+    **append-only from this release forward**: the DDL a helper emits
+    never changes under an existing name and arguments. Semantic changes
+    arrive as new function names, or new options whose defaults preserve
+    the old output, and are called out in release notes; hosts adopt new
+    semantics by writing a *new* migration, never by letting old history
+    mean something new.
+
+    (The policy's origin: A1 added the kind predicate to
+    `single_active_index/2`'s output, which broke fresh-database replay
+    for the one host with a shipped call to the old form. Current
+    signatures are the baseline the policy freezes.)
+
+    If a release ever must change emitted DDL despite this, the release
+    notes will say so explicitly, and hosts with shipped calls inline the
+    prior output in those migrations verbatim — history replays
+    identically, and only new migrations speak the new form.
+
     ## Backfill for existing adopters
 
     `kind` arrived with LOOP_RFC amendment A1; tables migrated before it

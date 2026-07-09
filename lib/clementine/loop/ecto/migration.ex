@@ -20,6 +20,12 @@ if Code.ensure_loaded?(Ecto.Migration) do
     (`kind` itself ships with `run_columns/0` — amendment A1; see that
     module's backfill note for tables migrated before it existed.)
 
+    These helpers follow the append-only stability policy stated in
+    `Clementine.Lifecycle.Ecto.Migration` (Helper stability): emitted DDL
+    never changes under an existing name and arguments, so shipped host
+    migrations replay identically on fresh databases across library
+    upgrades.
+
     ## Loop columns
 
         loop_module    text     the behaviour module, persisted as string
