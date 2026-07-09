@@ -5,10 +5,12 @@ defmodule Clementine.Telemetry.Logger do
   Follows the same pattern as `Phoenix.Logger`. Call `install/0` in your
   application startup to attach handlers for all Clementine telemetry events.
 
-  Rollout, LLM, tool, and run lifecycle events log at the configured level;
-  heartbeats log at `:debug` (they are a liveness tick, not news), and
-  failures — exceptions, lease loss, reaps — log at `:error`/`:warning`
-  regardless of the configured level.
+  Rollout, LLM, tool, run lifecycle, and loop events log at the
+  configured level; heartbeats, per-input arrivals, and inbox gauge polls
+  log at `:debug` (ticks, not news), and failures — exceptions, lease
+  loss, reaps, failed steps, dead letters, the self-healing loop
+  verdicts — log at `:error`/`:warning` regardless of the configured
+  level.
 
   ## Usage
 
@@ -42,7 +44,14 @@ defmodule Clementine.Telemetry.Logger do
     [:clementine, :run, :requeued],
     [:clementine, :run, :lease_lost],
     [:clementine, :run, :reaped],
-    [:clementine, :loop, :verdict]
+    [:clementine, :loop, :verdict],
+    [:clementine, :loop, :step],
+    [:clementine, :loop, :step_failed],
+    [:clementine, :loop, :spawned],
+    [:clementine, :loop, :cascade],
+    [:clementine, :loop, :input],
+    [:clementine, :loop, :dead_letter],
+    [:clementine, :loop, :inbox]
   ]
 
   @doc """
@@ -204,9 +213,65 @@ defmodule Clementine.Telemetry.Logger do
     end)
   end
 
+  def handle_event([:clementine, :loop, :step], measurements, metadata, config) do
+    Logger.log(config.level, fn ->
+      "[Clementine] Loop step #{loop_summary(metadata)} outcome=#{metadata.outcome} mode=#{metadata.mode} batch=#{metadata.batch} duration=#{duration_ms(measurements)}ms"
+    end)
+  end
+
+  def handle_event([:clementine, :loop, :step_failed], _measurements, metadata, config) do
+    Logger.log(:error, fn ->
+      "[Clementine] Loop step failed #{loop_summary(metadata)} requeued=#{metadata.requeued} error=#{metadata.error.message}"
+    end)
+
+    _ = config
+  end
+
+  def handle_event([:clementine, :loop, :spawned], _measurements, metadata, config) do
+    Logger.log(config.level, fn ->
+      "[Clementine] Loop spawned child #{loop_summary(metadata)} tag=#{inspect(metadata.tag)}"
+    end)
+  end
+
+  def handle_event([:clementine, :loop, :cascade], _measurements, metadata, config) do
+    Logger.log(config.level, fn ->
+      "[Clementine] Loop cascade entered #{loop_summary(metadata)} trigger=#{metadata.trigger} children=#{metadata.children}"
+    end)
+  end
+
+  def handle_event([:clementine, :loop, :input], _measurements, metadata, config) do
+    Logger.log(:debug, fn ->
+      "[Clementine] Loop input loop=#{inspect(metadata.loop_ref)} kind=#{metadata.kind} outcome=#{metadata.outcome}"
+    end)
+
+    _ = config
+  end
+
+  # Retained evidence is always news: never a crash, never a jam, never
+  # silent (LOOP_RFC Governing Invariant 11).
+  def handle_event([:clementine, :loop, :dead_letter], measurements, metadata, config) do
+    Logger.log(:warning, fn ->
+      "[Clementine] Loop dead letter loop=#{inspect(metadata.loop_ref)} reason=#{metadata.reason} count=#{measurements.count}"
+    end)
+
+    _ = config
+  end
+
+  def handle_event([:clementine, :loop, :inbox], measurements, metadata, config) do
+    Logger.log(:debug, fn ->
+      "[Clementine] Loop inbox loop=#{inspect(metadata.loop_ref)} depth=#{measurements.depth} oldest_age=#{measurements.oldest_age_ms}ms"
+    end)
+
+    _ = config
+  end
+
   defp run_summary(metadata, measurements \\ %{}) do
     epoch = Map.get(metadata, :epoch) || Map.get(measurements, :epoch)
     "run=#{inspect(metadata.run_ref)} epoch=#{epoch}"
+  end
+
+  defp loop_summary(metadata) do
+    "loop=#{inspect(metadata.loop_ref)} epoch=#{metadata.epoch}"
   end
 
   defp duration_ms(%{duration: duration}) do

@@ -309,6 +309,11 @@ if Code.ensure_loaded?(Ecto.Query) do
         end
 
         @impl Clementine.Loop.Host
+        def dead_letters(loop_ref, limit, ctx) do
+          Clementine.Loop.Ecto.dead_letters(__MODULE__, loop_ref, limit, ctx)
+        end
+
+        @impl Clementine.Loop.Host
         def bump_attempts(refs, ctx) do
           Clementine.Loop.Ecto.bump_attempts(__MODULE__, refs, ctx)
         end
@@ -382,8 +387,9 @@ if Code.ensure_loaded?(Ecto.Query) do
       # Child cancels are cargo: their lifecycle transitions commit with
       # this unit, so their post-commit emissions (after_transition, the
       # cancel push, protocol telemetry) must too — fired only if the unit
-      # commits, dropped if it rolls back.
-      Clementine.Emissions.begin_deferral()
+      # commits, dropped if it rolls back. The adapter's own inbox
+      # telemetry (:input, :dead_letter) rides the same frame.
+      token = Clementine.Emissions.begin_deferral()
 
       try do
         config.repo.transaction(fn ->
@@ -394,14 +400,14 @@ if Code.ensure_loaded?(Ecto.Query) do
         end)
         |> tap(fn
           {:ok, facts} ->
-            Clementine.Emissions.flush()
+            Clementine.Emissions.flush(token)
             notify_step(config, commit, facts, ctx)
 
           {:error, _reason} ->
             :ok
         end)
       after
-        Clementine.Emissions.drop()
+        Clementine.Emissions.drop(token)
       end
     end
 
@@ -508,12 +514,15 @@ if Code.ensure_loaded?(Ecto.Query) do
       |> Enum.each(fn {reason, refs} ->
         encoded = Codec.encode_dead_reason(reason)
 
-        config.repo.update_all(
-          from(i in pending_by_refs(config, loop_ref, refs),
-            update: [set: [dead_at: fragment("now()"), dead_reason: ^encoded]]
-          ),
-          []
-        )
+        {count, _} =
+          config.repo.update_all(
+            from(i in pending_by_refs(config, loop_ref, refs),
+              update: [set: [dead_at: fragment("now()"), dead_reason: ^encoded]]
+            ),
+            []
+          )
+
+        emit_dead_letter(loop_ref, reason, count)
       end)
 
       :ok
@@ -791,15 +800,17 @@ if Code.ensure_loaded?(Ecto.Query) do
     defp terminal_sweep(_config, %StepCommit{terminal_sweep: false}), do: :ok
 
     defp terminal_sweep(config, %StepCommit{loop_ref: loop_ref}) do
-      config.repo.update_all(
-        from(i in config.inbox,
-          where: i.loop_ref == type(^loop_ref, ^ref_type(config)),
-          where: is_nil(i.dead_at),
-          update: [set: [dead_at: fragment("now()"), dead_reason: "terminal_sweep"]]
-        ),
-        []
-      )
+      {count, _} =
+        config.repo.update_all(
+          from(i in config.inbox,
+            where: i.loop_ref == type(^loop_ref, ^ref_type(config)),
+            where: is_nil(i.dead_at),
+            update: [set: [dead_at: fragment("now()"), dead_reason: "terminal_sweep"]]
+          ),
+          []
+        )
 
+      emit_dead_letter(loop_ref, :terminal_sweep, count)
       :ok
     end
 
@@ -816,21 +827,33 @@ if Code.ensure_loaded?(Ecto.Query) do
         when is_binary(dedup_key) or is_nil(dedup_key) do
       config = module.__clementine_loop_config__()
 
-      config.repo.transaction(fn ->
-        case lock_run(config, loop_ref) do
-          nil ->
-            config.repo.rollback(:not_found)
+      # The bracket holds the :input/:dead_letter emissions until this
+      # unit commits — an append rolled back never happened to observers.
+      token = Clementine.Emissions.begin_deferral()
 
-          row ->
-            # A2's mirror: the inbox verbs refuse rollout-kind rows the way
-            # request_cancel refuses loop-kind ones — a miswired ref must
-            # not grow a mailbox or have its suspension cleared by a wake.
-            unless loop_row?(config, row), do: config.repo.rollback(:rollout_run)
+      try do
+        config.repo.transaction(fn ->
+          case lock_run(config, loop_ref) do
+            nil ->
+              config.repo.rollback(:not_found)
 
-            {kind, payload} = Codec.encode_input(input, vocabulary: vocabulary_of(row, config))
-            deliver_locked(module, config, row, kind, payload, dedup_key, wake?: true, ctx: ctx)
-        end
-      end)
+            row ->
+              # A2's mirror: the inbox verbs refuse rollout-kind rows the way
+              # request_cancel refuses loop-kind ones — a miswired ref must
+              # not grow a mailbox or have its suspension cleared by a wake.
+              unless loop_row?(config, row), do: config.repo.rollback(:rollout_run)
+
+              {kind, payload} = Codec.encode_input(input, vocabulary: vocabulary_of(row, config))
+              deliver_locked(module, config, row, kind, payload, dedup_key, wake?: true, ctx: ctx)
+          end
+        end)
+        |> tap(fn
+          {:ok, _outcome} -> Clementine.Emissions.flush(token)
+          {:error, _reason} -> :ok
+        end)
+      after
+        Clementine.Emissions.drop(token)
+      end
     end
 
     # The serialization point (LOOP_RFC §The Loop Host Contract): the
@@ -873,6 +896,8 @@ if Code.ensure_loaded?(Ecto.Query) do
     end
 
     # true = inserted; false = the dedup index already holds the key.
+    # Every inbox row's birth emits exactly one deferred event: :input for
+    # a pending row (or a dedup hit), :dead_letter for a row born dead.
     defp insert_input(config, loop_ref, kind, payload, dedup_key, opts \\ []) do
       row = %{loop_ref: loop_ref, kind: kind, payload: payload, dedup_key: dedup_key}
 
@@ -883,7 +908,38 @@ if Code.ensure_loaded?(Ecto.Query) do
         end
 
       {count, _} = config.repo.insert_all(config.inbox, [row], on_conflict: :nothing)
+
+      case {count, opts[:dead]} do
+        {1, nil} -> emit_input(loop_ref, kind, :appended)
+        {1, reason} -> emit_dead_letter(loop_ref, Codec.decode_dead_reason(reason), 1)
+        {0, _} -> emit_input(loop_ref, kind, :duplicate)
+      end
+
       count == 1
+    end
+
+    defp emit_input(loop_ref, kind, outcome) when is_binary(kind) do
+      decoded = Enum.find(Input.kinds(), :message, &(Atom.to_string(&1) == kind))
+
+      Clementine.Emissions.emit(fn ->
+        :telemetry.execute(
+          [:clementine, :loop, :input],
+          %{},
+          %{loop_ref: loop_ref, kind: decoded, outcome: outcome}
+        )
+      end)
+    end
+
+    defp emit_dead_letter(_loop_ref, _reason, 0), do: :ok
+
+    defp emit_dead_letter(loop_ref, reason, count) when is_atom(reason) do
+      Clementine.Emissions.emit(fn ->
+        :telemetry.execute(
+          [:clementine, :loop, :dead_letter],
+          %{count: count},
+          %{loop_ref: loop_ref, reason: reason}
+        )
+      end)
     end
 
     ## pending / bump_attempts
@@ -900,7 +956,13 @@ if Code.ensure_loaded?(Ecto.Query) do
           where: is_nil(i.dead_at),
           order_by: [asc: i.id],
           limit: ^limit,
-          select: %{id: i.id, kind: i.kind, payload: i.payload, attempts: i.attempts}
+          select: %{
+            id: i.id,
+            kind: i.kind,
+            payload: i.payload,
+            attempts: i.attempts,
+            inserted_at: i.inserted_at
+          }
         )
 
       query =
@@ -909,20 +971,66 @@ if Code.ensure_loaded?(Ecto.Query) do
           :any -> query
         end
 
-      rows = config.repo.all(query)
-
-      Enum.map(rows, fn row ->
+      config.repo.all(query)
+      |> Enum.map(fn row ->
         case Codec.decode_input(row.kind, row.payload, vocabulary: vocab) do
           {:ok, input} ->
-            %StoredInput{ref: row.id, input: input, attempts: row.attempts}
+            %StoredInput{
+              ref: row.id,
+              input: input,
+              attempts: row.attempts,
+              inserted_at: row.inserted_at
+            }
 
           {:error, error} ->
             %StoredInput{
               ref: row.id,
               input: placeholder_input(row.kind),
               attempts: row.attempts,
+              inserted_at: row.inserted_at,
               decode_error: error
             }
+        end
+      end)
+    end
+
+    @doc false
+    def dead_letters(module, loop_ref, limit, _ctx) when is_integer(limit) and limit > 0 do
+      config = module.__clementine_loop_config__()
+      vocab = loop_vocabulary(config, loop_ref)
+
+      rows =
+        config.repo.all(
+          from(i in config.inbox,
+            where: i.loop_ref == type(^loop_ref, ^ref_type(config)),
+            where: not is_nil(i.dead_at),
+            order_by: [desc: i.id],
+            limit: ^limit,
+            select: %{
+              id: i.id,
+              kind: i.kind,
+              payload: i.payload,
+              attempts: i.attempts,
+              inserted_at: i.inserted_at,
+              dead_at: i.dead_at,
+              dead_reason: i.dead_reason
+            }
+          )
+        )
+
+      Enum.map(rows, fn row ->
+        stored = %StoredInput{
+          ref: row.id,
+          input: placeholder_input(row.kind),
+          attempts: row.attempts,
+          inserted_at: row.inserted_at,
+          dead_at: row.dead_at,
+          dead_reason: Codec.decode_dead_reason(row.dead_reason)
+        }
+
+        case Codec.decode_input(row.kind, row.payload, vocabulary: vocab) do
+          {:ok, input} -> %{stored | input: input}
+          {:error, error} -> %{stored | decode_error: error}
         end
       end)
     end
@@ -1339,42 +1447,54 @@ if Code.ensure_loaded?(Ecto.Query) do
       payload = Codec.elapsed_payload(tag_key)
       dedup_key = Codec.elapsed_dedup_key(tag_key, schedule_id)
 
-      config.repo.transaction(fn ->
-        case lock_run(config, loop_ref) do
-          nil ->
-            config.repo.rollback(:not_found)
+      token = Clementine.Emissions.begin_deferral()
 
-          row ->
-            unless loop_row?(config, row), do: config.repo.rollback(:rollout_run)
+      try do
+        config.repo.transaction(fn ->
+          case lock_run(config, loop_ref) do
+            nil ->
+              config.repo.rollback(:not_found)
 
-            status = row |> Map.fetch!(config.fields[:status]) |> LifecycleCodec.decode_status()
+            row ->
+              unless loop_row?(config, row), do: config.repo.rollback(:rollout_run)
 
-            cond do
-              # Terminal wins the reason: the RFC's "timers of terminal
-              # loops" clause, whatever else the schedule raced.
-              Facts.terminal?(status) ->
-                deliver_locked(host, config, row, "elapsed", payload, dedup_key,
-                  wake?: true,
-                  ctx: ctx
-                )
+              status = row |> Map.fetch!(config.fields[:status]) |> LifecycleCodec.decode_status()
 
-              stale_fire?(config, row, tag_key, schedule_id) ->
-                ref = Map.fetch!(row, config.fields[:ref])
+              cond do
+                # Terminal wins the reason: the RFC's "timers of terminal
+                # loops" clause, whatever else the schedule raced.
+                Facts.terminal?(status) ->
+                  deliver_locked(host, config, row, "elapsed", payload, dedup_key,
+                    wake?: true,
+                    ctx: ctx
+                  )
 
-                if insert_input(config, ref, "elapsed", payload, dedup_key, dead: "stale_elapsed") do
-                  :dead_lettered
-                else
-                  :duplicate
-                end
+                stale_fire?(config, row, tag_key, schedule_id) ->
+                  ref = Map.fetch!(row, config.fields[:ref])
 
-              true ->
-                deliver_locked(host, config, row, "elapsed", payload, dedup_key,
-                  wake?: true,
-                  ctx: ctx
-                )
-            end
-        end
-      end)
+                  if insert_input(config, ref, "elapsed", payload, dedup_key,
+                       dead: "stale_elapsed"
+                     ) do
+                    :dead_lettered
+                  else
+                    :duplicate
+                  end
+
+                true ->
+                  deliver_locked(host, config, row, "elapsed", payload, dedup_key,
+                    wake?: true,
+                    ctx: ctx
+                  )
+              end
+          end
+        end)
+        |> tap(fn
+          {:ok, _outcome} -> Clementine.Emissions.flush(token)
+          {:error, _reason} -> :ok
+        end)
+      after
+        Clementine.Emissions.drop(token)
+      end
     end
 
     # The door's staleness judgment, made under the row lock that
@@ -1421,6 +1541,60 @@ if Code.ensure_loaded?(Ecto.Query) do
     def fire_at(host, {:now_plus, ms}) when is_integer(ms) and ms >= 0 do
       config = host.__clementine_loop_config__()
       DateTime.add(storage_now(config.repo), ms, :millisecond)
+    end
+
+    ## The paging gauges (LOOP_RFC §Operations)
+
+    @doc """
+    Per-loop pending-inbox gauges from one aggregate read: depth and the
+    oldest unconsumed input's age in milliseconds, both on the storage
+    clock — the stuck detector's raw data. Loops whose pending window is
+    empty do not appear; dead letters never count.
+    """
+    @spec inbox_depths(module()) :: [
+            %{loop_ref: term(), depth: non_neg_integer(), oldest_age_ms: non_neg_integer()}
+          ]
+    def inbox_depths(host) do
+      config = host.__clementine_loop_config__()
+
+      config.repo.all(
+        from(i in config.inbox,
+          where: is_nil(i.dead_at),
+          group_by: i.loop_ref,
+          select: %{
+            loop_ref: i.loop_ref,
+            depth: count(i.id),
+            oldest_age_ms:
+              fragment(
+                "greatest((extract(epoch from (now() - min(?))) * 1000)::bigint, 0)",
+                i.inserted_at
+              )
+          }
+        )
+      )
+    end
+
+    @doc """
+    Emits one `[:clementine, :loop, :inbox]` gauge event per loop with
+    pending inputs — `inbox_depths/1` as the measurement half of a
+    `:telemetry_poller` entry, the wiring LOOP_RFC §Operations asks the
+    walkthrough for:
+
+        {:telemetry_poller,
+         measurements: [{Clementine.Loop.Ecto, :emit_inbox_depths, [MyApp.LoopHost]}],
+         period: :timer.seconds(30)}
+
+    Shapes in `Clementine.Telemetry`.
+    """
+    @spec emit_inbox_depths(module()) :: :ok
+    def emit_inbox_depths(host) do
+      Enum.each(inbox_depths(host), fn row ->
+        :telemetry.execute(
+          [:clementine, :loop, :inbox],
+          %{depth: row.depth, oldest_age_ms: row.oldest_age_ms},
+          %{loop_ref: row.loop_ref}
+        )
+      end)
     end
 
     ## Shared

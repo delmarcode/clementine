@@ -81,8 +81,10 @@ defmodule Clementine.Loop.Runner do
   Notifications and telemetry are post-commit only. The host's
   `apply_step` fires its own transition notifications after its unit
   commits; the runner emits `[:clementine, :loop, :step]` after a
-  committed step and `[:clementine, :loop, :step_failed]` after the
-  requeue that resolves an in-step failure (shapes in
+  committed step — plus `[:clementine, :loop, :spawned]` per child the
+  commit created and `[:clementine, :loop, :cascade]` when the commit
+  entered cascade mode — and `[:clementine, :loop, :step_failed]` after
+  the requeue that resolves an in-step failure (shapes in
   `Clementine.Telemetry`). Nothing observable precedes the commit it
   describes.
 
@@ -97,7 +99,7 @@ defmodule Clementine.Loop.Runner do
   alias Clementine.{Error, Lease, ResumeToken, Suspension}
   alias Clementine.Lifecycle.{Facts, Protocol, Transition}
   alias Clementine.Loop
-  alias Clementine.Loop.{Envelope, Step, StoredInput}
+  alias Clementine.Loop.{Envelope, Step, StepCommit, StoredInput}
 
   @default_deadline_ms :timer.minutes(5)
   @apply_attempts 3
@@ -276,7 +278,7 @@ defmodule Clementine.Loop.Runner do
            loop_args: loaded.args
          ) do
       {:ok, commit} ->
-        apply_commit(host, lease, ctx, commit, started, @apply_attempts)
+        apply_commit(host, lease, ctx, commit, envelope, started, @apply_attempts)
 
       {:error, {:incompatible_state, detail}} ->
         incompatible_park(lease, :incompatible_state, detail)
@@ -307,11 +309,11 @@ defmodule Clementine.Loop.Runner do
     end
   end
 
-  defp apply_commit(host, %Lease{} = lease, ctx, commit, started, attempts_left) do
+  defp apply_commit(host, %Lease{} = lease, ctx, commit, stored_envelope, started, attempts_left) do
     case host.apply_step(commit, ctx) do
       {:ok, %Facts{} = facts} ->
         outcome = outcome_of(facts)
-        emit_step(lease, commit.meta, outcome, started)
+        emit_step(lease, commit, stored_envelope, outcome, started)
         outcome
 
       {:error, :stale} ->
@@ -330,7 +332,7 @@ defmodule Clementine.Loop.Runner do
 
       {:error, _reason} when attempts_left > 1 ->
         Process.sleep(@apply_backoff_ms)
-        apply_commit(host, lease, ctx, commit, started, attempts_left - 1)
+        apply_commit(host, lease, ctx, commit, stored_envelope, started, attempts_left - 1)
 
       # Retries exhausted; the run stays running and the reaper requeues
       # (A3a) — the commit is replayable by construction, so nothing is
@@ -486,8 +488,15 @@ defmodule Clementine.Loop.Runner do
     outcome
   end
 
-  defp emit_step(%Lease{} = lease, meta, outcome, started) do
+  defp emit_step(
+         %Lease{} = lease,
+         %StepCommit{meta: meta} = commit,
+         stored_envelope,
+         outcome,
+         started
+       ) do
     {tag, _facts} = outcome
+    mode = Map.get(meta, :mode, :normal)
 
     :telemetry.execute(
       [:clementine, :loop, :step],
@@ -496,9 +505,43 @@ defmodule Clementine.Loop.Runner do
         loop_ref: lease.run_ref,
         epoch: lease.epoch,
         outcome: tag,
-        mode: Map.get(meta, :mode, :normal),
+        mode: mode,
         batch: Map.get(meta, :batch, 0)
       }
     )
+
+    Enum.each(commit.children, fn spec ->
+      :telemetry.execute(
+        [:clementine, :loop, :spawned],
+        %{},
+        %{loop_ref: lease.run_ref, epoch: lease.epoch, tag: spec.tag, tag_key: spec.tag_key}
+      )
+    end)
+
+    if cascade_entry?(commit, stored_envelope) do
+      :telemetry.execute(
+        [:clementine, :loop, :cascade],
+        %{},
+        %{
+          loop_ref: lease.run_ref,
+          epoch: lease.epoch,
+          trigger: if(mode == :cascade, do: :cancel, else: :halt),
+          children: length(commit.cancel_children)
+        }
+      )
+    end
   end
+
+  # The committed step that began a cascade — it cancels live children as
+  # cargo (a halt with children in flight, or the flag's first drain), or
+  # it is a cascade-mode commit against an envelope not yet holding the
+  # pending halt (the no-children short-circuit, which finishes at once).
+  # A replay of a crashed entry re-detects, but only one commit ever
+  # lands, so the event fires exactly once per entry.
+  defp cascade_entry?(%StepCommit{cancel_children: [_ | _]}, _stored), do: true
+
+  defp cascade_entry?(%StepCommit{meta: %{mode: :cascade}}, stored),
+    do: stored == nil or not Envelope.cascading?(stored)
+
+  defp cascade_entry?(%StepCommit{}, _stored), do: false
 end

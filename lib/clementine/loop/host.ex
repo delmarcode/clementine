@@ -120,6 +120,16 @@ defmodule Clementine.Loop.Host do
               [StoredInput.t()]
 
   @doc """
+  The retained dead letters, newest first, up to `limit` — the doctor's
+  evidence read (`Clementine.Loop.inspect/3`), never the step machinery's.
+  Rows come back with `dead_at`/`dead_reason` set (the reason decoded to
+  its `t:Clementine.Loop.StepCommit.dead_reason/0` atom) and the same
+  lazy per-row payload decoding as `pending/4`. Optional: a host that
+  does not implement it degrades the doctor's report, nothing else.
+  """
+  @callback dead_letters(loop_ref(), limit :: pos_integer(), ctx()) :: [StoredInput.t()]
+
+  @doc """
   The drain-time attempts bump: one small committed write, outside both
   atomic units, so a payload that kills the VM still advances toward its
   dead-letter threshold.
@@ -198,4 +208,6 @@ defmodule Clementine.Loop.Host do
               | {:error, :rollout_run}
               | {:error, :not_found}
               | {:error, term()}
+
+  @optional_callbacks dead_letters: 3
 end

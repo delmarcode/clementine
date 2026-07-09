@@ -3,11 +3,20 @@ defmodule Clementine.Emissions do
   # The post-commit emission seam: telemetry events, `after_transition/3`
   # hooks, and cancel pushes all describe *committed* state, so a caller
   # executing protocol operations inside its own enclosing atomic unit
-  # (the loop adapter's `apply_step/2` cancelling children as cargo)
+  # (the loop adapter's `apply_step/2` cancelling children as cargo, the
+  # lifecycle adapter's terminal transaction running projection glue)
   # brackets that unit with begin/flush/drop — emissions stash in arrival
   # order, fire only after the unit commits, and drop when it rolls back.
   # No observer, metric, or push may describe a transition that never
   # happened.
+  #
+  # Brackets nest: `begin_deferral/0` pushes a frame and returns its
+  # token; `flush/1` closes the frame — firing its emissions when it was
+  # outermost, otherwise handing them to the enclosing frame, because an
+  # inner Ecto "transaction" inside an outer one is a savepoint and its
+  # work is durable only when the *outer* unit commits. `drop/1` discards
+  # the frame alone. Both no-op when the token's frame is already closed,
+  # so the `after`-block `drop/1` is safe following a `flush/1`.
   #
   # The stash is process-local because the enclosing transaction is: Ecto
   # transactions live on the calling process's connection. Without an
@@ -23,31 +32,44 @@ defmodule Clementine.Emissions do
         fun.()
         :ok
 
-      stashed ->
-        Process.put(@key, [fun | stashed])
+      [{token, frame} | rest] ->
+        Process.put(@key, [{token, [fun | frame]} | rest])
         :ok
     end
   end
 
-  @spec begin_deferral() :: :ok
+  @spec begin_deferral() :: reference()
   def begin_deferral do
-    Process.put(@key, [])
-    :ok
+    token = make_ref()
+    Process.put(@key, [{token, []} | Process.get(@key) || []])
+    token
   end
 
-  @spec flush() :: :ok
-  def flush do
-    case Process.delete(@key) do
-      nil -> :ok
-      stashed -> stashed |> Enum.reverse() |> Enum.each(& &1.())
+  @spec flush(reference()) :: :ok
+  def flush(token) do
+    case Process.get(@key) do
+      [{^token, frame}] ->
+        Process.delete(@key)
+        frame |> Enum.reverse() |> Enum.each(& &1.())
+
+      [{^token, frame}, {parent, parent_frame} | rest] ->
+        Process.put(@key, [{parent, frame ++ parent_frame} | rest])
+
+      _already_closed ->
+        :ok
     end
 
     :ok
   end
 
-  @spec drop() :: :ok
-  def drop do
-    Process.delete(@key)
+  @spec drop(reference()) :: :ok
+  def drop(token) do
+    case Process.get(@key) do
+      [{^token, _frame}] -> Process.delete(@key)
+      [{^token, _frame} | rest] -> Process.put(@key, rest)
+      _already_closed -> :ok
+    end
+
     :ok
   end
 end

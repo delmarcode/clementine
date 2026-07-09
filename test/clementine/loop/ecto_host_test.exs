@@ -1131,6 +1131,192 @@ defmodule Clementine.Loop.EctoHostTest do
     end
   end
 
+  describe "inbox telemetry" do
+    test ":input fires post-commit per append, tagged with the dedup outcome" do
+      loop = parked_loop!()
+      attach_inbox_probe!()
+
+      assert {:ok, :appended} = LoopHost.append(loop.ref, message(1), "m:1", nil)
+      loop_ref = loop.ref
+
+      assert_receive {[:clementine, :loop, :input], %{},
+                      %{loop_ref: ^loop_ref, kind: :message, outcome: :appended}}
+
+      assert {:ok, :duplicate} = LoopHost.append(loop.ref, message(1), "m:1", nil)
+
+      assert_receive {[:clementine, :loop, :input], %{},
+                      %{loop_ref: ^loop_ref, kind: :message, outcome: :duplicate}}
+    end
+
+    test "matrix row L10: an append to a terminal loop emits :dead_letter reason :terminal" do
+      loop = parked_loop!()
+      {:ok, :appended} = LoopHost.append(loop.ref, Input.message(%{"halt" => "done"}), nil, nil)
+      assert run_step!(loop.ref).status == :completed
+
+      attach_inbox_probe!()
+      assert {:ok, :dead_lettered} = LoopHost.append(loop.ref, message(2), nil, nil)
+      loop_ref = loop.ref
+
+      assert_receive {[:clementine, :loop, :dead_letter], %{count: 1},
+                      %{loop_ref: ^loop_ref, reason: :terminal}}
+
+      refute_receive {[:clementine, :loop, :input], _, _}, 10
+    end
+
+    test "a completion appended inside the child's terminal transaction emits with that commit" do
+      loop = parked_loop!()
+      spawn_child!(loop.ref, {:reply, 1})
+      [child] = TestRepo.all(from(r in Run, where: r.loop_ref == ^loop.ref))
+
+      attach_inbox_probe!()
+      {:ok, _} = Protocol.finish(claim!(child.id), Result.completed(output: "ok"))
+      loop_ref = loop.ref
+
+      assert_receive {[:clementine, :loop, :input], %{},
+                      %{loop_ref: ^loop_ref, kind: :completed, outcome: :appended}}
+    end
+
+    test "a rolled-back terminal drops its deferred append emission — nothing ever happened" do
+      loop = parked_loop!()
+
+      child =
+        insert_run!(
+          loop_ref: loop.ref,
+          tag_key: Codec.key({:reply, 9}, vocabulary: [:reply]),
+          kind: "rollout",
+          label: "raise:completed"
+        )
+
+      lease = claim!(child.id)
+      attach_inbox_probe!()
+
+      assert_raise RuntimeError, ~r/projection probe/, fn ->
+        Protocol.finish(lease, Result.completed(output: "x"))
+      end
+
+      assert inbox_rows(loop.ref) == []
+      refute_receive {[:clementine, :loop, :input], _, _}, 20
+      refute_receive {[:clementine, :loop, :dead_letter], _, _}, 20
+    end
+
+    test "matrix row L7: the threshold commit emits :dead_letter :poison plus the synthesized evidence's :input" do
+      loop = parked_loop!()
+      {:ok, :appended} = LoopHost.append(loop.ref, message(1), nil, nil)
+      [%{ref: row_ref}] = pending!(loop.ref)
+      exhaust_attempts(row_ref)
+
+      attach_inbox_probe!()
+      run_step!(loop.ref)
+      loop_ref = loop.ref
+
+      assert_receive {[:clementine, :loop, :dead_letter], %{count: 1},
+                      %{loop_ref: ^loop_ref, reason: :poison}}
+
+      assert_receive {[:clementine, :loop, :input], %{},
+                      %{loop_ref: ^loop_ref, kind: :input_failed, outcome: :appended}}
+    end
+
+    test "matrix row L9: the terminal sweep emits one :dead_letter with the swept count" do
+      loop = parked_loop!()
+      {:ok, :appended} = LoopHost.append(loop.ref, message(1), nil, nil)
+      {:ok, :appended} = LoopHost.append(loop.ref, message(2), nil, nil)
+      {:ok, :flagged} = LoopProtocol.cancel(LoopHost, loop.ref, :tester)
+
+      attach_inbox_probe!()
+      assert {:finished, _facts} = runner_step(loop.ref)
+      loop_ref = loop.ref
+
+      assert_receive {[:clementine, :loop, :dead_letter], %{count: 2},
+                      %{loop_ref: ^loop_ref, reason: :terminal_sweep}}
+    end
+
+    test "matrix row L6: a provably stale fire emits :dead_letter :stale_elapsed at the door" do
+      loop = parked_loop!()
+      tag_key = Codec.key(:poll, vocabulary: [:poll])
+
+      attach_inbox_probe!()
+
+      assert {:ok, :dead_lettered} =
+               Clementine.Loop.Ecto.fire_timer(LoopHost, loop.ref, tag_key, 12_345)
+
+      loop_ref = loop.ref
+
+      assert_receive {[:clementine, :loop, :dead_letter], %{count: 1},
+                      %{loop_ref: ^loop_ref, reason: :stale_elapsed}}
+    end
+  end
+
+  describe "the paging gauges and the doctor's reads" do
+    test "inbox_depths aggregates depth and oldest age per loop; emit_inbox_depths emits gauges" do
+      quiet = parked_loop!()
+      busy = parked_loop!()
+
+      for i <- 1..3 do
+        {:ok, :appended} = LoopHost.append(busy.ref, message(i), nil, nil)
+      end
+
+      # Backdate the oldest so age is measurably positive on the storage clock.
+      [%{ref: oldest} | _rest] = pending!(busy.ref)
+
+      TestRepo.update_all(
+        from(i in @inbox, where: i.id == ^oldest),
+        set: [inserted_at: DateTime.add(DateTime.utc_now(), -90, :second)]
+      )
+
+      depths = Clementine.Loop.Ecto.inbox_depths(LoopHost)
+      assert %{depth: 3, oldest_age_ms: age} = Enum.find(depths, &(&1.loop_ref == busy.ref))
+      assert age >= 60_000
+      refute Enum.any?(depths, &(&1.loop_ref == quiet.ref))
+
+      attach_inbox_probe!()
+      assert :ok = Clementine.Loop.Ecto.emit_inbox_depths(LoopHost)
+      busy_ref = busy.ref
+
+      assert_receive {[:clementine, :loop, :inbox], %{depth: 3, oldest_age_ms: _},
+                      %{loop_ref: ^busy_ref}}
+    end
+
+    test "pending rows carry inserted_at; dead_letters/3 returns decoded evidence, newest first" do
+      loop = parked_loop!()
+      {:ok, :appended} = LoopHost.append(loop.ref, message(1), nil, nil)
+      assert [%StoredInput{inserted_at: %DateTime{}}] = pending!(loop.ref)
+
+      {:ok, :appended} = LoopHost.append(loop.ref, message(2), nil, nil)
+      {:ok, :flagged} = LoopProtocol.cancel(LoopHost, loop.ref, :tester)
+      assert {:finished, _} = runner_step(loop.ref)
+
+      assert [newest, oldest] = LoopHost.dead_letters(loop.ref, 50, nil)
+      assert newest.ref > oldest.ref
+      assert %StoredInput{dead_reason: :terminal_sweep, dead_at: %DateTime{}} = newest
+      assert {:message, %{"id" => 1}} = Input.to_callback(oldest.input)
+
+      # Post-terminal appends join the evidence with their own reason.
+      {:ok, :dead_lettered} = LoopHost.append(loop.ref, message(3), nil, nil)
+
+      assert [%StoredInput{dead_reason: :terminal}, _, _] =
+               LoopHost.dead_letters(loop.ref, 50, nil)
+
+      assert [%StoredInput{dead_reason: :terminal}] = LoopHost.dead_letters(loop.ref, 1, nil)
+    end
+
+    test "Loop.inspect/3 reads the Ecto seam end to end" do
+      loop = parked_loop!()
+      spawn_child!(loop.ref, {:reply, 1})
+      {:ok, :appended} = LoopHost.append(loop.ref, message(9), nil, nil)
+
+      {:ok, report} = Clementine.Loop.inspect(LoopHost, loop.ref, lifecycle: Lifecycle)
+
+      assert {:ok, ScriptedLoop} = report.module
+      assert [%{tag: {:ok, {:reply, 1}}, status: :queued}] = report.children
+      assert [%StoredInput{inserted_at: %DateTime{}}] = report.pending
+      assert report.dead_letters == []
+
+      # The appended message woke the loop (queued), so no park strand —
+      # the fresh queued row is within stale_after.
+      assert report.strands == []
+    end
+  end
+
   describe "envelope round-trip" do
     test "recipes round-trip the envelope: state, filled children, timer meta, pending halt, usage" do
       loop = parked_loop!()
@@ -1243,6 +1429,27 @@ defmodule Clementine.Loop.EctoHostTest do
         fn _event, _measurements, meta, _config ->
           send(pid, {:run_finished, meta.run_ref, meta.terminal})
         end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
+  # Forwards the adapter-emitted inbox events — the probe for deferral:
+  # an event arriving here proves its creating unit committed.
+  defp attach_inbox_probe! do
+    pid = self()
+    id = "inbox-probe-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach_many(
+        id,
+        [
+          [:clementine, :loop, :input],
+          [:clementine, :loop, :dead_letter],
+          [:clementine, :loop, :inbox]
+        ],
+        fn event, measurements, meta, _config -> send(pid, {event, measurements, meta}) end,
         nil
       )
 

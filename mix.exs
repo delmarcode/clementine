@@ -22,7 +22,9 @@ defmodule Clementine.MixProject do
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/durable-execution.md": [title: "Durable Execution"],
         "guides/approvals.md": [title: "Approvals & Suspension"],
-        "guides/observation.md": [title: "Observing Runs"]
+        "guides/observation.md": [title: "Observing Runs"],
+        "guides/durable-loops.md": [title: "Durable Loops"],
+        "guides/loop-operations.md": [title: "Loop Operations"]
       ],
       groups_for_extras: [
         Guides: ~r{guides/}
@@ -70,6 +72,11 @@ defmodule Clementine.MixProject do
           Clementine.Reconciler,
           Clementine.Reconciler.Policy,
           Clementine.InterruptReason
+        ],
+        "Durable loops": [
+          ~r{Clementine\.Loop($|\.)},
+          Clementine.LoopCase,
+          Clementine.LoopCase.Battery
         ],
         "Events & observation": [
           Clementine.Event,

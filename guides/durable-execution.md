@@ -688,5 +688,8 @@ end
   [Approvals & Suspension](approvals.md).
 - Stream tokens to browsers, survive reconnects, and broadcast lifecycle
   changes — [Observing Runs](observation.md).
+- Stand up agents that outlive any single run — an email thread agent, a
+  judge, a watcher — on the same table and worker pattern —
+  [Durable Loops](durable-loops.md).
 - The design rationale, failure matrix, and invariants —
   `docs/DURABLE_EXECUTION_RFC.md` in the repository.
