@@ -374,6 +374,10 @@ agent = Clementine.Agent.new(model: {:openai, "gpt-5"})
 {:ok, result} = Clementine.run(agent, "Hi")
 ```
 
+See [docs/MODELS.md](docs/MODELS.md) for the full catalog reference:
+per-provider recipes, endpoint/credential configuration, the reasoning
+mapping table, and the checklist for adding any model or provider.
+
 ## Why Clementine?
 
 ### vs LangChain
