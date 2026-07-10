@@ -21,27 +21,51 @@ defmodule Clementine.LLM.ModelRegistry do
           id: "gpt-5",
           defaults: [max_output_tokens: 4096],
           reasoning: [effort: :medium]
+        ],
+        deepseek: [
+          provider: :openrouter,
+          id: "deepseek/deepseek-v3.2",
+          reasoning: [effort: :high]
+        ],
+        qwen_finetune: [
+          provider: :openai_compatible,
+          base_url: "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
+          api_key: {:system, "TINKER_API_KEY"},
+          id: "tinker://my-run:train:0/sampler_weights/000080"
         ]
 
   `:reasoning` is provider-neutral at this level; the provider adapter
   owns the wire translation (see `Clementine.LLM.Reasoning`). Aliases are
   cheap — configure one alias per reasoning level to run the same model id
   at several levels.
+
+  `:openrouter`, `:bedrock`, `:vertex`, and `:openai_compatible` models
+  are served by the shared `Clementine.LLM.ChatCompletions` client; only
+  those entries may carry `:base_url`/`:api_key` overrides (see that
+  module for provider endpoint and credential configuration).
   """
 
   alias Clementine.LLM.Reasoning
 
-  @providers [:anthropic, :openai]
+  @providers [:anthropic, :bedrock, :openai, :openai_compatible, :openrouter, :vertex]
 
-  @type provider :: :anthropic | :openai
+  # Providers served by the shared Chat Completions client; only their
+  # catalog entries may carry endpoint credentials.
+  @chat_completions_providers [:bedrock, :openai_compatible, :openrouter, :vertex]
+
+  @type provider ::
+          :anthropic | :bedrock | :openai | :openai_compatible | :openrouter | :vertex
   @type model_ref :: atom() | {provider(), String.t()}
   @type reasoning_config :: Reasoning.config()
+  @type api_key :: String.t() | {:system, String.t()} | {module(), atom(), [term()]}
 
   @type resolved_model :: %{
           provider: provider(),
           id: String.t(),
           defaults: keyword(),
           reasoning: reasoning_config(),
+          base_url: String.t() | nil,
+          api_key: api_key() | nil,
           alias: atom() | nil
         }
 
@@ -52,8 +76,24 @@ defmodule Clementine.LLM.ModelRegistry do
     reasoning: [
       type: {:custom, Reasoning, :validate_config, []},
       default: nil
-    ]
+    ],
+    base_url: [type: :string],
+    api_key: [type: {:custom, __MODULE__, :validate_api_key, []}]
   ]
+
+  @doc false
+  @spec validate_api_key(term()) :: {:ok, api_key() | nil} | {:error, String.t()}
+  def validate_api_key(nil), do: {:ok, nil}
+  def validate_api_key(key) when is_binary(key), do: {:ok, key}
+  def validate_api_key({:system, env_var} = key) when is_binary(env_var), do: {:ok, key}
+
+  def validate_api_key({module, function, args} = key)
+      when is_atom(module) and is_atom(function) and is_list(args),
+      do: {:ok, key}
+
+  def validate_api_key(_value) do
+    {:error, ~s(expected a string, {:system, "ENV_VAR"}, or {module, function, args})}
+  end
 
   @doc """
   Validates configured model aliases. Raises on invalid configuration.
@@ -102,7 +142,15 @@ defmodule Clementine.LLM.ModelRegistry do
               "Invalid model tuple #{inspect({provider, id})}: model id must be a non-empty string"
 
       true ->
-        %{provider: provider, id: id, defaults: [], reasoning: nil, alias: nil}
+        %{
+          provider: provider,
+          id: id,
+          defaults: [],
+          reasoning: nil,
+          base_url: nil,
+          api_key: nil,
+          alias: nil
+        }
     end
   end
 
@@ -122,6 +170,8 @@ defmodule Clementine.LLM.ModelRegistry do
           id: Keyword.fetch!(validated, :id),
           defaults: Keyword.get(validated, :defaults, []),
           reasoning: Keyword.get(validated, :reasoning),
+          base_url: Keyword.get(validated, :base_url),
+          api_key: Keyword.get(validated, :api_key),
           alias: model_alias
         }
     end
@@ -156,12 +206,26 @@ defmodule Clementine.LLM.ModelRegistry do
     id = ensure_non_empty_id!(Keyword.fetch!(validated, :id), context)
     reasoning = Keyword.get(validated, :reasoning)
 
+    ensure_endpoint_keys_supported!(validated, provider, context)
+
     case Reasoning.validate_model_config(provider, reasoning) do
       {:ok, _reasoning} ->
         Keyword.put(validated, :id, id)
 
       {:error, message} ->
         raise ArgumentError, "#{context}: :reasoning #{message}"
+    end
+  end
+
+  defp ensure_endpoint_keys_supported!(validated, provider, context) do
+    unless provider in @chat_completions_providers do
+      Enum.each([:base_url, :api_key], fn key ->
+        if Keyword.get(validated, key) do
+          raise ArgumentError,
+                "#{context}: #{inspect(key)} is only supported for chat completions " <>
+                  "providers #{inspect(@chat_completions_providers)}"
+        end
+      end)
     end
   end
 

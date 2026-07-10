@@ -58,6 +58,27 @@ defmodule Clementine.LLM.RouterTest do
     assert events == [{:text_delta, "ok"}]
   end
 
+  test "routes chat completions providers to the ChatCompletions client by default" do
+    Application.put_env(:clementine, :models,
+      deepseek: [provider: :openrouter, id: "deepseek/deepseek-v3.2"]
+    )
+
+    Application.delete_env(:clementine, :llm_provider_clients)
+
+    prev_key = Application.get_env(:clementine, :openrouter_api_key)
+    Application.delete_env(:clementine, :openrouter_api_key)
+
+    on_exit(fn ->
+      if prev_key, do: Application.put_env(:clementine, :openrouter_api_key, prev_key)
+    end)
+
+    # Reaching the ChatCompletions client's credential check proves the
+    # default provider mapping dispatched there.
+    assert_raise RuntimeError, ~r/Missing :openrouter_api_key/, fn ->
+      Router.call(:deepseek, "sys", [UserMessage.new("hi")], [])
+    end
+  end
+
   test "routes direct provider tuple model references" do
     Application.put_env(:clementine, :llm_provider_clients, openai: Clementine.LLM.MockClient)
 

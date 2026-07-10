@@ -30,10 +30,51 @@ defmodule Clementine.LLM.ModelRegistryTest do
         id: "gpt-5",
         defaults: [max_output_tokens: 4096],
         reasoning: [effort: :medium]
+      ],
+      deepseek: [
+        provider: :openrouter,
+        id: "deepseek/deepseek-v3.2",
+        reasoning: [effort: :high, max_tokens: 2000]
+      ],
+      qwen_bedrock: [
+        provider: :bedrock,
+        id: "qwen.qwen3-235b-a22b-2507-v1:0",
+        reasoning: :low
+      ],
+      glm_vertex: [
+        provider: :vertex,
+        id: "zai/glm-4.7-maas",
+        api_key: {MyApp.GcpAuth, :access_token, []}
+      ],
+      qwen_finetune: [
+        provider: :openai_compatible,
+        id: "tinker://run:train:0/sampler_weights/000080",
+        base_url: "https://tinker.example.com/oai/api/v1",
+        api_key: {:system, "TINKER_API_KEY"}
       ]
     )
 
     assert :ok = ModelRegistry.validate_config!()
+  end
+
+  test "validate_config!/0 raises for endpoint keys on non chat-completions providers" do
+    Application.put_env(:clementine, :models,
+      broken: [provider: :anthropic, id: "claude-sonnet", base_url: "https://example.com"]
+    )
+
+    assert_raise ArgumentError, ~r/:base_url is only supported for chat completions/, fn ->
+      ModelRegistry.validate_config!()
+    end
+  end
+
+  test "validate_config!/0 raises for invalid api_key shapes" do
+    Application.put_env(:clementine, :models,
+      broken: [provider: :openrouter, id: "deepseek/deepseek-v3.2", api_key: 42]
+    )
+
+    assert_raise ArgumentError, ~r/expected a string, \{:system, "ENV_VAR"\}/, fn ->
+      ModelRegistry.validate_config!()
+    end
   end
 
   test "validate_config!/0 raises for invalid model config" do
@@ -111,9 +152,31 @@ defmodule Clementine.LLM.ModelRegistryTest do
     end
   end
 
+  test "resolve!/1 returns endpoint config for chat completions aliases" do
+    Application.put_env(:clementine, :models,
+      qwen_finetune: [
+        provider: :openai_compatible,
+        id: "tinker://run:train:0/sampler_weights/000080",
+        base_url: "https://tinker.example.com/oai/api/v1",
+        api_key: {:system, "TINKER_API_KEY"}
+      ]
+    )
+
+    assert %{
+             provider: :openai_compatible,
+             id: "tinker://run:train:0/sampler_weights/000080",
+             base_url: "https://tinker.example.com/oai/api/v1",
+             api_key: {:system, "TINKER_API_KEY"},
+             alias: :qwen_finetune
+           } = ModelRegistry.resolve!(:qwen_finetune)
+  end
+
   test "resolve!/1 supports direct provider tuple references" do
     assert %{provider: :openai, id: "gpt-5", defaults: [], alias: nil} =
              ModelRegistry.resolve!({:openai, "gpt-5"})
+
+    assert %{provider: :openrouter, id: "deepseek/deepseek-v3.2", base_url: nil, api_key: nil} =
+             ModelRegistry.resolve!({:openrouter, "deepseek/deepseek-v3.2"})
   end
 
   test "resolve!/1 raises for unknown aliases" do

@@ -200,6 +200,95 @@ defmodule Clementine.LLM.ReasoningTest do
     end
   end
 
+  describe "to_provider_config/2 for :openrouter" do
+    test "translates nothing for nil and empty configs" do
+      assert {:ok, %{}} = Reasoning.to_provider_config(:openrouter, nil)
+      assert {:ok, %{}} = Reasoning.to_provider_config(:openrouter, [])
+      assert {:ok, %{}} = Reasoning.to_provider_config(:openrouter, %{})
+    end
+
+    test "treats a bare value as effort shorthand" do
+      assert {:ok, %{"reasoning" => %{"effort" => "max"}}} =
+               Reasoning.to_provider_config(:openrouter, :max)
+    end
+
+    test "translates the unified reasoning object" do
+      assert {:ok,
+              %{
+                "reasoning" => %{
+                  "effort" => "high",
+                  "max_tokens" => 2000,
+                  "exclude" => false,
+                  "enabled" => true
+                }
+              }} =
+               Reasoning.to_provider_config(:openrouter,
+                 effort: :high,
+                 max_tokens: 2000,
+                 exclude: false,
+                 enabled: true
+               )
+    end
+
+    test "rejects unsupported keys and values" do
+      assert {:error, "unsupported OpenRouter reasoning key" <> _} =
+               Reasoning.to_provider_config(:openrouter, thinking: :adaptive)
+
+      assert {:error, "unsupported OpenRouter reasoning effort" <> _} =
+               Reasoning.to_provider_config(:openrouter, effort: :ultra)
+
+      assert {:error, "unsupported OpenRouter reasoning max_tokens" <> _} =
+               Reasoning.to_provider_config(:openrouter, max_tokens: 0)
+
+      assert {:error, "unsupported OpenRouter reasoning exclude" <> _} =
+               Reasoning.to_provider_config(:openrouter, exclude: "yes")
+    end
+
+    test "rejects non-keyword lists and other shapes" do
+      message = "OpenRouter reasoning config must be an atom, string, keyword list, or map"
+
+      assert {:error, ^message} = Reasoning.to_provider_config(:openrouter, [1, 2])
+      assert {:error, ^message} = Reasoning.to_provider_config(:openrouter, 42)
+    end
+  end
+
+  describe "to_provider_config/2 for chat completions effort providers" do
+    for {provider, label} <- [
+          bedrock: "Bedrock",
+          vertex: "Vertex",
+          openai_compatible: "OpenAI-compatible"
+        ] do
+      test "#{provider} translates effort into reasoning_effort" do
+        provider = unquote(provider)
+
+        assert {:ok, %{}} = Reasoning.to_provider_config(provider, nil)
+        assert {:ok, %{}} = Reasoning.to_provider_config(provider, [])
+
+        assert {:ok, %{"reasoning_effort" => "high"}} =
+                 Reasoning.to_provider_config(provider, :high)
+
+        assert {:ok, %{"reasoning_effort" => "minimal"}} =
+                 Reasoning.to_provider_config(provider, effort: "minimal")
+      end
+
+      test "#{provider} rejects unsupported keys, values, and shapes" do
+        provider = unquote(provider)
+        label = unquote(label)
+
+        assert {:error, effort_message} = Reasoning.to_provider_config(provider, :max)
+        assert effort_message =~ "unsupported #{label} reasoning effort"
+
+        assert {:error, key_message} =
+                 Reasoning.to_provider_config(provider, budget_tokens: 1024)
+
+        assert key_message =~ "unsupported #{label} reasoning key"
+
+        assert {:error, "#{label} reasoning config must be an atom, string, keyword list, or map"} ==
+                 Reasoning.to_provider_config(provider, 42)
+      end
+    end
+  end
+
   describe "to_provider_config!/2" do
     test "returns the fields on success" do
       assert %{"output_config" => %{"effort" => "high"}} =
@@ -224,6 +313,13 @@ defmodule Clementine.LLM.ReasoningTest do
 
       assert {:ok, [thinking: :adaptive]} =
                Reasoning.validate_model_config(:anthropic, thinking: :adaptive)
+
+      assert {:ok, [effort: :high, max_tokens: 2000]} =
+               Reasoning.validate_model_config(:openrouter, effort: :high, max_tokens: 2000)
+
+      assert {:ok, :low} = Reasoning.validate_model_config(:bedrock, :low)
+      assert {:ok, :low} = Reasoning.validate_model_config(:vertex, :low)
+      assert {:ok, :low} = Reasoning.validate_model_config(:openai_compatible, :low)
     end
 
     test "propagates translation errors" do
