@@ -13,7 +13,8 @@ defmodule Clementine.LLM.ModelRegistry do
         claude_sonnet: [
           provider: :anthropic,
           id: "claude-sonnet-4-20250514",
-          defaults: [max_tokens: 8192]
+          defaults: [max_tokens: 8192],
+          reasoning: [thinking: :adaptive, effort: :high]
         ],
         gpt_5: [
           provider: :openai,
@@ -21,6 +22,11 @@ defmodule Clementine.LLM.ModelRegistry do
           defaults: [max_output_tokens: 4096],
           reasoning: [effort: :medium]
         ]
+
+  `:reasoning` is provider-neutral at this level; the provider adapter
+  owns the wire translation (see `Clementine.LLM.Reasoning`). Aliases are
+  cheap — configure one alias per reasoning level to run the same model id
+  at several levels.
   """
 
   alias Clementine.LLM.Reasoning

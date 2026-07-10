@@ -297,7 +297,8 @@ config :clementine, :models,
   claude_sonnet: [
     provider: :anthropic,
     id: "claude-sonnet-4-20250514",
-    defaults: [max_tokens: 8192]
+    defaults: [max_tokens: 8192],
+    reasoning: [thinking: :adaptive, effort: :high]
   ],
   claude_opus: [
     provider: :anthropic,
@@ -316,6 +317,13 @@ config :clementine, :models,
     defaults: [max_output_tokens: 4096]
   ]
 ```
+
+The optional `reasoning:` key is provider-neutral: a bare effort level
+(`reasoning: :high`) works for both providers, and richer keyword forms map
+to each provider's own controls — `effort`/`summary` for OpenAI, and
+`thinking`/`effort`/`budget_tokens`/`display` for Anthropic. Configure one
+alias per reasoning level to run the same model id at several levels. See
+`Clementine.LLM.Reasoning` for the full mapping.
 
 You can also bypass aliases and pass provider model IDs directly:
 

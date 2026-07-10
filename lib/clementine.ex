@@ -79,7 +79,8 @@ defmodule Clementine do
         claude_sonnet: [
           provider: :anthropic,
           id: "claude-sonnet-4-20250514",
-          defaults: [max_tokens: 8192]
+          defaults: [max_tokens: 8192],
+          reasoning: [thinking: :adaptive, effort: :high]
         ],
         gpt_5: [
           provider: :openai,

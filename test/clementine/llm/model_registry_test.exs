@@ -22,7 +22,8 @@ defmodule Clementine.LLM.ModelRegistryTest do
       claude_sonnet: [
         provider: :anthropic,
         id: "claude-sonnet-4-20250514",
-        defaults: [max_tokens: 8192]
+        defaults: [max_tokens: 8192],
+        reasoning: [thinking: :adaptive, effort: :high]
       ],
       gpt_5: [
         provider: :openai,
@@ -71,13 +72,13 @@ defmodule Clementine.LLM.ModelRegistryTest do
     end
   end
 
-  test "validate_config!/0 raises when reasoning is configured for unsupported adapters" do
+  test "validate_config!/0 raises for invalid Anthropic reasoning value" do
     Application.put_env(:clementine, :models,
-      broken: [provider: :anthropic, id: "claude-sonnet", reasoning: [effort: :medium]]
+      broken: [provider: :anthropic, id: "claude-sonnet", reasoning: [thinking: :enabled]]
     )
 
     assert_raise ArgumentError,
-                 ~r/:reasoning is not supported by Clementine's :anthropic adapter yet/,
+                 ~r/Anthropic reasoning thinking "enabled" requires budget_tokens/,
                  fn ->
                    ModelRegistry.validate_config!()
                  end

@@ -20,9 +20,13 @@ defmodule Clementine.LLM.Anthropic do
         claude_sonnet: [
           provider: :anthropic,
           id: "claude-sonnet-4-20250514",
-          defaults: [max_tokens: 8192]
+          defaults: [max_tokens: 8192],
+          reasoning: [thinking: :adaptive, effort: :high]
         ]
 
+  `:reasoning` translates to the Messages API `thinking` and
+  `output_config` request fields (see `Clementine.LLM.Reasoning`); a
+  `:reasoning` entry in request opts overrides the configured value.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -30,6 +34,7 @@ defmodule Clementine.LLM.Anthropic do
   alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Anthropic.{Messages, Tools}
   alias Clementine.LLM.ProviderStream
+  alias Clementine.LLM.Reasoning
   alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
 
@@ -240,6 +245,8 @@ defmodule Clementine.LLM.Anthropic do
       "messages" => format_messages(messages)
     }
 
+    body = maybe_put_reasoning(body, Keyword.get(opts, :reasoning, resolved.reasoning))
+
     body =
       if system != nil and system != "" do
         Map.put(body, "system", system)
@@ -255,6 +262,12 @@ defmodule Clementine.LLM.Anthropic do
       end
 
     body
+  end
+
+  defp maybe_put_reasoning(body, nil), do: body
+
+  defp maybe_put_reasoning(body, reasoning) do
+    Map.merge(body, Reasoning.to_provider_config!(:anthropic, reasoning))
   end
 
   defp build_headers do
