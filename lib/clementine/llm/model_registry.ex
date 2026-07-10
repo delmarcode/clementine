@@ -12,7 +12,7 @@ defmodule Clementine.LLM.ModelRegistry do
       config :clementine, :models,
         claude_sonnet: [
           provider: :anthropic,
-          id: "claude-sonnet-4-20250514",
+          id: "claude-sonnet-5",
           defaults: [max_tokens: 8192],
           reasoning: [thinking: :adaptive, effort: :high]
         ],
