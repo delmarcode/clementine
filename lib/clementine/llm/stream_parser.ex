@@ -295,8 +295,8 @@ defmodule Clementine.LLM.StreamParser do
               tool_uses: [],
               thinking_blocks: [],
               current_thinking: nil,
-              current_tool: nil,
-              current_tool_input: "",
+              open_tools: %{},
+              open_tool_ids: [],
               stop_reason: nil,
               usage: %{},
               error: nil
@@ -327,37 +327,45 @@ defmodule Clementine.LLM.StreamParser do
       %{acc | thinking_blocks: acc.thinking_blocks ++ [{:redacted, data}]}
     end
 
+    # Open tool calls are tracked by id: the Chat Completions parser can
+    # stream several calls in one turn before any stop event, and their
+    # input deltas may interleave. Ids route the deltas; stops close calls
+    # oldest-first, matching every parser's stop order.
     def process(%__MODULE__{} = acc, {:tool_use_start, id, name}) do
-      %{acc | current_tool: %{id: id, name: name}, current_tool_input: ""}
+      if Map.has_key?(acc.open_tools, id) do
+        acc
+      else
+        %{
+          acc
+          | open_tools: Map.put(acc.open_tools, id, %{id: id, name: name, input: ""}),
+            open_tool_ids: acc.open_tool_ids ++ [id]
+        }
+      end
     end
 
-    def process(%__MODULE__{} = acc, {:input_json_delta, _id, json}) do
-      %{acc | current_tool_input: acc.current_tool_input <> json}
+    def process(%__MODULE__{} = acc, {:input_json_delta, id, json}) do
+      case acc.open_tools do
+        %{^id => tool} ->
+          %{acc | open_tools: Map.put(acc.open_tools, id, %{tool | input: tool.input <> json})}
+
+        _ ->
+          acc
+      end
     end
 
-    def process(
-          %__MODULE__{current_tool: tool, current_tool_input: input} = acc,
-          {:content_block_stop, _}
-        )
-        when tool != nil do
-      case decode_tool_input(input) do
+    def process(%__MODULE__{open_tool_ids: [id | rest]} = acc, {:content_block_stop, _}) do
+      {tool, open_tools} = Map.pop(acc.open_tools, id)
+      acc = %{acc | open_tools: open_tools, open_tool_ids: rest}
+
+      case decode_tool_input(tool.input) do
         {:ok, parsed_input} ->
-          tool_use = Map.put(tool, :input, parsed_input)
-
           %{
             acc
-            | tool_uses: acc.tool_uses ++ [tool_use],
-              current_tool: nil,
-              current_tool_input: ""
+            | tool_uses: acc.tool_uses ++ [%{id: tool.id, name: tool.name, input: parsed_input}]
           }
 
         {:error, reason} ->
-          %{
-            acc
-            | error: acc.error || tool_input_error(tool, reason),
-              current_tool: nil,
-              current_tool_input: ""
-          }
+          %{acc | error: acc.error || tool_input_error(tool, reason)}
       end
     end
 

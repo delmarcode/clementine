@@ -436,6 +436,37 @@ defmodule Clementine.LLM.StreamParserTest do
       assert tool.input == %{"path" => "test.txt"}
     end
 
+    test "accumulates parallel tool calls with interleaved deltas" do
+      acc =
+        Accumulator.new()
+        |> Accumulator.process({:tool_use_start, "toolu_a", "echo"})
+        |> Accumulator.process({:tool_use_start, "toolu_b", "add"})
+        |> Accumulator.process({:input_json_delta, "toolu_a", "{\"message\":"})
+        |> Accumulator.process({:input_json_delta, "toolu_b", "{\"a\":1,"})
+        |> Accumulator.process({:input_json_delta, "toolu_a", "\"hi\"}"})
+        |> Accumulator.process({:input_json_delta, "toolu_b", "\"b\":2}"})
+        |> Accumulator.process({:content_block_stop, 0})
+        |> Accumulator.process({:content_block_stop, 1})
+
+      refute Accumulator.error?(acc)
+
+      assert [
+               %{id: "toolu_a", name: "echo", input: %{"message" => "hi"}},
+               %{id: "toolu_b", name: "add", input: %{"a" => 1, "b" => 2}}
+             ] = acc.tool_uses
+    end
+
+    test "drops input deltas for unknown tool ids" do
+      acc =
+        Accumulator.new()
+        |> Accumulator.process({:tool_use_start, "toolu_a", "echo"})
+        |> Accumulator.process({:input_json_delta, "toolu_unknown", "{\"x\":1}"})
+        |> Accumulator.process({:input_json_delta, "toolu_a", "{}"})
+        |> Accumulator.process({:content_block_stop, 0})
+
+      assert [%{id: "toolu_a", input: %{}}] = acc.tool_uses
+    end
+
     test "accumulates thinking blocks with their signatures" do
       response =
         Accumulator.new()

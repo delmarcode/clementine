@@ -124,6 +124,47 @@ defmodule Clementine.LLM.ChatCompletionsStreamParserTest do
            ]
   end
 
+  test "parallel tool calls survive accumulation into a response" do
+    alias Clementine.LLM.Message.Content
+    alias Clementine.LLM.Response
+    alias Clementine.LLM.StreamParser.Accumulator
+
+    events =
+      parse_all([
+        delta_chunk(%{
+          "tool_calls" => [
+            %{
+              "index" => 0,
+              "id" => "call_a",
+              "function" => %{"name" => "echo", "arguments" => ~s({"message":)}
+            },
+            %{"index" => 1, "id" => "call_b", "function" => %{"name" => "add", "arguments" => ""}}
+          ]
+        }),
+        delta_chunk(%{
+          "tool_calls" => [
+            %{"index" => 1, "function" => %{"arguments" => ~s({"a":1,"b":2})}},
+            %{"index" => 0, "function" => %{"arguments" => ~s("hi"})}}
+          ]
+        }),
+        delta_chunk(%{}, finish_reason: "tool_calls"),
+        "data: [DONE]\n\n"
+      ])
+
+    response =
+      events
+      |> Enum.reduce(Accumulator.new(), &Accumulator.process(&2, &1))
+      |> Accumulator.to_response()
+
+    assert %Response{
+             stop_reason: "tool_use",
+             content: [
+               %Content.ToolUse{id: "call_a", name: "echo", input: %{"message" => "hi"}},
+               %Content.ToolUse{id: "call_b", name: "add", input: %{"a" => 1, "b" => 2}}
+             ]
+           } = response
+  end
+
   test "maps length finish_reason to max_tokens" do
     events =
       parse_all([
