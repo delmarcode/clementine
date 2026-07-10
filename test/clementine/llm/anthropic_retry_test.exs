@@ -91,26 +91,21 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       Agent.stop(counter)
     end
 
-    test "returns error after exhausting retries", %{bypass: bypass} do
+    test "returns error carrying the provider body after exhausting retries", %{bypass: bypass} do
       {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      error_body =
+        ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}})
 
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         Agent.update(counter, fn n -> n + 1 end)
-
-        Plug.Conn.resp(
-          conn,
-          429,
-          ~s({"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}})
-        )
+        Plug.Conn.resp(conn, 429, error_body)
       end)
 
       events =
         Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
-      assert Enum.any?(events, fn
-               {:error, {:api_error, 429, _}} -> true
-               _ -> false
-             end)
+      assert {:error, {:api_error, 429, error_body}} in events
 
       # max_attempts is 3
       assert Agent.get(counter, & &1) == 3

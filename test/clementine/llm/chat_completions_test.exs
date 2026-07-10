@@ -263,6 +263,44 @@ defmodule Clementine.LLM.ChatCompletionsTest do
 
       assert List.last(events) == {:message_stop}
     end
+
+    test "stream/5 surfaces the provider error body on a non-200 response", %{bypass: bypass} do
+      error_body =
+        ~s({"error":{"message":"No endpoints found for deepseek/deepseek-v3.2","code":404}})
+
+      Bypass.expect(bypass, "POST", "/api/v1/chat/completions", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(404, error_body)
+      end)
+
+      events =
+        ChatCompletions.stream(:deepseek, "system", [UserMessage.new("Hi")], [])
+        |> Enum.to_list()
+
+      assert [{:error, {:api_error, 404, ^error_body}}] = events
+    end
+
+    test "stream/5 carries the provider error body after exhausting retries", %{bypass: bypass} do
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+      error_body = ~s({"error":{"message":"Provider returned error","code":502}})
+
+      Bypass.expect(bypass, "POST", "/api/v1/chat/completions", fn conn ->
+        Agent.update(counter, fn n -> n + 1 end)
+        Plug.Conn.resp(conn, 502, error_body)
+      end)
+
+      events =
+        ChatCompletions.stream(:deepseek, "system", [UserMessage.new("Hi")], [])
+        |> Enum.to_list()
+
+      assert {:error, {:api_error, 502, error_body}} in events
+
+      # max_attempts is 3
+      assert Agent.get(counter, & &1) == 3
+
+      Agent.stop(counter)
+    end
   end
 
   describe ":bedrock" do
