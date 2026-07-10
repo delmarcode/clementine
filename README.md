@@ -297,7 +297,8 @@ config :clementine, :models,
   claude_sonnet: [
     provider: :anthropic,
     id: "claude-sonnet-4-20250514",
-    defaults: [max_tokens: 8192]
+    defaults: [max_tokens: 8192],
+    reasoning: [thinking: :adaptive, effort: :high]
   ],
   claude_opus: [
     provider: :anthropic,
@@ -314,8 +315,57 @@ config :clementine, :models,
     provider: :openai,
     id: "gpt-5-codex",
     defaults: [max_output_tokens: 4096]
+  ],
+  deepseek: [
+    provider: :openrouter,
+    id: "deepseek/deepseek-v3.2",
+    reasoning: [effort: :high]
+  ],
+  qwen_bedrock: [
+    provider: :bedrock,
+    id: "qwen.qwen3-235b-a22b-2507-v1:0"
+  ],
+  glm_vertex: [
+    provider: :vertex,
+    id: "zai/glm-4.7-maas"
+  ],
+  qwen_finetune: [
+    provider: :openai_compatible,
+    base_url: "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
+    api_key: {:system, "TINKER_API_KEY"},
+    id: "tinker://my-run:train:0/sampler_weights/000080"
   ]
 ```
+
+The optional `reasoning:` key is provider-neutral: a bare effort level
+(`reasoning: :high`) works for every provider, and richer keyword forms map
+to each provider's own controls — `effort`/`summary` for OpenAI,
+`thinking`/`effort`/`budget_tokens`/`display` for Anthropic, the unified
+`reasoning` object for OpenRouter, and `reasoning_effort` for the other
+chat-completions providers. Configure one alias per reasoning level to run
+the same model id at several levels. See `Clementine.LLM.Reasoning` for the
+full mapping.
+
+### Open models and fine-tunes
+
+Beyond the first-party Anthropic and OpenAI clients, four provider atoms
+route through a shared OpenAI-compatible Chat Completions client
+(`Clementine.LLM.ChatCompletions`) — the dialect every open-model and
+fine-tune serving lane speaks:
+
+- `provider: :openrouter` — DeepSeek, Qwen, GLM, and hundreds of other
+  models behind one key. Configure `openrouter_api_key`.
+- `provider: :bedrock` — Amazon Bedrock's Chat Completions endpoint with a
+  Bedrock API key (bearer token, no SigV4). Configure `bedrock_api_key`
+  and `bedrock_region` (or `bedrock_base_url`).
+- `provider: :vertex` — Google Vertex AI's OpenAI-compatible MaaS endpoint.
+  Configure `vertex_project`, `vertex_region` (or `vertex_base_url`), and
+  `vertex_access_token` — typically an MFA tuple like
+  `{MyApp.GcpAuth, :access_token, []}` since OAuth tokens are short-lived.
+- `provider: :openai_compatible` — anything else that speaks the dialect:
+  Tinker (Thinking Machines) checkpoint inference, Together, Fireworks, or
+  self-hosted vLLM/SGLang. Set `base_url:` (and optionally `api_key:`) per
+  model; `api_key` may be omitted for keyless local servers.
 
 You can also bypass aliases and pass provider model IDs directly:
 
@@ -323,6 +373,10 @@ You can also bypass aliases and pass provider model IDs directly:
 agent = Clementine.Agent.new(model: {:openai, "gpt-5"})
 {:ok, result} = Clementine.run(agent, "Hi")
 ```
+
+See [docs/MODELS.md](docs/MODELS.md) for the full catalog reference:
+per-provider recipes, endpoint/credential configuration, the reasoning
+mapping table, and the checklist for adding any model or provider.
 
 ## Why Clementine?
 

@@ -152,6 +152,23 @@ defmodule Clementine.LLM.OpenAITest do
     end
   end
 
+  test "message encoding skips Anthropic thinking blocks in cross-provider history" do
+    alias Clementine.LLM.Message.AssistantMessage
+
+    encoded =
+      Clementine.LLM.OpenAI.Messages.encode_all([
+        %AssistantMessage{
+          content: [
+            Content.thinking("carried over", "sig123"),
+            Content.redacted_thinking("opaque123"),
+            Content.text("Answer.")
+          ]
+        }
+      ])
+
+    assert encoded == [%{"type" => "message", "role" => "assistant", "content" => "Answer."}]
+  end
+
   test "call/5 parses tool calls", %{bypass: bypass} do
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       response = %{

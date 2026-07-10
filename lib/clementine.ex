@@ -79,15 +79,25 @@ defmodule Clementine do
         claude_sonnet: [
           provider: :anthropic,
           id: "claude-sonnet-4-20250514",
-          defaults: [max_tokens: 8192]
+          defaults: [max_tokens: 8192],
+          reasoning: [thinking: :adaptive, effort: :high]
         ],
         gpt_5: [
           provider: :openai,
           id: "gpt-5",
           defaults: [max_output_tokens: 4096],
           reasoning: [effort: :medium]
+        ],
+        deepseek: [
+          provider: :openrouter,
+          id: "deepseek/deepseek-v3.2",
+          reasoning: [effort: :high]
         ]
 
+  Open models and fine-tunes served over the OpenAI-compatible Chat
+  Completions dialect (OpenRouter, AWS Bedrock, GCP Vertex, Tinker,
+  self-hosted vLLM) route through `Clementine.LLM.ChatCompletions` —
+  see that module for provider endpoint and credential configuration.
   """
 
   alias Clementine.{AgentServer, Events, Result, Rollout, Run, Runner}

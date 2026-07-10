@@ -215,13 +215,7 @@ defmodule Clementine.LLM.OpenAI do
   defp maybe_put_reasoning(body, nil), do: body
 
   defp maybe_put_reasoning(body, reasoning) do
-    reasoning = Reasoning.to_provider_config!(:openai, reasoning)
-
-    if map_size(reasoning) == 0 do
-      body
-    else
-      Map.put(body, "reasoning", reasoning)
-    end
+    Map.merge(body, Reasoning.to_provider_config!(:openai, reasoning))
   end
 
   defp build_headers do

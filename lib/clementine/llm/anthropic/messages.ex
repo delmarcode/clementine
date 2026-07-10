@@ -45,6 +45,14 @@ defmodule Clementine.LLM.Anthropic.Messages do
     Content.tool_result(id, content, Map.get(data, "is_error", false))
   end
 
+  def decode_content(%{"type" => "thinking", "thinking" => thinking} = data) do
+    Content.thinking(thinking, Map.get(data, "signature"))
+  end
+
+  def decode_content(%{"type" => "redacted_thinking", "data" => data}) do
+    Content.redacted_thinking(data)
+  end
+
   defp encode_content(%Content.Text{text: text}) do
     %{"type" => "text", "text" => text}
   end
@@ -56,5 +64,14 @@ defmodule Clementine.LLM.Anthropic.Messages do
   defp encode_content(%Content.ToolResult{tool_use_id: id, content: content, is_error: is_error}) do
     base = %{"type" => "tool_result", "tool_use_id" => id, "content" => content}
     if is_error, do: Map.put(base, "is_error", true), else: base
+  end
+
+  defp encode_content(%Content.Thinking{thinking: thinking, signature: signature}) do
+    base = %{"type" => "thinking", "thinking" => thinking}
+    if signature, do: Map.put(base, "signature", signature), else: base
+  end
+
+  defp encode_content(%Content.RedactedThinking{data: data}) do
+    %{"type" => "redacted_thinking", "data" => data}
   end
 end

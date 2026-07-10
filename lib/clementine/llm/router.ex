@@ -18,7 +18,11 @@ defmodule Clementine.LLM.Router do
 
   @default_provider_clients [
     anthropic: Clementine.LLM.Anthropic,
-    openai: Clementine.LLM.OpenAI
+    openai: Clementine.LLM.OpenAI,
+    openrouter: Clementine.LLM.ChatCompletions,
+    bedrock: Clementine.LLM.ChatCompletions,
+    vertex: Clementine.LLM.ChatCompletions,
+    openai_compatible: Clementine.LLM.ChatCompletions
   ]
 
   @impl true

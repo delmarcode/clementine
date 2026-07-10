@@ -20,9 +20,13 @@ defmodule Clementine.LLM.Anthropic do
         claude_sonnet: [
           provider: :anthropic,
           id: "claude-sonnet-4-20250514",
-          defaults: [max_tokens: 8192]
+          defaults: [max_tokens: 8192],
+          reasoning: [thinking: :adaptive, effort: :high]
         ]
 
+  `:reasoning` translates to the Messages API `thinking` and
+  `output_config` request fields (see `Clementine.LLM.Reasoning`); a
+  `:reasoning` entry in request opts overrides the configured value.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -30,6 +34,7 @@ defmodule Clementine.LLM.Anthropic do
   alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Anthropic.{Messages, Tools}
   alias Clementine.LLM.ProviderStream
+  alias Clementine.LLM.Reasoning
   alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
 
@@ -240,6 +245,8 @@ defmodule Clementine.LLM.Anthropic do
       "messages" => format_messages(messages)
     }
 
+    body = maybe_put_reasoning(body, Keyword.get(opts, :reasoning, resolved.reasoning))
+
     body =
       if system != nil and system != "" do
         Map.put(body, "system", system)
@@ -255,6 +262,12 @@ defmodule Clementine.LLM.Anthropic do
       end
 
     body
+  end
+
+  defp maybe_put_reasoning(body, nil), do: body
+
+  defp maybe_put_reasoning(body, reasoning) do
+    Map.merge(body, Reasoning.to_provider_config!(:anthropic, reasoning))
   end
 
   defp build_headers do
@@ -301,17 +314,32 @@ defmodule Clementine.LLM.Anthropic do
 
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do
     %Response{
-      content: Enum.map(content, &parse_content_block/1),
+      content: Enum.flat_map(content, &parse_content_block/1),
       stop_reason: stop_reason,
       usage: Map.get(body, "usage", %{})
     }
   end
 
   defp parse_content_block(%{"type" => "text", "text" => text}) do
-    Messages.decode_content(%{"type" => "text", "text" => text})
+    [Messages.decode_content(%{"type" => "text", "text" => text})]
   end
 
   defp parse_content_block(%{"type" => "tool_use"} = block) do
-    Messages.decode_content(block)
+    [Messages.decode_content(block)]
   end
+
+  # Reasoning-enabled responses lead with thinking blocks. They are
+  # preserved — signature included — because the API verifies them when the
+  # assistant turn is replayed in a tool-use loop.
+  defp parse_content_block(%{"type" => "thinking"} = block) do
+    [Messages.decode_content(block)]
+  end
+
+  defp parse_content_block(%{"type" => "redacted_thinking"} = block) do
+    [Messages.decode_content(block)]
+  end
+
+  # A block type this client does not know must not crash the call; the
+  # engine acts only on text and tool_use.
+  defp parse_content_block(_block), do: []
 end

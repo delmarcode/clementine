@@ -148,6 +148,11 @@ config :clementine, :models,
   ]
 ```
 
+`docs/MODELS.md` is the model-catalog reference: every entry key, the
+per-provider recipes (`:anthropic`, `:openai`, `:openrouter`, `:bedrock`,
+`:vertex`, `:openai_compatible`), the reasoning mapping table, and the
+checklist for adding a model or a new provider.
+
 ## Common Tasks
 
 ### Adding a New Tool
@@ -159,12 +164,14 @@ config :clementine, :models,
    - Use `{:ok, content, is_error: true}` for command-level failures (e.g. non-zero exit)
    - See `docs/TOOL_AUTHORING.md` for the full result contract
 
-### Adding a New LLM Provider
+### Adding a New Model or LLM Provider
 
-1. Create `lib/clementine/llm/provider_name.ex`
-2. Implement `Clementine.LLM.ClientBehaviour`
-3. Add model config to `config/config.exs`
-4. Update `Clementine.LLM` to route to the new provider
+Follow `docs/MODELS.md`. Most "new providers" are just OpenAI-compatible
+endpoints — a `provider: :openai_compatible` catalog entry with a
+`base_url`, no code. A genuinely new wire dialect needs: a
+`Clementine.LLM.ClientBehaviour` implementation, the provider atom in
+`Clementine.LLM.ModelRegistry`, a `Clementine.LLM.Router` mapping, and a
+`Clementine.LLM.Reasoning` translation.
 
 ### Debugging Agent Issues
 

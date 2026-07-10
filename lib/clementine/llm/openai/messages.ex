@@ -40,6 +40,14 @@ defmodule Clementine.LLM.OpenAI.Messages do
         %Content.ToolResult{} = block, {items, text_buffer} ->
           items = flush_text_message(role, text_buffer, items)
           {[tool_result_to_openai(block) | items], []}
+
+        # Anthropic reasoning artifacts have no Responses API encoding;
+        # a history carried across providers drops them rather than crashing.
+        %Content.Thinking{}, acc ->
+          acc
+
+        %Content.RedactedThinking{}, acc ->
+          acc
       end)
 
     items
