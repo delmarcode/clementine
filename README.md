@@ -302,7 +302,7 @@ config :clementine, :models,
   ],
   claude_opus: [
     provider: :anthropic,
-    id: "claude-opus-4-20250514",
+    id: "claude-opus-4-8",
     defaults: [max_tokens: 8192]
   ],
   gpt_5: [
