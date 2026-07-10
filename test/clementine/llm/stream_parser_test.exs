@@ -57,6 +57,45 @@ defmodule Clementine.LLM.StreamParserTest do
       assert [{:text_delta, "Hello"}] = events
     end
 
+    test "parses thinking content_block_start event" do
+      events =
+        parse_one("""
+        event: content_block_start
+        data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+        """)
+
+      assert [{:content_block_start, 0, :thinking}] = events
+    end
+
+    test "parses thinking_delta and signature_delta events" do
+      thinking_events =
+        parse_one("""
+        event: content_block_delta
+        data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me reason"}}
+        """)
+
+      assert [{:thinking_delta, "Let me reason"}] = thinking_events
+
+      signature_events =
+        parse_one("""
+        event: content_block_delta
+        data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig123"}}
+        """)
+
+      assert [{:signature_delta, "sig123"}] = signature_events
+    end
+
+    test "parses redacted_thinking content_block_start event" do
+      events =
+        parse_one("""
+        event: content_block_start
+        data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque123"}}
+        """)
+
+      assert [{:content_block_start, 0, :redacted_thinking}, {:redacted_thinking, "opaque123"}] =
+               events
+    end
+
     test "parses input_json_delta event with tool ID from prior state" do
       state = StreamParser.new()
 
@@ -395,6 +434,51 @@ defmodule Clementine.LLM.StreamParserTest do
       assert tool.id == "toolu_123"
       assert tool.name == "read_file"
       assert tool.input == %{"path" => "test.txt"}
+    end
+
+    test "accumulates thinking blocks with their signatures" do
+      response =
+        Accumulator.new()
+        |> Accumulator.process({:content_block_start, 0, :thinking})
+        |> Accumulator.process({:thinking_delta, "Let me "})
+        |> Accumulator.process({:thinking_delta, "reason."})
+        |> Accumulator.process({:signature_delta, "sig"})
+        |> Accumulator.process({:signature_delta, "123"})
+        |> Accumulator.process({:content_block_stop, 0})
+        |> Accumulator.process({:text_delta, "Answer."})
+        |> Accumulator.process({:message_delta, %{"stop_reason" => "end_turn"}, %{}})
+        |> Accumulator.process({:message_stop})
+        |> Accumulator.to_response()
+
+      assert %Response{
+               content: [
+                 %Content.Thinking{thinking: "Let me reason.", signature: "sig123"},
+                 %Content.Text{text: "Answer."}
+               ]
+             } = response
+    end
+
+    test "keeps separate signatures across multiple thinking blocks" do
+      response =
+        Accumulator.new()
+        |> Accumulator.process({:content_block_start, 0, :thinking})
+        |> Accumulator.process({:thinking_delta, "first"})
+        |> Accumulator.process({:signature_delta, "sig_a"})
+        |> Accumulator.process({:content_block_stop, 0})
+        |> Accumulator.process({:redacted_thinking, "opaque123"})
+        |> Accumulator.process({:content_block_stop, 1})
+        |> Accumulator.process({:tool_use_start, "toolu_1", "echo"})
+        |> Accumulator.process({:input_json_delta, "toolu_1", "{}"})
+        |> Accumulator.process({:content_block_stop, 2})
+        |> Accumulator.to_response()
+
+      assert %Response{
+               content: [
+                 %Content.Thinking{thinking: "first", signature: "sig_a"},
+                 %Content.RedactedThinking{data: "opaque123"},
+                 %Content.ToolUse{id: "toolu_1", name: "echo"}
+               ]
+             } = response
     end
 
     test "captures malformed tool input JSON instead of producing empty args" do

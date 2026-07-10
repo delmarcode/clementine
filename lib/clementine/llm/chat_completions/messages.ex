@@ -56,6 +56,14 @@ defmodule Clementine.LLM.ChatCompletions.Messages do
             flush_message(role, text_buffer, tool_calls, messages)
 
           {[tool_result_message(block) | messages], text_buffer, tool_calls}
+
+        # Anthropic reasoning artifacts have no chat-completions encoding;
+        # a history carried across providers drops them rather than crashing.
+        %Content.Thinking{}, acc ->
+          acc
+
+        %Content.RedactedThinking{}, acc ->
+          acc
       end)
 
     {messages, [], []} = flush_message(role, text_buffer, tool_calls, messages)

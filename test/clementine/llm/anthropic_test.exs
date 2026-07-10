@@ -2,8 +2,7 @@ defmodule Clementine.LLM.AnthropicTest do
   use ExUnit.Case, async: false
 
   alias Clementine.LLM.Anthropic
-  alias Clementine.LLM.Message.Content
-  alias Clementine.LLM.Message.UserMessage
+  alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
   alias Clementine.LLM.Response
 
   setup do
@@ -114,6 +113,79 @@ defmodule Clementine.LLM.AnthropicTest do
       assert_raise ArgumentError, ~r/unsupported Anthropic reasoning effort/, fn ->
         Anthropic.call(:claude_test, "system", [UserMessage.new("Hi")], [], reasoning: :ultra)
       end
+    end
+  end
+
+  describe "thinking blocks" do
+    test "call/5 parses thinking blocks and skips unknown block types", %{bypass: bypass} do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        response =
+          Jason.encode!(%{
+            "content" => [
+              %{"type" => "thinking", "thinking" => "Let me reason.", "signature" => "sig123"},
+              %{"type" => "redacted_thinking", "data" => "opaque123"},
+              %{"type" => "some_future_block", "payload" => "ignored"},
+              %{"type" => "text", "text" => "Answer."}
+            ],
+            "stop_reason" => "end_turn",
+            "usage" => %{"input_tokens" => 10, "output_tokens" => 20}
+          })
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, response)
+      end)
+
+      assert {:ok, %Response{} = response} =
+               Anthropic.call(:claude_reasoning, "system", [UserMessage.new("Hi")], [])
+
+      assert [
+               %Content.Thinking{thinking: "Let me reason.", signature: "sig123"},
+               %Content.RedactedThinking{data: "opaque123"},
+               %Content.Text{text: "Answer."}
+             ] = response.content
+    end
+
+    test "call/5 replays thinking blocks in assistant history", %{bypass: bypass} do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        assert [
+                 %{"role" => "user", "content" => "Hi"},
+                 %{
+                   "role" => "assistant",
+                   "content" => [
+                     %{
+                       "type" => "thinking",
+                       "thinking" => "Let me reason.",
+                       "signature" => "sig123"
+                     },
+                     %{"type" => "redacted_thinking", "data" => "opaque123"},
+                     %{"type" => "tool_use", "id" => "toolu_1", "name" => "echo", "input" => %{}}
+                   ]
+                 },
+                 %{"role" => "user", "content" => [%{"type" => "tool_result"} = _result]}
+               ] = request["messages"]
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("Done"))
+      end)
+
+      messages = [
+        UserMessage.new("Hi"),
+        %AssistantMessage{
+          content: [
+            Content.thinking("Let me reason.", "sig123"),
+            Content.redacted_thinking("opaque123"),
+            Content.tool_use("toolu_1", "echo", %{})
+          ]
+        },
+        %ToolResultMessage{content: [Content.tool_result("toolu_1", "hi")]}
+      ]
+
+      assert {:ok, %Response{}} = Anthropic.call(:claude_test, "system", messages, [])
     end
   end
 

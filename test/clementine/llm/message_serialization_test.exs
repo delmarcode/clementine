@@ -25,6 +25,21 @@ defmodule Clementine.LLM.MessageSerializationTest do
       assert Content.from_map(Content.to_map(block)) == block
     end
 
+    test "thinking with a signature" do
+      block = Content.thinking("step by step", "sig123")
+      assert Content.from_map(Content.to_map(block)) == block
+    end
+
+    test "thinking without a signature" do
+      block = Content.thinking("step by step")
+      assert Content.from_map(Content.to_map(block)) == block
+    end
+
+    test "redacted_thinking" do
+      block = Content.redacted_thinking("opaque123")
+      assert Content.from_map(Content.to_map(block)) == block
+    end
+
     test "to_map produces string-keyed, tagged maps" do
       assert Content.to_map(Content.text("hi")) == %{"type" => "text", "text" => "hi"}
 

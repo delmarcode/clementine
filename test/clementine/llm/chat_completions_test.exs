@@ -400,6 +400,21 @@ defmodule Clementine.LLM.ChatCompletionsTest do
     end
   end
 
+  test "message encoding skips Anthropic thinking blocks in cross-provider history" do
+    encoded =
+      Clementine.LLM.ChatCompletions.Messages.encode_all([
+        %AssistantMessage{
+          content: [
+            Content.thinking("carried over", "sig123"),
+            Content.redacted_thinking("opaque123"),
+            Content.text("Answer.")
+          ]
+        }
+      ])
+
+    assert encoded == [%{"role" => "assistant", "content" => "Answer."}]
+  end
+
   test "call/5 rejects models configured for non chat-completions providers" do
     Application.put_env(:clementine, :models,
       claude_test: [provider: :anthropic, id: "claude-sonnet-5"]

@@ -51,10 +51,37 @@ defmodule Clementine.LLM.Message do
             }
     end
 
+    defmodule Thinking do
+      @moduledoc """
+      Model reasoning content block (Anthropic extended/adaptive thinking).
+
+      The signature must round-trip unmodified: providers verify it when a
+      thinking block is replayed in a later turn of a tool-use loop.
+      """
+      @enforce_keys [:thinking]
+      defstruct [:thinking, :signature]
+
+      @type t :: %__MODULE__{thinking: String.t(), signature: String.t() | nil}
+    end
+
+    defmodule RedactedThinking do
+      @moduledoc """
+      Encrypted reasoning content block (Anthropic `redacted_thinking`).
+
+      Opaque to the host; preserved only so it can be replayed verbatim.
+      """
+      @enforce_keys [:data]
+      defstruct [:data]
+
+      @type t :: %__MODULE__{data: String.t()}
+    end
+
     @type text :: Text.t()
     @type tool_use :: ToolUse.t()
     @type tool_result :: ToolResult.t()
-    @type t :: text() | tool_use() | tool_result()
+    @type thinking :: Thinking.t()
+    @type redacted_thinking :: RedactedThinking.t()
+    @type t :: text() | tool_use() | tool_result() | thinking() | redacted_thinking()
     @type json_object :: %{String.t() => json_value()}
 
     @doc "Creates a text content block"
@@ -73,10 +100,23 @@ defmodule Clementine.LLM.Message do
       %ToolResult{tool_use_id: tool_use_id, content: content, is_error: is_error}
     end
 
+    @doc "Creates a thinking content block"
+    def thinking(thinking, signature \\ nil)
+        when is_binary(thinking) and (is_binary(signature) or is_nil(signature)) do
+      %Thinking{thinking: thinking, signature: signature}
+    end
+
+    @doc "Creates a redacted thinking content block"
+    def redacted_thinking(data) when is_binary(data) do
+      %RedactedThinking{data: data}
+    end
+
     @doc "Checks whether a struct is a known message content variant."
     def valid?(%Text{}), do: true
     def valid?(%ToolUse{}), do: true
     def valid?(%ToolResult{}), do: true
+    def valid?(%Thinking{}), do: true
+    def valid?(%RedactedThinking{}), do: true
     def valid?(_other), do: false
 
     @doc """
@@ -105,6 +145,14 @@ defmodule Clementine.LLM.Message do
         "content" => content,
         "is_error" => is_error
       }
+    end
+
+    def to_map(%Thinking{thinking: thinking, signature: signature}) do
+      %{"type" => "thinking", "thinking" => thinking, "signature" => signature}
+    end
+
+    def to_map(%RedactedThinking{data: data}) do
+      %{"type" => "redacted_thinking", "data" => data}
     end
 
     @doc """
@@ -147,6 +195,20 @@ defmodule Clementine.LLM.Message do
             fetch_boolean!(data, "is_error", "tool result is_error")
           )
 
+        "thinking" ->
+          validate_keys!(data, ["type", "thinking", "signature"], "thinking content")
+
+          data
+          |> fetch_binary!("thinking", "thinking content")
+          |> thinking(fetch_optional_binary!(data, "signature", "thinking signature"))
+
+        "redacted_thinking" ->
+          validate_keys!(data, ["type", "data"], "redacted_thinking content")
+
+          data
+          |> fetch_binary!("data", "redacted thinking data")
+          |> redacted_thinking()
+
         _other ->
           raise ArgumentError, "unknown content type: #{inspect(type)}"
       end
@@ -176,6 +238,19 @@ defmodule Clementine.LLM.Message do
 
         :error ->
           raise ArgumentError, "expected content map to include #{inspect(key)}"
+      end
+    end
+
+    defp fetch_optional_binary!(map, key, label) do
+      case Map.get(map, key) do
+        nil ->
+          nil
+
+        value when is_binary(value) ->
+          value
+
+        value ->
+          raise ArgumentError, "expected #{label} to be a string or nil, got: #{inspect(value)}"
       end
     end
 

@@ -314,17 +314,32 @@ defmodule Clementine.LLM.Anthropic do
 
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do
     %Response{
-      content: Enum.map(content, &parse_content_block/1),
+      content: Enum.flat_map(content, &parse_content_block/1),
       stop_reason: stop_reason,
       usage: Map.get(body, "usage", %{})
     }
   end
 
   defp parse_content_block(%{"type" => "text", "text" => text}) do
-    Messages.decode_content(%{"type" => "text", "text" => text})
+    [Messages.decode_content(%{"type" => "text", "text" => text})]
   end
 
   defp parse_content_block(%{"type" => "tool_use"} = block) do
-    Messages.decode_content(block)
+    [Messages.decode_content(block)]
   end
+
+  # Reasoning-enabled responses lead with thinking blocks. They are
+  # preserved — signature included — because the API verifies them when the
+  # assistant turn is replayed in a tool-use loop.
+  defp parse_content_block(%{"type" => "thinking"} = block) do
+    [Messages.decode_content(block)]
+  end
+
+  defp parse_content_block(%{"type" => "redacted_thinking"} = block) do
+    [Messages.decode_content(block)]
+  end
+
+  # A block type this client does not know must not crash the call; the
+  # engine acts only on text and tool_use.
+  defp parse_content_block(_block), do: []
 end
