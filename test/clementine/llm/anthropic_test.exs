@@ -189,6 +189,24 @@ defmodule Clementine.LLM.AnthropicTest do
     end
   end
 
+  describe "streaming errors" do
+    test "stream/5 surfaces the provider error body on a non-200 response", %{bypass: bypass} do
+      error_body =
+        ~s({"type":"error","error":{"type":"not_found_error","message":"model: claude-sonnet-4-20250514"}})
+
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(404, error_body)
+      end)
+
+      events =
+        Anthropic.stream(:claude_test, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+
+      assert [{:error, {:api_error, 404, ^error_body}}] = events
+    end
+  end
+
   defp text_response(text) do
     Jason.encode!(%{
       "content" => [%{"type" => "text", "text" => text}],

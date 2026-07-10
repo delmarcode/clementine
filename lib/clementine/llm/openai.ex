@@ -81,10 +81,10 @@ defmodule Clementine.LLM.OpenAI do
   defp do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, attempt) do
     data_sent = :atomics.new(1, signed: false)
 
-    callback = fn {:data, data}, acc ->
+    callback = fn {:data, data}, {req, resp} ->
       :atomics.put(data_sent, 1, 1)
       send(parent, {ref, {:data, data}})
-      {:cont, acc}
+      {:cont, {req, accumulate_error_body(resp, data)}}
     end
 
     result =
@@ -92,6 +92,7 @@ defmodule Clementine.LLM.OpenAI do
         json: body,
         headers: headers,
         into: callback,
+        decode_body: false,
         receive_timeout: remaining_budget(budget_ends)
       )
 
@@ -135,6 +136,17 @@ defmodule Clementine.LLM.OpenAI do
         send(parent, {ref, {:error, {:request_failed, reason}}})
     end
   end
+
+  # Chunks of a non-200 response are the provider's error body, not SSE:
+  # the parser ignores them, and the response Req hands back would
+  # otherwise carry an empty body. Keep them so the api_error clauses
+  # report the provider's actual message, as a raw string — the request
+  # sets decode_body: false because Req decoding the accumulated JSON
+  # would turn a malformed error body into a Jason.DecodeError that masks
+  # the HTTP status. A 200 body is never buffered — the parser consumes
+  # it as it streams.
+  defp accumulate_error_body(%{status: 200} = resp, _data), do: resp
+  defp accumulate_error_body(resp, data), do: %{resp | body: resp.body <> data}
 
   # A retry draws down the same budget as the attempt it follows: the
   # backoff sleep is capped to what remains, and a spent budget sends the

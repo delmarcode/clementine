@@ -223,6 +223,40 @@ defmodule Clementine.LLM.OpenAITest do
     assert [%Content.Text{text: "Hello stream"}] = response.content
   end
 
+  test "stream/5 surfaces the provider error body on a non-200 response", %{bypass: bypass} do
+    error_body =
+      ~s({"error":{"message":"The requested model 'gpt-5' does not exist.","type":"invalid_request_error"}})
+
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(404, error_body)
+    end)
+
+    events = OpenAI.stream(:gpt_test, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+
+    assert [{:error, {:api_error, 404, ^error_body}}] = events
+  end
+
+  test "stream/5 carries the provider error body after exhausting retries", %{bypass: bypass} do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+    error_body = ~s({"error":{"message":"The server had an error.","type":"server_error"}})
+
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      Agent.update(counter, fn n -> n + 1 end)
+      Plug.Conn.resp(conn, 500, error_body)
+    end)
+
+    events = OpenAI.stream(:gpt_test, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+
+    assert {:error, {:api_error, 500, error_body}} in events
+
+    # max_attempts is 3
+    assert Agent.get(counter, & &1) == 3
+
+    Agent.stop(counter)
+  end
+
   test "stream/5 emits tool use events and can be collected", %{bypass: bypass} do
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       conn
