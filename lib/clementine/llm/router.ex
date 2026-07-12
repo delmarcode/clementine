@@ -6,7 +6,7 @@ defmodule Clementine.LLM.Router do
   `:provider` key, for example:
 
       gpt_5: [provider: :openai, id: "gpt-5", defaults: [max_output_tokens: 4096]]
-      claude_sonnet: [provider: :anthropic, id: "claude-sonnet-4-20250514", defaults: [max_tokens: 8192]]
+      claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5", defaults: [max_tokens: 8192]]
 
   Direct references are also supported:
 
