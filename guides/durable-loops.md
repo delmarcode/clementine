@@ -354,11 +354,29 @@ end
 Days pass between clauses; deploys pass between clauses; the loop does
 not care. Three contract points:
 
-- **`state_version`** is recorded in every commit. A stored version the
-  running code no longer declares parks the loop visibly as
+- **`state_version`** is recorded in every commit. When a deploy bumps
+  it, ship one `handle_upgrade/2` clause per bump — the `code_change`
+  analog: `handle_upgrade(n, dumped_map)` returns `{:ok, map}` at
+  `n + 1`, the machinery chains stored → declared stepwise on the loop's
+  next wake, and `load/1` stays the only dumped→state door. Pure, like
+  `init/1` and `handle/2`. Without the callback (or on any chain
+  failure, or a rollback deploy) the loop parks visibly as
   `:incompatible_state` — never a crash, never a dead-letter (inputs are
   innocent of deploys) — until compatible code ships. A renamed
   `loop_module` parks as `:incompatible_spec` the same way.
+
+  ```elixir
+  # v2 renames "cursor" and adds a budget; v1 loops upgrade on next wake.
+  use Clementine.Loop, state_version: 2
+
+  def handle_upgrade(1, state) do
+    {:ok,
+     state
+     |> Map.put("message_cursor", state["cursor"])
+     |> Map.delete("cursor")
+     |> Map.put_new("budget", 100)}
+  end
+  ```
 - **`vocabulary`** is the atom whitelist for durable tags and payloads.
   Tags persist in indexes and idempotency keys, so atoms must be
   declared; tuples like `{:reply, id}` encode canonically and are why

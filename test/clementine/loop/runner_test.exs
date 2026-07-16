@@ -52,6 +52,16 @@ defmodule Clementine.Loop.RunnerTest do
     end
   end
 
+  defmodule RaisingUpgradeLoop do
+    @moduledoc "The broken healing deploy: state_version 2 whose handle_upgrade/2 raises."
+
+    use Clementine.Loop, state_version: 2
+
+    def init(_args), do: {:ok, %{}, []}
+    def handle(_input, state), do: {:ok, state, []}
+    def handle_upgrade(1, _state), do: raise("v1 shall not pass")
+  end
+
   defmodule FlagMidStep do
     @moduledoc """
     The strand interleaving: the cancel flag lands after the claim read
@@ -350,6 +360,87 @@ defmodule Clementine.Loop.RunnerTest do
       append!(store, ref, %{"id" => "restored"})
       assert {:parked, _} = step!(store, ref)
       assert state!(store, ref)["log"] == ["init", "message:orphaned", "message:restored"]
+    end
+
+    test "matrix row L2 (upgrade): a state_version bump with handle_upgrade/2 rescues an :incompatible_state park mid-flight",
+         %{store: store} do
+      attach_loop_events()
+
+      ref = create!(store, ScriptedLoop)
+      append!(store, ref, %{"id" => "before"})
+      assert {:parked, _} = step!(store, ref)
+
+      # Deploy 1: state_version 2 without the upgrade clause — parks
+      # operator-visible exactly as today (deploy honesty preserved).
+      Host.rewrite_module!(store, ref, "Clementine.Test.VersionedLoop")
+      append!(store, ref, %{"id" => "stranded"})
+
+      assert {:parked, %Facts{} = facts} = step!(store, ref)
+
+      assert facts.suspension.reason ==
+               {:external, {:incompatible_state, %{state_version: 1, declared: 2}}}
+
+      assert [%{attempts: 0, dead_reason: nil}] = pending_rows(store, ref)
+
+      # Deploy 2: the healing deploy carries handle_upgrade(1, _). A
+      # fresh append wakes the park (the reaper's :wake_pending verdict
+      # is the other door); the chain runs pre-bump and both pending
+      # inputs drain through the upgraded state in the same commit.
+      Host.rewrite_module!(store, ref, "Clementine.Test.UpgradedScriptedLoop")
+      append!(store, ref, %{"id" => "after"})
+
+      assert {:parked, %Facts{suspension: %{reason: {:external, :loop}}}} = step!(store, ref)
+
+      assert envelope!(store, ref).state_version == 2
+      state = state!(store, ref)
+      assert state["format"] == "v2"
+
+      assert state["log"] == [
+               "init",
+               "message:before",
+               "upgrade:1->2",
+               "message:stranded",
+               "message:after"
+             ]
+
+      assert pending_rows(store, ref) == []
+
+      assert_receive {[:clementine, :loop, :upgraded], %{},
+                      %{loop_ref: ^ref, epoch: 3, from: 1, to: 2}}
+
+      refute_receive {[:clementine, :loop, :upgraded], _, %{loop_ref: ^ref}}, 10
+    end
+
+    test "matrix row L2 (broken upgrade): a raising handle_upgrade/2 parks :incompatible_state pre-bump, the failing hop in the detail",
+         %{store: store} do
+      ref = create!(store, ScriptedLoop)
+      append!(store, ref, %{"id" => "before"})
+      assert {:parked, _} = step!(store, ref)
+
+      Host.rewrite_module!(store, ref, "Clementine.Loop.RunnerTest.RaisingUpgradeLoop")
+      append!(store, ref, %{"id" => "waiting"})
+
+      assert {:parked, %Facts{} = facts} = step!(store, ref)
+      assert {:external, {:incompatible_state, detail}} = facts.suspension.reason
+      assert %{state_version: 1, declared: 2, upgrade: %{from: 1, error: error}} = detail
+      assert error =~ "v1 shall not pass"
+
+      # Inputs are innocent of broken upgrades too: pending, un-bumped,
+      # un-marked — the chain runs before the attempts bump.
+      assert [%{attempts: 0, dead_reason: nil}] = pending_rows(store, ref)
+
+      # The fixed deploy still rescues.
+      Host.rewrite_module!(store, ref, "Clementine.Test.UpgradedScriptedLoop")
+      append!(store, ref, %{"id" => "healed"})
+      assert {:parked, %Facts{suspension: %{reason: {:external, :loop}}}} = step!(store, ref)
+
+      assert state!(store, ref)["log"] == [
+               "init",
+               "message:before",
+               "upgrade:1->2",
+               "message:waiting",
+               "message:healed"
+             ]
     end
   end
 
@@ -997,7 +1088,11 @@ defmodule Clementine.Loop.RunnerTest do
 
     :telemetry.attach_many(
       handler,
-      [[:clementine, :loop, :spawned], [:clementine, :loop, :cascade]],
+      [
+        [:clementine, :loop, :spawned],
+        [:clementine, :loop, :cascade],
+        [:clementine, :loop, :upgraded]
+      ],
       fn event, measurements, metadata, _ -> send(parent, {event, measurements, metadata}) end,
       nil
     )

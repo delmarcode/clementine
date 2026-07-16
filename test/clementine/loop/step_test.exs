@@ -2,12 +2,59 @@ defmodule Clementine.Loop.StepTest do
   use ExUnit.Case, async: true
 
   alias Clementine.Loop.{Codec, Envelope, Input, Step, StepCommit, StoredInput}
-  alias Clementine.Test.{BadDumpLoop, DoorLoop, ScriptedLoop, VersionedLoop}
+  alias Clementine.Test.{BadDumpLoop, DoorLoop, ScriptedLoop, UpgradedScriptedLoop, VersionedLoop}
   alias Clementine.{Result, Suspension, Usage}
 
   @loop_ref "loop-1"
   @epoch 3
   @opts [loop_ref: @loop_ref, epoch: @epoch]
+
+  defmodule MultiHopLoop do
+    @moduledoc "state_version 3 with the append-only chain: one clause per bump."
+
+    use Clementine.Loop, state_version: 3
+
+    def init(_args), do: {:ok, %{"log" => []}, []}
+
+    def handle({:message, payload}, state) do
+      {:ok, Map.update!(state, "log", &(&1 ++ ["message:#{payload["id"]}"])), []}
+    end
+
+    def handle(_input, state), do: {:ok, state, []}
+
+    def handle_upgrade(1, state), do: {:ok, Map.update!(state, "log", &(&1 ++ ["upgrade:1->2"]))}
+    def handle_upgrade(2, state), do: {:ok, Map.update!(state, "log", &(&1 ++ ["upgrade:2->3"]))}
+  end
+
+  defmodule StalledChainLoop do
+    @moduledoc "state_version 3 shipped without the 2->3 clause — the mid-chain gap."
+
+    use Clementine.Loop, state_version: 3
+
+    def init(_args), do: {:ok, %{}, []}
+    def handle(_input, state), do: {:ok, state, []}
+    def handle_upgrade(1, state), do: {:ok, state}
+  end
+
+  defmodule BadReturnUpgradeLoop do
+    @moduledoc "handle_upgrade/2 returns outside {:ok, map()}."
+
+    use Clementine.Loop, state_version: 2
+
+    def init(_args), do: {:ok, %{}, []}
+    def handle(_input, state), do: {:ok, state, []}
+    def handle_upgrade(1, state), do: state
+  end
+
+  defmodule BadOutputUpgradeLoop do
+    @moduledoc "The chain's output falls outside the durable vocabulary."
+
+    use Clementine.Loop, state_version: 2
+
+    def init(_args), do: {:ok, %{}, []}
+    def handle(_input, state), do: {:ok, state, []}
+    def handle_upgrade(1, state), do: {:ok, Map.put(state, "leak", :undeclared)}
+  end
 
   defp vocab, do: ScriptedLoop.__loop__(:vocabulary)
   defp key(tag), do: Codec.key(tag, vocabulary: vocab())
@@ -753,6 +800,110 @@ defmodule Clementine.Loop.StepTest do
     test "matrix row L2 (spec half): a module without the loop contract fails as :incompatible_spec" do
       assert {:error, {:incompatible_spec, %{reason: :not_a_loop}}} =
                Step.drain(String, nil, Step.plan(nil, []), @opts)
+    end
+  end
+
+  describe "state upgrade (handle_upgrade/2)" do
+    test "the chain runs stepwise, one clause per bump, then load/1 — the commit carries the declared version" do
+      envelope = %Envelope{state_version: 1, state: %{"log" => ["l", ["v1"]]}}
+      plan = Step.plan(envelope, [msg(1, %{"id" => "x"})])
+      commit = drain!(MultiHopLoop, envelope, plan)
+
+      assert commit.set.state_version == 3
+      assert commit.set.envelope.state_version == 3
+
+      assert Codec.decode(commit.set.envelope.state, vocabulary: [])["log"] ==
+               ["v1", "upgrade:1->2", "upgrade:2->3", "message:x"]
+    end
+
+    test "upgrade/2 carries the envelope to the declared version; nil and equal versions pass through" do
+      assert Step.upgrade(ScriptedLoop, nil) == {:ok, nil}
+
+      current = scripted_envelope()
+      assert Step.upgrade(ScriptedLoop, current) == {:ok, current}
+
+      stale = %Envelope{state_version: 1, state: Codec.encode(%{"log" => []}, vocabulary: [])}
+      {:ok, upgraded} = Step.upgrade(UpgradedScriptedLoop, stale)
+
+      assert upgraded.state_version == 2
+      decoded = Codec.decode(upgraded.state, vocabulary: [])
+      assert decoded["format"] == "v2"
+      assert decoded["log"] == ["upgrade:1->2"]
+    end
+
+    test "matrix row L2 (no upgrade path): callback absent keeps today's park detail byte-for-byte" do
+      envelope = %Envelope{state_version: 1, state: %{}}
+
+      assert {:error, {:incompatible_state, detail}} =
+               Step.drain(VersionedLoop, envelope, Step.plan(envelope, []), @opts)
+
+      assert detail == %{state_version: 1, declared: 2}
+    end
+
+    test "the rollback direction never chains: stored ahead of declared keeps the versionless detail" do
+      envelope = %Envelope{state_version: 3, state: %{}}
+
+      assert {:error, {:incompatible_state, detail}} =
+               Step.upgrade(UpgradedScriptedLoop, envelope)
+
+      assert detail == %{state_version: 3, declared: 2}
+    end
+
+    test "a missing mid-chain clause parks with the stalled hop named — earlier hops leave nothing behind" do
+      envelope = %Envelope{state_version: 1, state: %{}}
+
+      assert {:error, {:incompatible_state, detail}} =
+               Step.drain(StalledChainLoop, envelope, Step.plan(envelope, []), @opts)
+
+      assert %{state_version: 1, declared: 3, upgrade: %{from: 2, error: error}} = detail
+      assert error =~ "FunctionClauseError" or error =~ "no function clause"
+    end
+
+    test "a return outside {:ok, map()} parks with the hop named" do
+      envelope = %Envelope{state_version: 1, state: %{}}
+
+      assert {:error, {:incompatible_state, detail}} =
+               Step.drain(BadReturnUpgradeLoop, envelope, Step.plan(envelope, []), @opts)
+
+      assert %{state_version: 1, declared: 2, upgrade: %{from: 1, error: error}} = detail
+      assert error =~ "must return {:ok, map()}"
+    end
+
+    test "chain output outside the durable vocabulary parks at the gate, blaming the hop that produced it" do
+      envelope = %Envelope{state_version: 1, state: %{}}
+
+      assert {:error, {:incompatible_state, detail}} =
+               Step.upgrade(BadOutputUpgradeLoop, envelope)
+
+      assert %{state_version: 1, declared: 2, upgrade: %{from: 1, error: error}} = detail
+      assert error =~ "vocabulary"
+    end
+
+    test "stored state the current vocabulary no longer decodes is deploy-shaped at the gate: parks, never raises" do
+      envelope = %Envelope{state_version: 1, state: %{"tag" => ["a", "gone"]}}
+
+      assert {:error, {:incompatible_state, detail}} =
+               Step.upgrade(UpgradedScriptedLoop, envelope)
+
+      assert %{state_version: 1, declared: 2, upgrade: %{from: 1, error: error}} = detail
+      assert error =~ "vocabulary"
+    end
+
+    test "matrix row L2 (cancellability): cascade mode never runs the chain — a broken one cannot block cancellation" do
+      # StalledChainLoop cannot chain 1 -> 3; the normal drain refuses,
+      # the cascade proceeds at the stored version, chain never invoked.
+      envelope = %Envelope{state_version: 1, state: %{"old" => true}, children: %{}}
+
+      assert {:error, {:incompatible_state, _}} =
+               Step.drain(StalledChainLoop, envelope, Step.plan(envelope, []), @opts)
+
+      plan = Step.plan(envelope, [], cancel: :operator)
+      commit = drain!(StalledChainLoop, envelope, plan)
+
+      assert commit.op == :finish
+      assert %Result.Cancelled{reason: :operator} = commit.result
+      assert commit.set.envelope.state == %{"old" => true}
+      assert commit.set.state_version == 1
     end
   end
 

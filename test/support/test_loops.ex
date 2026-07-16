@@ -205,6 +205,35 @@ defmodule Clementine.Test.VersionedLoop do
   def handle(_input, state), do: {:ok, state, []}
 end
 
+defmodule Clementine.Test.UpgradedScriptedLoop do
+  @moduledoc """
+  The v2 deploy of `Clementine.Test.ScriptedLoop`, carrying the
+  `handle_upgrade/2` clause the bump demands (LOOP_RFC §State Upgrade).
+  The chain's marker lands in the log, so assertions read exactly when
+  the upgrade ran relative to the inputs around it.
+  """
+
+  use Clementine.Loop,
+    state_version: 2,
+    vocabulary: [:poll, :reply, :retry, :note, :run, :timer, :cancel_timer, :send]
+
+  def handle_upgrade(1, state) do
+    {:ok,
+     state
+     |> Map.update!("log", &(&1 ++ ["upgrade:1->2"]))
+     |> Map.put("format", "v2")}
+  end
+
+  def init(args) do
+    case Clementine.Test.ScriptedLoop.init(args) do
+      {:ok, state, actions} -> {:ok, Map.put(state, "format", "v2"), actions}
+      halt -> halt
+    end
+  end
+
+  defdelegate handle(input, state), to: Clementine.Test.ScriptedLoop
+end
+
 defmodule Clementine.Test.BadDumpLoop do
   @moduledoc "dump/1 violates the contract by returning a non-map."
 

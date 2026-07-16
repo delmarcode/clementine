@@ -82,11 +82,12 @@ defmodule Clementine.Loop.Runner do
   `apply_step` fires its own transition notifications after its unit
   commits; the runner emits `[:clementine, :loop, :step]` after a
   committed step — plus `[:clementine, :loop, :spawned]` per child the
-  commit created and `[:clementine, :loop, :cascade]` when the commit
-  entered cascade mode — and `[:clementine, :loop, :step_failed]` after
-  the requeue that resolves an in-step failure (shapes in
-  `Clementine.Telemetry`). Nothing observable precedes the commit it
-  describes.
+  commit created, `[:clementine, :loop, :cascade]` when the commit
+  entered cascade mode, and `[:clementine, :loop, :upgraded]` when it
+  carried a `handle_upgrade/2` state upgrade — and
+  `[:clementine, :loop, :step_failed]` after the requeue that resolves
+  an in-step failure (shapes in `Clementine.Telemetry`). Nothing
+  observable precedes the commit it describes.
 
   A resumed loop (a host driving the park's `ResumeToken` through
   `Lifecycle.Protocol.resume/4`) is just a wake: the runner takes its
@@ -167,9 +168,9 @@ defmodule Clementine.Loop.Runner do
   defp execute_step(host, %Lease{} = lease, ctx, started) do
     with {:ok, loaded} <- load_leased(host, lease, ctx),
          {:ok, module} <- resolve_module(lease, loaded),
-         {:ok, envelope} <- decode_envelope(lease, loaded),
-         :ok <- check_state_version(host, lease, ctx, loaded, module, envelope) do
-      drain_and_commit(host, lease, ctx, loaded, module, envelope, started)
+         {:ok, stored} <- decode_envelope(lease, loaded),
+         {:ok, envelope} <- upgrade_state(host, lease, ctx, loaded, module, stored) do
+      drain_and_commit(host, lease, ctx, loaded, module, envelope, stored, started)
     end
   end
 
@@ -177,30 +178,29 @@ defmodule Clementine.Loop.Runner do
     cancel_reason(loaded.facts) != nil or (envelope != nil and Envelope.cascading?(envelope))
   end
 
-  # Phase 2's version check runs before phase 3's bump (LOOP_RFC §The
-  # Step): inputs are innocent of deploys, so an incompatible loop must
-  # park before the head's attempts advance — or every deploy-mismatch
-  # step would walk an innocent input toward the poison threshold. The
-  # drain re-checks (its own contract), redundantly here. Cascade mode is
-  # exempt: it never loads state, which is what keeps an
-  # `:incompatible_state` loop cancellable (row L2's host-chosen end) —
-  # and is also why this park alone wakes on a racing cancel flag (see
-  # `incompatible_park`).
-  defp check_state_version(host, lease, ctx, loaded, module, envelope) do
-    declared = module.__loop__(:state_version)
+  # Phase 2's version gate runs before phase 3's bump (LOOP_RFC §The
+  # Step): inputs are innocent of deploys — and of broken upgrades — so
+  # an incompatible loop must park before the head's attempts advance, or
+  # every deploy-mismatch step would walk an innocent input toward the
+  # poison threshold. A stored version behind the declared one takes the
+  # `handle_upgrade/2` chain (`Step.upgrade/2`, rescued end to end); the
+  # step then drains on the upgraded envelope, which commits with
+  # whatever the step commits. The drain re-runs the gate (its own
+  # contract), redundantly here. Cascade mode is exempt: it never loads
+  # state, which is what keeps an `:incompatible_state` loop cancellable
+  # (row L2's host-chosen end) — and is also why this park alone wakes on
+  # a racing cancel flag (see `incompatible_park`).
+  defp upgrade_state(host, lease, ctx, loaded, module, envelope) do
+    if cascade_mode?(loaded, envelope) do
+      {:ok, envelope}
+    else
+      case Step.upgrade(module, envelope) do
+        {:ok, upgraded} ->
+          {:ok, upgraded}
 
-    cond do
-      cascade_mode?(loaded, envelope) or envelope == nil or
-          envelope.state_version == declared ->
-        :ok
-
-      true ->
-        incompatible_park(
-          lease,
-          :incompatible_state,
-          %{state_version: envelope.state_version, declared: declared},
-          wake_on_cancel: {host, ctx}
-        )
+        {:error, {:incompatible_state, detail}} ->
+          incompatible_park(lease, :incompatible_state, detail, wake_on_cancel: {host, ctx})
+      end
     end
   end
 
@@ -247,7 +247,9 @@ defmodule Clementine.Loop.Runner do
     end
   end
 
-  defp drain_and_commit(host, %Lease{} = lease, ctx, loaded, module, envelope, started) do
+  # `envelope` is the drain's (possibly upgraded); `stored` is the
+  # pre-upgrade decode, kept for the post-commit from/to signal.
+  defp drain_and_commit(host, %Lease{} = lease, ctx, loaded, module, envelope, stored, started) do
     batch_cap = Map.get(loaded.policy, "batch_cap", Step.default_batch_cap())
     threshold = Map.get(loaded.policy, "dead_letter_after", Step.default_dead_letter_after())
 
@@ -278,7 +280,7 @@ defmodule Clementine.Loop.Runner do
            loop_args: loaded.args
          ) do
       {:ok, commit} ->
-        apply_commit(host, lease, ctx, commit, envelope, started, @apply_attempts)
+        apply_commit(host, lease, ctx, commit, stored, started, @apply_attempts)
 
       {:error, {:incompatible_state, detail}} ->
         incompatible_park(lease, :incompatible_state, detail)
@@ -530,7 +532,30 @@ defmodule Clementine.Loop.Runner do
         }
       )
     end
+
+    emit_upgraded(lease, commit, stored_envelope)
   end
+
+  # The commit that carried a state upgrade: its written envelope's
+  # version moved past the stored one. Threshold commits omit the
+  # envelope (no carry), cascades carry the stored version verbatim, and
+  # a replayed crashed step re-upgrades from the unchanged stored
+  # envelope — so this fires once per carrying commit, post-commit,
+  # best-effort like every signal here.
+  defp emit_upgraded(
+         %Lease{} = lease,
+         %StepCommit{set: %{envelope: %Envelope{state_version: to}}},
+         %Envelope{state_version: from}
+       )
+       when to != from do
+    :telemetry.execute(
+      [:clementine, :loop, :upgraded],
+      %{},
+      %{loop_ref: lease.run_ref, epoch: lease.epoch, from: from, to: to}
+    )
+  end
+
+  defp emit_upgraded(_lease, _commit, _stored), do: :ok
 
   # The committed step that began a cascade — it cancels live children as
   # cargo (a halt with children in flight, or the flag's first drain), or
