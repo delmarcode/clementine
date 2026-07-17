@@ -392,10 +392,11 @@ next wake. Threshold (poison-mark) commits leave the envelope untouched
 by omission, exactly as before — the pure chain simply re-runs on the
 next non-threshold step.
 
-**Every failure parks; nothing bumps, nothing raises hot.** The chain
-is rescued end to end. Callback absent, no clause for a hop, a raise
-inside a hop, a return outside `{:ok, map}`, chain output the codec
-cannot encode, stored state the current vocabulary no longer decodes —
+**Every failure parks; nothing bumps, nothing escapes hot.** The chain
+converts every failure channel end to end. Callback absent, no clause
+for a hop, a raise/throw/exit inside a hop, a return outside
+`{:ok, map}`, chain output the codec cannot encode, stored state the
+current vocabulary no longer decodes —
 each parks the loop `:incompatible_state`, pre-bump. Callback absent
 and the rollback direction (`stored > declared`; the chain never walks
 backward) keep today's park detail byte-for-byte —

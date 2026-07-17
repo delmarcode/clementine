@@ -62,6 +62,16 @@ defmodule Clementine.Loop.RunnerTest do
     def handle_upgrade(1, _state), do: raise("v1 shall not pass")
   end
 
+  defmodule ThrowingUpgradeLoop do
+    @moduledoc "The broken healing deploy, non-exception flavor: handle_upgrade/2 throws."
+
+    use Clementine.Loop, state_version: 2
+
+    def init(_args), do: {:ok, %{}, []}
+    def handle(_input, state), do: {:ok, state, []}
+    def handle_upgrade(1, _state), do: throw(:refused)
+  end
+
   defmodule FlagMidStep do
     @moduledoc """
     The strand interleaving: the cancel flag lands after the claim read
@@ -441,6 +451,27 @@ defmodule Clementine.Loop.RunnerTest do
                "message:waiting",
                "message:healed"
              ]
+    end
+
+    test "matrix row L2 (broken upgrade, non-exception): a throwing handle_upgrade/2 parks — never the hot requeue path",
+         %{store: store} do
+      ref = create!(store, ScriptedLoop)
+      append!(store, ref, %{"id" => "before"})
+      assert {:parked, _} = step!(store, ref)
+
+      Host.rewrite_module!(store, ref, "Clementine.Loop.RunnerTest.ThrowingUpgradeLoop")
+      append!(store, ref, %{"id" => "waiting"})
+
+      # A park, not {:error, _}: the gate converts the throw instead of
+      # letting it escape to fail_step's requeue — which, pre-bump, would
+      # retry hot forever with attempts never advancing.
+      assert {:parked, %Facts{status: :waiting} = facts} = step!(store, ref)
+      assert {:external, {:incompatible_state, detail}} = facts.suspension.reason
+
+      assert %{state_version: 1, declared: 2, upgrade: %{from: 1, error: "throw: :refused"}} =
+               detail
+
+      assert [%{attempts: 0, dead_reason: nil}] = pending_rows(store, ref)
     end
   end
 

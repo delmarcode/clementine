@@ -230,10 +230,11 @@ defmodule Clementine.Loop.Step do
   unchanged; a failed chain names the failing hop
   (`upgrade: %{from: n, error: message}`).
 
-  Rescued end to end — the stored-state decode, every hop, the
+  Every failure channel converts to the error tuple — raises, throws,
+  and exits, across the stored-state decode, every hop, and the
   re-encode — because every failure in it is deploy-shaped: the fix is
   the next deploy, so the caller parks the loop pre-bump instead of
-  raising into the hot requeue path or blaming an innocent input. Pure
+  escaping into the hot requeue path or blaming an innocent input. Pure
   over its arguments, like the fold it front-runs: a crashed step
   replays the chain from the unchanged stored envelope to an identical
   result.
@@ -284,8 +285,12 @@ defmodule Clementine.Loop.Step do
     e -> {:error, upgrade_error(stored, declared, stored, e)}
   end
 
-  # One hop per version, stepwise; each invocation rescues its own hop so
-  # the failing version is the one named in the park detail.
+  # One hop per version, stepwise; each invocation rescues and catches
+  # its own hop so the failing version is the one named in the park
+  # detail. Throws and exits convert alongside raises: the gate runs
+  # pre-bump, so a failure escaping it would walk fail_step's requeue
+  # with attempts never advancing — a hot retry loop, the exact thing
+  # the park exists to prevent.
   defp chain(_module, _stored, from, declared, dumped) when from == declared, do: {:ok, dumped}
 
   defp chain(module, stored, from, declared, dumped) do
@@ -299,6 +304,8 @@ defmodule Clementine.Loop.Step do
     end
   rescue
     e -> {:error, upgrade_error(stored, declared, from, e)}
+  catch
+    kind, reason -> {:error, upgrade_error(stored, declared, from, "#{kind}: #{inspect(reason)}")}
   end
 
   defp upgrade_error(stored, declared, from, %{__exception__: true} = e),

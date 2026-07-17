@@ -56,6 +56,17 @@ defmodule Clementine.Loop.StepTest do
     def handle_upgrade(1, state), do: {:ok, Map.put(state, "leak", :undeclared)}
   end
 
+  defmodule NonExceptionUpgradeLoop do
+    @moduledoc "handle_upgrade/2 fails outside the exception channel — throw or exit, payload-driven."
+
+    use Clementine.Loop, state_version: 2
+
+    def init(_args), do: {:ok, %{}, []}
+    def handle(_input, state), do: {:ok, state, []}
+    def handle_upgrade(1, %{"fail" => "throw"}), do: throw(:refused)
+    def handle_upgrade(1, %{"fail" => "exit"}), do: exit(:shutdown)
+  end
+
   defp vocab, do: ScriptedLoop.__loop__(:vocabulary)
   defp key(tag), do: Codec.key(tag, vocabulary: vocab())
 
@@ -867,6 +878,17 @@ defmodule Clementine.Loop.StepTest do
 
       assert %{state_version: 1, declared: 2, upgrade: %{from: 1, error: error}} = detail
       assert error =~ "must return {:ok, map()}"
+    end
+
+    test "a throw or exit inside a hop parks with the hop named — non-exception failures never escape the gate" do
+      for {mode, expected} <- [{"throw", "throw: :refused"}, {"exit", "exit: :shutdown"}] do
+        envelope = %Envelope{state_version: 1, state: %{"fail" => mode}}
+
+        assert {:error, {:incompatible_state, detail}} =
+                 Step.drain(NonExceptionUpgradeLoop, envelope, Step.plan(envelope, []), @opts)
+
+        assert %{state_version: 1, declared: 2, upgrade: %{from: 1, error: ^expected}} = detail
+      end
     end
 
     test "chain output outside the durable vocabulary parks at the gate, blaming the hop that produced it" do
