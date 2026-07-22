@@ -135,7 +135,7 @@ Every strand class maps to a failure-matrix row and a healing mechanism
 | Strand | Matrix row | Healed by |
 |--------|-----------|-----------|
 | `:incompatible_spec` | L2 | a deploy carrying the module (or a cancel — the cascade never loads state) |
-| `:incompatible_state` | L2 | a deploy declaring the stored `state_version` |
+| `:incompatible_state` | L2 | a deploy declaring the stored `state_version`, or one whose `handle_upgrade/2` chain covers it — the next wake upgrades and drains |
 | `:parked_with_pending` | L4 | the reaper's `:wake_pending` verdict |
 | `:parked_with_cancel` | L8 | the next wake — the flag reads at claim, ahead of the drain |
 | `:stranded_completion` | L13 | the reaper's `:reconcile_children` verdict |

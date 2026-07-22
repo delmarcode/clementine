@@ -28,11 +28,12 @@ defmodule Clementine.Loop do
   ## Options
 
   - `:state_version` — positive integer (default `1`), recorded in every
-    envelope the loop commits. A stored version the current module does
-    not declare fails the step as `:incompatible_state` — parked visibly,
+    envelope the loop commits. A stored version behind the declared one
+    upgrades through the `handle_upgrade/2` chain when the module exports
+    it; otherwise — and on any chain failure, and in the rollback
+    direction — the step fails as `:incompatible_state`: parked visibly,
     never a crash, distinct from input dead-letters (inputs are innocent
-    of deploys). `handle_upgrade/2` is reserved as the `code_change`
-    analog and not yet part of the contract.
+    of deploys, and of broken upgrades).
   - `:vocabulary` — the atom whitelist for `Clementine.Loop.Codec`
     (default `[]`). Tags and payloads may use exactly these atoms.
 
@@ -62,7 +63,19 @@ defmodule Clementine.Loop do
   @callback dump(state()) :: map()
   @callback load(map()) :: state()
 
-  @optional_callbacks dump: 1, load: 1
+  @doc """
+  The `code_change` analog (LOOP_RFC §State Upgrade): receives the
+  codec-decoded dumped state at `from_version` — exactly what `load/1`
+  would receive — and returns it at `from_version + 1`. The machinery
+  folds the chain `stored..declared - 1` stepwise, then `load/1`s the
+  result: one clause per version bump, append-only, so a loop that slept
+  through several deploys chains through all of them. Pure, like
+  `init/1` and `handle/2` — the chain is part of the fold and replays.
+  Any failure parks the loop `:incompatible_state`, pre-bump.
+  """
+  @callback handle_upgrade(from_version :: pos_integer(), state :: map()) :: {:ok, map()}
+
+  @optional_callbacks dump: 1, load: 1, handle_upgrade: 2
 
   defmacro __using__(opts) do
     state_version = Keyword.get(opts, :state_version, 1)

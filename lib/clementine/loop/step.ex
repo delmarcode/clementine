@@ -19,7 +19,9 @@ defmodule Clementine.Loop.Step do
 
   Deploy-shaped problems return clean errors — `{:error,
   {:incompatible_state, _}}` (stored `state_version` this code cannot
-  load) and `{:error, {:incompatible_spec, _}}` (not a loop module) — the
+  load: a version behind the declared one first takes the
+  `handle_upgrade/2` chain when the module exports it, see `upgrade/2`)
+  and `{:error, {:incompatible_spec, _}}` (not a loop module) — the
   loop parks visibly until compatible code deploys (matrix row L2). Inputs
   are innocent of deploys, so these never dead-letter anything.
 
@@ -217,6 +219,103 @@ defmodule Clementine.Loop.Step do
     end
   end
 
+  @doc """
+  Phase 2's version gate (LOOP_RFC §State Upgrade): the envelope as-is
+  when versions agree (or before the first commit), the envelope carried
+  to the declared version when the module exports `handle_upgrade/2` and
+  the chain succeeds, and `{:error, {:incompatible_state, detail}}`
+  otherwise. Callback absent and the rollback direction (`stored >
+  declared`) keep the versionless detail exactly —
+  `%{state_version: stored, declared: declared}` — deploy honesty
+  unchanged; a failed chain names the failing hop
+  (`upgrade: %{from: n, error: message}`).
+
+  Every failure channel converts to the error tuple — raises, throws,
+  and exits, across the stored-state decode, every hop, and the
+  re-encode — because every failure in it is deploy-shaped: the fix is
+  the next deploy, so the caller parks the loop pre-bump instead of
+  escaping into the hot requeue path or blaming an innocent input. Pure
+  over its arguments, like the fold it front-runs: a crashed step
+  replays the chain from the unchanged stored envelope to an identical
+  result.
+  """
+  @spec upgrade(module(), Envelope.t() | nil) ::
+          {:ok, Envelope.t() | nil} | {:error, {:incompatible_state, map()}}
+  def upgrade(_module, nil), do: {:ok, nil}
+
+  def upgrade(module, %Envelope{state_version: stored} = envelope) do
+    declared = module.__loop__(:state_version)
+
+    if stored == declared do
+      {:ok, envelope}
+    else
+      vocab = module.__loop__(:vocabulary)
+
+      with {:ok, dumped} <- upgrade_chain(module, stored, declared, envelope.state, vocab) do
+        encode_upgraded(envelope, declared, dumped, vocab)
+      end
+    end
+  end
+
+  defp encode_upgraded(envelope, declared, dumped, vocab) do
+    {:ok, %{envelope | state_version: declared, state: Codec.encode(dumped, vocabulary: vocab)}}
+  rescue
+    # Chain output outside the durable vocabulary: blame the hop that
+    # produced it.
+    e -> {:error, upgrade_error(envelope.state_version, declared, declared - 1, e)}
+  end
+
+  defp upgrade_chain(module, stored, declared, encoded_state, vocab) do
+    if stored > declared or
+         not (Code.ensure_loaded?(module) and function_exported?(module, :handle_upgrade, 2)) do
+      {:error, {:incompatible_state, %{state_version: stored, declared: declared}}}
+    else
+      with {:ok, dumped} <- decode_stored(stored, declared, encoded_state, vocab) do
+        chain(module, stored, stored, declared, dumped)
+      end
+    end
+  end
+
+  # A stored state the current vocabulary no longer decodes is
+  # deploy-shaped here (the equal-version decode keeps its poison
+  # doctrine): the chain exists to bridge deploys, so it parks instead.
+  defp decode_stored(stored, declared, encoded_state, vocab) do
+    {:ok, Codec.decode(encoded_state, vocabulary: vocab)}
+  rescue
+    e -> {:error, upgrade_error(stored, declared, stored, e)}
+  end
+
+  # One hop per version, stepwise; each invocation rescues and catches
+  # its own hop so the failing version is the one named in the park
+  # detail. Throws and exits convert alongside raises: the gate runs
+  # pre-bump, so a failure escaping it would walk fail_step's requeue
+  # with attempts never advancing — a hot retry loop, the exact thing
+  # the park exists to prevent.
+  defp chain(_module, _stored, from, declared, dumped) when from == declared, do: {:ok, dumped}
+
+  defp chain(module, stored, from, declared, dumped) do
+    case module.handle_upgrade(from, dumped) do
+      {:ok, next} when is_map(next) and not is_struct(next) ->
+        chain(module, stored, from + 1, declared, next)
+
+      other ->
+        {:error,
+         upgrade_error(stored, declared, from, "must return {:ok, map()}, got: #{inspect(other)}")}
+    end
+  rescue
+    e -> {:error, upgrade_error(stored, declared, from, e)}
+  catch
+    kind, reason -> {:error, upgrade_error(stored, declared, from, "#{kind}: #{inspect(reason)}")}
+  end
+
+  defp upgrade_error(stored, declared, from, %{__exception__: true} = e),
+    do: upgrade_error(stored, declared, from, Exception.message(e))
+
+  defp upgrade_error(stored, declared, from, message) do
+    {:incompatible_state,
+     %{state_version: stored, declared: declared, upgrade: %{from: from, error: message}}}
+  end
+
   ## Normal mode
 
   defp drain_normal(module, envelope, plan, loop_ref, epoch, loop_args) do
@@ -292,13 +391,24 @@ defmodule Clementine.Loop.Step do
   defp initial_fold(module, %Envelope{} = envelope, _loop_args, vocab, plan, loop_ref) do
     declared = module.__loop__(:state_version)
 
-    if envelope.state_version == declared do
-      state = module.load(Codec.decode(envelope.state, vocabulary: vocab))
+    with {:ok, dumped} <- stored_state(module, envelope, declared, vocab) do
+      state = module.load(dumped)
       {:ok, %{new_fold(envelope, plan, loop_ref) | state: state, initialized?: true}}
-    else
-      {:error,
-       {:incompatible_state, %{state_version: envelope.state_version, declared: declared}}}
     end
+  end
+
+  # Equal versions decode straight through — a raise here keeps the
+  # poison doctrine, the bump already committed. A stored version behind
+  # the declared one takes the rescued upgrade chain (LOOP_RFC §State
+  # Upgrade); the runner pre-runs the same gate via `upgrade/2`, so in
+  # production this branch sees equal versions — it exists so `drain/4`
+  # alone honors the full contract.
+  defp stored_state(_module, %Envelope{state_version: declared} = envelope, declared, vocab) do
+    {:ok, Codec.decode(envelope.state, vocabulary: vocab)}
+  end
+
+  defp stored_state(module, %Envelope{} = envelope, declared, vocab) do
+    upgrade_chain(module, envelope.state_version, declared, envelope.state, vocab)
   end
 
   defp new_fold(envelope, plan, loop_ref) do

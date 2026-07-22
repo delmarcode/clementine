@@ -120,8 +120,8 @@ defmodule Clementine.Telemetry do
   The loop layer owns the `:loop` prefix the engine rename vacated. Two
   emitters split the events by what they can honestly see: the **step
   runner** emits everything derivable from a committed `StepCommit`
-  (`:step`, `:step_failed`, `:spawned`, `:cascade`) after — never
-  before — the host's atomic unit commits, and the **storage adapter**
+  (`:step`, `:step_failed`, `:spawned`, `:cascade`, `:upgraded`) after —
+  never before — the host's atomic unit commits, and the **storage adapter**
   (`Clementine.Loop.Ecto`) emits the inbox-side events (`:input`,
   `:dead_letter`, `:inbox`) through the deferred-emission seam, so an
   event describing an append or dead letter fires only when the
@@ -204,6 +204,20 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{}`
   - Metadata: `%{loop_ref: term, epoch: pos_integer, trigger: :cancel | :halt, children: non_neg_integer}` —
     `children` is the live-child count being cancelled as cargo
+
+  ### `[:clementine, :loop, :upgraded]`
+
+  A committed step carried a `handle_upgrade/2` state upgrade (LOOP_RFC
+  §State Upgrade): the written envelope's `state_version` moved past the
+  stored one. Emitted by the step runner after the carrying commit — the
+  deploy-verification signal: after a healing deploy, the parked fleet
+  drains through this event as `:wake_pending` and fresh appends wake it.
+  Once per carrying commit (a replayed crashed step re-upgrades from the
+  unchanged stored envelope, and only one commit ever lands).
+
+  - Measurements: `%{}`
+  - Metadata: `%{loop_ref: term, epoch: pos_integer, from: pos_integer, to: pos_integer}` —
+    the stored and declared `state_version`s the commit bridged
 
   ### `[:clementine, :loop, :input]`
 

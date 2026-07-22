@@ -2,6 +2,8 @@
 
 Status: adopted — validated against Meli (SKUNK-156, 2026-07-09); see
 the Adoption Report at the end of this document  
+Amended: `handle_upgrade/2` finalized and implemented (SKUNK-212,
+2026-07-16) — see State Upgrade under The Behaviour  
 Scope: the outer control primitive reserved by the durable execution RFC  
 Builds on: `docs/DURABLE_EXECUTION_RFC.md` (v2.2, fully implemented — SKUNK-124)  
 Origin: the vocabulary reserved in that RFC, the suspend-versus-complete
@@ -301,7 +303,10 @@ defmodule Clementine.Loop do
   @callback dump(state :: term()) :: map()     # default: identity (state is a map)
   @callback load(map()) :: state :: term()     # default: identity
 
-  @optional_callbacks dump: 1, load: 1
+  @callback handle_upgrade(from_version :: pos_integer(), state :: map()) ::
+              {:ok, map()}                     # the code_change analog; see State Upgrade
+
+  @optional_callbacks dump: 1, load: 1, handle_upgrade: 2
 end
 ```
 
@@ -321,14 +326,114 @@ end
   `messages`, nil `input_message`, and machinery-aggregated `usage`; hosts
   discriminate loop terminals by `Facts.kind`.
 - `state_version` is declared via `use Clementine.Loop, state_version: n`
-  and recorded per commit. A version the current code cannot `load/1` fails
-  the step as loop-level **`:incompatible_state`** — a distinct path from
-  input dead-letters (inputs are innocent of deploys): the loop parks with
-  an operator-visible error fact until upgraded code deploys or the host
-  chooses a terminal. A reserved `handle_upgrade/2` is the `code_change`
-  analog (shape non-final). The same clean-failure doctrine covers a
-  renamed `loop_module` (`:incompatible_spec`) — module names persist in
-  the spec columns and share checkpoint doctrine's deploy honesty.
+  and recorded per commit. A stored version behind the declared one takes
+  the **`handle_upgrade/2` chain** when the module exports it (see State
+  Upgrade below); otherwise — and on any chain failure, and in the
+  rollback direction — the step fails as loop-level
+  **`:incompatible_state`**, a distinct path from input dead-letters
+  (inputs are innocent of deploys): the loop parks with an
+  operator-visible error fact until upgraded code deploys or the host
+  chooses a terminal. The same clean-failure doctrine covers a renamed
+  `loop_module` (`:incompatible_spec`) — module names persist in the spec
+  columns and share checkpoint doctrine's deploy honesty.
+
+### State Upgrade: `handle_upgrade/2`
+
+*Amendment (SKUNK-212, 2026-07-16). V2 reserved the name with shape
+explicitly non-final and parked version-incompatible loops until an
+operator or a compatible deploy intervened. Thread loops could live with
+that; case loops live until outcome — months — so state-shape changes
+**will** land mid-flight, and the upgrade path is load-bearing. The
+shape below is final; the Non-Final entry is retired.*
+
+```elixir
+@callback handle_upgrade(from_version :: pos_integer(), state :: map()) ::
+            {:ok, map()}
+@optional_callbacks handle_upgrade: 2
+```
+
+**The chain is stepwise on the dumped shape.** `handle_upgrade(n, map)`
+receives the codec-decoded dumped state at version `n` — exactly the
+value `load/1` would receive — and returns `{:ok, map}` at version
+`n + 1`. When a step finds `stored < declared`, the machinery folds the
+chain `stored, stored + 1, …, declared - 1` and hands the result to
+`load/1`, which stays the only dumped→state door. Migration discipline
+follows: each deploy that bumps `state_version` ships exactly one new
+clause, old clauses are append-only history, and a loop that slept
+through three deploys chains through all three. The alternative — one
+direct `stored → declared` hop — was rejected: it puts the combinatorial
+burden (every version knowing every prior version) on the app, where
+stepwise puts one clause per bump. State evolution at organizational
+timescale is the database-migration problem, and this is the
+database-migration shape.
+
+```elixir
+# v2 renames "cursor" and adds a budget; v1 loops upgrade on next wake.
+use Clementine.Loop, state_version: 2
+
+def handle_upgrade(1, state) do
+  {:ok,
+   state
+   |> Map.put("message_cursor", state["cursor"])
+   |> Map.delete("cursor")
+   |> Map.put_new("budget", 100)}
+end
+```
+
+**It runs lazily, pre-bump, in step phase 2.** The version gate already
+sits before the attempts bump because inputs are innocent of deploys;
+the chain runs at that same gate, because inputs are innocent of broken
+upgrades for the same reason. Success flows into the normal drain: the
+upgraded envelope (state at `declared`, `state_version: declared`)
+commits with whatever the step commits — park, continue, or finish —
+one atomic unit, invariant 3 intact. There is no separate upgrade
+transition and no fleet sweep at deploy; a parked loop upgrades on its
+next wake. Threshold (poison-mark) commits leave the envelope untouched
+by omission, exactly as before — the pure chain simply re-runs on the
+next non-threshold step.
+
+**Every failure parks; nothing bumps, nothing escapes hot.** The chain
+converts every failure channel end to end. Callback absent, no clause
+for a hop, a raise/throw/exit inside a hop, a return outside
+`{:ok, map}`, chain output the codec cannot encode, stored state the
+current vocabulary no longer decodes —
+each parks the loop `:incompatible_state`, pre-bump. Callback absent
+and the rollback direction (`stored > declared`; the chain never walks
+backward) keep today's park detail byte-for-byte —
+`%{state_version: stored, declared: declared}` — deploy honesty
+unchanged. A failed chain adds the failing hop:
+`upgrade: %{from: n, error: message}`. Both are deploy-shaped: the fix
+is the next deploy, so the loop parks operator-visible instead of
+walking the requeue path hot or blaming an innocent input.
+
+**Purity is the same contract as `init/1` and `handle/2`.** The chain
+is part of the fold: no reads, no clock, no randomness. A step that
+upgrades and crashes before its commit replays the chain from the
+unchanged stored envelope to an identical result (invariant 4).
+
+**The rescue needs no new wake machinery.** An `:incompatible_state`
+park always holds at least one pending input: the gate precedes the
+drain, so the input that woke the incompatible step stays unconsumed —
+and cascade mode, the only state-free drain, consumes completions only.
+A fresh append wakes the parked loop through the ordinary atomic
+append; a quiet one is woken by the reaper's `:wake_pending` verdict
+(A3c). Either wake lands on the upgraded code, the chain runs, and the
+park was never a grave.
+
+**Scope.** The chain covers the app's `state_version` only. The
+envelope format version (`"v"`) is machinery-owned and migrates with
+the machinery; `:incompatible_spec` is not rescuable by a module that
+is no longer there. Cascade mode never upgrades — it never touches
+state, which is what keeps an incompatible loop cancellable — so a
+broken chain can never block a cancellation. `load/1` failures on the
+chain's output keep their existing doctrine (the poison path), same as
+on any stored state.
+
+**Observation.** The step that commits an upgraded envelope emits
+`[:clementine, :loop, :upgraded]` post-commit with `from`/`to`
+versions — the deploy-verification signal: after a healing deploy,
+watch the parked fleet drain through it. Like every post-commit signal
+it is best-effort; the commit, not the event, is the truth.
 
 ### Tags And Payloads
 
@@ -400,8 +505,9 @@ exactly like the shipped worker pattern. The loop never holds a rollout.
 ```
 1. Claim (Protocol.claim — kind :loop; deadline from loop_policy).
 2. Load: envelope from the envelope column; load/1 the state (version
-   check → :incompatible_state path on mismatch); if facts.cancel is set,
-   enter cascade mode instead (see Cancellation And Halt).
+   check → the handle_upgrade/2 chain, or the :incompatible_state park,
+   on mismatch); if facts.cancel is set, enter cascade mode instead
+   (see Cancellation And Halt).
 3. Bump attempts: one small committed write marking the drained batch's
    HEAD input attempt+1 (the Oban fetch-increment analog — counted even if
    this VM dies mid-step). Head at K → dead-letter it + synthesize its
@@ -692,7 +798,7 @@ decisions, not surprises:
 | # | Scenario | Mechanism | Outcome |
 |---|----------|-----------|---------|
 | L1 | Step crashes anywhere before commit | one-atomic-commit + A3a requeue-always | identical replay; cargo no-ops on tag/dedup keys; no duplicate children, sends, or timers |
-| L2 | Deploy during a weeks-long park | state_version / loop_module checks | `:incompatible_state`/`:incompatible_spec` — parked visibly, never a crash; upgrade or host-chosen terminal |
+| L2 | Deploy during a weeks-long park | state_version / loop_module checks; the `handle_upgrade/2` chain | with an upgrade path, the next wake chains and drains; without one, `:incompatible_state`/`:incompatible_spec` — parked visibly, never a crash; upgrade or host-chosen terminal |
 | L3 | Appends race each other and the wake | append's atomic insert+wake+enqueue; claim CAS | one step drains all, FIFO commit-visibility order |
 | L4 | Append lands between drain and park | park's in-commit pending re-check → downgrade to continue | never parked with pending inputs; `:wake_pending` backstops imperfect substrates |
 | L5 | Fast child completes during crash window; replay re-drains spawn + completion | in-fold dedup | replayed spawn re-records the tag before its completion is judged: delivered once, dropped never |
@@ -741,8 +847,9 @@ decisions, not surprises:
 
 ## Non-Final
 
-- `handle_upgrade/2` shape; dead-letter K default; per-step batch cap
-  default; loop deadline defaults in `loop_policy`.
+- Dead-letter K default; per-step batch cap default; loop deadline
+  defaults in `loop_policy`. (`handle_upgrade/2` graduated to final —
+  see State Upgrade.)
 - `LoopView` (the fold for dashboards) — `inspect/2` covers operations
   first.
 - Send-key exposure for host-initiated appends (today: caller-supplied
