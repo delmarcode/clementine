@@ -153,13 +153,25 @@ defmodule Clementine.ToolInput do
   # never include the parameter's own name, so a value ending in nested
   # markup named like it (`<section><section>x</section></section>`) stays.
   defp trailing_call_syntax(value, name, tool) do
-    own = "</(?:[^<>\\s]*parameter|#{Regex.escape(Atom.to_string(name))})>"
-    regex = Regex.compile!("#{own}(?:\\s*#{closer(List.wrap(tool))})+\\s*\\z")
+    if wrapper_named?(name, tool) do
+      nil
+    else
+      own = "</(?:[^<>\\s]*parameter|#{Regex.escape(Atom.to_string(name))})>"
+      regex = Regex.compile!("#{own}(?:\\s*#{closer(List.wrap(tool))})+\\s*\\z")
 
-    case Regex.run(regex, value, return: :index) do
-      [{start, _length}] -> start
-      nil -> nil
+      case Regex.run(regex, value, return: :index) do
+        [{start, _length}] -> start
+        nil -> nil
+      end
     end
+  end
+
+  # A parameter named like a call wrapper (its tool, or `...invoke`,
+  # `...function_calls`, `...parameter`) cannot tell its own closing tag
+  # from the call's, so its value is never cut at the end.
+  defp wrapper_named?(name, tool) do
+    name = Atom.to_string(name)
+    name == to_string(tool) or String.ends_with?(name, ["parameter", "invoke", "function_calls"])
   end
 
   # One of the call syntax's closing tags: a `...parameter` tag, the call
