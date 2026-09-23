@@ -16,7 +16,9 @@ defmodule Clementine.ToolInput do
   rather than fixing the syntax. So `repair/2` recovers the embedded values
   instead. The garbled parameter keeps the text before the stray closing
   tag, and each embedded parameter the tool declares and the input lacks
-  gets its value, decoded to the declared type.
+  gets its value, decoded to the declared type. Only the call syntax's own
+  tags are removed; markup that is part of a value (an email's `</p>`) is
+  kept.
 
   A boundary is `<parameter name="x">`, or `<x>` directly after a stray
   closing tag naming a declared parameter (or a `parameter` tag), where `x`
@@ -24,9 +26,6 @@ defmodule Clementine.ToolInput do
   produce. Only top-level string parameters are repaired, and a value the
   provider delivered as a real field is never overwritten.
   """
-
-  @closing_tag "</[^<>\\s]{1,64}>"
-  @trailing_closing_tags Regex.compile!("(\\s*#{@closing_tag})+\\s*\\z")
 
   @doc """
   Repairs `input` (string or atom keys, as delivered) against the tool's
@@ -42,7 +41,7 @@ defmodule Clementine.ToolInput do
            {key, value} when is_binary(value) <- fetch(input, name),
            [_ | _] = others <- names -- [name],
            [{first_start, _, _} | _] = boundaries <- boundaries(value, name, others) do
-        head = value |> binary_part(0, first_start) |> clean()
+        head = value |> binary_part(0, first_start) |> String.trim()
         recovered = recover(value, boundaries, parameters, input)
 
         input =
@@ -60,17 +59,16 @@ defmodule Clementine.ToolInput do
   def repair(input, _parameters), do: {input, []}
 
   # Every boundary in the value, in order: {start, end, name}, where the
-  # span covers the stray closing tag and the opening markup. The element
-  # form needs the stray tag to close a declared parameter (or be a
-  # `...parameter` tag), so ordinary HTML such as `</b> <summary>` is not
-  # a boundary.
+  # span covers the stray closing tag and the opening markup. A stray tag
+  # closes a declared parameter or is a `...parameter` tag, so ordinary
+  # HTML (`</p>`, `</b> <summary>`) is neither consumed nor a boundary.
   defp boundaries(value, own, others) do
     embedded = alternatives(others)
     stray = "</(?:[^<>\\s]*parameter|#{alternatives([own | others])})>"
 
     regex =
       Regex.compile!(
-        "(?:#{@closing_tag}\\s*)?<parameter name=\"(#{embedded})\">" <>
+        "(?:#{stray}\\s*)?<parameter name=\"(#{embedded})\">" <>
           "|#{stray}\\s*<(#{embedded})>"
       )
 
@@ -96,7 +94,10 @@ defmodule Clementine.ToolInput do
     boundaries
     |> Enum.zip(ends)
     |> Enum.flat_map(fn {{_start, value_start, name}, value_end} ->
-      raw = value |> binary_part(value_start, value_end - value_start) |> clean()
+      raw =
+        value
+        |> binary_part(value_start, value_end - value_start)
+        |> strip_call_syntax(name)
 
       with false <- present?(input, name),
            {:ok, decoded} <- decode(raw, Keyword.get(parameters[name], :type)) do
@@ -108,7 +109,18 @@ defmodule Clementine.ToolInput do
     |> Enum.uniq_by(&elem(&1, 0))
   end
 
-  defp clean(text), do: text |> String.replace(@trailing_closing_tags, "") |> String.trim()
+  # A recovered value may end with the call syntax's own closers: its
+  # element tag, a `...parameter` tag, or the call wrappers after the last
+  # parameter. Anything else, such as `</p>` in an email body, is content.
+  defp strip_call_syntax(text, name) do
+    closers =
+      "</(?:[^<>\\s]*parameter|[^<>\\s]*invoke|[^<>\\s]*function_calls|" <>
+        Regex.escape(Atom.to_string(name)) <> ")>"
+
+    text
+    |> String.replace(Regex.compile!("(\\s*#{closers})+\\s*\\z"), "")
+    |> String.trim()
+  end
 
   defp decode("", _type), do: :error
   defp decode(text, :string), do: {:ok, text}
@@ -137,12 +149,8 @@ defmodule Clementine.ToolInput do
     end
   end
 
-  defp present?(input, name) do
-    case fetch(input, name) do
-      {_key, value} -> value not in [nil, ""]
-      :error -> false
-    end
-  end
+  # A key the provider delivered is a real field, whatever its value.
+  defp present?(input, name), do: fetch(input, name) != :error
 
   # Nothing before the stray tag means nothing to keep: the parameter is
   # then missing, and validation reports it.

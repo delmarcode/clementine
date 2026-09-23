@@ -79,6 +79,45 @@ defmodule Clementine.ToolInputTest do
               [:rationale]} = ToolInput.repair(input, @verdict)
     end
 
+    test "keeps markup that belongs to a value, removing only the call syntax" do
+      email = [
+        body: [type: :string, required: true],
+        subject: [type: :string]
+      ]
+
+      assert {%{"body" => "<p>Hi there.</p>", "subject" => "Re: <b>your order</b>"},
+              [:body, :subject]} =
+               ToolInput.repair(
+                 %{
+                   "body" =>
+                     "<p>Hi there.</p></body>\n" <>
+                       "<parameter name=\"subject\">Re: <b>your order</b></parameter>\n</invoke>"
+                 },
+                 email
+               )
+
+      # No stray tag at all: the paragraph's own closing tag stays put.
+      assert {%{"body" => "<p>Hi.</p>", "subject" => "Re: order"}, [:body, :subject]} =
+               ToolInput.repair(
+                 %{"body" => "<p>Hi.</p><parameter name=\"subject\">Re: order"},
+                 email
+               )
+    end
+
+    test "an explicitly delivered empty or nil field counts as present" do
+      for delivered <- ["", nil] do
+        input = %{
+          "tier" => "urgent",
+          "summary" => "S",
+          "recommended_action" => delivered,
+          "rationale" => "R.</rationale>\n<parameter name=\"recommended_action\">Leaked"
+        }
+
+        assert {%{"recommended_action" => ^delivered, "rationale" => "R."}, [:rationale]} =
+                 ToolInput.repair(input, @verdict)
+      end
+    end
+
     test "skips embedded values that do not decode to the declared type" do
       input = %{
         "tier" => "urgent",
