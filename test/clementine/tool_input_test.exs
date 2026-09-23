@@ -124,6 +124,11 @@ defmodule Clementine.ToolInputTest do
 
       input = %{"tier" => "emergency</tier>\n</record_verdict>"}
       assert {^input, []} = ToolInput.repair(input, @verdict)
+
+      # Nested markup named like the parameter is content, not call syntax.
+      page = [section: [type: :string], title: [type: :string]]
+      input = %{"section" => "<section><section>x</section></section>", "title" => "T"}
+      assert {^input, []} = ToolInput.repair(input, page, tool: "write_page")
     end
 
     test "never overwrites a value delivered as a real field, but still cleans the garbled one" do

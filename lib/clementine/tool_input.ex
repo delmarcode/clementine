@@ -143,16 +143,18 @@ defmodule Clementine.ToolInput do
   # first of them is the value, byte for byte (indentation and trailing
   # newlines included), and other markup such as an email's `</p>` stays.
   defp strip_call_syntax(text, name, tool) do
-    closer = closer(name, tool)
+    closer = closer([name | List.wrap(tool)])
     String.replace(text, Regex.compile!("#{closer}(?:\\s*#{closer})*\\s*\\z"), "")
   end
 
   # Where a value's trailing call syntax starts, if it has any: the
   # parameter's own closing tag (or a `...parameter` tag) followed by at
-  # least one more closer, then only whitespace.
+  # least one of the call's wrappers, then only whitespace. The wrappers
+  # never include the parameter's own name, so a value ending in nested
+  # markup named like it (`<section><section>x</section></section>`) stays.
   defp trailing_call_syntax(value, name, tool) do
     own = "</(?:[^<>\\s]*parameter|#{Regex.escape(Atom.to_string(name))})>"
-    regex = Regex.compile!("#{own}(?:\\s*#{closer(name, tool)})+\\s*\\z")
+    regex = Regex.compile!("#{own}(?:\\s*#{closer(List.wrap(tool))})+\\s*\\z")
 
     case Regex.run(regex, value, return: :index) do
       [{start, _length}] -> start
@@ -161,10 +163,13 @@ defmodule Clementine.ToolInput do
   end
 
   # One of the call syntax's closing tags: a `...parameter` tag, the call
-  # wrappers, the parameter's element tag, or the tool's name.
-  defp closer(name, tool) do
-    names = Enum.map_join([name | List.wrap(tool)], "|", &Regex.escape(to_string(&1)))
-    "</(?:[^<>\\s]*parameter|[^<>\\s]*invoke|[^<>\\s]*function_calls|#{names})>"
+  # wrappers, or one of `names` (a parameter's element tag, the tool's name).
+  defp closer(names) do
+    alternatives =
+      ["[^<>\\s]*parameter", "[^<>\\s]*invoke", "[^<>\\s]*function_calls"] ++
+        Enum.map(names, &Regex.escape(to_string(&1)))
+
+    "</(?:#{Enum.join(alternatives, "|")})>"
   end
 
   defp decode(text, type) do
