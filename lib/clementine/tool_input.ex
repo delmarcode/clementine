@@ -41,7 +41,7 @@ defmodule Clementine.ToolInput do
            {key, value} when is_binary(value) <- fetch(input, name),
            [_ | _] = others <- names -- [name],
            [{first_start, _, _} | _] = boundaries <- boundaries(value, name, others) do
-        head = value |> binary_part(0, first_start) |> String.trim()
+        head = binary_part(value, 0, first_start)
         recovered = recover(value, boundaries, parameters, input)
 
         input =
@@ -111,21 +111,24 @@ defmodule Clementine.ToolInput do
 
   # A recovered value may end with the call syntax's own closers: its
   # element tag, a `...parameter` tag, or the call wrappers after the last
-  # parameter. Anything else, such as `</p>` in an email body, is content.
+  # parameter, separated by whitespace. They go; everything before the
+  # first of them is the value, byte for byte (indentation and trailing
+  # newlines included), and other markup such as an email's `</p>` stays.
   defp strip_call_syntax(text, name) do
-    closers =
+    closer =
       "</(?:[^<>\\s]*parameter|[^<>\\s]*invoke|[^<>\\s]*function_calls|" <>
         Regex.escape(Atom.to_string(name)) <> ")>"
 
-    text
-    |> String.replace(Regex.compile!("(\\s*#{closers})+\\s*\\z"), "")
-    |> String.trim()
+    String.replace(text, Regex.compile!("#{closer}(?:\\s*#{closer})*\\s*\\z"), "")
   end
 
-  defp decode("", _type), do: :error
-  defp decode(text, :string), do: {:ok, text}
-
   defp decode(text, type) do
+    if String.trim(text) == "", do: :error, else: decode_typed(text, type)
+  end
+
+  defp decode_typed(text, :string), do: {:ok, text}
+
+  defp decode_typed(text, type) do
     case Jason.decode(text) do
       {:ok, value} -> if typed?(value, type), do: {:ok, value}, else: :error
       {:error, _} -> :error
@@ -152,10 +155,11 @@ defmodule Clementine.ToolInput do
   # A key the provider delivered is a real field, whatever its value.
   defp present?(input, name), do: fetch(input, name) != :error
 
-  # Nothing before the stray tag means nothing to keep: the parameter is
-  # then missing, and validation reports it.
-  defp put_head(input, key, ""), do: Map.delete(input, key)
-  defp put_head(input, key, head), do: Map.put(input, key, head)
+  # Nothing but whitespace before the stray tag means nothing to keep: the
+  # parameter is then missing, and validation reports it.
+  defp put_head(input, key, head) do
+    if String.trim(head) == "", do: Map.delete(input, key), else: Map.put(input, key, head)
+  end
 
   defp put_recovered(input, recovered, key) when is_binary(key),
     do:

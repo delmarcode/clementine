@@ -104,6 +104,30 @@ defmodule Clementine.ToolInputTest do
                )
     end
 
+    test "recovered values keep their whitespace exactly" do
+      file = [path: [type: :string, required: true], content: [type: :string, required: true]]
+
+      input = %{
+        "path" =>
+          "  notes.txt\n</path>\n<parameter name=\"content\">  indented\nline\n</parameter>\n</invoke>"
+      }
+
+      assert {%{"path" => "  notes.txt\n", "content" => "  indented\nline\n"}, [:path, :content]} =
+               ToolInput.repair(input, file)
+
+      # Whitespace-only is still nothing: missing, not a value.
+      assert {repaired, [:path, :content]} =
+               ToolInput.repair(%{"path" => " \n</path><parameter name=\"content\">x"}, file)
+
+      refute Map.has_key?(repaired, "path")
+      assert {_, []} = ToolInput.repair(%{"path" => "a", "content" => "b"}, file)
+
+      assert {%{"path" => "p"} = only_path, [:path]} =
+               ToolInput.repair(%{"path" => "p</path><parameter name=\"content\">  \n"}, file)
+
+      refute Map.has_key?(only_path, "content")
+    end
+
     test "an explicitly delivered empty or nil field counts as present" do
       for delivered <- ["", nil] do
         input = %{

@@ -310,7 +310,7 @@ Models occasionally end a string parameter with the wrong closing tag and keep w
 "rationale" => "Anticoagulated.</rationale>\n<parameter name=\"recommended_action\">Same-day CT"
 ```
 
-Before validation, `Clementine.ToolInput.repair/2` splits such input back apart: the garbled parameter keeps the text before the stray tag, and each embedded parameter your tool declares, and the input lacks, gets its value decoded to the declared type. Values the provider delivered as real fields (even `""` or `nil`) are never overwritten, only top-level string parameters are repaired, and only the call syntax's own tags are removed, so markup that belongs to a value, such as an email's `</p>`, is kept. Each repair emits `[:clementine, :tool, :input_repaired]` with the parameters it touched, so you can count them.
+Before validation, `Clementine.ToolInput.repair/2` splits such input back apart: the garbled parameter keeps the text before the stray tag, and each embedded parameter your tool declares, and the input lacks, gets its value decoded to the declared type. Values the provider delivered as real fields (even `""` or `nil`) are never overwritten, only top-level string parameters are repaired, and only the call syntax's own tags are removed: values are kept byte for byte, including an email's `</p>` or a file's indentation and trailing newline. Each repair emits `[:clementine, :tool, :input_repaired]` with the parameters it touched, so you can count them.
 
 Recovering beats rejecting here: asked to resubmit after this kind of failure, models tend to degrade their arguments (placeholder values, a different answer) rather than fix the syntax.
 
