@@ -14,7 +14,8 @@ defmodule Clementine.ToolInput do
   and a rationale with markup in it. Asking the model to resubmit tends to
   make things worse: under repeated rejections it degrades the arguments
   rather than fixing the syntax. So `repair/2` recovers the embedded values
-  instead. The garbled parameter keeps the text before the stray closing
+  instead. `Clementine.Rollout` applies it to the model's calls before
+  gating and execution. The garbled parameter keeps the text before the stray closing
   tag, and each embedded parameter the tool declares and the input lacks
   gets its value, decoded to the declared type. Only the call syntax's own
   tags are removed; markup that is part of a value (an email's `</p>`) is

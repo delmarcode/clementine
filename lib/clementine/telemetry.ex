@@ -313,8 +313,9 @@ defmodule Clementine.Telemetry do
 
   ### `[:clementine, :tool, :input_repaired]`
 
-  Emitted before `:start` when the model wrote parameters as markup inside
-  another string parameter and `Clementine.ToolInput` recovered them.
+  Emitted when the rollout acts on a model tool call whose parameters were
+  written as markup inside another string parameter, and `Clementine.ToolInput`
+  recovered them before the call was gated or executed.
 
   - Measurements: `%{count: integer}` (parameters touched)
   - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer, fields: [atom]}`

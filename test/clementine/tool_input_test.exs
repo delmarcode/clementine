@@ -197,72 +197,28 @@ defmodule Clementine.ToolInputTest do
     end
   end
 
-  @doc false
-  def forward(_event, measurements, metadata, {pid, ref}),
-    do: send(pid, {ref, measurements, metadata})
-
-  describe "ToolRunner.execute_single/3" do
+  describe "ToolRunner" do
     defmodule RecordVerdict do
       use Clementine.Tool,
         name: "record_verdict",
         description: "Records a verdict",
         parameters: [
           tier: [type: :string, required: true, enum: ["monitor", "urgent"]],
-          summary: [type: :string, required: true],
-          rationale: [type: :string]
+          summary: [type: :string, required: true]
         ]
 
       @impl true
-      def run(args, _context),
-        do: {:ok, inspect(Map.new(args), custom_options: [sort_maps: true])}
+      def run(_args, _context), do: {:ok, "recorded"}
     end
 
-    test "runs the tool on repaired input and reports the repair" do
-      ref = make_ref()
-      test_pid = self()
-
-      :telemetry.attach(
-        "tool-input-repaired-#{inspect(ref)}",
-        [:clementine, :tool, :input_repaired],
-        &__MODULE__.forward/4,
-        {test_pid, ref}
-      )
-
-      on_exit(fn -> :telemetry.detach("tool-input-repaired-#{inspect(ref)}") end)
-
-      # Without the repair, the swallowed tier fails validation.
+    test "passes arguments through unchanged; the rollout repairs before gating" do
       call = %{
-        id: "call_1",
         name: "record_verdict",
-        input: %{"summary" => "Chest pain at rest.</summary>\n<parameter name=\"tier\">urgent"}
+        input: %{"summary" => "Chest pain.</summary>\n<parameter name=\"tier\">urgent"}
       }
 
-      assert {:ok, %{content: content, is_error: false}} =
+      assert {:error, "Invalid arguments: missing required parameter: tier"} =
                ToolRunner.execute_single([RecordVerdict], call, %{})
-
-      assert content =~ ~s(summary: "Chest pain at rest.")
-      assert content =~ ~s(tier: "urgent")
-
-      assert_receive {^ref, %{count: 2},
-                      %{tool: "record_verdict", tool_call_id: "call_1", fields: [:summary, :tier]}}
-    end
-
-    test "clean input is not reported" do
-      ref = make_ref()
-      test_pid = self()
-
-      :telemetry.attach(
-        "tool-input-clean-#{inspect(ref)}",
-        [:clementine, :tool, :input_repaired],
-        &__MODULE__.forward/4,
-        {test_pid, ref}
-      )
-
-      on_exit(fn -> :telemetry.detach("tool-input-clean-#{inspect(ref)}") end)
-
-      call = %{name: "record_verdict", input: %{"tier" => "monitor", "summary" => "Fine."}}
-      assert {:ok, _} = ToolRunner.execute_single([RecordVerdict], call, %{})
-      refute_receive {^ref, _, _}
     end
   end
 end
