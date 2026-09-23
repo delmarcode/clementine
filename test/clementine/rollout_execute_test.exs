@@ -933,6 +933,22 @@ defmodule Clementine.RolloutExecuteTest do
       assert message =~ "does not resolve"
     end
 
+    test "approved arguments that are not a map make the checkpoint incompatible" do
+      for args <- [nil, ["env", "prod"], "prod"] do
+        checkpoint = approval_checkpoint(pending: {"tu_1", "gated_deploy", args})
+
+        assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+                 Rollout.execute(
+                   rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                   resume: {checkpoint, {:approved, %{}}}
+                 )
+
+        assert message =~ "arguments are not a map"
+      end
+
+      refute_received {:deployed, _}
+    end
+
     test "a checkpoint that cannot support its own pending call is incompatible" do
       checkpoint = %Checkpoint{approval_checkpoint() | messages: [UserMessage.new("go")]}
 

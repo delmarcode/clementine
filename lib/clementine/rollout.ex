@@ -397,8 +397,11 @@ defmodule Clementine.Rollout do
 
           # The approved call runs with exactly the arguments approved:
           # the checkpointed ones, never a re-derivation from history.
-          _tool ->
+          _tool when is_map(pending.args) ->
             {:ok, %{pending_use | input: pending.args}, batch}
+
+          _tool ->
+            {:error, incompatible_checkpoint("pending approval arguments are not a map", pending)}
         end
     end
   end
