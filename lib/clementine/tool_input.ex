@@ -21,8 +21,9 @@ defmodule Clementine.ToolInput do
   tags are removed; markup that is part of a value (an email's `</p>`) is
   kept.
 
-  A boundary is `<parameter name="x">`, or `<x>` directly after a stray
-  closing tag naming a declared parameter (or a `parameter` tag), where `x`
+  A boundary is `<parameter name="x">`, or `<x>` (also seen as `<x">`)
+  directly after a stray closing tag naming a declared parameter (or a
+  `parameter` tag), where `x`
   is another parameter the tool declares: a signature ordinary text does not
   produce. Only top-level string parameters are repaired, and a value the
   provider delivered as a real field is never overwritten.
@@ -70,7 +71,7 @@ defmodule Clementine.ToolInput do
     regex =
       Regex.compile!(
         "(?:#{stray}\\s*)?<parameter name=\"(#{embedded})\">" <>
-          "|#{stray}\\s*<(#{embedded})>"
+          "|#{stray}\\s*<(#{embedded})\"?>"
       )
 
     regex

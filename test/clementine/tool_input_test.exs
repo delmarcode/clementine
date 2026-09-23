@@ -57,6 +57,20 @@ defmodule Clementine.ToolInputTest do
       assert fields == [:summary, :red_flags, :rationale, :recommended_action, :score]
     end
 
+    test "recovers an element tag written with a stray quote" do
+      # As delivered by the provider in a live triage screen.
+      input = %{
+        "tier" => "monitor",
+        "summary" =>
+          "Uncomplicated cystitis; needs a prescription.</summary>\n<red_flags\">[\"none\"]"
+      }
+
+      assert {%{
+                "summary" => "Uncomplicated cystitis; needs a prescription.",
+                "red_flags" => ["none"]
+              }, [:summary, :red_flags]} = ToolInput.repair(input, @verdict)
+    end
+
     test "recovers a swallowed required parameter behind a variant parameter tag" do
       input = %{
         "summary" => "Thunderclap headache.</antml：parameter>\n<parameter name=\"tier\">emergency"
