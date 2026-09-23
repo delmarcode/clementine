@@ -27,25 +27,36 @@ defmodule Clementine.ToolInput do
   is another parameter the tool declares: a signature ordinary text does not
   produce. Only top-level string parameters are repaired, and a value the
   provider delivered as a real field is never overwritten.
+
+  A value can also end in the call syntax with no parameter after it:
+
+      %{"tier" => "emergency</tier>\n</submit_assessment>"}
+
+  Its own closing tag (or a `parameter` tag) followed by at least one of the
+  call's closers (`</invoke>`, `</function_calls>`, a `parameter` tag, or the
+  tool's own name when `:tool` is given) is cut off. A lone closing tag is
+  kept: an HTML email body may well end in `</body>`.
   """
 
   @doc """
   Repairs `input` (string or atom keys, as delivered) against the tool's
   `parameters`. Returns the input and the parameters the repair touched:
   empty when nothing was garbled.
+
+  Options: `:tool`, the tool's name, whose closing tag is then call syntax
+  too.
   """
-  @spec repair(map(), keyword()) :: {map(), [atom()]}
-  def repair(input, parameters) when is_map(input) and is_list(parameters) do
+  @spec repair(map(), keyword(), keyword()) :: {map(), [atom()]}
+  def repair(input, parameters, opts \\ [])
+
+  def repair(input, parameters, opts) when is_map(input) and is_list(parameters) do
     names = Keyword.keys(parameters)
+    tool = Keyword.get(opts, :tool)
 
-    Enum.reduce(parameters, {input, []}, fn {name, opts}, {input, repaired} ->
-      with :string <- Keyword.get(opts, :type),
+    Enum.reduce(parameters, {input, []}, fn {name, param}, {input, repaired} ->
+      with :string <- Keyword.get(param, :type),
            {key, value} when is_binary(value) <- fetch(input, name),
-           [_ | _] = others <- names -- [name],
-           [{first_start, _, _} | _] = boundaries <- boundaries(value, name, others) do
-        head = binary_part(value, 0, first_start)
-        recovered = recover(value, boundaries, parameters, input)
-
+           {head, recovered} <- split(value, name, names -- [name], parameters, input, tool) do
         input =
           input
           |> put_head(key, head)
@@ -58,7 +69,22 @@ defmodule Clementine.ToolInput do
     end)
   end
 
-  def repair(input, _parameters), do: {input, []}
+  def repair(input, _parameters, _opts), do: {input, []}
+
+  # A garbled value as the text to keep and the embedded parameters to
+  # recover, or :intact.
+  defp split(value, name, others, parameters, input, tool) do
+    case others != [] and boundaries(value, name, others) do
+      [{first_start, _, _} | _] = found ->
+        {binary_part(value, 0, first_start), recover(value, found, parameters, input, tool)}
+
+      _ ->
+        case trailing_call_syntax(value, name, tool) do
+          nil -> :intact
+          start -> {binary_part(value, 0, start), []}
+        end
+    end
+  end
 
   # Every boundary in the value, in order: {start, end, name}, where the
   # span covers the stray closing tag and the opening markup. A stray tag
@@ -90,7 +116,7 @@ defmodule Clementine.ToolInput do
 
   # The embedded values, as {name, decoded} for declared parameters the
   # input does not already carry; each runs to the next boundary.
-  defp recover(value, boundaries, parameters, input) do
+  defp recover(value, boundaries, parameters, input, tool) do
     ends = Enum.map(tl(boundaries), &elem(&1, 0)) ++ [byte_size(value)]
 
     boundaries
@@ -99,7 +125,7 @@ defmodule Clementine.ToolInput do
       raw =
         value
         |> binary_part(value_start, value_end - value_start)
-        |> strip_call_syntax(name)
+        |> strip_call_syntax(name, tool)
 
       with false <- present?(input, name),
            {:ok, decoded} <- decode(raw, Keyword.get(parameters[name], :type)) do
@@ -116,12 +142,46 @@ defmodule Clementine.ToolInput do
   # parameter, separated by whitespace. They go; everything before the
   # first of them is the value, byte for byte (indentation and trailing
   # newlines included), and other markup such as an email's `</p>` stays.
-  defp strip_call_syntax(text, name) do
-    closer =
-      "</(?:[^<>\\s]*parameter|[^<>\\s]*invoke|[^<>\\s]*function_calls|" <>
-        Regex.escape(Atom.to_string(name)) <> ")>"
-
+  defp strip_call_syntax(text, name, tool) do
+    closer = closer([name | List.wrap(tool)])
     String.replace(text, Regex.compile!("#{closer}(?:\\s*#{closer})*\\s*\\z"), "")
+  end
+
+  # Where a value's trailing call syntax starts, if it has any: the
+  # parameter's own closing tag (or a `...parameter` tag) followed by at
+  # least one of the call's wrappers, then only whitespace. The wrappers
+  # never include the parameter's own name, so a value ending in nested
+  # markup named like it (`<section><section>x</section></section>`) stays.
+  defp trailing_call_syntax(value, name, tool) do
+    if wrapper_named?(name, tool) do
+      nil
+    else
+      own = "</(?:[^<>\\s]*parameter|#{Regex.escape(Atom.to_string(name))})>"
+      regex = Regex.compile!("#{own}(?:\\s*#{closer(List.wrap(tool))})+\\s*\\z")
+
+      case Regex.run(regex, value, return: :index) do
+        [{start, _length}] -> start
+        nil -> nil
+      end
+    end
+  end
+
+  # A parameter named like a call wrapper (its tool, or `...invoke`,
+  # `...function_calls`, `...parameter`) cannot tell its own closing tag
+  # from the call's, so its value is never cut at the end.
+  defp wrapper_named?(name, tool) do
+    name = Atom.to_string(name)
+    name == to_string(tool) or String.ends_with?(name, ["parameter", "invoke", "function_calls"])
+  end
+
+  # One of the call syntax's closing tags: a `...parameter` tag, the call
+  # wrappers, or one of `names` (a parameter's element tag, the tool's name).
+  defp closer(names) do
+    alternatives =
+      ["[^<>\\s]*parameter", "[^<>\\s]*invoke", "[^<>\\s]*function_calls"] ++
+        Enum.map(names, &Regex.escape(to_string(&1)))
+
+    "</(?:#{Enum.join(alternatives, "|")})>"
   end
 
   defp decode(text, type) do

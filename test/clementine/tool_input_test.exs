@@ -13,7 +13,7 @@ defmodule Clementine.ToolInputTest do
     score: [type: :integer]
   ]
 
-  describe "repair/2" do
+  describe "repair/3" do
     test "recovers a parameter written as <parameter name=...> inside another" do
       # As delivered by the provider in a live triage screen.
       input = %{
@@ -78,6 +78,64 @@ defmodule Clementine.ToolInputTest do
 
       assert {%{"summary" => "Thunderclap headache.", "tier" => "emergency"}, [:summary, :tier]} =
                ToolInput.repair(input, @verdict)
+    end
+
+    test "cuts off call syntax a value ends in when no parameter follows" do
+      # As delivered by the provider in live triage screens: the enum fails
+      # validation and the free text would reach a reader with markup in it.
+      input = %{
+        "tier" => "emergency</tier>\n</record_verdict>\n\n",
+        "summary" => "New-onset diabetes; possible DKA.</summary>\n</invoke>",
+        "rationale" => "Exertional chest pain.</antml：parameter>\n</invoke>",
+        "recommended_action" => "  </recommended_action>\n</record_verdict>"
+      }
+
+      assert {repaired, [:tier, :summary, :rationale, :recommended_action]} =
+               ToolInput.repair(input, @verdict, tool: "record_verdict")
+
+      assert repaired == %{
+               "tier" => "emergency",
+               "summary" => "New-onset diabetes; possible DKA.",
+               "rationale" => "Exertional chest pain."
+             }
+    end
+
+    test "a recovered value loses the tool's closing tag too" do
+      input = %{
+        "summary" =>
+          "Stroke signs.</summary>\n<parameter name=\"tier\">emergency</tier>\n</record_verdict>"
+      }
+
+      assert {%{"summary" => "Stroke signs.", "tier" => "emergency"}, [:summary, :tier]} =
+               ToolInput.repair(input, @verdict, tool: "record_verdict")
+    end
+
+    test "keeps a lone closing tag, and the tool's tag only counts when the tool is named" do
+      email = [body: [type: :string, required: true], subject: [type: :string]]
+
+      for body <- [
+            "<html><body><p>Hi.</p></body></html>",
+            "<p>Hi.</p></body>",
+            "<p>Hi.</p></body>\n"
+          ] do
+        input = %{"body" => body, "subject" => "Hello"}
+        assert {^input, []} = ToolInput.repair(input, email, tool: "send_email")
+      end
+
+      input = %{"tier" => "emergency</tier>\n</record_verdict>"}
+      assert {^input, []} = ToolInput.repair(input, @verdict)
+
+      # Nested markup named like the parameter is content, not call syntax,
+      # also when the name collides with a wrapper's.
+      page = [section: [type: :string], title: [type: :string]]
+      input = %{"section" => "<section><section>x</section></section>", "title" => "T"}
+      assert {^input, []} = ToolInput.repair(input, page, tool: "write_page")
+      assert {^input, []} = ToolInput.repair(input, page, tool: "section")
+
+      step = [step_parameter: [type: :string], title: [type: :string]]
+      nested = "<step_parameter><step_parameter>x</step_parameter></step_parameter>"
+      input = %{"step_parameter" => nested, "title" => "T"}
+      assert {^input, []} = ToolInput.repair(input, step, tool: "plan")
     end
 
     test "never overwrites a value delivered as a real field, but still cleans the garbled one" do

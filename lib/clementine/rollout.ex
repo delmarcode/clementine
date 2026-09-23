@@ -652,7 +652,8 @@ defmodule Clementine.Rollout do
     Enum.map(tool_uses, fn tool_use ->
       with %{} = input <- tool_use.input,
            tool when not is_nil(tool) <- Tool.find_by_name(exec.tools, tool_use.name),
-           {repaired, [_ | _] = fields} <- ToolInput.repair(input, tool.__parameters__()) do
+           {repaired, [_ | _] = fields} <-
+             ToolInput.repair(input, tool.__parameters__(), tool: tool_use.name) do
         if report?, do: report_repair(exec, tool_use, fields)
         %{tool_use | input: repaired}
       else
