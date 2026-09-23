@@ -311,6 +311,15 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{duration: native_time}`
   - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer, kind: atom, reason: term}`
 
+  ### `[:clementine, :tool, :input_repaired]`
+
+  Emitted when the rollout acts on a model tool call whose parameters were
+  written as markup inside another string parameter, and `Clementine.ToolInput`
+  recovered them before the call was gated or executed.
+
+  - Measurements: `%{count: integer}` (parameters touched)
+  - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer, fields: [atom]}`
+
   ## Logging
 
   To enable development logging:

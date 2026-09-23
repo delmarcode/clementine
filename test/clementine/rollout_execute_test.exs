@@ -48,6 +48,58 @@ defmodule Clementine.RolloutExecuteTest do
     end
   end
 
+  defmodule RecordVerdict do
+    @moduledoc false
+    use Clementine.Tool,
+      name: "record_verdict",
+      description: "Records a verdict and notifies the test",
+      parameters: [
+        tier: [type: :string, required: true],
+        summary: [type: :string, required: true]
+      ]
+
+    @impl true
+    def run(args, context) do
+      send(context.notify, {:verdict, args})
+      {:ok, "recorded"}
+    end
+  end
+
+  defmodule GatedRelease do
+    @moduledoc false
+    use Clementine.Tool,
+      name: "gated_release",
+      description: "Releases somewhere; requires human approval",
+      approval: :required,
+      parameters: [
+        description: [type: :string, required: true],
+        environment: [type: :string]
+      ]
+
+    @impl true
+    def run(args, context) do
+      send(context.notify, {:released, args})
+      {:ok, "released"}
+    end
+  end
+
+  @doc false
+  def forward_repair(_event, measurements, metadata, pid),
+    do: send(pid, {:repaired, measurements, metadata})
+
+  defp report_repairs_to_self do
+    id = {__MODULE__, make_ref()}
+
+    :telemetry.attach(
+      id,
+      [:clementine, :tool, :input_repaired],
+      &__MODULE__.forward_repair/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
   defp rollout(opts \\ []) do
     agent =
       Clementine.Agent.new(
@@ -655,6 +707,73 @@ defmodule Clementine.RolloutExecuteTest do
     end
   end
 
+  describe "garbled tool input" do
+    test "a garbled call runs with the recovered arguments; history keeps the model's own call" do
+      report_repairs_to_self()
+      garbled = %{"summary" => "Chest pain.</summary>\n<parameter name=\"tier\">urgent"}
+      expect_stream(tool_events("tu_g1", "record_verdict", garbled))
+      expect_stream(text_events("Done."))
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(rollout(tools: [RecordVerdict], context: %{notify: self()}))
+
+      assert_received {:verdict, %{summary: "Chest pain.", tier: "urgent"}}
+
+      assert [%AssistantMessage{} = assistant | _] = result.messages
+      assert [%Content.ToolUse{input: ^garbled}] = AssistantMessage.get_tool_uses(assistant)
+
+      assert_received {:repaired, %{count: 2},
+                       %{tool: "record_verdict", tool_call_id: "tu_g1", fields: [:summary, :tier]}}
+    end
+
+    test "an approval-gated call is presented with exactly the arguments that will run" do
+      garbled = %{
+        "description" => "Ship the fix.</description>\n<parameter name=\"environment\">production"
+      }
+
+      repaired = %{"description" => "Ship the fix.", "environment" => "production"}
+      expect_stream(tool_events("tu_g2", "gated_release", garbled))
+
+      assert {:suspend, %Suspension.Request{} = request} =
+               Rollout.execute(rollout(tools: [GatedRelease], context: %{notify: self()}))
+
+      assert {:approval, %ApprovalRequest{args: ^repaired}} = request.reason
+      assert %Pending.ToolApproval{args: ^repaired} = request.pending
+      assert [_input, %AssistantMessage{} = assistant] = request.messages
+      assert [%Content.ToolUse{input: ^garbled}] = AssistantMessage.get_tool_uses(assistant)
+      refute_received {:released, _}
+    end
+
+    test "an approved resume runs the checkpointed arguments, not a re-derivation from history" do
+      report_repairs_to_self()
+
+      garbled = %{
+        "description" => "Ship the fix.</description>\n<parameter name=\"environment\">production"
+      }
+
+      approved = %{"description" => "Ship the fix.", "environment" => "staging"}
+
+      checkpoint =
+        approval_checkpoint(
+          batch: [{"tu_g3", "gated_release", garbled}],
+          pending: {"tu_g3", "gated_release", approved}
+        )
+
+      expect_stream(text_events("Released."))
+
+      assert {:ok, %Result.Completed{}} =
+               Rollout.execute(
+                 rollout(tools: [GatedRelease], context: %{notify: self()}),
+                 resume: {checkpoint, {:approved, %{by: "u1"}}}
+               )
+
+      assert_received {:released, %{description: "Ship the fix.", environment: "staging"}}
+
+      # The batch was already reported when it was first acted on.
+      refute_received {:repaired, _, %{tool_call_id: "tu_g3"}}
+    end
+  end
+
   describe "resume (pending approval)" do
     test "an approved resume executes the pending call and the loop continues" do
       checkpoint = approval_checkpoint()
@@ -812,6 +931,22 @@ defmodule Clementine.RolloutExecuteTest do
                Rollout.execute(rollout(tools: []), resume: {checkpoint, {:approved, %{}}})
 
       assert message =~ "does not resolve"
+    end
+
+    test "approved arguments that are not a map make the checkpoint incompatible" do
+      for args <- [nil, ["env", "prod"], "prod"] do
+        checkpoint = approval_checkpoint(pending: {"tu_1", "gated_deploy", args})
+
+        assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+                 Rollout.execute(
+                   rollout(tools: [GatedDeploy], context: %{notify: self()}),
+                   resume: {checkpoint, {:approved, %{}}}
+                 )
+
+        assert message =~ "arguments are not a map"
+      end
+
+      refute_received {:deployed, _}
     end
 
     test "a checkpoint that cannot support its own pending call is incompatible" do

@@ -36,6 +36,7 @@ defmodule Clementine.Telemetry.Logger do
     [:clementine, :tool, :start],
     [:clementine, :tool, :stop],
     [:clementine, :tool, :exception],
+    [:clementine, :tool, :input_repaired],
     [:clementine, :run, :claimed],
     [:clementine, :run, :heartbeat],
     [:clementine, :run, :suspended],
@@ -139,6 +140,14 @@ defmodule Clementine.Telemetry.Logger do
   def handle_event([:clementine, :tool, :exception], measurements, metadata, config) do
     Logger.log(:error, fn ->
       "[Clementine] Tool crashed #{tool_summary(metadata)} duration=#{duration_ms(measurements)}ms kind=#{metadata.kind} reason=#{inspect(metadata.reason)}"
+    end)
+
+    _ = config
+  end
+
+  def handle_event([:clementine, :tool, :input_repaired], _measurements, metadata, config) do
+    Logger.log(:warning, fn ->
+      "[Clementine] Tool input repaired #{tool_summary(metadata)} fields=#{Enum.join(metadata.fields, ",")}"
     end)
 
     _ = config

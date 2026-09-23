@@ -42,7 +42,7 @@ defmodule Clementine.Rollout do
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
   alias Clementine.LLM.Message.{Content, ToolResultMessage}
-  alias Clementine.{ApprovalRequest, LLM, Pending, Suspension, Tool, ToolRunner}
+  alias Clementine.{ApprovalRequest, LLM, Pending, Suspension, Tool, ToolInput, ToolRunner}
 
   @default_max_iterations 10
 
@@ -369,8 +369,11 @@ defmodule Clementine.Rollout do
   defp pending_batch(%Execution{} = exec, %Pending.ToolApproval{} = pending) do
     batch =
       case List.last(exec.messages) do
-        %AssistantMessage{} = message -> AssistantMessage.get_tool_uses(message)
-        _other -> []
+        %AssistantMessage{} = message ->
+          repair_tool_uses(exec, AssistantMessage.get_tool_uses(message), false)
+
+        _other ->
+          []
       end
 
     case Enum.find(batch, &(&1.id == pending.tool_use_id)) do
@@ -392,8 +395,13 @@ defmodule Clementine.Rollout do
                pending
              )}
 
+          # The approved call runs with exactly the arguments approved:
+          # the checkpointed ones, never a re-derivation from history.
+          _tool when is_map(pending.args) ->
+            {:ok, %{pending_use | input: pending.args}, batch}
+
           _tool ->
-            {:ok, pending_use, batch}
+            {:error, incompatible_checkpoint("pending approval arguments are not a map", pending)}
         end
     end
   end
@@ -630,9 +638,35 @@ defmodule Clementine.Rollout do
   # executor must not start new external effects.
   defp act_on_tools(%Execution{} = exec, tool_uses) do
     case check_signals() do
-      :continue -> settle_batch(exec, tool_uses, %{})
+      :continue -> settle_batch(exec, repair_tool_uses(exec, tool_uses, true), %{})
       unwound -> conclude(exec, unwound)
     end
+  end
+
+  # The model's calls are normalized once, when its batch is acted on and
+  # before anything is gated or executed, so an approver sees exactly the
+  # arguments that will run (Clementine.ToolInput). History keeps the
+  # model's own calls. `report?` is false when a resume re-reads a batch
+  # already reported.
+  defp repair_tool_uses(%Execution{} = exec, tool_uses, report?) do
+    Enum.map(tool_uses, fn tool_use ->
+      with %{} = input <- tool_use.input,
+           tool when not is_nil(tool) <- Tool.find_by_name(exec.tools, tool_use.name),
+           {repaired, [_ | _] = fields} <- ToolInput.repair(input, tool.__parameters__()) do
+        if report?, do: report_repair(exec, tool_use, fields)
+        %{tool_use | input: repaired}
+      else
+        _ -> tool_use
+      end
+    end)
+  end
+
+  defp report_repair(%Execution{} = exec, tool_use, fields) do
+    :telemetry.execute(
+      [:clementine, :tool, :input_repaired],
+      %{count: length(fields)},
+      %{tool: tool_use.name, tool_call_id: tool_use.id, iteration: exec.iteration, fields: fields}
+    )
   end
 
   # Settles one tool batch toward its ToolResultMessage, possibly across
