@@ -726,6 +726,19 @@ defmodule Clementine.RolloutExecuteTest do
                        %{tool: "record_verdict", tool_call_id: "tu_g1", fields: [:summary, :tier]}}
     end
 
+    test "the repair knows the tool's name, so its closing tag is cut from a value" do
+      report_repairs_to_self()
+      garbled = %{"summary" => "Chest pain.", "tier" => "urgent</tier>\n</record_verdict>"}
+      expect_stream(tool_events("tu_g4", "record_verdict", garbled))
+      expect_stream(text_events("Done."))
+
+      assert {:ok, %Result.Completed{}} =
+               Rollout.execute(rollout(tools: [RecordVerdict], context: %{notify: self()}))
+
+      assert_received {:verdict, %{summary: "Chest pain.", tier: "urgent"}}
+      assert_received {:repaired, %{count: 1}, %{tool_call_id: "tu_g4", fields: [:tier]}}
+    end
+
     test "an approval-gated call is presented with exactly the arguments that will run" do
       garbled = %{
         "description" => "Ship the fix.</description>\n<parameter name=\"environment\">production"
