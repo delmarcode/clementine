@@ -277,6 +277,10 @@ defmodule Clementine.ToolRunner do
         {:error, "Unknown tool: #{name}"}
 
       tool ->
+        # Recover parameters the model wrote as markup inside another string
+        # parameter (see Clementine.ToolInput) before anything validates.
+        {input, repaired} = Clementine.ToolInput.repair(input, tool.__parameters__())
+
         # Convert string keys to atoms using the tool's parameter schema.
         # Only keys declared in the schema are atomized; unknown keys are dropped
         # to avoid unbounded atom creation from untrusted LLM input.
@@ -284,6 +288,14 @@ defmodule Clementine.ToolRunner do
 
         tool_call_id = Map.get(call, :id)
         iteration = Map.get(context, :_clementine_iteration, 0)
+
+        if repaired != [] do
+          :telemetry.execute(
+            [:clementine, :tool, :input_repaired],
+            %{count: length(repaired)},
+            %{tool: name, tool_call_id: tool_call_id, iteration: iteration, fields: repaired}
+          )
+        end
 
         telemetry_meta = %{
           tool: name,

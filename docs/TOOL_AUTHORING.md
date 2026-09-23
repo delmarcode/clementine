@@ -302,6 +302,18 @@ Invalid arguments: expected tags[1] to be a string, got: integer
 
 Multiple errors are joined with `"; "`. These errors are sent to the LLM as `is_error: true` tool results automatically — no special handling needed in your tool.
 
+### Garbled parameters
+
+Models occasionally end a string parameter with the wrong closing tag and keep writing the remaining parameters in their own call syntax, so they arrive as text inside the first one:
+
+```
+"rationale" => "Anticoagulated.</rationale>\n<parameter name=\"recommended_action\">Same-day CT"
+```
+
+Before validation, `Clementine.ToolInput.repair/2` splits such input back apart: the garbled parameter keeps the text before the stray tag, and each embedded parameter your tool declares, and the input lacks, gets its value decoded to the declared type. Values the provider delivered as real fields are never overwritten, and only top-level string parameters are repaired. Each repair emits `[:clementine, :tool, :input_repaired]` with the parameters it touched, so you can count them.
+
+Recovering beats rejecting here: asked to resubmit after this kind of failure, models tend to degrade their arguments (placeholder values, a different answer) rather than fix the syntax.
+
 ### Error Messages
 
 Focus on returning clear error strings. The LLM reads these to decide what to do next:

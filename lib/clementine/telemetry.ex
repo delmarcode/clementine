@@ -311,6 +311,14 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{duration: native_time}`
   - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer, kind: atom, reason: term}`
 
+  ### `[:clementine, :tool, :input_repaired]`
+
+  Emitted before `:start` when the model wrote parameters as markup inside
+  another string parameter and `Clementine.ToolInput` recovered them.
+
+  - Measurements: `%{count: integer}` (parameters touched)
+  - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer, fields: [atom]}`
+
   ## Logging
 
   To enable development logging:
