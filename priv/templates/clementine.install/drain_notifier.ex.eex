@@ -17,7 +17,9 @@ defmodule <%= @agents %>.DrainNotifier do
 
   @registry <%= @agents %>.Runners
 
-  def start_link(_opts), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, nil, name: Keyword.get(opts, :name, __MODULE__))
+  end
 
   @doc "Registers the calling runner process. Workers call it first in perform/1."
   def register, do: Registry.register(@registry, :active, nil)

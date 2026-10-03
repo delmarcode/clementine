@@ -70,7 +70,8 @@ if Code.ensure_loaded?(Igniter) do
 
       with :ok <- validate(name, tool),
            {:ok, ctx} <- Clementine.context(igniter, []),
-           {:ok, igniter} <- require_runtime(igniter, ctx) do
+           {:ok, igniter} <- require_runtime(igniter, ctx),
+           {:ok, igniter} <- available(igniter, ctx, name) do
         generate(igniter, ctx, name, tool)
       else
         {:error, %Igniter{} = igniter} -> igniter
@@ -78,7 +79,15 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    # The generated test aliases the agent, its tool, and the catalog, next
+    # to the AgentRun, Runs, and RunWorker aliases AgentsCase brings: their
+    # short names must not collide.
+    @taken_short_names ~w(AgentRun Catalog Runs RunWorker)
+
     defp validate(name, tool) do
+      agent_short = name |> String.split(".") |> List.last()
+      tool_short = Macro.camelize(tool)
+
       cond do
         not Regex.match?(~r/^[A-Z][A-Za-z0-9]*(\.[A-Z][A-Za-z0-9]*)*$/, name) ->
           {:error,
@@ -87,10 +96,20 @@ if Code.ensure_loaded?(Igniter) do
         not Regex.match?(~r/^[a-z][a-z0-9_]*$/, tool) ->
           {:error, "--tool must be a snake_case name like lookup_order, got: #{tool}"}
 
+        agent_short in @taken_short_names or tool_short in @taken_short_names ->
+          {:error,
+           "#{agent_short} and #{tool_short} must not be one of " <>
+             "#{Enum.join(@taken_short_names, ", ")}. Pick another name."}
+
+        agent_short == tool_short ->
+          {:error, "The agent and its tool would both be #{agent_short}. Pass another --tool."}
+
         true ->
           :ok
       end
     end
+
+    defp short_name(module), do: module |> Module.split() |> List.last()
 
     defp require_runtime(igniter, ctx) do
       catalog = Module.concat(ctx.agents, Catalog)
@@ -108,19 +127,63 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    # The runtime's own names, including the two that are not modules in
+    # lib/: the runner registry and the test suite's model mock.
+    @runtime ~w(AgentRun Lifecycle Definition Catalog Runs RunWorker Reaper DrainNotifier
+                Runners LLMMock LifecycleTest RunsTest)
+
+    # An existing module is only ever left alone. It may be listed in the
+    # catalog when it already is an agent (a second run, or an agent written
+    # by hand); any other module of that name makes the name unavailable,
+    # because listing it would make the catalog call key/0 on a module that
+    # has none.
+    defp available(_igniter, ctx, name) when name in @runtime do
+      {:error,
+       "#{inspect(Module.concat(ctx.agents, name))} is part of Clementine's runtime. " <>
+         "Pick another name."}
+    end
+
+    defp available(igniter, ctx, name) do
+      module = Module.concat(ctx.agents, name)
+      definition = Module.concat(ctx.agents, Definition)
+
+      case Igniter.Project.Module.find_module(igniter, module) do
+        {:error, igniter} ->
+          {:ok, igniter}
+
+        {:ok, {igniter, _source, zipper}} ->
+          if Clementine.implements?(zipper, definition) do
+            {:ok, igniter}
+          else
+            {:error,
+             "#{inspect(module)} already exists and is not an agent " <>
+               "(it does not implement #{inspect(definition)}). Pick another name."}
+          end
+      end
+    end
+
     defp generate(igniter, ctx, name, tool) do
       module = Module.concat(ctx.agents, name)
       tool_module = Module.concat([module, Tools, Macro.camelize(tool)])
       key = name |> Macro.underscore() |> String.replace("/", "_")
 
+      catalog = Module.concat(ctx.agents, Catalog)
+
       assigns = [
         app_module: inspect(ctx.app_module),
         agents: inspect(ctx.agents),
         module: inspect(module),
+        alias: short_name(module),
         key: key,
         human: String.replace(key, "_", " "),
         tool_module: inspect(tool_module),
-        tool_name: tool
+        tool_alias: short_name(tool_module),
+        tool_name: tool,
+        # Sorted the way credo's AliasOrder reads them.
+        test_aliases:
+          [catalog, module, tool_module]
+          |> Enum.map(&inspect/1)
+          |> Enum.sort_by(&String.downcase/1)
       ]
 
       igniter

@@ -189,9 +189,15 @@ tool macro updates them in the same commit.
 - `test/mix/clementine.*_test.exs` drive the tasks through `Igniter.Test`
   (via `Clementine.IgniterCase`) and prove a second run changes nothing.
 - `scripts/installer-smoke.sh` generates a real Phoenix app, installs
-  twice, generates an agent twice, and runs the app's tests, including the
-  conformance suite on Postgres. It needs the `phx_new` archive, so it is
-  not in CI; run it after changing a template.
+  twice, generates an agent twice, and runs the app's format, compile,
+  `credo --strict` (on the generated files), and tests, including the
+  conformance suite on Postgres. CI's `installer` job runs it with a pinned
+  `phx_new`; run it locally after changing a template.
+- The generated migration pins the column recipe with
+  `Clementine.Lifecycle.Ecto.Migration.up(table, version: 1, ...)`.
+  Version 1's DDL is frozen and asserted in
+  `test/clementine/lifecycle/ecto_migration_versions_test.exs`; a recipe
+  change is a new version, never an edit to an old one.
 - Never place a supervision child with Igniter's `add_new_child/3`: use
   `Mix.Clementine.add_child/4`, which inserts beside its anchor or edits
   nothing (its moduledoc says why).

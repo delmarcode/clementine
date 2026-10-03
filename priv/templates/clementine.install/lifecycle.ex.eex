@@ -21,6 +21,7 @@ defmodule <%= @agents %>.Lifecycle do
   import Ecto.Query, only: [from: 2]
 
   alias Clementine.Result
+
   alias <%= @agents %>.AgentRun
 
   @impl Clementine.Lifecycle.Ecto

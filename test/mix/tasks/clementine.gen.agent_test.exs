@@ -54,6 +54,53 @@ defmodule Mix.Tasks.Clementine.Gen.AgentTest do
              "defmodule MyApp.Agents.Billing.TriageTest do"
   end
 
+  test "refuses a runtime module's name" do
+    igniter = installed() |> gen_agent(["Reaper"])
+
+    assert_has_issue(igniter, &(&1 =~ "MyApp.Agents.Reaper is part of Clementine's runtime"))
+  end
+
+  test "refuses names whose aliases would collide in the generated test" do
+    installed() |> gen_agent(["Shop.Catalog"]) |> assert_has_issue(&(&1 =~ "must not be one of"))
+    installed() |> gen_agent(["Lookup"]) |> assert_has_issue(&(&1 =~ "Pass another --tool"))
+  end
+
+  test "refuses the name of a module that exists and is not an agent" do
+    billing = "defmodule MyApp.Agents.Billing do\n  def total, do: 0\nend\n"
+
+    installed()
+    |> Igniter.create_new_file("lib/my_app/agents/billing.ex", billing)
+    |> apply_igniter!()
+    |> gen_agent(["Billing"])
+    |> assert_has_issue(&(&1 =~ "MyApp.Agents.Billing already exists and is not an agent"))
+  end
+
+  test "lists an agent written by hand without touching its file" do
+    agent = """
+    defmodule MyApp.Agents.Triage do
+      alias MyApp.Agents.Definition
+
+      @behaviour Definition
+
+      @impl true
+      def key, do: "triage"
+
+      @impl true
+      def agent(_run), do: Clementine.Agent.new(model: :claude_sonnet)
+    end
+    """
+
+    igniter =
+      installed()
+      |> Igniter.create_new_file("lib/my_app/agents/triage.ex", agent)
+      |> apply_igniter!()
+      |> gen_agent(["Triage"])
+      |> assert_unchanged("lib/my_app/agents/triage.ex")
+      |> apply_igniter!()
+
+    assert content(igniter, "config/config.exs") =~ "agents: [MyApp.Agents.Triage]"
+  end
+
   test "needs the runtime from clementine.install" do
     project() |> gen_agent(["Weather"]) |> assert_has_issue(&(&1 =~ "mix clementine.install"))
   end

@@ -3,7 +3,8 @@
 # real, freshly generated Phoenix app: install, install again (no change),
 # generate an agent, generate it again (no change), then the app's own
 # gates. Its test suite runs Clementine's conformance suite against the
-# generated lifecycle on Postgres, and the generated agent end to end.
+# generated lifecycle on Postgres, and the generated agent end to end. The
+# generated code must also pass `credo --strict`.
 #
 # Needs the phx_new archive (`mix archive.install hex phx_new`; set
 # MIX_ARCHIVES to use one outside ~/.mix) and a Postgres the generated
@@ -36,7 +37,7 @@ rm -rf "$app"
 mix phx.new "$app" --no-assets --no-mailer --no-dashboard --no-gettext --no-install
 cd "$app"
 
-perl -0pi -e "s|(\{:bandit, \"[^\"]+\"\})|\$1,\n      {:oban, \"~> 2.19\"},\n      {:igniter, \"~> 0.8.4\", only: [:dev, :test]},\n      {:clementine, path: \"$clementine\"}|" mix.exs
+perl -0pi -e "s|(\{:bandit, \"[^\"]+\"\})|\$1,\n      {:oban, \"~> 2.19\"},\n      {:igniter, \"~> 0.8.4\", only: [:dev, :test]},\n      {:credo, \"~> 1.7\", only: [:dev, :test], runtime: false},\n      {:clementine, path: \"$clementine\"}|" mix.exs
 grep -q ':clementine, path:' mix.exs || { echo "FAIL: could not add deps to mix.exs" >&2; exit 1; }
 
 mix deps.get
@@ -59,6 +60,19 @@ assert_unchanged "a second clementine.gen.agent"
 
 mix format --check-formatted
 MIX_ENV=test mix compile --warnings-as-errors
+# What the generators wrote must pass credo's default checks at --strict
+# (nesting depth, logger metadata keys, alias order and usage, and the
+# rest). Phoenix's own files are not ours to judge, so filter to ours.
+generated="lib/$app/agents|test/$app/agents|test/support/agents_case.ex"
+issues="$({ mix credo --strict --format oneline || true; } | grep -E "$generated" || true)"
+if [ -n "$issues" ]; then
+  echo "$issues"
+  echo "FAIL: credo --strict flags generated code" >&2
+  exit 1
+fi
+# A test database left by an earlier run would hold tables from migrations
+# with other timestamps.
+MIX_ENV=test mix ecto.drop --quiet
 mix test
 MIX_ENV=test mix ecto.drop --quiet
 

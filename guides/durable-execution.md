@@ -29,7 +29,9 @@ mix clementine.gen.agent Weather
 
 `clementine.install` writes this guide's code into your app under
 `MyApp.Agents`: the migration (Step 0, scoped by a `subject_type` and
-`subject_id` pair instead of a conversation), `AgentRun`, `Lifecycle`
+`subject_id` pair instead of a conversation, with the recipe pinned by
+`Clementine.Lifecycle.Ecto.Migration.up(:agent_runs, version: 1, ...)`
+so a later Clementine builds the same table), `AgentRun`, `Lifecycle`
 (Step 1), `Runs.start/3` (Step 2), `RunWorker` (Step 3), `Reaper` with
 `Runs.sweep/1` (Step 4), `DrainNotifier` and its registry (Step 5), and
 `MyApp.AgentsCase` with the conformance suite below. It adds the `agents`

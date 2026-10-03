@@ -14,6 +14,9 @@ defmodule Mix.Tasks.Clementine.InstallTest do
     test/support/agents_case.ex
     test/my_app/agents/lifecycle_test.exs
     test/my_app/agents/runs_test.exs
+    test/my_app/agents/run_worker_test.exs
+    test/my_app/agents/reaper_test.exs
+    test/my_app/agents/drain_notifier_test.exs
   )
 
   describe "a Phoenix app with Oban" do
@@ -24,14 +27,18 @@ defmodule Mix.Tasks.Clementine.InstallTest do
 
       [migration] = migrations(igniter, "_create_agent_runs.exs")
       assert content(igniter, migration) =~ "defmodule MyApp.Repo.Migrations.CreateAgentRuns"
-      assert content(igniter, migration) =~ "Clementine.Lifecycle.Ecto.Migration.run_columns()"
+      # Pinned to a recipe version, so a later Clementine builds the same table.
+      assert content(igniter, migration) =~ "Clementine.Lifecycle.Ecto.Migration.up(:agent_runs,"
+      assert content(igniter, migration) =~ "version: 1,"
       assert content(igniter, migration) =~ "scope: [:subject_type, :subject_id]"
+      refute content(igniter, migration) =~ "run_columns()"
 
       config = content(igniter, "config/config.exs")
       assert config =~ "queues: [default: 10, agents: 10]"
       assert config =~ "config :my_app, MyApp.Agents.Catalog, agents: []"
       assert config =~ ~s|anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}|
       assert config =~ ~s|claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5"]|
+      assert config =~ "metadata: [:request_id, :run_id]"
 
       test_config = content(igniter, "config/test.exs")
       assert test_config =~ "config :my_app, MyApp.Agents.Reaper, enabled: false"

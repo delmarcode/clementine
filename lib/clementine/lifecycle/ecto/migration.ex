@@ -58,6 +58,31 @@ if Code.ensure_loaded?(Ecto.Migration) do
     prior output in those migrations verbatim — history replays
     identically, and only new migrations speak the new form.
 
+    ## Versioned recipe
+
+    `up/2` and `down/2` pin the recipe to a numbered version, the way
+    `Oban.Migration.up(version: n)` does. Each version's DDL is frozen in
+    this module, separate from the helpers above, and a test asserts the
+    schema version 1 builds column by column and index by index. A host
+    migration that says `version: 1` builds the same table under every
+    later Clementine:
+
+        def up do
+          create table(:agent_runs) do
+            add :agent, :text, null: false
+            timestamps()
+          end
+
+          Clementine.Lifecycle.Ecto.Migration.up(:agent_runs,
+            version: 1,
+            scope: :conversation_id
+          )
+        end
+
+    When a version 2 exists, a host adopts it in a new migration with
+    `up(:agent_runs, from: 1, version: 2)`. `mix clementine.install`
+    generates the versioned form.
+
     ## Backfill for existing adopters
 
     `kind` arrived with LOOP_RFC amendment A1; tables migrated before it
@@ -176,6 +201,128 @@ if Code.ensure_loaded?(Ecto.Migration) do
           where: "#{status_column} IN (#{in_list}) AND #{kind_column} = 'rollout'"
         )
       )
+    end
+
+    @current_version 1
+
+    @doc "The newest recipe version `up/2` can apply."
+    @spec current_version() :: pos_integer()
+    def current_version, do: @current_version
+
+    @doc """
+    Applies the recipe to an existing `table`, from version `:from`
+    (default `0`, a table without it) through `:version`. Call it at the
+    migration's top level, after the table exists.
+
+    Options:
+
+      * `:version` (required) — the recipe version to reach, `1` through
+        `current_version/0`. There is no default, so a migration always
+        names the DDL it was written against.
+      * `:from` — the version the table already has; default `0`.
+      * `:scope` (required by version 1) — the single-active index's
+        scoping column or columns.
+      * `:statuses` — the statuses version 1's index counts as active;
+        defaults to `[:queued, :running, :waiting]`.
+      * `:name` — version 1's index name; defaults to
+        `<table>_single_active_run_index`.
+
+    Version 1 adds the fifteen recipe columns (see the moduledoc) and the
+    single-active index on rollout-kind rows.
+    """
+    @spec up(atom() | String.t(), keyword()) :: :ok
+    def up(table, opts) do
+      {from, version} = range!(opts, :from)
+
+      for step <- (from + 1)..version//1, do: step_up(step, table, opts)
+      :ok
+    end
+
+    @doc """
+    Reverses `up/2`: removes versions `:version` down through `:to` + 1
+    (default `0`, the whole recipe). Takes the `:name` given to `up/2`, if
+    any. A migration that drops the whole table does not need it.
+    """
+    @spec down(atom() | String.t(), keyword()) :: :ok
+    def down(table, opts) do
+      {to, version} = range!(opts, :to)
+
+      for step <- version..(to + 1)//-1, do: step_down(step, table, opts)
+      :ok
+    end
+
+    defp range!(opts, floor_key) do
+      version = Keyword.fetch!(opts, :version)
+      floor = Keyword.get(opts, floor_key, 0)
+
+      unless version in 1..@current_version//1 and floor in 0..version//1 do
+        raise ArgumentError,
+              "recipe versions run 1..#{@current_version}; got #{floor_key}: #{inspect(floor)}, " <>
+                "version: #{inspect(version)}"
+      end
+
+      {floor, version}
+    end
+
+    # Version 1 is frozen: it never calls run_columns/0 or
+    # single_active_index/2, so nothing those helpers ever do changes what
+    # a `version: 1` migration builds. A new version is a new pair of
+    # clauses, never an edit to these.
+    defp step_up(1, table, opts) do
+      scope = opts |> Keyword.fetch!(:scope) |> List.wrap()
+      statuses = Keyword.get(opts, :statuses, [:queued, :running, :waiting])
+
+      case statuses -- Facts.active_statuses() do
+        [] ->
+          :ok
+
+        invalid ->
+          raise ArgumentError, "statuses must be active statuses, got: #{inspect(invalid)}"
+      end
+
+      alter table(table) do
+        add(:kind, :text, null: false, default: "rollout")
+        add(:status, :text, null: false, default: "queued")
+        add(:lease_epoch, :bigint, null: false, default: 0)
+        add(:executor_id, :text)
+        add(:heartbeat_at, :timestamptz)
+        add(:deadline, :timestamptz)
+        add(:queued_at, :timestamptz, default: fragment("now()"))
+        add(:cancel, :map)
+        add(:suspension, :map)
+        add(:resume, :map)
+        add(:effects, :boolean, null: false, default: false)
+        add(:usage, :map)
+        add(:error, :map)
+        add(:interrupt, :map)
+        add(:finished_at, :timestamptz)
+      end
+
+      in_list = Enum.map_join(statuses, ", ", &"'#{&1}'")
+
+      create(
+        index(table, scope,
+          unique: true,
+          name: v1_index_name(table, opts),
+          where: "status IN (#{in_list}) AND kind = 'rollout'"
+        )
+      )
+    end
+
+    defp step_down(1, table, opts) do
+      drop_if_exists(index(table, [:status], name: v1_index_name(table, opts)))
+
+      alter table(table) do
+        for column <-
+              ~w(kind status lease_epoch executor_id heartbeat_at deadline queued_at cancel
+                 suspension resume effects usage error interrupt finished_at)a do
+          remove(column)
+        end
+      end
+    end
+
+    defp v1_index_name(table, opts) do
+      Keyword.get(opts, :name, "#{table}_single_active_run_index")
     end
   end
 end

@@ -14,7 +14,7 @@ defmodule Mix.ClementineTemplatesTest do
   use ExUnit.Case, async: false
 
   @install ~w(agent_run lifecycle definition catalog runs run_worker reaper drain_notifier agents_case)
-  @install_tests ~w(lifecycle_test runs_test)
+  @install_tests ~w(lifecycle_test runs_test run_worker_test reaper_test drain_notifier_test)
 
   @repo """
   defmodule MyApp.Repo do
@@ -104,10 +104,17 @@ defmodule Mix.ClementineTemplatesTest do
       app_module: "MyApp",
       agents: "MyApp.Agents",
       module: "MyApp.Agents.Weather",
+      alias: "Weather",
       key: "weather",
       human: "weather",
       tool_module: "MyApp.Agents.Weather.Tools.Lookup",
-      tool_name: "lookup"
+      tool_alias: "Lookup",
+      tool_name: "lookup",
+      test_aliases: [
+        "MyApp.Agents.Catalog",
+        "MyApp.Agents.Weather",
+        "MyApp.Agents.Weather.Tools.Lookup"
+      ]
     ]
   end
 end

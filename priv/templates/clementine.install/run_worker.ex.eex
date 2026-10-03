@@ -15,6 +15,7 @@ defmodule <%= @agents %>.RunWorker do
   use Oban.Worker, queue: :agents, max_attempts: 1
 
   alias Clementine.Lifecycle.Facts
+
   alias <%= @agents %>.{DrainNotifier, Runs}
 
   @impl Oban.Worker

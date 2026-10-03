@@ -2,7 +2,7 @@
 # app's; the lifecycle columns are Clementine's column recipe, written only
 # through <%= @agents %>.Lifecycle, each write a guarded compare-and-swap
 # on (status, lease_epoch).
-def change do
+def up do
   create table(:agent_runs<%= if @binary_id, do: ", primary_key: false" %>) do
 <%= if @binary_id do %>    add :id, :binary_id, primary_key: true
 
@@ -20,22 +20,26 @@ def change do
     add :oban_job_id, :bigint
     add :metadata, :map, null: false, default: %{}
 
-    # kind, status, lease_epoch, executor_id, heartbeat_at, deadline,
-    # queued_at, cancel, suspension, resume, effects, usage, error,
-    # interrupt, finished_at.
-    Clementine.Lifecycle.Ecto.Migration.run_columns()
-
     timestamps(type: :utc_datetime_usec)
   end
+
+  # Clementine's columns (kind, status, lease_epoch, executor_id,
+  # heartbeat_at, deadline, queued_at, cancel, suspension, resume, effects,
+  # usage, error, interrupt, finished_at) and the double-send guard, pinned
+  # to version 1 of the recipe so a later Clementine builds the same table.
+  # The guard counts queued, running, and waiting runs as active: a run
+  # parked on an approval blocks new runs for its subject until it resolves.
+  Clementine.Lifecycle.Ecto.Migration.up(:agent_runs,
+    version: 1,
+    scope: [:subject_type, :subject_id]
+  )
 
   create index(:agent_runs, [:kind, :status])
   create index(:agent_runs, [:agent])
   create index(:agent_runs, [:subject_type, :subject_id])
   create index(:agent_runs, [:oban_job_id])
+end
 
-  # The double-send guard. Active means queued, running, or waiting: a run
-  # parked on an approval blocks new runs for its subject until it resolves.
-  Clementine.Lifecycle.Ecto.Migration.single_active_index(:agent_runs,
-    scope: [:subject_type, :subject_id]
-  )
+def down do
+  drop table(:agent_runs)
 end

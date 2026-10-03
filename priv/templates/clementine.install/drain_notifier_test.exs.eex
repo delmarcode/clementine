@@ -1,0 +1,14 @@
+defmodule <%= @agents %>.DrainNotifierTest do
+  use ExUnit.Case, async: false
+
+  alias <%= @agents %>.DrainNotifier
+
+  test "tells every registered runner to drain when it stops" do
+    start_supervised!({DrainNotifier, name: :drain_notifier_test})
+    {:ok, _owner} = DrainNotifier.register()
+
+    stop_supervised!(DrainNotifier)
+
+    assert_receive {:clementine, :drain}
+  end
+end

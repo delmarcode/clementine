@@ -7,18 +7,23 @@ defmodule <%= @agents %>.LifecycleTest do
   storage contract, this fails.
   """
 
+  alias Ecto.Adapters.SQL.Sandbox
+
+  alias <%= @agents %>.{Lifecycle, Runs}
+  alias <%= @app_module %>.AgentsCase
+
   use Clementine.LifecycleCase,
-    lifecycle: <%= @agents %>.Lifecycle,
-    create_run: &<%= @app_module %>.AgentsCase.create_conformance_run/1,
-    storage_now: &<%= @agents %>.Runs.db_now!/0,
+    lifecycle: Lifecycle,
+    create_run: &AgentsCase.create_conformance_run/1,
+    storage_now: &Runs.db_now!/0,
     nonexistent_ref: <%= if @binary_id, do: ~s("00000000-0000-0000-0000-000000000000"), else: "-1" %>
 
   # Racing writers need sibling processes on the sandbox connection. Shared
   # ownership serializes queries at the connection, while every logical
   # interleaving the compare-and-swap must survive still occurs.
   setup do
-    pid = Ecto.Adapters.SQL.Sandbox.start_owner!(<%= @repo %>, shared: true)
-    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
+    pid = Sandbox.start_owner!(<%= @repo %>, shared: true)
+    on_exit(fn -> Sandbox.stop_owner(pid) end)
     :ok
   end
 end

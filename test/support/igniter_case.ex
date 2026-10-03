@@ -94,6 +94,10 @@ defmodule Clementine.IgniterCase do
 
   config :my_app, Oban, repo: MyApp.Repo, queues: [default: 10]
 
+  config :logger, :default_formatter,
+    format: "$time $metadata[$level] $message\\n",
+    metadata: [:request_id]
+
   import_config "\#{config_env()}.exs"
   """
 

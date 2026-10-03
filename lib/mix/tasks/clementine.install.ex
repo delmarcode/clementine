@@ -17,7 +17,8 @@ defmodule Mix.Tasks.Clementine.Install.Docs do
     code into your app, which is yours to read and change from then on:
 
       * a migration for an `agent_runs` table: your product columns plus
-        Clementine's column recipe and the single-active index
+        Clementine's column recipe and the single-active index, pinned to
+        recipe version 1 so a later Clementine builds the same table
       * `MyApp.Agents.AgentRun`, the schema
       * `MyApp.Agents.Lifecycle`, the storage contract and its projection
       * `MyApp.Agents.Definition` and `MyApp.Agents.Catalog`, how agents are
@@ -25,11 +26,13 @@ defmodule Mix.Tasks.Clementine.Install.Docs do
       * `MyApp.Agents.Runs`: start, execute, cancel, resume, and sweep
       * `MyApp.Agents.RunWorker`, the Oban worker on the `agents` queue
       * `MyApp.Agents.Reaper` and `MyApp.Agents.DrainNotifier`
-      * `MyApp.AgentsCase` with a Mox model, the conformance suite for your
-        lifecycle, and tests for `Runs`
+      * `MyApp.AgentsCase` with a Mox model and test agents, the
+        conformance suite for your lifecycle, and tests for `Runs`,
+        `RunWorker`, `Reaper`, and `DrainNotifier`
 
-    It also adds the `agents` Oban queue, Clementine's provider key and a
-    model alias to `config/config.exs`, the test settings to
+    It also adds the `agents` Oban queue, Clementine's provider key, a
+    model alias, and the `run_id` logger metadata key to
+    `config/config.exs`, the test settings to
     `config/test.exs`, `mox` as a test dependency, and three children to
     your application: the runner registry right before Oban, and the reaper
     and drain notifier right after it.
@@ -158,33 +161,29 @@ if Code.ensure_loaded?(Igniter) do
       end)
     end
 
+    @tests ~w(lifecycle_test runs_test run_worker_test reaper_test drain_notifier_test)a
+
     defp test_support(igniter, ctx, assigns) do
       case_module = Module.concat(ctx.app_module, AgentsCase)
 
-      igniter
-      |> Clementine.create_once(
-        "clementine.install/agents_case.ex.eex",
-        Igniter.Project.Module.proper_location(igniter, case_module, :test_support),
-        assigns
-      )
-      |> Clementine.create_once(
-        "clementine.install/lifecycle_test.exs.eex",
-        Igniter.Project.Module.proper_location(
+      igniter =
+        Clementine.create_once(
           igniter,
-          Module.concat(ctx.agents, LifecycleTest),
-          :test
-        ),
-        assigns
-      )
-      |> Clementine.create_once(
-        "clementine.install/runs_test.exs.eex",
-        Igniter.Project.Module.proper_location(
+          "clementine.install/agents_case.ex.eex",
+          Igniter.Project.Module.proper_location(igniter, case_module, :test_support),
+          assigns
+        )
+
+      Enum.reduce(@tests, igniter, fn name, igniter ->
+        module = Module.concat(ctx.agents, Macro.camelize(Atom.to_string(name)))
+
+        Clementine.create_once(
           igniter,
-          Module.concat(ctx.agents, RunsTest),
-          :test
-        ),
-        assigns
-      )
+          "clementine.install/#{name}.exs.eex",
+          Igniter.Project.Module.proper_location(igniter, module, :test),
+          assigns
+        )
+      end)
     end
 
     defp config(igniter, ctx) do
@@ -207,6 +206,16 @@ if Code.ensure_loaded?(Igniter) do
         :clementine,
         [:models, :claude_sonnet],
         {:code, Sourceror.parse_string!(~s|[provider: :anthropic, id: "claude-sonnet-5"]|)}
+      )
+      # RunWorker tags its logs with the run; the formatter prints only the
+      # metadata keys it lists, and credo's MissedMetadataKeyInLoggerConfig
+      # checks that it lists them.
+      |> Igniter.Project.Config.configure(
+        "config.exs",
+        :logger,
+        [:default_formatter, :metadata],
+        [:run_id],
+        updater: &Igniter.Code.List.append_new_to_list(&1, :run_id)
       )
       |> Igniter.Project.Config.configure_new("test.exs", app, [reaper, :enabled], false)
       |> Igniter.Project.Config.configure_new("test.exs", :clementine, [:llm_client], mock)

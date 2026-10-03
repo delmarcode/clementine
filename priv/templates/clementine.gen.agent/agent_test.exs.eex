@@ -1,16 +1,18 @@
 defmodule <%= @module %>Test do
   use <%= @app_module %>.AgentsCase
 
+<%= for name <- @test_aliases do %>  alias <%= name %>
+<% end %>
   test "is registered in the catalog" do
-    assert {:ok, <%= @module %>} = <%= @agents %>.Catalog.fetch("<%= @key %>")
+    assert {:ok, <%= @alias %>} = Catalog.fetch("<%= @key %>")
   end
 
   test "builds an agent with its tool" do
-    assert %Clementine.Agent{tools: [<%= @tool_module %>]} = <%= @module %>.agent(%AgentRun{})
+    assert %Clementine.Agent{tools: [<%= @tool_alias %>]} = <%= @alias %>.agent(%AgentRun{})
   end
 
   test "the tool answers a query" do
-    assert {:ok, text} = <%= @tool_module %>.run(%{query: "anything"}, %{})
+    assert {:ok, text} = <%= @tool_alias %>.run(%{query: "anything"}, %{})
     assert is_binary(text)
   end
 

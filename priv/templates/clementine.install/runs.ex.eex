@@ -15,9 +15,11 @@ defmodule <%= @agents %>.Runs do
   import Ecto.Query
 
   alias Clementine.Lifecycle.Ecto.Codec
+  alias Clementine.Lifecycle.Ecto.Oban, as: JobCheck
   alias Clementine.Lifecycle.{Facts, Protocol}
   alias Clementine.{Reconciler, Suspension}
   alias Ecto.Multi
+
   alias <%= @agents %>.{AgentRun, Catalog, Lifecycle, RunWorker}
 
   require Logger
@@ -53,37 +55,38 @@ defmodule <%= @agents %>.Runs do
          {:ok, prompt} <- validate_prompt(prompt) do
       {subject_type, subject_id} = subject(Keyword.get(opts, :subject))
 
-      attrs = %{
+      insert_run(%{
         agent: agent_key,
         input: %{"prompt" => prompt},
         subject_type: subject_type,
         subject_id: subject_id,
         metadata: Keyword.get(opts, :metadata, %{})
-      }
-
-      Multi.new()
-      |> Multi.insert(:run, AgentRun.queued_changeset(attrs))
-      |> Oban.insert(:job, fn %{run: run} -> RunWorker.new(%{"run_id" => run.id}) end)
-      |> Multi.update(:linked, fn %{run: run, job: job} ->
-        Ecto.Changeset.change(run, oban_job_id: job.id)
-      end)
-      |> <%= @repo %>.transaction()
-      |> case do
-        {:ok, %{linked: run}} ->
-          {:ok, run}
-
-        {:error, :run, %Ecto.Changeset{} = changeset, _changes} ->
-          if AgentRun.active_run_conflict?(changeset),
-            do: {:error, :active_run_exists},
-            else: {:error, changeset}
-
-        {:error, _step, reason, _changes} ->
-          {:error, reason}
-      end
+      })
     end
   end
 
+  defp insert_run(attrs) do
+    Multi.new()
+    |> Multi.insert(:run, AgentRun.queued_changeset(attrs))
+    |> Oban.insert(:job, fn %{run: run} -> RunWorker.new(%{"run_id" => run.id}) end)
+    |> Multi.update(:linked, fn %{run: run, job: job} ->
+      Ecto.Changeset.change(run, oban_job_id: job.id)
+    end)
+    |> <%= @repo %>.transaction()
+    |> case do
+      {:ok, %{linked: run}} -> {:ok, run}
+      {:error, :run, %Ecto.Changeset{} = changeset, _changes} -> {:error, insert_error(changeset)}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  defp insert_error(changeset) do
+    if AgentRun.active_run_conflict?(changeset), do: :active_run_exists, else: changeset
+  end
+
+  # A subject with no id stores NULL, so such runs never block each other.
   defp subject(nil), do: {nil, nil}
+  defp subject({type, nil}), do: {to_string(type), nil}
   defp subject({type, id}), do: {to_string(type), to_string(id)}
 
   @doc "The run with `id`, or nil."
@@ -232,12 +235,39 @@ defmodule <%= @agents %>.Runs do
   `{:denied, meta}` (`meta[:message]` reaches the model on a denial), and
   hands it back to a worker. Who may decide is this app's meaning: check
   it before calling; the resume token authenticates nothing.
+
+  The resume and the new job commit in one transaction. Apart, a sweep
+  between them would find a queued run whose only job is the one that
+  completed when the run parked (or none, once Oban's pruner removed it)
+  and interrupt it, losing the decision.
   """
   @spec resume(term(), {:approved, map()} | {:denied, map()}) :: :ok | {:error, term()}
   def resume(run_id, decision) do
-    with {:ok, %Suspension{token: token}} <- suspension(run_id),
+    case <%= @repo %>.transaction(fn -> resume_locked(run_id, decision) end) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # The row lock keeps a concurrent cancel or second decision from writing
+  # between the read and the resume, so the resume cannot go stale inside
+  # this transaction; the other writer waits, then finds the run queued.
+  defp resume_locked(run_id, decision) do
+    with :ok <- lock_run(run_id),
+         {:ok, %Suspension{token: token}} <- suspension(run_id),
          {:ok, _facts} <- Protocol.resume(Lifecycle, token, decision) do
       re_enqueue!(run_id)
+    else
+      {:error, reason} -> <%= @repo %>.rollback(reason)
+    end
+  end
+
+  defp lock_run(run_id) do
+    query = from(r in AgentRun, where: r.id == ^run_id, select: r.id, lock: "FOR UPDATE")
+
+    case <%= @repo %>.one(query) do
+      nil -> {:error, :not_found}
+      _id -> :ok
     end
   end
 
@@ -292,11 +322,33 @@ defmodule <%= @agents %>.Runs do
   # then the Oban cross-check. A waiting run judges healthy by construction:
   # its job completed on purpose when it suspended.
   defp judge(facts, job, now, policy) do
-    case Reconciler.judge(facts, now, policy) do
-      :healthy -> Clementine.Lifecycle.Ecto.Oban.judge_job(facts, job)
+    case Reconciler.judge(claim_clock(facts, job, now), now, policy) do
+      :healthy -> JobCheck.judge_job(facts, job)
       verdict -> verdict
     end
   end
+
+  # The claim timeout catches a worker that died or wedged before it
+  # claimed its run. A job still waiting in Oban's queue has no worker yet:
+  # that is backlog, and a burst bigger than the agents queue's limit
+  # would otherwise interrupt runs that were never given a chance to
+  # start. So a queued run's claim clock starts when its job starts
+  # executing, not when the run was queued.
+  @waiting_job_states ~w(available scheduled retryable)
+
+  defp claim_clock(%Facts{status: :queued} = facts, %{state: state}, now)
+       when state in @waiting_job_states,
+       do: %{facts | queued_at: now}
+
+  defp claim_clock(
+         %Facts{status: :queued, queued_at: %DateTime{} = queued} = facts,
+         %{attempted_at: %DateTime{} = started},
+         _now
+       ) do
+    if DateTime.compare(started, queued) == :gt, do: %{facts | queued_at: started}, else: facts
+  end
+
+  defp claim_clock(facts, _job, _now), do: facts
 
   defp apply_verdict({:interrupt, reason}, facts, acc) do
     case Protocol.interrupt(Lifecycle, facts, reason) do
@@ -308,20 +360,24 @@ defmodule <%= @agents %>.Runs do
   end
 
   defp apply_verdict({:requeue, reason}, facts, acc) do
-    case Protocol.requeue(Lifecycle, facts, reason) do
-      {:ok, _facts} ->
-        :ok = re_enqueue!(facts.ref)
-        %{acc | requeued: acc.requeued + 1}
-
-      {:error, reason} when reason in [:stale, :effects_present] ->
-        acc
-
-      {:error, other} ->
-        log_sweep_error(facts.ref, other, acc)
+    case <%= @repo %>.transaction(fn -> requeue(facts, reason) end) do
+      {:ok, :ok} -> %{acc | requeued: acc.requeued + 1}
+      {:error, reason} when reason in [:stale, :effects_present] -> acc
+      {:error, other} -> log_sweep_error(facts.ref, other, acc)
     end
   end
 
   defp apply_verdict(_healthy, _facts, acc), do: acc
+
+  # The requeue and its new job commit together, for the reason resume/2
+  # gives: apart, another node's sweep could interrupt the queued run
+  # before its job exists.
+  defp requeue(facts, reason) do
+    case Protocol.requeue(Lifecycle, facts, reason) do
+      {:ok, _facts} -> re_enqueue!(facts.ref)
+      {:error, reason} -> <%= @repo %>.rollback(reason)
+    end
+  end
 
   defp active_runs do
     AgentRun

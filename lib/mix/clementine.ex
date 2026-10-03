@@ -188,6 +188,28 @@ if Code.ensure_loaded?(Igniter) do
     end
 
     @doc """
+    True when the module under `zipper` declares `@behaviour behaviour`,
+    by full name or through an alias.
+    """
+    @spec implements?(Zipper.t(), module()) :: boolean()
+    def implements?(zipper, behaviour) do
+      zipper
+      |> Common.move_to(fn z ->
+        case z.node do
+          {:@, _, [{:behaviour, _, [_arg]}]} ->
+            z |> Zipper.down() |> Zipper.down() |> Common.nodes_equal?(behaviour)
+
+          _other ->
+            false
+        end
+      end)
+      |> case do
+        {:ok, _zipper} -> true
+        :error -> false
+      end
+    end
+
+    @doc """
     Moves to the list item that starts `module`: `module` itself or a
     `{module, args}` tuple, in any list literal.
     """
