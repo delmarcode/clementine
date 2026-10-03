@@ -1,0 +1,35 @@
+defmodule <%= @agents %>.Catalog do
+  @moduledoc """
+  The agents this app runs, keyed by the `agent` column of a run row.
+
+  Agents register in config, which `mix clementine.gen.agent` appends to:
+
+      config :<%= @app_name %>, <%= @agents %>.Catalog,
+        agents: [<%= @agents %>.Weather]
+
+  Every listed module implements `<%= @agents %>.Definition`.
+  """
+
+  @doc "Every registered agent module."
+  @spec all() :: [module()]
+  def all do
+    :<%= @app_name %>
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:agents, [])
+  end
+
+  @doc "Every registered agent key."
+  @spec keys() :: [String.t()]
+  def keys, do: Enum.map(all(), & &1.key())
+
+  @doc "The agent module registered under `key`."
+  @spec fetch(String.t()) :: {:ok, module()} | :error
+  def fetch(key) when is_binary(key) do
+    case Enum.find(all(), &(&1.key() == key)) do
+      nil -> :error
+      module -> {:ok, module}
+    end
+  end
+
+  def fetch(_key), do: :error
+end

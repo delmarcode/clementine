@@ -1,0 +1,22 @@
+defmodule <%= @tool_module %> do
+  @moduledoc """
+  A tool of the <%= @human %> agent. The model sees its name, description,
+  and parameters; `run/2` returns the text the model reads back.
+  """
+
+  use Clementine.Tool,
+    name: "<%= @tool_name %>",
+    description: "Looks up information for the <%= @human %> agent.",
+    # :safe declares no external effects, so a run that only used this tool
+    # may be retried after a crash or a deploy. Use :unsafe for a tool that
+    # writes, sends, or charges anything.
+    retry: :safe,
+    parameters: [
+      query: [type: :string, required: true, description: "What to look up"]
+    ]
+
+  @impl true
+  def run(%{query: query}, _context) do
+    {:ok, "Nothing is known about #{inspect(query)} yet."}
+  end
+end

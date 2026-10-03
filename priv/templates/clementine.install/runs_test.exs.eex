@@ -1,0 +1,108 @@
+defmodule <%= @agents %>.RunsTest do
+  use <%= @app_module %>.AgentsCase
+
+  defmodule Echo do
+    @behaviour <%= @agents %>.Definition
+
+    @impl true
+    def key, do: "runs_test_echo"
+
+    @impl true
+    def agent(_run) do
+      Clementine.Agent.new(model: :claude_sonnet, instructions: "Answer briefly.")
+    end
+  end
+
+  defmodule SendNote do
+    use Clementine.Tool,
+      name: "send_note",
+      description: "Sends a note.",
+      approval: :required,
+      retry: :unsafe,
+      parameters: [text: [type: :string, required: true]]
+
+    @impl true
+    def run(%{text: text}, _context), do: {:ok, "Sent #{text}."}
+  end
+
+  defmodule Notifier do
+    @behaviour <%= @agents %>.Definition
+
+    @impl true
+    def key, do: "runs_test_notifier"
+
+    @impl true
+    def agent(_run) do
+      Clementine.Agent.new(model: :claude_sonnet, instructions: "Send notes.", tools: [SendNote])
+    end
+  end
+
+  setup do
+    register_agents([Echo, Notifier])
+  end
+
+  test "a started run executes on the agents queue and stores its output" do
+    {:ok, run} = Runs.start("runs_test_echo", "Say hello")
+    assert_enqueued(worker: RunWorker, args: %{"run_id" => run.id}, queue: :agents)
+
+    expect_turn(text_events("Hello."))
+    assert :ok = perform_job(RunWorker, %{"run_id" => run.id})
+
+    assert %AgentRun{status: "completed", result: %{"output" => "Hello."}} =
+             Runs.get_run!(run.id)
+  end
+
+  test "a tool that needs approval parks the run until a decision resumes it" do
+    {:ok, run} = Runs.start("runs_test_notifier", "Tell the team")
+
+    expect_turn(tool_events("toolu_1", "send_note", %{text: "hello"}))
+    assert :ok = perform_job(RunWorker, %{"run_id" => run.id})
+
+    assert %AgentRun{status: "waiting"} = Runs.get_run!(run.id)
+    assert {:ok, %Clementine.Suspension{reason: {:approval, _request}}} = Runs.suspension(run.id)
+
+    assert :ok = Runs.resume(run.id, {:approved, %{"by" => "test"}})
+    assert_enqueued(worker: RunWorker, args: %{"run_id" => run.id})
+
+    expect_turn(text_events("Sent."))
+    assert :ok = perform_job(RunWorker, %{"run_id" => run.id})
+
+    assert %AgentRun{status: "completed", result: %{"output" => "Sent."}} =
+             Runs.get_run!(run.id)
+  end
+
+  test "a subject has at most one active run" do
+    assert {:ok, _run} = Runs.start("runs_test_echo", "First", subject: {"ticket", 1})
+
+    assert {:error, :active_run_exists} =
+             Runs.start("runs_test_echo", "Second", subject: {"ticket", 1})
+
+    assert {:ok, _run} = Runs.start("runs_test_echo", "Elsewhere", subject: {"ticket", 2})
+  end
+
+  test "an unknown agent and a blank prompt are refused" do
+    assert {:error, :unknown_agent} = Runs.start("no_such_agent", "Hello")
+    assert {:error, :blank_prompt} = Runs.start("runs_test_echo", "  ")
+  end
+
+  test "cancelling a queued run finishes it" do
+    {:ok, run} = Runs.start("runs_test_echo", "Never mind")
+
+    assert {:ok, :finished} = Runs.cancel(run.id)
+    assert %AgentRun{status: "cancelled"} = Runs.get_run!(run.id)
+  end
+
+  test "a run whose agent is gone is cancelled as unstartable" do
+    run = insert_queued_run!(%{agent: "retired_agent"})
+
+    assert {:cancel, _reason} = perform_job(RunWorker, %{"run_id" => run.id})
+    assert %AgentRun{status: "cancelled"} = Runs.get_run!(run.id)
+  end
+
+  test "the sweep interrupts a run whose job is gone" do
+    run = insert_queued_run!()
+
+    assert %{interrupted: 1} = Runs.sweep()
+    assert %AgentRun{status: "interrupted"} = Runs.get_run!(run.id)
+  end
+end

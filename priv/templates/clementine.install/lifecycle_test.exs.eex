@@ -1,0 +1,24 @@
+defmodule <%= @agents %>.LifecycleTest do
+  @moduledoc """
+  Clementine's conformance suite, run against this app's lifecycle, schema,
+  and database: concurrent claim races, zombie fencing across suspend and
+  resume, cancel racing suspend in both orders, projection atomicity, and
+  storage-clock stamps. If a migration or projection change breaks the
+  storage contract, this fails.
+  """
+
+  use Clementine.LifecycleCase,
+    lifecycle: <%= @agents %>.Lifecycle,
+    create_run: &<%= @app_module %>.AgentsCase.create_conformance_run/1,
+    storage_now: &<%= @agents %>.Runs.db_now!/0,
+    nonexistent_ref: <%= if @binary_id, do: ~s("00000000-0000-0000-0000-000000000000"), else: "-1" %>
+
+  # Racing writers need sibling processes on the sandbox connection. Shared
+  # ownership serializes queries at the connection, while every logical
+  # interleaving the compare-and-swap must survive still occurs.
+  setup do
+    pid = Ecto.Adapters.SQL.Sandbox.start_owner!(<%= @repo %>, shared: true)
+    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
+    :ok
+  end
+end

@@ -1,0 +1,59 @@
+defmodule <%= @agents %>.RunWorker do
+  @moduledoc """
+  The durable Oban executor for one agent run.
+
+  Deliberately thin: load the row, build the inert values, call the runner,
+  map its closed return union. Claiming, lease fencing, heartbeats,
+  suspension, cancellation, and the terminal commit are
+  `Clementine.Runner`'s job against `<%= @agents %>.Lifecycle`.
+
+  `max_attempts: 1` is correct. Retry is the reaper's decision, through its
+  requeue policy, never Oban's blind re-perform: a failed or interrupted
+  run may already have touched the world.
+  """
+
+  use Oban.Worker, queue: :agents, max_attempts: 1
+
+  alias Clementine.Lifecycle.Facts
+  alias <%= @agents %>.{DrainNotifier, Runs}
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{id: job_id, args: %{"run_id" => run_id}}) do
+    Logger.metadata(run_id: run_id)
+
+    # Register first, so a drain at shutdown reaches this process.
+    DrainNotifier.register()
+
+    case Runs.execute(run_id, executor_id: "oban:#{job_id}:#{node()}") do
+      {:finished, %Facts{status: :queued}} ->
+        # A graceful drain requeued the run before any effect fired; the
+        # next node picks it up and it survives the deploy unseen.
+        Runs.re_enqueue!(run_id)
+
+      {:finished, _facts} ->
+        # Any terminal: completed, failed, cancelled, or interrupted. The
+        # projection committed with it.
+        :ok
+
+      {:suspended, _token} ->
+        # Parked in `waiting` with a durable checkpoint until
+        # Runs.resume/2. A completed job is the normal state of a parked run.
+        :ok
+
+      {:discard, reason} ->
+        # Nothing was written and nothing may be: a lost claim race, a lost
+        # lease, or a terminal that already exists.
+        {:cancel, inspect(reason)}
+
+      {:unstartable, reason} ->
+        # The run could not be built and was cancelled with the reason.
+        {:cancel, inspect(reason)}
+
+      {:error, reason} ->
+        # The terminal write ran out of retries; the run is still `running`
+        # and the reaper finishes the story. Re-performing could repeat
+        # effects, so cancel the job instead.
+        {:cancel, inspect(reason)}
+    end
+  end
+end
