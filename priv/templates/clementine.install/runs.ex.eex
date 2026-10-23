@@ -1,0 +1,400 @@
+defmodule <%= @agents %>.Runs do
+  @moduledoc """
+  Starting, executing, resuming, cancelling, and reaping agent runs: the
+  glue between `agent_runs` and Clementine's execution machinery.
+
+  Clementine owns the mechanism (claims, lease fencing, heartbeats,
+  suspension, resume, reaping). This module owns the meaning: which rows
+  exist, how a run is built, and who gets to start or cancel one. Lifecycle
+  state moves only through `Clementine.Runner` and
+  `Clementine.Lifecycle.Protocol`; every write is a guarded
+  compare-and-swap, and `{:error, :stale}` from a race means the guard
+  worked.
+  """
+
+  import Ecto.Query
+
+  alias Clementine.Lifecycle.Ecto.Codec
+  alias Clementine.Lifecycle.Ecto.Oban, as: JobCheck
+  alias Clementine.Lifecycle.{Facts, Protocol}
+  alias Clementine.{Reconciler, Suspension}
+  alias Ecto.Multi
+
+  alias <%= @agents %>.{AgentRun, Catalog, Lifecycle, RunWorker}
+
+  require Logger
+
+  @fields Codec.resolve_fields(:id, [])
+
+  # The wall-clock budget of one execution, minted fresh at every claim,
+  # unless the agent sets `defaults: [max_duration: ...]`.
+  @max_duration :timer.minutes(10)
+
+  @doc """
+  Starts a run of the agent registered under `agent_key` with `prompt`.
+  The run row and its Oban job insert in one transaction, so neither
+  exists without the other.
+
+  ## Options
+
+    * `:subject` — `{type, id}`, what the run is about. At most one run per
+      subject is active at a time.
+    * `:metadata` — a map stored on the row.
+
+  Returns `{:error, :unknown_agent}` for a key the catalog does not know,
+  `{:error, :blank_prompt}` for an empty prompt, and
+  `{:error, :active_run_exists}` when the subject already has an active
+  run.
+  """
+  @spec start(String.t(), String.t(), keyword()) ::
+          {:ok, AgentRun.t()}
+          | {:error,
+             :unknown_agent | :blank_prompt | :active_run_exists | Ecto.Changeset.t() | term()}
+  def start(agent_key, prompt, opts \\ []) when is_binary(agent_key) and is_binary(prompt) do
+    with {:ok, _module} <- fetch_agent(agent_key),
+         {:ok, prompt} <- validate_prompt(prompt) do
+      {subject_type, subject_id} = subject(Keyword.get(opts, :subject))
+
+      insert_run(%{
+        agent: agent_key,
+        input: %{"prompt" => prompt},
+        subject_type: subject_type,
+        subject_id: subject_id,
+        metadata: Keyword.get(opts, :metadata, %{})
+      })
+    end
+  end
+
+  defp insert_run(attrs) do
+    Multi.new()
+    |> Multi.insert(:run, AgentRun.queued_changeset(attrs))
+    |> Oban.insert(:job, fn %{run: run} -> RunWorker.new(%{"run_id" => run.id}) end)
+    |> Multi.update(:linked, fn %{run: run, job: job} ->
+      Ecto.Changeset.change(run, oban_job_id: job.id)
+    end)
+    |> <%= @repo %>.transaction()
+    |> case do
+      {:ok, %{linked: run}} -> {:ok, run}
+      {:error, :run, %Ecto.Changeset{} = changeset, _changes} -> {:error, insert_error(changeset)}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  defp insert_error(changeset) do
+    if AgentRun.active_run_conflict?(changeset), do: :active_run_exists, else: changeset
+  end
+
+  # A subject with no id stores NULL, so such runs never block each other.
+  defp subject(nil), do: {nil, nil}
+  defp subject({type, nil}), do: {to_string(type), nil}
+  defp subject({type, id}), do: {to_string(type), to_string(id)}
+
+  @doc "The run with `id`, or nil."
+  @spec get_run(term()) :: AgentRun.t() | nil
+  def get_run(id), do: <%= @repo %>.get(AgentRun, id)
+
+  @doc "The run with `id`; raises when there is none."
+  @spec get_run!(term()) :: AgentRun.t()
+  def get_run!(id), do: <%= @repo %>.get!(AgentRun, id)
+
+  @doc """
+  Executes one durable attempt: load the row, build the inert values, hand
+  them to the runner. Returns the runner's closed outcome union, plus
+  `{:unstartable, reason}` when the run cannot be built (its agent is gone,
+  its prompt is blank); those runs are cancelled with the reason instead of
+  aging out in `queued`.
+  """
+  @spec execute(term(), keyword()) :: Clementine.Runner.outcome() | {:unstartable, term()}
+  def execute(run_id, opts) do
+    executor_id = Keyword.fetch!(opts, :executor_id)
+
+    case get_run(run_id) do
+      nil ->
+        {:discard, :run_not_found}
+
+      %AgentRun{} = row ->
+        case build(row) do
+          {:ok, run} ->
+            Clementine.Runner.execute(run,
+              lifecycle: Lifecycle,
+              executor_id: executor_id,
+              events: Keyword.get(opts, :events, Clementine.Events.Null)
+            )
+
+          {:error, reason} ->
+            cancel_unstartable(row.id, reason)
+        end
+    end
+  end
+
+  @doc """
+  The inert `Clementine.Run` for one execution of `row`. Agents are built
+  at claim time from code, so a deploy that changes an agent applies to
+  the next execution of every run.
+  """
+  @spec build(AgentRun.t()) :: {:ok, Clementine.Run.t()} | {:error, term()}
+  def build(%AgentRun{} = row) do
+    with {:ok, module} <- fetch_agent(row.agent),
+         {:ok, prompt} <- prompt(row) do
+      agent = module.agent(row)
+
+      rollout =
+        Clementine.Rollout.new(
+          agent: agent,
+          input: prompt,
+          context: %{
+            run_id: row.id,
+            agent: row.agent,
+            subject_type: row.subject_type,
+            subject_id: row.subject_id
+          },
+          limits: default_limits(agent)
+        )
+
+      {:ok, Clementine.Run.new(ref: row.id, rollout: rollout)}
+    end
+  rescue
+    # Construction failures (a bad model alias, a malformed agent) happen
+    # before any claim; left alone, the row would sit queued until the
+    # reaper's claim timeout.
+    e in [ArgumentError, KeyError] -> {:error, Exception.message(e)}
+  end
+
+  defp default_limits(%Clementine.Agent{defaults: defaults}) do
+    if Keyword.has_key?(defaults, :max_duration), do: [], else: [max_duration: @max_duration]
+  end
+
+  defp fetch_agent(key) do
+    case Catalog.fetch(key) do
+      {:ok, module} -> {:ok, module}
+      :error -> {:error, :unknown_agent}
+    end
+  end
+
+  defp prompt(%AgentRun{input: %{"prompt" => prompt}}), do: validate_prompt(prompt)
+  defp prompt(%AgentRun{}), do: {:error, :blank_prompt}
+
+  defp validate_prompt(prompt) when is_binary(prompt) do
+    if String.trim(prompt) == "", do: {:error, :blank_prompt}, else: {:ok, prompt}
+  end
+
+  defp validate_prompt(_prompt), do: {:error, :blank_prompt}
+
+  defp cancel_unstartable(run_id, reason) do
+    detail = if is_binary(reason), do: reason, else: inspect(reason)
+
+    # String keys keep the stored reason readable as JSON.
+    _ = cancel(run_id, %{"code" => "unstartable", "detail" => detail})
+    {:unstartable, reason}
+  end
+
+  @doc """
+  A new job for an existing run: after a resume, a drain requeue, or a
+  reaper requeue. Same worker; the row's job correlation follows.
+  """
+  @spec re_enqueue!(term()) :: :ok
+  def re_enqueue!(run_id) do
+    {:ok, job} = Oban.insert(RunWorker.new(%{"run_id" => run_id}))
+
+    {1, _} =
+      <%= @repo %>.update_all(from(r in AgentRun, where: r.id == ^run_id),
+        set: [oban_job_id: job.id]
+      )
+
+    :ok
+  end
+
+  @doc """
+  Cancels a run. A running run gets the cooperative flag (the runner
+  honors it at its next boundary); a queued or waiting run finishes
+  `cancelled` at once. Who may cancel which run is this app's decision:
+  check it before calling.
+  """
+  @spec cancel(term(), map()) ::
+          {:ok, :flagged | :finished} | {:error, :already_terminal | :not_found | term()}
+  def cancel(run_id, reason \\ %{"code" => "cancelled"}) do
+    Protocol.request_cancel(Lifecycle, run_id, reason)
+  end
+
+  @doc """
+  What a `waiting` run is parked on: the stored `Clementine.Suspension`,
+  whose `reason` is `{:approval, %Clementine.ApprovalRequest{}}` for a
+  tool gated with `approval: :required`.
+  """
+  @spec suspension(term()) :: {:ok, Suspension.t()} | {:error, :not_waiting | term()}
+  def suspension(run_id) do
+    case Lifecycle.fetch(run_id, nil) do
+      {:ok, %Facts{status: :waiting, suspension: %Suspension{} = suspension}} -> {:ok, suspension}
+      {:ok, %Facts{}} -> {:error, :not_waiting}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Resumes a `waiting` run with a decision, `{:approved, meta}` or
+  `{:denied, meta}` (`meta[:message]` reaches the model on a denial), and
+  hands it back to a worker. Who may decide is this app's meaning: check
+  it before calling; the resume token authenticates nothing.
+
+  The resume and the new job commit in one transaction. Apart, a sweep
+  between them would find a queued run whose only job is the one that
+  completed when the run parked (or none, once Oban's pruner removed it)
+  and interrupt it, losing the decision.
+  """
+  @spec resume(term(), {:approved, map()} | {:denied, map()}) :: :ok | {:error, term()}
+  def resume(run_id, decision) do
+    case <%= @repo %>.transaction(fn -> resume_locked(run_id, decision) end) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # The row lock keeps a concurrent cancel or second decision from writing
+  # between the read and the resume, so the resume cannot go stale inside
+  # this transaction; the other writer waits, then finds the run queued.
+  defp resume_locked(run_id, decision) do
+    with :ok <- lock_run(run_id),
+         {:ok, %Suspension{token: token}} <- suspension(run_id),
+         {:ok, _facts} <- Protocol.resume(Lifecycle, token, decision) do
+      re_enqueue!(run_id)
+    else
+      {:error, reason} -> <%= @repo %>.rollback(reason)
+    end
+  end
+
+  defp lock_run(run_id) do
+    query = from(r in AgentRun, where: r.id == ^run_id, select: r.id, lock: "FOR UPDATE")
+
+    case <%= @repo %>.one(query) do
+      nil -> {:error, :not_found}
+      _id -> :ok
+    end
+  end
+
+  @doc """
+  The reaper's sweep. The query is this app's (its table, its indexes);
+  the judgment is Clementine's, status-scoped, with the Oban cross-check
+  for runs the clock alone cannot convict. Concurrent sweeps on other
+  nodes are safe: every verdict lands as a compare-and-swap on the exact
+  facts this sweep observed.
+  """
+  @spec sweep(Reconciler.Policy.t()) :: %{interrupted: non_neg_integer(), requeued: non_neg_integer()}
+  def sweep(policy \\ policy()) do
+    now = db_now!()
+    rows = active_runs()
+    jobs = oban_jobs_by_id(rows)
+
+    Enum.reduce(rows, %{interrupted: 0, requeued: 0}, fn row, acc ->
+      facts = Codec.to_facts(row, @fields)
+
+      facts
+      |> judge(jobs[row.oban_job_id], now, policy)
+      |> apply_verdict(facts, acc)
+    end)
+  end
+
+  @doc """
+  The reaper policy, from `config :<%= @app_name %>, <%= @agents %>.Reaper`
+  (`stale_after`, `deadline_grace`, `claim_timeout`, `max_wait`, `retry`).
+  Unset keys take Clementine's conservative defaults: a 2-minute stale
+  threshold, a 15-minute claim timeout, no wait ceiling, and no retry.
+  """
+  @spec policy() :: Reconciler.Policy.t()
+  def policy do
+    :<%= @app_name %>
+    |> Application.get_env(<%= @agents %>.Reaper, [])
+    |> Keyword.take([:stale_after, :deadline_grace, :claim_timeout, :max_wait, :retry])
+    |> Reconciler.Policy.new()
+  end
+
+  @doc """
+  The storage clock, the same source that stamped the facts. A node-local
+  `DateTime.utc_now/0` would bring back the two-clock problem the
+  protocol's symbolic timestamps remove.
+  """
+  @spec db_now!() :: DateTime.t()
+  def db_now! do
+    %{rows: [[now]]} = <%= @repo %>.query!("SELECT now()")
+    now
+  end
+
+  # Library judgment first (heartbeat, deadline, queue age, wait ceiling),
+  # then the Oban cross-check. A waiting run judges healthy by construction:
+  # its job completed on purpose when it suspended.
+  defp judge(facts, job, now, policy) do
+    case Reconciler.judge(claim_clock(facts, job, now), now, policy) do
+      :healthy -> JobCheck.judge_job(facts, job)
+      verdict -> verdict
+    end
+  end
+
+  # The claim timeout catches a worker that died or wedged before it
+  # claimed its run. A job still waiting in Oban's queue has no worker yet:
+  # that is backlog, and a burst bigger than the agents queue's limit
+  # would otherwise interrupt runs that were never given a chance to
+  # start. So a queued run's claim clock starts when its job starts
+  # executing, not when the run was queued.
+  @waiting_job_states ~w(available scheduled retryable)
+
+  defp claim_clock(%Facts{status: :queued} = facts, %{state: state}, now)
+       when state in @waiting_job_states,
+       do: %{facts | queued_at: now}
+
+  defp claim_clock(
+         %Facts{status: :queued, queued_at: %DateTime{} = queued} = facts,
+         %{attempted_at: %DateTime{} = started},
+         _now
+       ) do
+    if DateTime.compare(started, queued) == :gt, do: %{facts | queued_at: started}, else: facts
+  end
+
+  defp claim_clock(facts, _job, _now), do: facts
+
+  defp apply_verdict({:interrupt, reason}, facts, acc) do
+    case Protocol.interrupt(Lifecycle, facts, reason) do
+      {:ok, _facts} -> %{acc | interrupted: acc.interrupted + 1}
+      # A racing finish, or another reaper, won: the guard working.
+      {:error, :stale} -> acc
+      {:error, other} -> log_sweep_error(facts.ref, other, acc)
+    end
+  end
+
+  defp apply_verdict({:requeue, reason}, facts, acc) do
+    case <%= @repo %>.transaction(fn -> requeue(facts, reason) end) do
+      {:ok, :ok} -> %{acc | requeued: acc.requeued + 1}
+      {:error, reason} when reason in [:stale, :effects_present] -> acc
+      {:error, other} -> log_sweep_error(facts.ref, other, acc)
+    end
+  end
+
+  defp apply_verdict(_healthy, _facts, acc), do: acc
+
+  # The requeue and its new job commit together, for the reason resume/2
+  # gives: apart, another node's sweep could interrupt the queued run
+  # before its job exists.
+  defp requeue(facts, reason) do
+    case Protocol.requeue(Lifecycle, facts, reason) do
+      {:ok, _facts} -> re_enqueue!(facts.ref)
+      {:error, reason} -> <%= @repo %>.rollback(reason)
+    end
+  end
+
+  defp active_runs do
+    AgentRun
+    |> where([r], r.kind == "rollout" and r.status in ^AgentRun.active_statuses())
+    |> <%= @repo %>.all()
+  end
+
+  defp oban_jobs_by_id(rows) do
+    ids = rows |> Enum.map(& &1.oban_job_id) |> Enum.reject(&is_nil/1)
+
+    from(j in Oban.Job, where: j.id in ^ids)
+    |> <%= @repo %>.all()
+    |> Map.new(&{&1.id, &1})
+  end
+
+  defp log_sweep_error(run_id, reason, acc) do
+    Logger.warning("Agent run sweep could not write run #{run_id}: #{inspect(reason)}")
+    acc
+  end
+end

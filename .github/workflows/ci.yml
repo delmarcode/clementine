@@ -69,3 +69,48 @@ jobs:
 
       - name: Run tests
         run: mix test
+
+  installer:
+    # scripts/installer-smoke.sh: a fresh Phoenix app gets Oban, then
+    # `mix clementine.install` and `mix clementine.gen.agent` twice each (the
+    # second run must change nothing), then the app's format, compile,
+    # credo --strict, and test gates, including the conformance suite.
+    name: Installer smoke (phx_new ${{ matrix.phx_new }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          # 1.7.x generates apps that do not build on Elixir 1.19.
+          - elixir: "1.19"
+            otp: "27"
+            phx_new: "1.8.15"
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - name: Install phx_new
+        run: mix archive.install hex phx_new ${{ matrix.phx_new }} --force
+
+      - name: Generate a Phoenix app and run the generators against it
+        run: scripts/installer-smoke.sh "$RUNNER_TEMP/installer-smoke"

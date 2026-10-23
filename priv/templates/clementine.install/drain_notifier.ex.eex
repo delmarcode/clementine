@@ -1,0 +1,39 @@
+defmodule <%= @agents %>.DrainNotifier do
+  @moduledoc """
+  Sends `{:clementine, :drain}` to every running agent run when the node
+  begins shutting down.
+
+  It sits after Oban in the supervision tree, so it stops before Oban
+  starts waiting out its `shutdown_grace_period`. Runners unwind inside
+  that window: a run that has not touched the world is requeued for the
+  next node, and one that has finishes `interrupted(:drain)`. The reaper
+  stays the fallback for a node that never got to drain.
+
+  Runner processes register in the `<%= @agents %>.Runners` registry,
+  which starts before Oban.
+  """
+
+  use GenServer
+
+  @registry <%= @agents %>.Runners
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, nil, name: Keyword.get(opts, :name, __MODULE__))
+  end
+
+  @doc "Registers the calling runner process. Workers call it first in perform/1."
+  def register, do: Registry.register(@registry, :active, nil)
+
+  @impl GenServer
+  def init(nil) do
+    Process.flag(:trap_exit, true)
+    {:ok, nil}
+  end
+
+  @impl GenServer
+  def terminate(_reason, _state) do
+    Registry.dispatch(@registry, :active, fn entries ->
+      for {pid, _value} <- entries, do: send(pid, {:clementine, :drain})
+    end)
+  end
+end

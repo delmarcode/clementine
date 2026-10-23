@@ -1,0 +1,62 @@
+defmodule <%= @agents %>.Lifecycle do
+  @moduledoc """
+  The storage contract between Clementine's durable-execution protocol and
+  the `agent_runs` table.
+
+  `use Clementine.Lifecycle.Ecto` generates `fetch/2` and `apply/2`: every
+  lifecycle write is one guarded compare-and-swap on `(status, lease_epoch)`.
+  `project/3` runs inside the same transaction as the write that makes a
+  run terminal, so a completed run's output commits with its `completed`
+  status or not at all. Write whatever completion means here: store the
+  output, append messages to a conversation, update counters.
+
+  `<%= @agents %>.LifecycleTest` runs Clementine's conformance suite
+  against this module and the real database.
+  """
+
+  use Clementine.Lifecycle.Ecto,
+    repo: <%= @repo %>,
+    schema: <%= @agents %>.AgentRun
+
+  import Ecto.Query, only: [from: 2]
+
+  alias Clementine.Result
+
+  alias <%= @agents %>.AgentRun
+
+  @impl Clementine.Lifecycle.Ecto
+  def project(result, %AgentRun{} = run, _ctx) do
+    :ok = conformance_probe(result, run)
+
+    case result do
+      %Result.Completed{output: output} ->
+        {1, _} =
+          <%= @repo %>.update_all(from(r in AgentRun, where: r.id == ^run.id),
+            set: [result: %{"output" => output}]
+          )
+
+        :ok
+
+      # Failed, cancelled, and interrupted runs write no product rows.
+      _other ->
+        :ok
+    end
+  end
+
+  # The conformance suite's projection probe (see Clementine.LifecycleCase).
+  # A run whose metadata carries the marker makes its projection raise,
+  # which is how the suite proves the projection runs inside the atomic
+  # unit and receives the exact Result variant. Only tests set the marker.
+  defp conformance_probe(result, %AgentRun{metadata: %{"conformance_probe" => probe}}) do
+    case {probe, result} do
+      {"raise", _result} -> raise "conformance probe"
+      {"completed", %Result.Completed{}} -> raise "conformance probe: completed"
+      {"failed", %Result.Failed{}} -> raise "conformance probe: failed"
+      {"cancelled", %Result.Cancelled{}} -> raise "conformance probe: cancelled"
+      {"interrupted", %Result.Interrupted{}} -> raise "conformance probe: interrupted"
+      _other -> :ok
+    end
+  end
+
+  defp conformance_probe(_result, _run), do: :ok
+end

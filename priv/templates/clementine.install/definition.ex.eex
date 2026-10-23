@@ -1,0 +1,24 @@
+defmodule <%= @agents %>.Definition do
+  @moduledoc """
+  An agent this app runs: a stable key, and the `Clementine.Agent` it
+  builds for one execution of a run.
+
+  Generate one with `mix clementine.gen.agent Name`, which also lists it
+  in `<%= @agents %>.Catalog`.
+  """
+
+  alias <%= @agents %>.AgentRun
+
+  @doc """
+  The key run rows carry in their `agent` column. Keep it stable once runs
+  exist: a run whose key no longer resolves is cancelled as unstartable.
+  """
+  @callback key() :: String.t()
+
+  @doc """
+  The agent for one execution of `run`: model, instructions, tools, and
+  limits (`defaults: [max_iterations: ..., max_duration: ...]`). Called at
+  every claim, so it may read whatever the instructions need.
+  """
+  @callback agent(run :: AgentRun.t()) :: Clementine.Agent.t()
+end

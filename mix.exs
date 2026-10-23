@@ -119,6 +119,10 @@ defmodule Clementine.MixProject do
       {:nimble_options, "~> 1.1"},
       {:telemetry, "~> 1.0"},
       {:telemetry_metrics, "~> 1.0"},
+      # Optional: `mix clementine.install` and `mix clementine.gen.agent`
+      # compile only when the host brings Igniter in, the way Oban ships
+      # `oban.install`. Nothing from it runs in production.
+      {:igniter, "~> 0.8.4", optional: true},
       {:mox, "~> 1.1", only: :test},
       {:bypass, "~> 2.1", only: :test},
       # Dev/test only: lets the guides' Oban-based host samples (workers,

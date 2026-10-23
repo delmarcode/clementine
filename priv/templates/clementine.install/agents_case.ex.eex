@@ -1,0 +1,235 @@
+# The scripted model. config/test.exs makes it Clementine's LLM client, so
+# no test reaches a real provider; a test that runs an agent scripts each
+# model turn with expect_turn/1.
+Mox.defmock(<%= @agents %>.LLMMock, for: Clementine.LLM.ClientBehaviour)
+
+defmodule <%= @app_module %>.AgentsCase do
+  @moduledoc """
+  The case for tests that run agents: the SQL sandbox, Oban's testing
+  helpers, Mox, and helpers to script the model and make runs.
+
+      use <%= @app_module %>.AgentsCase
+
+      test "answers" do
+        expect_turn(text_events("Sunny."))
+        {:ok, run} = Runs.start("weather", "How is it outside?")
+
+        assert :ok = perform_job(RunWorker, %{"run_id" => run.id})
+        assert %AgentRun{status: "completed"} = Runs.get_run!(run.id)
+      end
+
+  Runs execute in more than one process (heartbeats, tools), so a test
+  module that executes runs stays `async: false`, the default here: the
+  sandbox and the model mock are then shared with every process the run
+  starts.
+  """
+
+  use ExUnit.CaseTemplate
+
+  import Ecto.Query, only: [from: 2]
+
+  alias Ecto.Adapters.SQL.Sandbox
+
+  alias <%= @agents %>.AgentRun
+
+  using do
+    quote do
+      use Oban.Testing, repo: <%= @repo %>
+
+      import Mox
+      import <%= @app_module %>.AgentsCase
+
+      alias <%= @agents %>.{AgentRun, Runs, RunWorker}
+
+      setup :set_mox_from_context
+      setup :verify_on_exit!
+    end
+  end
+
+  setup tags do
+    pid = Sandbox.start_owner!(<%= @repo %>, shared: not tags[:async])
+    on_exit(fn -> Sandbox.stop_owner(pid) end)
+    :ok
+  end
+
+  @doc """
+  Scripts the model's next turn: the provider events it streams back.
+  Build them with `text_events/1` and `tool_events/3`.
+  """
+  def expect_turn(events) when is_list(events) do
+    Mox.expect(<%= @agents %>.LLMMock, :stream, fn _model, _system, _messages, _tools, _opts ->
+      events
+    end)
+  end
+
+  @doc "A model turn that answers with `text` and ends the run."
+  def text_events(text) do
+    [
+      {:text_delta, text},
+      {:message_delta, %{"stop_reason" => "end_turn"},
+       %{"input_tokens" => 10, "output_tokens" => 5}}
+    ]
+  end
+
+  @doc "A model turn that calls the tool named `name` with `input`."
+  def tool_events(id, name, input) do
+    [
+      {:tool_use_start, id, name},
+      {:input_json_delta, id, Jason.encode!(input)},
+      {:content_block_stop, 0},
+      {:message_delta, %{"stop_reason" => "tool_use"},
+       %{"input_tokens" => 10, "output_tokens" => 5}}
+    ]
+  end
+
+  @doc """
+  Registers extra agent modules in `<%= @agents %>.Catalog` for the rest
+  of the test.
+  """
+  def register_agents(modules) when is_list(modules) do
+    app = :<%= @app_name %>
+    original = Application.get_env(app, <%= @agents %>.Catalog)
+    agents = Keyword.get(original || [], :agents, [])
+
+    Application.put_env(app, <%= @agents %>.Catalog,
+      Keyword.put(original || [], :agents, Enum.uniq(agents ++ modules))
+    )
+
+    ExUnit.Callbacks.on_exit(fn ->
+      if original,
+        do: Application.put_env(app, <%= @agents %>.Catalog, original),
+        else: Application.delete_env(app, <%= @agents %>.Catalog)
+    end)
+  end
+
+  @doc """
+  Moves a run's `queued_at`, and its job's `attempted_at` when given, back
+  by `minutes`: how a test ages a run past the reaper's thresholds.
+  """
+  def backdate!(%AgentRun{} = run, minutes, opts \\ []) do
+    then = DateTime.add(DateTime.utc_now(), -minutes, :minute)
+
+    {1, _} =
+      <%= @repo %>.update_all(from(r in AgentRun, where: r.id == ^run.id),
+        set: [queued_at: then]
+      )
+
+    if job_state = opts[:job_state] do
+      {1, _} =
+        <%= @repo %>.update_all(from(j in Oban.Job, where: j.id == ^run.oban_job_id),
+          set: [state: job_state, attempted_at: then]
+        )
+    end
+
+    :ok
+  end
+
+  @doc """
+  Inserts a queued run directly, with no Oban job. For tests of the
+  lifecycle and the reaper; product code starts runs with
+  `<%= @agents %>.Runs.start/3`.
+  """
+  def insert_queued_run!(attrs \\ %{}) do
+    attrs
+    |> Map.new()
+    |> Map.put_new(:agent, "test")
+    |> Map.put_new(:input, %{"prompt" => "Hello"})
+    |> AgentRun.queued_changeset()
+    |> <%= @repo %>.insert!()
+  end
+
+  @doc """
+  The `create_run` function of `Clementine.LifecycleCase`: a queued run in
+  a fresh subject (the single-active index never collides), carrying the
+  suite's projection probe in its metadata and its run kind in `kind`.
+  """
+  def create_conformance_run(attrs) do
+    run =
+      insert_queued_run!(%{
+        subject_type: "conformance",
+        subject_id: Integer.to_string(System.unique_integer([:positive])),
+        metadata: conformance_probe(Keyword.get(attrs, :projection))
+      })
+
+    case Keyword.get(attrs, :kind, :rollout) do
+      :rollout ->
+        :ok
+
+      kind ->
+        {1, _} =
+          <%= @repo %>.update_all(from(r in AgentRun, where: r.id == ^run.id),
+            set: [kind: Atom.to_string(kind)]
+          )
+    end
+
+    run.id
+  end
+
+  defp conformance_probe(nil), do: %{}
+  defp conformance_probe(:raise), do: %{"conformance_probe" => "raise"}
+
+  defp conformance_probe({:raise_on, variant}),
+    do: %{"conformance_probe" => Atom.to_string(variant)}
+end
+
+defmodule <%= @app_module %>.AgentsCase.Echo do
+  @moduledoc "A test agent with no tools: one model turn answers."
+  @behaviour <%= @agents %>.Definition
+
+  @impl true
+  def key, do: "test_echo"
+
+  @impl true
+  def agent(_run), do: Clementine.Agent.new(model: :claude_sonnet, instructions: "Answer.")
+end
+
+defmodule <%= @app_module %>.AgentsCase.Lookup do
+  @moduledoc "A test agent whose one tool is safe to repeat, so its runs can be requeued."
+  @behaviour <%= @agents %>.Definition
+
+  defmodule Tool do
+    @moduledoc false
+    use Clementine.Tool,
+      name: "lookup",
+      description: "Looks something up.",
+      retry: :safe,
+      parameters: [query: [type: :string, required: true]]
+
+    @impl true
+    def run(%{query: query}, _context), do: {:ok, "Found #{query}."}
+  end
+
+  @impl true
+  def key, do: "test_lookup"
+
+  @impl true
+  def agent(_run) do
+    Clementine.Agent.new(model: :claude_sonnet, instructions: "Look up.", tools: [Tool])
+  end
+end
+
+defmodule <%= @app_module %>.AgentsCase.Approval do
+  @moduledoc "A test agent whose one tool needs a human's approval."
+  @behaviour <%= @agents %>.Definition
+
+  defmodule SendNote do
+    @moduledoc false
+    use Clementine.Tool,
+      name: "send_note",
+      description: "Sends a note.",
+      approval: :required,
+      retry: :unsafe,
+      parameters: [text: [type: :string, required: true]]
+
+    @impl true
+    def run(%{text: text}, _context), do: {:ok, "Sent #{text}."}
+  end
+
+  @impl true
+  def key, do: "test_approval"
+
+  @impl true
+  def agent(_run) do
+    Clementine.Agent.new(model: :claude_sonnet, instructions: "Send notes.", tools: [SendNote])
+  end
+end

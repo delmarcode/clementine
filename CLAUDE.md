@@ -46,6 +46,10 @@ lib/
 │   ├── tool_runner.ex               # Supervised tool execution
 │   ├── llm/                         # Provider clients, stream parsers, model registry
 │   └── tools/                       # Built-in tools
+└── mix/
+    ├── clementine.ex                # Shared generator machinery (guarded child placement)
+    └── tasks/                       # clementine.install, clementine.gen.agent (Igniter)
+priv/templates/                      # The code the generators write into a host app
 ```
 
 ## Key Patterns
@@ -172,6 +176,31 @@ endpoints — a `provider: :openai_compatible` catalog entry with a
 `Clementine.LLM.ClientBehaviour` implementation, the provider atom in
 `Clementine.LLM.ModelRegistry`, a `Clementine.LLM.Router` mapping, and a
 `Clementine.LLM.Reasoning` translation.
+
+### Changing the Runtime the Generators Write
+
+`mix clementine.install` and `mix clementine.gen.agent` render
+`priv/templates/` into a host app, so the templates move with the library:
+a change to the column recipe, the lifecycle protocol, the runner, or the
+tool macro updates them in the same commit.
+
+- `test/mix/clementine_templates_test.exs` compiles the rendered code with
+  zero warnings allowed, so API drift fails CI.
+- `test/mix/clementine.*_test.exs` drive the tasks through `Igniter.Test`
+  (via `Clementine.IgniterCase`) and prove a second run changes nothing.
+- `scripts/installer-smoke.sh` generates a real Phoenix app, installs
+  twice, generates an agent twice, and runs the app's format, compile,
+  `credo --strict` (on the generated files), and tests, including the
+  conformance suite on Postgres. CI's `installer` job runs it with a pinned
+  `phx_new`; run it locally after changing a template.
+- The generated migration pins the column recipe with
+  `Clementine.Lifecycle.Ecto.Migration.up(table, version: 1, ...)`.
+  Version 1's DDL is frozen and asserted in
+  `test/clementine/lifecycle/ecto_migration_versions_test.exs`; a recipe
+  change is a new version, never an edit to an old one.
+- Never place a supervision child with Igniter's `add_new_child/3`: use
+  `Mix.Clementine.add_child/4`, which inserts beside its anchor or edits
+  nothing (its moduledoc says why).
 
 ### Debugging Agent Issues
 

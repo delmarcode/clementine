@@ -91,3 +91,30 @@ defmodule Clementine.Test.Ecto.CreateUuidRuns do
     end
   end
 end
+
+defmodule Clementine.Test.Ecto.CreateRecipeV1Runs do
+  @moduledoc """
+  The versioned recipe, exercised for real: one table gets version 1 (its
+  schema is asserted column by column against a frozen snapshot), and one
+  gets version 1 and then loses it again.
+  """
+
+  use Ecto.Migration
+
+  alias Clementine.Lifecycle.Ecto.Migration, as: Recipe
+
+  def up do
+    create table(:clementine_test_v1_runs) do
+      add(:scope_id, :bigint)
+    end
+
+    Recipe.up(:clementine_test_v1_runs, version: 1, scope: :scope_id)
+
+    create table(:clementine_test_v1_down) do
+      add(:scope_id, :bigint)
+    end
+
+    Recipe.up(:clementine_test_v1_down, version: 1, scope: :scope_id)
+    Recipe.down(:clementine_test_v1_down, version: 1)
+  end
+end

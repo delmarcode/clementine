@@ -1,0 +1,30 @@
+defmodule <%= @module %>Test do
+  use <%= @app_module %>.AgentsCase
+
+<%= for name <- @test_aliases do %>  alias <%= name %>
+<% end %>
+  test "is registered in the catalog" do
+    assert {:ok, <%= @alias %>} = Catalog.fetch("<%= @key %>")
+  end
+
+  test "builds an agent with its tool" do
+    assert %Clementine.Agent{tools: [<%= @tool_alias %>]} = <%= @alias %>.agent(%AgentRun{})
+  end
+
+  test "the tool answers a query" do
+    assert {:ok, text} = <%= @tool_alias %>.run(%{query: "anything"}, %{})
+    assert is_binary(text)
+  end
+
+  test "a run calls the tool, then answers" do
+    {:ok, run} = Runs.start("<%= @key %>", "Look something up")
+
+    expect_turn(tool_events("toolu_1", "<%= @tool_name %>", %{query: "something"}))
+    expect_turn(text_events("Here is what I found."))
+
+    assert :ok = perform_job(RunWorker, %{"run_id" => run.id})
+
+    assert %AgentRun{status: "completed", result: %{"output" => "Here is what I found."}} =
+             Runs.get_run!(run.id)
+  end
+end

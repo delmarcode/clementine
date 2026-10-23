@@ -1,0 +1,60 @@
+defmodule <%= @agents %>.Reaper do
+  @moduledoc """
+  The periodic sweep that writes the terminal a dead executor could not.
+
+  A dying node writes nothing on purpose; its runs' heartbeats stop, and
+  every tick here runs `<%= @agents %>.Runs.sweep/1`, which interrupts
+  (or, by policy, requeues) the runs that are no longer alive. Sweeps on
+  several nodes need no coordination.
+
+  Configured under `config :<%= @app_name %>, <%= @agents %>.Reaper`:
+  `enabled` (default `true`; the test config turns it off so sweeps run on
+  demand), `interval` (default one minute), and the policy keys
+  `<%= @agents %>.Runs.policy/0` reads.
+  """
+
+  use GenServer
+
+  require Logger
+
+  alias <%= @agents %>.Runs
+
+  @default_interval :timer.seconds(60)
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+  end
+
+  @impl GenServer
+  def init(opts) do
+    config = Keyword.merge(Application.get_env(:<%= @app_name %>, __MODULE__, []), opts)
+
+    if Keyword.get(config, :enabled, true) do
+      send(self(), :sweep)
+      {:ok, %{interval: Keyword.get(config, :interval, @default_interval)}}
+    else
+      :ignore
+    end
+  end
+
+  @impl GenServer
+  def handle_info(:sweep, state) do
+    sweep()
+    Process.send_after(self(), :sweep, state.interval)
+    {:noreply, state}
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  defp sweep do
+    case Runs.sweep() do
+      %{interrupted: 0, requeued: 0} ->
+        :ok
+
+      %{interrupted: interrupted, requeued: requeued} ->
+        Logger.info("Agent run sweep interrupted #{interrupted} and requeued #{requeued} runs")
+    end
+  rescue
+    e -> Logger.error("Agent run sweep failed: " <> Exception.message(e))
+  end
+end
