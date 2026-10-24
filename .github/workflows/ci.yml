@@ -74,7 +74,8 @@ jobs:
     # scripts/installer-smoke.sh: a fresh Phoenix app gets Oban, then
     # `mix clementine.install` and `mix clementine.gen.agent` twice each (the
     # second run must change nothing), then the app's format, compile,
-    # credo --strict, and test gates, including the conformance suite.
+    # credo --strict, and test gates. The generated test runs the agent end
+    # to end through the library's runtime on Postgres.
     name: Installer smoke (phx_new ${{ matrix.phx_new }})
     runs-on: ubuntu-latest
 

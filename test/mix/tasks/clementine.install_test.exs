@@ -2,47 +2,39 @@ defmodule Mix.Tasks.Clementine.InstallTest do
   # Not async: each test runs from a plain directory (see Clementine.IgniterCase).
   use Clementine.IgniterCase
 
-  @runtime_files ~w(
-    lib/my_app/agents/agent_run.ex
-    lib/my_app/agents/lifecycle.ex
-    lib/my_app/agents/definition.ex
-    lib/my_app/agents/catalog.ex
-    lib/my_app/agents/runs.ex
-    lib/my_app/agents/run_worker.ex
-    lib/my_app/agents/reaper.ex
-    lib/my_app/agents/drain_notifier.ex
-    test/support/agents_case.ex
-    test/my_app/agents/lifecycle_test.exs
-    test/my_app/agents/runs_test.exs
-    test/my_app/agents/run_worker_test.exs
-    test/my_app/agents/reaper_test.exs
-    test/my_app/agents/drain_notifier_test.exs
-  )
-
   describe "a Phoenix app with Oban" do
-    test "gets the runtime: migration, modules, test support, config, children, mox" do
+    test "gets the glue: migration, test case, config, child, mox" do
       {:ok, igniter, %{tasks: tasks}} = project() |> install() |> apply_igniter()
 
-      for path <- @runtime_files, do: assert(content(igniter, path) =~ "defmodule MyApp.")
+      [migration] = migrations(igniter)
+      migration = content(igniter, migration)
+      assert migration =~ "defmodule MyApp.Repo.Migrations.AddClementine"
+      assert migration =~ "def up, do: Clementine.Migration.up(version: 1)"
+      assert migration =~ "def down, do: Clementine.Migration.down(version: 1)"
 
-      [migration] = migrations(igniter, "_create_agent_runs.exs")
-      assert content(igniter, migration) =~ "defmodule MyApp.Repo.Migrations.CreateAgentRuns"
-      # Pinned to a recipe version, so a later Clementine builds the same table.
-      assert content(igniter, migration) =~ "Clementine.Lifecycle.Ecto.Migration.up(:agent_runs,"
-      assert content(igniter, migration) =~ "version: 1,"
-      assert content(igniter, migration) =~ "scope: [:subject_type, :subject_id]"
-      refute content(igniter, migration) =~ "run_columns()"
+      agents_case = content(igniter, "test/support/agents_case.ex")
+
+      assert agents_case =~
+               "Mox.defmock(MyApp.Agents.LLMMock, for: Clementine.LLM.ClientBehaviour)"
+
+      assert agents_case =~ "defmodule MyApp.AgentsCase do"
+      assert agents_case =~ "use Oban.Testing, repo: MyApp.Repo"
+
+      # The runtime is Clementine's: nothing of it is copied into the app.
+      assert paths(igniter, "lib/my_app/agents") == []
+      assert paths(igniter, "test/support/") == ["test/support/agents_case.ex"]
+      assert paths(igniter, "test/my_app/") == []
 
       config = content(igniter, "config/config.exs")
       assert config =~ "queues: [default: 10, agents: 10]"
-      assert config =~ "config :my_app, MyApp.Agents.Catalog, agents: []"
       assert config =~ ~s|anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}|
       assert config =~ ~s|claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5"]|
       assert config =~ "metadata: [:request_id, :run_id]"
+      refute config =~ "Catalog"
 
       test_config = content(igniter, "config/test.exs")
-      assert test_config =~ "config :my_app, MyApp.Agents.Reaper, enabled: false"
       assert test_config =~ "config :clementine, llm_client: MyApp.Agents.LLMMock"
+      refute test_config =~ "Reaper"
 
       assert content(igniter, "mix.exs") =~ ~s|{:mox, "~> 1.1", only: :test}|
       assert {"deps.get", []} in tasks
@@ -56,7 +48,7 @@ defmodule Mix.Tasks.Clementine.InstallTest do
       |> assert_unchanged()
     end
 
-    test "the registry starts right before Oban, the reaper and drain notifier right after" do
+    test "the runtime starts right after Oban" do
       igniter = project() |> install() |> apply_igniter!()
 
       # Igniter's add_new_child would put a child with no placement first,
@@ -65,22 +57,39 @@ defmodule Mix.Tasks.Clementine.InstallTest do
                "MyAppWeb.Telemetry,",
                "MyApp.Repo,",
                "{DNSCluster, query: Application.get_env(:my_app, :dns_cluster_query) || :ignore},",
-               "{Registry, keys: :duplicate, name: MyApp.Agents.Runners},",
                "# Jobs run once the repo is up.",
                "{Oban, Application.fetch_env!(:my_app, Oban)},",
-               "MyApp.Agents.Reaper,",
-               "MyApp.Agents.DrainNotifier,",
+               "{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []},",
                "{Phoenix.PubSub, name: MyApp.PubSub},",
                "MyAppWeb.Endpoint"
              ]
     end
 
-    test "a file the host already changed is left alone" do
-      runs = "defmodule MyApp.Agents.Runs do\n  # ours now\nend\n"
+    test "--repo names the repo" do
+      other = "defmodule MyApp.OtherRepo do\n  use Ecto.Repo, otp_app: :my_app\nend\n"
 
-      project(files: %{"lib/my_app/agents/runs.ex" => runs})
+      igniter =
+        project(files: %{"lib/my_app/other_repo.ex" => other})
+        |> install(["--repo", "MyApp.OtherRepo"])
+        |> apply_igniter!()
+
+      assert [_migration] = migrations(igniter, "other_repo")
+      assert content(igniter, "lib/my_app/application.ex") =~ "repo: MyApp.OtherRepo"
+      assert content(igniter, "test/support/agents_case.ex") =~ "repo: MyApp.OtherRepo"
+    end
+
+    test "--repo must name a repo that exists" do
+      project()
+      |> install(["--repo", "MyApp.Missing"])
+      |> assert_has_issue(&(&1 =~ "Repo MyApp.Missing does not exist"))
+    end
+
+    test "a file the host already changed is left alone" do
+      agents_case = "defmodule MyApp.AgentsCase do\n  # ours now\nend\n"
+
+      project(files: %{"test/support/agents_case.ex" => agents_case})
       |> install()
-      |> assert_unchanged("lib/my_app/agents/runs.ex")
+      |> assert_unchanged("test/support/agents_case.ex")
     end
 
     test "config the host already set keeps its value" do
@@ -102,20 +111,6 @@ defmodule Mix.Tasks.Clementine.InstallTest do
       assert config =~ "queues: [default: 10, agents: 3]"
       assert config =~ ~s|anthropic_api_key: "from-vault"|
       refute config =~ "ANTHROPIC_API_KEY"
-    end
-
-    test "--binary-id makes binary ids" do
-      igniter = project() |> install(["--binary-id"]) |> apply_igniter!()
-
-      [migration] = migrations(igniter, "_create_agent_runs.exs")
-      assert content(igniter, migration) =~ "create table(:agent_runs, primary_key: false)"
-      assert content(igniter, migration) =~ ~r/add[ (]:id, :binary_id, primary_key: true/
-
-      assert content(igniter, "lib/my_app/agents/agent_run.ex") =~
-               "@primary_key {:id, :binary_id, autogenerate: true}"
-
-      assert content(igniter, "test/my_app/agents/lifecycle_test.exs") =~
-               ~s|nonexistent_ref: "00000000-0000-0000-0000-000000000000"|
     end
   end
 
@@ -153,10 +148,8 @@ defmodule Mix.Tasks.Clementine.InstallTest do
                "MyApp.Repo,",
                "{Phoenix.PubSub, name: MyApp.PubSub}",
                "] ++",
-               "{Registry, keys: :duplicate, name: MyApp.Agents.Runners},",
                "{Oban, Application.fetch_env!(:my_app, Oban)},",
-               "MyApp.Agents.Reaper,",
-               "MyApp.Agents.DrainNotifier,",
+               "{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []},",
                "MyAppWeb.Endpoint"
              ]
 
@@ -181,13 +174,38 @@ defmodule Mix.Tasks.Clementine.InstallTest do
         |> install()
         |> apply_igniter()
 
-      refute content(igniter, "lib/my_app/application.ex") =~ "MyApp.Agents"
-      assert Enum.count(warnings, &(&1 =~ "could not place a supervision child")) == 3
+      refute content(igniter, "lib/my_app/application.ex") =~ "Clementine"
+      assert [warning] = Enum.filter(warnings, &(&1 =~ "could not place a supervision child"))
+      assert warning =~ "after Oban"
+      assert warning =~ "{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []}"
+    end
 
-      assert Enum.any?(
-               warnings,
-               &(&1 =~ "{Registry, keys: :duplicate, name: MyApp.Agents.Runners}")
-             )
+    test "a module that calls Clementine elsewhere still gets the child" do
+      application = """
+      defmodule MyApp.Application do
+        use Application
+
+        @impl true
+        def start(_type, _args) do
+          children = [
+            MyApp.Repo,
+            {Oban, Application.fetch_env!(:my_app, Oban)}
+          ]
+
+          Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
+        end
+
+        def ask(agent, prompt), do: Clementine.run(agent, prompt)
+      end
+      """
+
+      igniter =
+        project(files: %{"lib/my_app/application.ex" => application})
+        |> install()
+        |> apply_igniter!()
+
+      assert content(igniter, "lib/my_app/application.ex") =~
+               "{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []}"
     end
 
     test "a child the host moved is not added again" do
@@ -199,14 +217,13 @@ defmodule Mix.Tasks.Clementine.InstallTest do
         def start(_type, _args) do
           children = [
             MyApp.Repo,
-            {Registry, keys: :duplicate, name: MyApp.Agents.Runners},
             {Oban, Application.fetch_env!(:my_app, Oban)}
           ] ++ agent_children()
 
           Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
         end
 
-        defp agent_children, do: [MyApp.Agents.DrainNotifier, MyApp.Agents.Reaper]
+        defp agent_children, do: [{Clementine, Application.fetch_env!(:my_app, Clementine)}]
       end
       """
 
@@ -243,11 +260,19 @@ defmodule Mix.Tasks.Clementine.InstallTest do
     Igniter.compose_task(igniter, "clementine.install", argv)
   end
 
-  defp migrations(igniter, suffix) do
+  # The repo's add_clementine migrations.
+  defp migrations(igniter, repo \\ "repo") do
+    igniter
+    |> paths("priv/#{repo}/migrations/")
+    |> Enum.filter(&String.ends_with?(&1, "_add_clementine.exs"))
+  end
+
+  defp paths(igniter, prefix) do
     igniter.rewrite
     |> Rewrite.sources()
     |> Enum.map(& &1.path)
-    |> Enum.filter(&String.ends_with?(&1, suffix))
+    |> Enum.filter(&String.starts_with?(&1, prefix))
+    |> Enum.sort()
   end
 
   # The application's children as trimmed lines, from the line after

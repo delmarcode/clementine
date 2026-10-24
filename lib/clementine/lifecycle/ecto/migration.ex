@@ -80,8 +80,8 @@ if Code.ensure_loaded?(Ecto.Migration) do
         end
 
     When a version 2 exists, a host adopts it in a new migration with
-    `up(:agent_runs, from: 1, version: 2)`. `mix clementine.install`
-    generates the versioned form.
+    `up(:agent_runs, from: 1, version: 2)`. `Clementine.Migration`, which
+    `mix clementine.install` generates a call to, uses the versioned form.
 
     ## Backfill for existing adopters
 

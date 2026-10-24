@@ -1,14 +1,12 @@
 defmodule <%= @module %>Test do
   use <%= @app_module %>.AgentsCase
 
-<%= for name <- @test_aliases do %>  alias <%= name %>
-<% end %>
-  test "is registered in the catalog" do
-    assert {:ok, <%= @alias %>} = Catalog.fetch("<%= @key %>")
-  end
+  alias <%= @module %>
+  alias <%= @tool_module %>
 
   test "builds an agent with its tool" do
-    assert %Clementine.Agent{tools: [<%= @tool_alias %>]} = <%= @alias %>.agent(%AgentRun{})
+    assert %Clementine.Agent{tools: [<%= @tool_alias %>]} =
+             <%= @alias %>.agent(%Clementine.Runs.AgentRun{})
   end
 
   test "the tool answers a query" do
@@ -17,14 +15,16 @@ defmodule <%= @module %>Test do
   end
 
   test "a run calls the tool, then answers" do
-    {:ok, run} = Runs.start("<%= @key %>", "Look something up")
+    {:ok, run} = Clementine.Runs.start(<%= @alias %>, "Look something up")
 
     expect_turn(tool_events("toolu_1", "<%= @tool_name %>", %{query: "something"}))
     expect_turn(text_events("Here is what I found."))
 
-    assert :ok = perform_job(RunWorker, %{"run_id" => run.id})
+    assert :ok = perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})
 
-    assert %AgentRun{status: "completed", result: %{"output" => "Here is what I found."}} =
-             Runs.get_run!(run.id)
+    assert %Clementine.Runs.AgentRun{
+             status: "completed",
+             result: %{"output" => "Here is what I found."}
+           } = Clementine.Runs.get(run.id)
   end
 end

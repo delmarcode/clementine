@@ -1,7 +1,7 @@
 defmodule Clementine.GuidesTest do
   @moduledoc """
-  Keeps the hexdocs guides in lockstep with the code: every `elixir`
-  fence in `guides/*.md` must at least parse, and every complete module
+  Keeps the hexdocs guides and `usage-rules.md` in lockstep with the
+  code: every `elixir` fence in them must at least parse, and every complete module
   sample compiles for real — so a renamed function, changed arity, or
   dropped option in the library breaks the guide's sample here, not in an
   adopter's cold read.
@@ -30,7 +30,7 @@ defmodule Clementine.GuidesTest do
   # Compiled guide modules are global state; keep the file serial.
   use ExUnit.Case, async: false
 
-  @guides Path.wildcard("guides/*.md")
+  @guides Path.wildcard("guides/*.md") ++ ["usage-rules.md"]
 
   @parse_only_marker ~r/^<!--\s*guide-sample:\s*parse-only\s*-->\s*$/
   @host_app_namespace ~r/MyApp/

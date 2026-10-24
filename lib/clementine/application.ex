@@ -12,7 +12,13 @@ defmodule Clementine.Application do
 
     children = [
       # Task supervisor for tool execution
-      {Task.Supervisor, name: Clementine.TaskSupervisor}
+      {Task.Supervisor, name: Clementine.TaskSupervisor},
+      # Durable-runtime workers register here so a draining node can reach
+      # them (Clementine.Runs.DrainNotifier). It lives in Clementine's own
+      # tree, which starts before the host's and stops after it, because a
+      # registry links to every process registered in it: stopped while
+      # workers still run, it would take them down with it.
+      {Registry, keys: :duplicate, name: Clementine.Runs.Registry}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
