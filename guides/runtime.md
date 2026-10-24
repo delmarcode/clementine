@@ -209,7 +209,14 @@ Before the runtime moved into the library, `mix clementine.install`
 copied it into the app as `MyApp.Agents.{AgentRun, Lifecycle, Definition,
 Catalog, Runs, RunWorker, Reaper, DrainNotifier}`. The table it generated
 is the table `Clementine.Migration` version 1 builds (for apps generated
-with binary ids), so moving keeps every row:
+with binary ids), so moving keeps every row.
+
+Move in two deploys. First bump Clementine and change nothing else: the
+copied runtime keeps running, and every node now has
+`Clementine.Runs.Worker`. A node without the `{Clementine, ...}` child
+holds such a job (it snoozes) until a node with the runtime takes it, so
+during the second deploy's rollout an old node never fails a job a new
+node enqueued. The second deploy makes the switch:
 
 1. Delete those modules except `RunWorker`, their tests, and the
    `MyApp.Agents.Runners`, `Reaper`, and `DrainNotifier` children.
