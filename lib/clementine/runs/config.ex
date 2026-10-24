@@ -57,13 +57,21 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @spec put(t()) :: :ok
     def put(%__MODULE__{} = config), do: :persistent_term.put(@key, config)
 
+    @spec fetch() :: {:ok, t()} | :error
+    def fetch do
+      case :persistent_term.get(@key, nil) do
+        %__MODULE__{} = config -> {:ok, config}
+        nil -> :error
+      end
+    end
+
     @spec fetch!() :: t()
     def fetch! do
-      case :persistent_term.get(@key, nil) do
-        %__MODULE__{} = config ->
+      case fetch() do
+        {:ok, config} ->
           config
 
-        nil ->
+        :error ->
           raise RuntimeError,
                 "Clementine's durable runtime is not running: add " <>
                   "{Clementine, repo: MyApp.Repo, agents: [...]} to your application's " <>

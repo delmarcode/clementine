@@ -211,8 +211,8 @@ Catalog, Runs, RunWorker, Reaper, DrainNotifier}`. The table it generated
 is the table `Clementine.Migration` version 1 builds (for apps generated
 with binary ids), so moving keeps every row:
 
-1. Delete those modules, their tests, and the `MyApp.Agents.Runners`,
-   `Reaper`, and `DrainNotifier` children.
+1. Delete those modules except `RunWorker`, their tests, and the
+   `MyApp.Agents.Runners`, `Reaper`, and `DrainNotifier` children.
 2. Add `{Clementine, repo: ..., agents: [...]}` after Oban, listing the
    agents from `config :my_app, MyApp.Agents.Catalog`, and delete that
    config.
@@ -228,6 +228,23 @@ with binary ids), so moving keeps every row:
 6. Keep the old migration and do not add `Clementine.Migration.up/1`:
    the table exists. A later version arrives as
    `Clementine.Migration.up(from: 1, version: 2)`.
+7. Keep `RunWorker` for one deploy, reduced to a forwarder. Jobs already
+   queued name it, and so do jobs an old node requeues while it drains;
+   without it they fail, and the reaper interrupts their runs. The job
+   arguments are the same:
+
+   ```elixir
+   defmodule MyApp.Agents.RunWorker do
+     use Oban.Worker, queue: :agents, max_attempts: 1
+
+     @impl Oban.Worker
+     def perform(job), do: Clementine.Runs.Worker.perform(job)
+   end
+   ```
+
+   Delete it in a later deploy, once no unfinished job names it:
+   `SELECT count(*) FROM oban_jobs WHERE worker = 'MyApp.Agents.RunWorker'
+   AND state NOT IN ('completed', 'cancelled', 'discarded')` returns 0.
 
 An app whose run machinery grew on its own (yakky's `Yakky.Agents`)
 moves the same way once its table matches version 1. Compare it column

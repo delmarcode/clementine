@@ -19,6 +19,21 @@ defmodule Clementine.Runs.WorkerTest do
     assert_enqueued(worker: Worker, args: %{"run_id" => run.id}, queue: :agents)
   end
 
+  test "a job that arrives before the runtime is up waits for it" do
+    {:ok, run} = Runs.start(Echo, "Early")
+    :persistent_term.erase({Clementine.Runs.Config, :config})
+
+    assert {:snooze, 1} = perform_job(Worker, %{"run_id" => run.id})
+
+    Clementine.Runs.Config.put(
+      Clementine.Runs.Config.new!(repo: TestRepo, agents: [Echo], host: Clementine.RunsCase.Host)
+    )
+
+    expect_turn(text_events("Hello."))
+    assert :ok = perform_job(Worker, %{"run_id" => run.id})
+    assert %AgentRun{status: "completed"} = Runs.get(run.id)
+  end
+
   test "a run that already finished is not executed again" do
     {:ok, run} = Runs.start(Echo, "Once")
     expect_turn(text_events("Done."))

@@ -28,14 +28,28 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # unless the agent sets `defaults: [max_duration: ...]`.
     @max_duration :timer.minutes(10)
 
+    # How long a job waits when it arrives before the runtime is up.
+    @not_ready_snooze 1
+
     @impl Oban.Worker
-    def perform(%Oban.Job{id: job_id, args: %{"run_id" => run_id}}) do
+    def perform(%Oban.Job{args: %{"run_id" => run_id}} = job) do
       Logger.metadata(run_id: run_id)
 
+      # Oban starts first and may hand over a backlog before
+      # {Clementine, ...} has published its config. Snoozing keeps the job
+      # (Oban adds the attempt back), where failing would discard it and
+      # leave the run to the reaper.
+      case Config.fetch() do
+        {:ok, config} -> perform(config, job)
+        :error -> {:snooze, @not_ready_snooze}
+      end
+    end
+
+    defp perform(config, %Oban.Job{id: job_id, args: %{"run_id" => run_id}}) do
       # Register first, so a drain at shutdown reaches this process.
       DrainNotifier.register()
 
-      case execute(Config.fetch!(), run_id, "oban:#{job_id}:#{node()}") do
+      case execute(config, run_id, "oban:#{job_id}:#{node()}") do
         {:finished, %Facts{status: :queued}} ->
           # A graceful drain requeued the run before any effect fired; the
           # next node picks it up and it survives the deploy unseen.
