@@ -21,9 +21,9 @@ if Code.ensure_loaded?(Ecto.Migration) do
 
     `agent_runs`, keyed by UUID:
 
-        agent         text, not null     the agent's key (Clementine.Agent)
+        agent_key     text, not null     the agent's key (Clementine.Agent)
         subject_type  text               what the run is about; at most one
-        subject_id    text               active run per subject
+        subject_id    text               active run per agent and subject
         input         jsonb              %{"prompt" => ...}
         result        jsonb              %{"output" => ...} once completed
         oban_job_id   bigint             the run's current job
@@ -32,11 +32,13 @@ if Code.ensure_loaded?(Ecto.Migration) do
 
     plus the lifecycle columns of the column recipe
     (`Clementine.Lifecycle.Ecto.Migration`, version 1) and its
-    single-active index on `(subject_type, subject_id)`. The index counts
-    queued, running, and waiting runs as active, so a run parked on an
-    approval blocks new runs for its subject until it resolves; runs
-    without a subject id never block each other, because NULLs are
-    distinct in a unique index.
+    single-active index on `(agent_key, subject_type, subject_id)`. Two
+    agents may work on one subject at once, and one agent only once: a
+    chat turn and a triage check of the same conversation don't block
+    each other. The index counts queued, running, and waiting runs as
+    active, so a run parked on an approval blocks new runs of its agent
+    for its subject until it resolves; runs without a subject id never
+    block each other, because NULLs are distinct in a unique index.
     """
 
     import Ecto.Migration
@@ -90,7 +92,7 @@ if Code.ensure_loaded?(Ecto.Migration) do
     defp step_up(1) do
       create table(@table, primary_key: false) do
         add(:id, :binary_id, primary_key: true)
-        add(:agent, :text, null: false)
+        add(:agent_key, :text, null: false)
         add(:subject_type, :text)
         add(:subject_id, :text)
         add(:input, :map, null: false, default: %{})
@@ -103,11 +105,11 @@ if Code.ensure_loaded?(Ecto.Migration) do
 
       Clementine.Lifecycle.Ecto.Migration.up(@table,
         version: 1,
-        scope: [:subject_type, :subject_id]
+        scope: [:agent_key, :subject_type, :subject_id]
       )
 
       create(index(@table, [:kind, :status]))
-      create(index(@table, [:agent]))
+      create(index(@table, [:agent_key]))
       create(index(@table, [:subject_type, :subject_id]))
       create(index(@table, [:oban_job_id]))
     end

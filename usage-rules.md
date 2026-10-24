@@ -27,10 +27,11 @@ lifecycle, or a reaper into the app.
 %Clementine.Runs.AgentRun{status: "completed", result: %{"output" => output}} = Clementine.Runs.get(run.id)
 ```
 
-- `start/3` takes the agent module. It returns `{:error, :active_run_exists}`
-  when the subject already has a queued, running, or waiting run, and
-  `:unknown_agent` or `:blank_prompt` for bad input. `metadata: %{}` is
-  stored as given.
+- `start/3` takes the agent module. Each agent has at most one queued,
+  running, or waiting run per subject: starting the same agent again
+  returns `{:error, :active_run_exists}`, and a different agent on the
+  same subject starts. It returns `:unknown_agent` or `:blank_prompt` for
+  bad input. `metadata: %{}` is stored as given.
 - `resume/2` takes `{:approved, meta}` or `{:denied, meta}` for a waiting
   run; a denial's `meta[:message]` reaches the model. It returns
   `{:error, :not_found | :not_waiting}`, or the host's refusal.

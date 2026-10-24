@@ -66,7 +66,7 @@ defmodule Clementine.Agent do
         }
 
   @doc """
-  The key run rows carry in their `agent` column. Keep it stable once runs
+  The key run rows carry in their `agent_key` column. Keep it stable once runs
   exist: a run whose key no longer resolves is cancelled as unstartable.
   """
   @callback key() :: String.t()

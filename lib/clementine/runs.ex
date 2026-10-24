@@ -52,15 +52,16 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     ## Options
 
-      * `:subject` — `{type, id}`, what the run is about, stored as text. At
-        most one run per subject is active (queued, running, or waiting) at
-        a time; a subject with a `nil` id never blocks another.
+      * `:subject` — `{type, id}`, what the run is about, stored as text.
+        Each agent has at most one active run (queued, running, or
+        waiting) per subject, and different agents never block each
+        other; a subject with a `nil` id never blocks another.
       * `:metadata` — a map stored on the row as given.
 
     Returns `{:error, :unknown_agent}` for a module the child spec does not
     list, `{:error, :blank_prompt}` for an empty prompt, and
-    `{:error, :active_run_exists}` when the subject already has an active
-    run.
+    `{:error, :active_run_exists}` when this agent already has an active
+    run for the subject.
     """
     @spec start(module(), String.t(), keyword()) ::
             {:ok, AgentRun.t()}
@@ -73,7 +74,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         {subject_type, subject_id} = subject(Keyword.get(opts, :subject))
 
         insert_run(config, %{
-          agent: key,
+          agent_key: key,
           input: %{"prompt" => prompt},
           subject_type: subject_type,
           subject_id: subject_id,

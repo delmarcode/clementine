@@ -54,7 +54,7 @@ defmodule Clementine.Runs.WorkerTest do
 
   test "a run whose agent is gone is cancelled as unstartable, and the host hears why" do
     Process.register(self(), :clementine_runs_test)
-    run = insert_queued_run!(%{agent: "retired_agent"})
+    run = insert_queued_run!(%{agent_key: "retired_agent"})
 
     assert {:cancel, reason} = perform_job(Worker, %{"run_id" => run.id})
     assert reason =~ "unknown_agent"

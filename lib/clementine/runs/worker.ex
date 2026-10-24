@@ -116,7 +116,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # time from code, so a deploy that changes an agent applies to the next
     # execution of every run.
     defp build(config, %AgentRun{} = row) do
-      with {:ok, module} <- fetch_agent(config, row.agent),
+      with {:ok, module} <- fetch_agent(config, row.agent_key),
            {:ok, prompt} <- prompt(row),
            {:ok, subject} <- resolve_subject(config.host, row) do
         row = %{row | subject: subject}
@@ -128,7 +128,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             input: prompt,
             context: %{
               run_id: row.id,
-              agent: row.agent,
+              agent_key: row.agent_key,
               subject_type: row.subject_type,
               subject_id: row.subject_id,
               subject: subject

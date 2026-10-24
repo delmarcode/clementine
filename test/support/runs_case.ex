@@ -105,7 +105,7 @@ defmodule Clementine.RunsCase do
   def insert_queued_run!(attrs \\ %{}) do
     attrs
     |> Map.new()
-    |> Map.put_new(:agent, "test_echo")
+    |> Map.put_new(:agent_key, "test_echo")
     |> Map.put_new(:input, %{"prompt" => "Hello"})
     |> AgentRun.queued_changeset()
     |> TestRepo.insert!()

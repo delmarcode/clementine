@@ -97,18 +97,21 @@ defmodule Clementine.Runs.RuntimeTest do
         |> Map.new(fn [name, type] -> {name, type} end)
 
       assert columns["id"] == "uuid"
-      assert columns["agent"] == "text"
+      assert columns["agent_key"] == "text"
       assert columns["subject_id"] == "text"
       assert columns["input"] == "jsonb"
       assert columns["lease_epoch"] == "bigint"
       assert columns["queued_at"] == "timestamp with time zone"
       assert map_size(columns) == 25
 
-      assert [[_index]] =
+      assert [[index]] =
                TestRepo.query!("""
                SELECT indexdef FROM pg_indexes
                WHERE indexname = 'agent_runs_single_active_run_index'
                """).rows
+
+      assert index =~ "UNIQUE INDEX"
+      assert index =~ "(agent_key, subject_type, subject_id)"
     end
 
     test "names only versions that exist" do

@@ -4,7 +4,7 @@ if Code.ensure_loaded?(Ecto.Schema) do
     One durable attempt to execute an agent: a row of `agent_runs`
     (`Clementine.Migration`), as `Clementine.Runs.get/1` returns it.
 
-    The app's fields are `agent` (the agent's key), `subject_type` and
+    The app's fields are `agent_key` (the agent's key), `subject_type` and
     `subject_id`, `input` (`%{"prompt" => ...}`), `result`
     (`%{"output" => ...}` once completed), `oban_job_id`, and `metadata`.
     `status` is one of `queued`, `running`, `waiting`, `completed`,
@@ -26,7 +26,7 @@ if Code.ensure_loaded?(Ecto.Schema) do
     @type t :: %__MODULE__{}
 
     schema "agent_runs" do
-      field(:agent, :string)
+      field(:agent_key, :string)
       field(:subject_type, :string)
       field(:subject_id, :string)
       field(:subject, :any, virtual: true)
@@ -58,13 +58,13 @@ if Code.ensure_loaded?(Ecto.Schema) do
 
     @doc false
     # A queued run. The unique_constraint names the single-active index, so
-    # a second active run for one subject is a changeset error, not an
-    # exception.
+    # a second active run of one agent for one subject is a changeset
+    # error, not an exception.
     def queued_changeset(attrs) do
       %__MODULE__{}
-      |> cast(attrs, [:agent, :subject_type, :subject_id, :input, :metadata])
-      |> validate_required([:agent])
-      |> unique_constraint([:subject_type, :subject_id],
+      |> cast(attrs, [:agent_key, :subject_type, :subject_id, :input, :metadata])
+      |> validate_required([:agent_key])
+      |> unique_constraint([:agent_key, :subject_type, :subject_id],
         name: :agent_runs_single_active_run_index
       )
     end
@@ -72,7 +72,7 @@ if Code.ensure_loaded?(Ecto.Schema) do
     @doc false
     def active_run_conflict?(%Ecto.Changeset{errors: errors}) do
       Enum.any?(errors, fn
-        {:subject_type, {_message, opts}} -> opts[:constraint] == :unique
+        {:agent_key, {_message, opts}} -> opts[:constraint] == :unique
         _other -> false
       end)
     end

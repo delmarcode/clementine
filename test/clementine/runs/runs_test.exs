@@ -17,7 +17,11 @@ defmodule Clementine.RunsTest do
     test "a started run executes on the agents queue, stores its output, and reports it" do
       {:ok, run} = Runs.start(Echo, "Say hello")
 
-      assert %AgentRun{agent: "test_echo", status: "queued", input: %{"prompt" => "Say hello"}} =
+      assert %AgentRun{
+               agent_key: "test_echo",
+               status: "queued",
+               input: %{"prompt" => "Say hello"}
+             } =
                run
 
       assert_enqueued(worker: Worker, args: %{"run_id" => run.id}, queue: :agents)
@@ -31,10 +35,25 @@ defmodule Clementine.RunsTest do
                        %Result.Completed{output: "Hello."}}
     end
 
-    test "a subject has at most one active run" do
+    test "each agent has at most one active run per subject" do
       assert {:ok, _run} = Runs.start(Echo, "First", subject: {"ticket", 1})
       assert {:error, :active_run_exists} = Runs.start(Echo, "Second", subject: {"ticket", 1})
       assert {:ok, _run} = Runs.start(Echo, "Elsewhere", subject: {:ticket, 2})
+    end
+
+    test "different agents on one subject both run" do
+      assert {:ok, echo} = Runs.start(Echo, "Answer", subject: {"ticket", 1})
+      assert {:ok, lookup} = Runs.start(Lookup, "Look it up", subject: {"ticket", 1})
+      assert {:error, :active_run_exists} = Runs.start(Lookup, "Again", subject: {"ticket", 1})
+
+      expect_turn(text_events("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => echo.id})
+
+      expect_turn(text_events("Found it."))
+      assert :ok = perform_job(Worker, %{"run_id" => lookup.id})
+
+      assert %AgentRun{agent_key: "test_echo", status: "completed"} = Runs.get(echo.id)
+      assert %AgentRun{agent_key: "test_lookup", status: "completed"} = Runs.get(lookup.id)
     end
 
     test "a subject with no id stores NULL, so such runs never block each other" do

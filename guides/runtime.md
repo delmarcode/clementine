@@ -45,7 +45,7 @@ commit in one transaction. `oban` defaults to `Oban`, `queue` to `:agents`
 none, and `host` to none. Nothing else is configurable.
 
 The migration builds `agent_runs`, keyed by UUID, with the column recipe
-and the single-active index on `(subject_type, subject_id)`:
+and the single-active index on `(agent_key, subject_type, subject_id)`:
 
 ```elixir
 defmodule MyApp.Repo.Migrations.AddClementine do
@@ -101,10 +101,11 @@ Clementine.Runs.get(run.id)
 {:ok, :finished} = Clementine.Runs.cancel(run.id)
 ```
 
-- `start/3` inserts the run and its Oban job in one transaction. A
-  subject has at most one active run (queued, running, or waiting):
-  a second start returns `{:error, :active_run_exists}`. A subject with a
-  `nil` id never blocks another.
+- `start/3` inserts the run and its Oban job in one transaction. Each
+  agent has at most one active run (queued, running, or waiting) per
+  subject: a second start of the same agent returns
+  `{:error, :active_run_exists}`, and another agent may start on the same
+  subject. A subject with a `nil` id never blocks another.
 - `get/1` returns the row. Read it freely; only the runtime writes it.
 - `resume/2` takes a waiting run's decision, `{:approved, meta}` or
   `{:denied, meta}`. A tool declared `approval: :required` parks its run
@@ -233,16 +234,14 @@ a sweep, a burst that outgrows the queue, the reaper, and the drain.
 
 Before the runtime moved into the library, `mix clementine.install`
 copied it into the app as `MyApp.Agents.{AgentRun, Lifecycle, Definition,
-Catalog, Runs, RunWorker, Reaper, DrainNotifier}`. The table it generated
-is the table `Clementine.Migration` version 1 builds (for apps generated
-with binary ids), so moving keeps every row.
+Catalog, Runs, RunWorker, Reaper, DrainNotifier}`. Its table (for apps
+generated with binary ids) is version 1's table before two changes: the
+agent column was `agent`, and the single-active index covered
+`(subject_type, subject_id)`. Step 6 migrates it, and every row stays.
 
-Move in two deploys. First bump Clementine and change nothing else: the
-copied runtime keeps running, and every node now has
-`Clementine.Runs.Worker`. A node without the `{Clementine, ...}` child
-holds such a job (it snoozes) until a node with the runtime takes it, so
-during the second deploy's rollout an old node never fails a job a new
-node enqueued. The second deploy makes the switch:
+Move in one switch deploy. The migration renames a column the copied
+runtime reads, so stop every old node before it runs; a rolling deploy
+would leave old nodes failing on the missing column.
 
 1. Delete those modules except `RunWorker`, their tests, and the
    `MyApp.Agents.Runners`, `Reaper`, and `DrainNotifier` children.
@@ -257,14 +256,39 @@ node enqueued. The second deploy makes the switch:
    around `Runs.resume/2` into `authorize_resume/2`.
 5. Replace `MyApp.Agents.Runs.start("key", prompt)` with
    `Clementine.Runs.start(MyApp.Agents.Key, prompt)`, `get_run/1` with
-   `get/1`, and `RunWorker` with `Clementine.Runs.Worker` in tests.
-6. Keep the old migration and do not add `Clementine.Migration.up/1`:
-   the table exists. A later version arrives as
-   `Clementine.Migration.up(from: 1, version: 2)`.
-7. Keep `RunWorker` for one deploy, reduced to a forwarder. Jobs already
-   queued name it, and so do jobs an old node requeues while it drains;
-   without it they fail, and the reaper interrupts their runs. The job
-   arguments are the same:
+   `get/1`, `run.agent` with `run.agent_key`, and `RunWorker` with
+   `Clementine.Runs.Worker` in tests.
+6. Keep the old migration, and do not add `Clementine.Migration.up/1`:
+   the table exists. Add one that brings it to version 1:
+
+   ```elixir
+   defmodule MyApp.Repo.Migrations.MatchClementineVersion1 do
+     use Ecto.Migration
+
+     def change do
+       rename table(:agent_runs), :agent, to: :agent_key
+       execute "ALTER INDEX agent_runs_agent_index RENAME TO agent_runs_agent_key_index",
+               "ALTER INDEX agent_runs_agent_key_index RENAME TO agent_runs_agent_index"
+
+       drop index(:agent_runs, [:subject_type, :subject_id],
+              name: :agent_runs_single_active_run_index,
+              unique: true,
+              where: "status IN ('queued', 'running', 'waiting') AND kind = 'rollout'"
+            )
+
+       create unique_index(:agent_runs, [:agent_key, :subject_type, :subject_id],
+                name: :agent_runs_single_active_run_index,
+                where: "status IN ('queued', 'running', 'waiting') AND kind = 'rollout'"
+              )
+     end
+   end
+   ```
+
+   A later version arrives as `Clementine.Migration.up(from: 1, version: 2)`.
+7. Keep `RunWorker` for one deploy, reduced to a forwarder. Jobs queued
+   before the switch name it, and so do jobs the old nodes requeued while
+   they drained; without it they fail, and the reaper interrupts their
+   runs. The job arguments are the same:
 
    ```elixir
    defmodule MyApp.Agents.RunWorker do
@@ -281,10 +305,10 @@ node enqueued. The second deploy makes the switch:
 
 An app whose run machinery grew on its own (yakky's `Yakky.Agents`)
 moves the same way once its table matches version 1. Compare it column
-by column first: version 1 names the agent column `agent`, stores
+by column first: version 1 names the agent column `agent_key`, stores
 `subject_id` as text, scopes the single-active index by
-`(subject_type, subject_id)`, and inserts rows with no other required
-columns. Product columns may stay as long as they are nullable or have
-defaults. Broadcasts of a run's end move to `run_committed/2`. What such
-an app does on top (chat turns that load a conversation's history,
-broadcasts of every other transition) stays in the app.
+`(agent_key, subject_type, subject_id)`, and inserts rows with no other
+required columns. Product columns may stay as long as they are nullable
+or have defaults. Broadcasts of a run's end move to `run_committed/2`.
+What such an app does on top (chat turns that load a conversation's
+history, broadcasts of every other transition) stays in the app.
