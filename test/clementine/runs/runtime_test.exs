@@ -39,6 +39,19 @@ defmodule Clementine.Runs.RuntimeTest do
       end
     end
 
+    test "refuses an Oban instance on another repo" do
+      defmodule OtherRepo do
+        use Ecto.Repo, otp_app: :clementine, adapter: Ecto.Adapters.Postgres
+      end
+
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: message}, _stack}} =
+               Clementine.Runs.Supervisor.start_link(repo: OtherRepo)
+
+      assert message =~ "Oban instance Oban uses Clementine.TestRepo"
+    end
+
     test "says to start after Oban when no Oban instance runs" do
       Process.flag(:trap_exit, true)
 

@@ -180,6 +180,34 @@ defmodule Mix.Tasks.Clementine.InstallTest do
       assert warning =~ "{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []}"
     end
 
+    test "a module that calls Clementine elsewhere still gets the child" do
+      application = """
+      defmodule MyApp.Application do
+        use Application
+
+        @impl true
+        def start(_type, _args) do
+          children = [
+            MyApp.Repo,
+            {Oban, Application.fetch_env!(:my_app, Oban)}
+          ]
+
+          Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
+        end
+
+        def ask(agent, prompt), do: Clementine.run(agent, prompt)
+      end
+      """
+
+      igniter =
+        project(files: %{"lib/my_app/application.ex" => application})
+        |> install()
+        |> apply_igniter!()
+
+      assert content(igniter, "lib/my_app/application.ex") =~
+               "{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []}"
+    end
+
     test "a child the host moved is not added again" do
       application = """
       defmodule MyApp.Application do

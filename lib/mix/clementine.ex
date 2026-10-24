@@ -68,9 +68,11 @@ if Code.ensure_loaded?(Igniter) do
     Adds `child` (source code) to the application's supervision tree,
     immediately `:before` or `:after` the list item that starts `anchor`.
 
-    `present` names a module whose mention anywhere in the application
-    module means the child is already there (usually the child's own
-    module). Then nothing changes, wherever the host moved it.
+    `present` names the module a child already in the tree starts with:
+    a list item that is `present` or a `{present, args}` tuple, in any list
+    of the application module. Then nothing changes, wherever the host
+    moved it. Other references to `present` (a helper calling it) do not
+    count.
 
     The anchor is found in any list in the module, including one joined
     with `++` or returned by a helper function. When no list item starts
@@ -94,7 +96,7 @@ if Code.ensure_loaded?(Igniter) do
                 manual_child(child, side, anchor, "#{inspect(app)} not found")
               )
 
-            mentions?(source, present) ->
+            match?({:ok, _child}, find_child(Zipper.topmost(source), present)) ->
               igniter
 
             true ->
@@ -134,20 +136,6 @@ if Code.ensure_loaded?(Igniter) do
 
           #{child}
       """
-    end
-
-    @doc "True when `module` appears as an alias anywhere under `zipper`."
-    @spec mentions?(Zipper.t(), module()) :: boolean()
-    def mentions?(zipper, module) do
-      zipper
-      |> Zipper.topmost()
-      |> Common.move_to(fn z ->
-        match?({:__aliases__, _, _}, z.node) and Common.nodes_equal?(z, module)
-      end)
-      |> case do
-        {:ok, _zipper} -> true
-        :error -> false
-      end
     end
 
     @doc """

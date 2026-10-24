@@ -39,7 +39,8 @@ children = [
 ]
 ```
 
-`repo` is required. `oban` defaults to `Oban`, `queue` to `:agents`
+`repo` is required, and must be the repo Oban uses: a run and its job
+commit in one transaction. `oban` defaults to `Oban`, `queue` to `:agents`
 (declare it in the Oban config: `queues: [agents: 10]`), `agents` to
 none, and `host` to none. Nothing else is configurable.
 
