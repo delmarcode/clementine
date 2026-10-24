@@ -150,6 +150,10 @@ defmodule Clementine.AgentServer do
           tasks: %{}
         }
 
+        # A supervisor's shutdown then reaches terminate/2, which stops the
+        # turn in flight.
+        Process.flag(:trap_exit, true)
+
         schedule_task_cleanup()
         {:ok, state}
       end
@@ -383,6 +387,26 @@ defmodule Clementine.AgentServer do
 
         schedule_task_cleanup()
         {:noreply, %{state | tasks: tasks}}
+      end
+
+      # Trapping exits turns a linked process's exit into a message. A link
+      # keeps its meaning: a normal exit is nothing, and any other stops the
+      # agent, through terminate/2.
+      @impl true
+      def handle_info({:EXIT, _pid, :normal}, state), do: {:noreply, state}
+      def handle_info({:EXIT, _pid, reason}, state), do: {:stop, reason, state}
+
+      # The turn in flight runs under Clementine.TaskSupervisor, unlinked so
+      # a crashing turn can't take the agent down, so nothing else stops it
+      # with the agent: left alone it would keep calling the model and
+      # running tools for an agent that no longer exists.
+      @impl true
+      def terminate(_reason, state) do
+        for {_task_id, %{status: :running, task: task}} <- state.tasks do
+          Task.shutdown(task, :brutal_kill)
+        end
+
+        :ok
       end
 
       # Private helpers
