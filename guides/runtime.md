@@ -171,7 +171,7 @@ with `Oban.Testing`:
 ```elixir
 {:ok, run} = Clementine.Runs.start(MyApp.Agents.Weather, "Is it sunny?")
 
-expect(MyApp.LLMMock, :stream, fn _model, _system, _messages, _tools, _opts ->
+expect(MyApp.Agents.LLMMock, :stream, fn _model, _system, _messages, _tools, _opts ->
   [{:text_delta, "Sunny."}, {:message_delta, %{"stop_reason" => "end_turn"}, %{}}]
 end)
 
@@ -179,7 +179,9 @@ assert :ok = perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})
 assert %{status: "completed"} = Clementine.Runs.get(run.id)
 ```
 
-`mix clementine.install` writes `MyApp.AgentsCase` with these helpers.
+`mix clementine.install` writes the mock, makes it the `llm_client` in
+`config/test.exs`, and writes `MyApp.AgentsCase`, whose `expect_turn/1`,
+`text_events/1`, and `tool_events/3` script turns like this one.
 The runtime's own suite proves the concurrency claims against Postgres in
 Clementine's CI: the conformance suite on `agent_runs`, the resume racing
 a sweep, a burst that outgrows the queue, the reaper, and the drain.
