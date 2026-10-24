@@ -25,7 +25,8 @@ defmodule Clementine.MixProject do
         "guides/approvals.md": [title: "Approvals & Suspension"],
         "guides/observation.md": [title: "Observing Runs"],
         "guides/durable-loops.md": [title: "Durable Loops"],
-        "guides/loop-operations.md": [title: "Loop Operations"]
+        "guides/loop-operations.md": [title: "Loop Operations"],
+        "usage-rules.md": [title: "Usage Rules"]
       ],
       groups_for_extras: [
         Guides: ~r{guides/}

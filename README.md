@@ -45,7 +45,10 @@ Then `Clementine.Runs.start(MyApp.Agents.Weather, "Will it rain?")` starts a
 run that survives deploys and crashes. Running either task again changes
 nothing. [The Durable Runtime](guides/runtime.md) guide covers the API, the
 host callbacks, and moving from a runtime an older installer copied into
-the app.
+the app. Coding agents in the app get the rules from
+[`usage-rules.md`](usage-rules.md), which the
+[`usage_rules`](https://hexdocs.pm/usage_rules) package gathers into an
+`AGENTS.md`.
 
 ## Quick Start
 

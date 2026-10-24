@@ -35,9 +35,10 @@ defmodule Clementine do
 
       {:ok, run} = Clementine.Runs.start(MyApp.Agents.Weather, "Is it sunny?")
 
-  See `Clementine.Runs`. Apps with their own run tables use the nouns
-  explicitly instead: build a `Clementine.Run` and call
-  `Clementine.Runner.execute/2` from a worker with a durable
+  See `Clementine.Runs` and `Clementine.Host`; coding agents working in
+  such an app read [`usage-rules.md`](usage-rules.md). Apps with their own
+  run tables use the nouns explicitly instead: build a `Clementine.Run`
+  and call `Clementine.Runner.execute/2` from a worker with a durable
   `Clementine.Lifecycle` implementation. See the durable execution RFC in
   `docs/DURABLE_EXECUTION_RFC.md`.
 

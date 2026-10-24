@@ -184,8 +184,11 @@ The durable runtime (`Clementine.Runs`, `{Clementine, ...}`,
 `mix clementine.gen.agent` render `priv/templates/` into a host app, and
 write only glue: the child spec, one migration, config, a test case, and
 `use Clementine.Agent` modules. A change to that public surface (the child
-spec's options, `Clementine.Runs`, `use Clementine.Agent`, the tool macro)
-updates the templates in the same commit.
+spec's options, `Clementine.Runs`, `Clementine.Host`, `use Clementine.Agent`,
+the tool macro) updates the templates and `usage-rules.md` in the same
+commit. `usage-rules.md` is what coding agents in host apps read (the
+`usage_rules` package copies it into their `AGENTS.md`): keep it short and
+decisive, and its samples pass `test/clementine/guides_test.exs`.
 
 - `test/mix/clementine_templates_test.exs` compiles the rendered code with
   zero warnings allowed, so API drift fails CI.

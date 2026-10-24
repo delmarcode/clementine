@@ -116,7 +116,7 @@ Clementine.Runs.get(run.id)
 
 ## The host module
 
-Three questions belong to the app, and one optional module answers them.
+Four questions belong to the app, and one optional module answers them.
 Every callback is optional:
 
 ```elixir
@@ -133,14 +133,22 @@ defmodule MyApp.Agents.Host do
 
   def authorize_resume(_run, _decision), do: {:error, :forbidden}
 
-  # What happens when a run finishes. Inside the terminal write's
-  # transaction: these writes commit with the status or not at all.
+  # What must happen when a run ends. Inside the transaction that ends
+  # it: these writes, and the mail job, commit with the run's end or not
+  # at all.
   @impl true
   def run_finished(run, %Result.Completed{output: output}) do
     MyApp.Tickets.record_triage!(run.subject_id, output)
+    Oban.insert!(MyApp.Workers.TriageMail.new(%{"ticket_id" => run.subject_id}))
   end
 
   def run_finished(_run, _result), do: :ok
+
+  # Who hears of it. After the commit, once, best-effort.
+  @impl true
+  def run_committed(run, _result) do
+    Phoenix.PubSub.broadcast(MyApp.PubSub, "ticket:#{run.subject_id}", {:run_ended, run.id})
+  end
 
   # How a subject resolves, at every claim. An error cancels the run as
   # unstartable.
@@ -154,12 +162,29 @@ defmodule MyApp.Agents.Host do
 end
 ```
 
-`run_finished/2` sees every terminal (`Completed`, `Failed`, `Cancelled`,
+Both finish hooks see every end (`Completed`, `Failed`, `Cancelled`,
 `Interrupted`), after the runtime stored a completed run's output in
-`result`. Because it runs inside the transaction, raising aborts the
-terminal write; send email or call services from an Oban job inserted
-here, which commits with the run. The resolved subject reaches `agent/1`
-as `run.subject` and every tool as `context.subject`.
+`result`. To choose between them, ask whether losing the work matters:
+
+- **It matters**: `run_finished/2`, inside the transaction that ends the
+  run. Raising aborts the end, and the runner retries it, so nothing that
+  leaves the database belongs here: send mail or call services from an
+  Oban job inserted here, which commits with the run.
+- **It may be lost**: `run_committed/2`, after that transaction commits,
+  once, and never for an end that rolled back. It runs in whichever
+  process wrote the end (the worker, the reaper, or the caller of
+  `cancel/1`), and a raise there is logged. A node that dies between the
+  commit and the call loses it.
+
+Keep both fast, and call `cancel/1` outside a transaction (it raises
+inside one, because its `run_committed/2` would fire before the caller's
+commit). The resolved subject reaches `agent/1` as `run.subject` and every
+tool as `context.subject`.
+
+Coding agents working in the app get these rules from
+[`usage-rules.md`](../usage-rules.md), which the
+[`usage_rules`](https://hexdocs.pm/usage_rules) package gathers into the
+app's `AGENTS.md`.
 
 ## Testing
 
@@ -200,8 +225,9 @@ a sweep, a burst that outgrows the queue, the reaper, and the drain.
   requeued for the next node, and the rest finish `interrupted`. Give
   them time with Oban's `shutdown_grace_period` and keep the platform's
   termination grace above it.
-- **Retries.** None by default (`max_attempts: 1`): a failed or
-  interrupted run may already have acted, and only the reaper may requeue.
+- **Retries.** None (`max_attempts: 1`): a failed or interrupted run may
+  already have acted. The reaper interrupts; only the drain requeues, and
+  only runs that have not touched the world.
 
 ## Moving from a copied runtime
 
@@ -259,6 +285,6 @@ by column first: version 1 names the agent column `agent`, stores
 `subject_id` as text, scopes the single-active index by
 `(subject_type, subject_id)`, and inserts rows with no other required
 columns. Product columns may stay as long as they are nullable or have
-defaults. What such an app does on top (chat turns that load a
-conversation's history, broadcasts on every transition) stays in the
-app.
+defaults. Broadcasts of a run's end move to `run_committed/2`. What such
+an app does on top (chat turns that load a conversation's history,
+broadcasts of every other transition) stays in the app.
