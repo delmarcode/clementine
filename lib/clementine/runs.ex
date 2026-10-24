@@ -3,8 +3,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @moduledoc """
     The durable runtime's API: start, resume, cancel, and read agent runs.
 
-    A host app runs agents durably with three pieces of glue, which
-    `mix clementine.install` writes:
+    A host app runs agents durably with three pieces of glue
+    (`mix clementine.install` writes the first two, and
+    `mix clementine.gen.agent` the third):
 
       * a child after Oban in its supervision tree:
 
@@ -146,11 +147,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         when verdict in [:approved, :denied] and is_map(meta) do
       %Config{repo: repo} = config = Config.fetch!()
 
-      with {:ok, id} <- cast_id(run_id) do
-        case repo.transaction(fn -> resume_locked(config, id, decision) end) do
-          {:ok, :ok} -> :ok
-          {:error, reason} -> {:error, reason}
-        end
+      with {:ok, id} <- cast_id(run_id),
+           {:ok, :ok} <- repo.transaction(fn -> resume_locked(config, id, decision) end) do
+        :ok
       end
     end
 
