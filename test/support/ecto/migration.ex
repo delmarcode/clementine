@@ -118,3 +118,22 @@ defmodule Clementine.Test.Ecto.CreateRecipeV1Runs do
     Recipe.down(:clementine_test_v1_down, version: 1)
   end
 end
+
+defmodule Clementine.Test.Ecto.CreateAgentRuns do
+  @moduledoc """
+  The durable runtime's tables, the way a host builds them: `agent_runs`
+  from `Clementine.Migration`, and Oban's `oban_jobs`.
+  """
+
+  use Ecto.Migration
+
+  def up do
+    Oban.Migration.up()
+    Clementine.Migration.up(version: 1)
+  end
+
+  def down do
+    Clementine.Migration.down(version: 1)
+    Oban.Migration.down(version: 1)
+  end
+end

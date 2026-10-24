@@ -1,28 +1,18 @@
 defmodule <%= @module %> do
   @moduledoc """
-  The <%= @human %> agent.
+  The <%= @human %> agent. It is listed in the `agents:` of the
+  `{Clementine, ...}` child in your application. Start a run with:
 
-  Start a run with:
-
-      <%= @agents %>.Runs.start("<%= @key %>", prompt)
+      Clementine.Runs.start(<%= @module %>, prompt)
   """
 
-  @behaviour <%= @agents %>.Definition
-
-  @impl true
-  def key, do: "<%= @key %>"
-
-  @impl true
-  def agent(_run) do
-    Clementine.Agent.new(
-      id: key(),
-      model: :claude_sonnet,
-      instructions: """
-      You are the <%= @human %> agent. Use your tools to find what you need,
-      then answer in a few sentences.
-      """,
-      tools: [<%= @tool_module %>],
-      defaults: [max_iterations: 10, max_duration: :timer.minutes(5)]
-    )
-  end
+  use Clementine.Agent,
+    key: "<%= @key %>",
+    model: :claude_sonnet,
+    instructions: """
+    You are the <%= @human %> agent. Use your tools to find what you need,
+    then answer in a few sentences.
+    """,
+    tools: [<%= @tool_module %>],
+    defaults: [max_iterations: 10, max_duration: :timer.minutes(5)]
 end

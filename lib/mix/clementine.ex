@@ -21,54 +21,18 @@ if Code.ensure_loaded?(Igniter) do
     alias Sourceror.Zipper
 
     @typedoc "The names a generator renders with."
-    @type context :: %{
-            app_name: atom(),
-            app_module: module(),
-            agents: module(),
-            repo: module()
-          }
+    @type context :: %{app_name: atom(), app_module: module(), agents: module()}
 
-    @doc "The host's app name, module prefix, agents namespace, and repo."
-    @spec context(Igniter.t(), keyword()) :: {:ok, context()} | {:error, Igniter.t()}
-    def context(igniter, opts) do
-      app_name = Igniter.Project.Application.app_name(igniter)
+    @doc "The host's app name, module prefix, and agents namespace."
+    @spec context(Igniter.t()) :: context()
+    def context(igniter) do
       app_module = Igniter.Project.Module.module_name_prefix(igniter)
 
-      with {:ok, repo} <- repo(igniter, app_name, opts[:repo]) do
-        {:ok,
-         %{
-           app_name: app_name,
-           app_module: app_module,
-           agents: Module.concat(app_module, Agents),
-           repo: repo
-         }}
-      end
-    end
-
-    defp repo(igniter, app_name, nil) do
-      case Igniter.Libs.Ecto.list_repos(igniter) do
-        {_igniter, [repo | _]} ->
-          {:ok, repo}
-
-        _none ->
-          {:error,
-           Igniter.add_issue(igniter, """
-           No Ecto repo found for #{inspect(app_name)}. Clementine's durable runtime
-           stores runs in Postgres through Ecto; add a repo, or pass --repo.
-           """)}
-      end
-    end
-
-    defp repo(igniter, _app_name, name) do
-      repo = Igniter.Project.Module.parse(name)
-
-      case Igniter.Project.Module.module_exists(igniter, repo) do
-        {true, _igniter} ->
-          {:ok, repo}
-
-        {false, _igniter} ->
-          {:error, Igniter.add_issue(igniter, "Repo #{inspect(repo)} does not exist.")}
-      end
+      %{
+        app_name: Igniter.Project.Application.app_name(igniter),
+        app_module: app_module,
+        agents: Module.concat(app_module, Agents)
+      }
     end
 
     @doc "Absolute path of one of Clementine's generator templates."
@@ -104,10 +68,11 @@ if Code.ensure_loaded?(Igniter) do
     Adds `child` (source code) to the application's supervision tree,
     immediately `:before` or `:after` the list item that starts `anchor`.
 
-    `present` names a module whose mention anywhere in the application
-    module means the child is already there (the child's own module, or
-    the name a `{Registry, name: ...}` child registers). Then nothing
-    changes, wherever the host moved it.
+    `present` names the module a child already in the tree starts with:
+    a list item that is `present` or a `{present, args}` tuple, in any list
+    of the application module. Then nothing changes, wherever the host
+    moved it. Other references to `present` (a helper calling it) do not
+    count.
 
     The anchor is found in any list in the module, including one joined
     with `++` or returned by a helper function. When no list item starts
@@ -131,7 +96,7 @@ if Code.ensure_loaded?(Igniter) do
                 manual_child(child, side, anchor, "#{inspect(app)} not found")
               )
 
-            mentions?(source, present) ->
+            match?({:ok, _child}, find_child(Zipper.topmost(source), present)) ->
               igniter
 
             true ->
@@ -173,31 +138,21 @@ if Code.ensure_loaded?(Igniter) do
       """
     end
 
-    @doc "True when `module` appears as an alias anywhere under `zipper`."
-    @spec mentions?(Zipper.t(), module()) :: boolean()
-    def mentions?(zipper, module) do
-      zipper
-      |> Zipper.topmost()
-      |> Common.move_to(fn z ->
-        match?({:__aliases__, _, _}, z.node) and Common.nodes_equal?(z, module)
-      end)
-      |> case do
-        {:ok, _zipper} -> true
-        :error -> false
-      end
-    end
-
     @doc """
-    True when the module under `zipper` declares `@behaviour behaviour`,
-    by full name or through an alias.
+    True when the module under `zipper` is a `Clementine.Agent`: it calls
+    `use Clementine.Agent` or declares `@behaviour Clementine.Agent`, by
+    full name or through an alias.
     """
-    @spec implements?(Zipper.t(), module()) :: boolean()
-    def implements?(zipper, behaviour) do
+    @spec agent?(Zipper.t()) :: boolean()
+    def agent?(zipper) do
       zipper
       |> Common.move_to(fn z ->
         case z.node do
+          {:use, _, [_module | _opts]} ->
+            z |> Zipper.down() |> Common.nodes_equal?(Clementine.Agent)
+
           {:@, _, [{:behaviour, _, [_arg]}]} ->
-            z |> Zipper.down() |> Zipper.down() |> Common.nodes_equal?(behaviour)
+            z |> Zipper.down() |> Zipper.down() |> Common.nodes_equal?(Clementine.Agent)
 
           _other ->
             false

@@ -16,33 +16,14 @@ function, and one worker. The subtle concurrency code — the parts that are
 easy to get wrong — ships in the library and is verified against *your*
 storage by a generated conformance suite.
 
-## The shortcut: `mix clementine.install`
+## The shortcut: the durable runtime
 
-Every step below is also a generator. In a Phoenix app with Oban, and
-with `{:igniter, "~> 0.8", only: [:dev, :test]}` in its deps:
-
-```bash
-mix clementine.install
-mix ecto.migrate
-mix clementine.gen.agent Weather
-```
-
-`clementine.install` writes this guide's code into your app under
-`MyApp.Agents`: the migration (Step 0, scoped by a `subject_type` and
-`subject_id` pair instead of a conversation, with the recipe pinned by
-`Clementine.Lifecycle.Ecto.Migration.up(:agent_runs, version: 1, ...)`
-so a later Clementine builds the same table), `AgentRun`, `Lifecycle`
-(Step 1), `Runs.start/3` (Step 2), `RunWorker` (Step 3), `Reaper` with
-`Runs.sweep/1` (Step 4), `DrainNotifier` and its registry (Step 5), and
-`MyApp.AgentsCase` with the conformance suite below. It adds the `agents`
-queue, a provider key, and a model alias to your config, and places the
-registry right before Oban and the reaper and drain notifier right after
-it. `clementine.gen.agent` adds an agent module, a tool, and a test, and
-lists the agent in `MyApp.Agents.Catalog`.
-
-Both tasks are idempotent: they never overwrite a file or a config key
-that exists, so a second run changes nothing. The generated code is yours
-from then on. The rest of this guide explains what it does.
+Clementine ships this guide's machinery as a runtime that owns its table,
+worker, reaper, and drain; the host writes a child spec, one migration,
+and agent modules, and `mix clementine.install` writes even those. See
+[The Durable Runtime](runtime.md). This guide is for apps that keep their
+own run table and worker: it builds the same machinery from the pieces,
+and explains what the runtime does.
 
 ## The shape
 

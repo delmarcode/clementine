@@ -2,9 +2,10 @@
 # Proves `mix clementine.install` and `mix clementine.gen.agent` against a
 # real, freshly generated Phoenix app: install, install again (no change),
 # generate an agent, generate it again (no change), then the app's own
-# gates. Its test suite runs Clementine's conformance suite against the
-# generated lifecycle on Postgres, and the generated agent end to end. The
-# generated code must also pass `credo --strict`.
+# gates. The generated test runs the agent end to end through Clementine's
+# runtime on Postgres, so it proves the glue: the child spec, the
+# migration, the test config, and the test case. The generated code must
+# also pass `credo --strict`.
 #
 # Needs the phx_new archive (`mix archive.install hex phx_new`; set
 # MIX_ARCHIVES to use one outside ~/.mix) and a Postgres the generated

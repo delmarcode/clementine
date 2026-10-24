@@ -13,21 +13,21 @@ defmodule Mix.Tasks.Clementine.Gen.Agent.Docs do
     """
     #{short_doc()}
 
-    Needs the runtime from `mix clementine.install`. For `Weather` it
-    writes:
+    Needs the `{Clementine, ...}` child that `mix clementine.install` adds
+    to your application. For `Weather` it writes:
 
-      * `MyApp.Agents.Weather`, a `MyApp.Agents.Definition` with the key
+      * `MyApp.Agents.Weather`, a `use Clementine.Agent` module with the key
         `"weather"`
       * `MyApp.Agents.Weather.Tools.Lookup`, a `Clementine.Tool` to replace
         with a real one
       * `test/my_app/agents/weather_test.exs`, which runs the agent end to
         end against a scripted model
 
-    and lists the agent in `config :my_app, MyApp.Agents.Catalog, agents:`.
-    Start a run with `MyApp.Agents.Runs.start("weather", prompt)`.
+    and adds `MyApp.Agents.Weather` to the child's `agents:`. Start a run
+    with `Clementine.Runs.start(MyApp.Agents.Weather, prompt)`.
 
     Running it again changes nothing: existing files are left as they are,
-    and the agent is listed in the catalog once.
+    and the agent is listed once.
 
     ## Example
 
@@ -50,8 +50,6 @@ if Code.ensure_loaded?(Igniter) do
 
     use Igniter.Mix.Task
 
-    alias Mix.Clementine
-
     @impl Igniter.Mix.Task
     def info(_argv, _composing_task) do
       %Igniter.Mix.Task.Info{
@@ -67,10 +65,10 @@ if Code.ensure_loaded?(Igniter) do
     def igniter(igniter) do
       name = igniter.args.positional.name
       tool = igniter.args.options[:tool]
+      ctx = Mix.Clementine.context(igniter)
 
       with :ok <- validate(name, tool),
-           {:ok, ctx} <- Clementine.context(igniter, []),
-           {:ok, igniter} <- require_runtime(igniter, ctx),
+           {:ok, igniter} <- require_runtime(igniter),
            {:ok, igniter} <- available(igniter, ctx, name) do
         generate(igniter, ctx, name, tool)
       else
@@ -79,10 +77,10 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
-    # The generated test aliases the agent, its tool, and the catalog, next
-    # to the AgentRun, Runs, and RunWorker aliases AgentsCase brings: their
-    # short names must not collide.
-    @taken_short_names ~w(AgentRun Catalog Runs RunWorker)
+    # The generated test aliases the agent and its tool and calls
+    # Clementine.Runs: neither short name may shadow `Clementine`, nor
+    # each other.
+    @taken_short_names ~w(Clementine)
 
     defp validate(name, tool) do
       agent_short = name |> String.split(".") |> List.last()
@@ -111,53 +109,49 @@ if Code.ensure_loaded?(Igniter) do
 
     defp short_name(module), do: module |> Module.split() |> List.last()
 
-    defp require_runtime(igniter, ctx) do
-      catalog = Module.concat(ctx.agents, Catalog)
-
-      case Igniter.Project.Module.module_exists(igniter, catalog) do
-        {true, igniter} ->
-          {:ok, igniter}
-
-        {false, igniter} ->
+    # The agent is listed in the runtime's child spec, so the runtime must
+    # be among the application's children.
+    defp require_runtime(igniter) do
+      with app when not is_nil(app) <- Mix.Clementine.app_module(igniter),
+           {:ok, {igniter, _source, zipper}} <- Igniter.Project.Module.find_module(igniter, app),
+           {:ok, _child} <- Mix.Clementine.find_child(zipper, Clementine) do
+        {:ok, igniter}
+      else
+        _missing ->
           {:error,
-           Igniter.add_issue(
-             igniter,
-             "#{inspect(catalog)} does not exist. Run `mix clementine.install` first."
-           )}
+           "The application has no {Clementine, ...} child. " <>
+             "Run `mix clementine.install` first."}
       end
     end
 
-    # The runtime's own names, including the two that are not modules in
-    # lib/: the runner registry and the test suite's model mock.
-    @runtime ~w(AgentRun Lifecycle Definition Catalog Runs RunWorker Reaper DrainNotifier
-                Runners LLMMock LifecycleTest RunsTest)
+    # The model mock test/support/agents_case.ex defines.
+    @reserved ~w(LLMMock)
 
-    # An existing module is only ever left alone. It may be listed in the
-    # catalog when it already is an agent (a second run, or an agent written
-    # by hand); any other module of that name makes the name unavailable,
-    # because listing it would make the catalog call key/0 on a module that
-    # has none.
-    defp available(_igniter, ctx, name) when name in @runtime do
+    # An existing module is only ever left alone. It may be listed when it
+    # already is an agent (a second run, or an agent written by hand); any
+    # other module of that name makes the name unavailable, because the
+    # runtime refuses to start with a module in `agents:` that is not an
+    # agent.
+    defp available(_igniter, ctx, name) when name in @reserved do
       {:error,
-       "#{inspect(Module.concat(ctx.agents, name))} is part of Clementine's runtime. " <>
-         "Pick another name."}
+       "#{inspect(Module.concat(ctx.agents, name))} is the model mock in " <>
+         "test/support/agents_case.ex. Pick another name."}
     end
 
     defp available(igniter, ctx, name) do
       module = Module.concat(ctx.agents, name)
-      definition = Module.concat(ctx.agents, Definition)
 
       case Igniter.Project.Module.find_module(igniter, module) do
         {:error, igniter} ->
           {:ok, igniter}
 
         {:ok, {igniter, _source, zipper}} ->
-          if Clementine.implements?(zipper, definition) do
+          if Mix.Clementine.agent?(zipper) do
             {:ok, igniter}
           else
             {:error,
              "#{inspect(module)} already exists and is not an agent " <>
-               "(it does not implement #{inspect(definition)}). Pick another name."}
+               "(it does not use Clementine.Agent). Pick another name."}
           end
       end
     end
@@ -167,37 +161,29 @@ if Code.ensure_loaded?(Igniter) do
       tool_module = Module.concat([module, Tools, Macro.camelize(tool)])
       key = name |> Macro.underscore() |> String.replace("/", "_")
 
-      catalog = Module.concat(ctx.agents, Catalog)
-
       assigns = [
         app_module: inspect(ctx.app_module),
-        agents: inspect(ctx.agents),
         module: inspect(module),
         alias: short_name(module),
         key: key,
         human: String.replace(key, "_", " "),
         tool_module: inspect(tool_module),
         tool_alias: short_name(tool_module),
-        tool_name: tool,
-        # Sorted the way credo's AliasOrder reads them.
-        test_aliases:
-          [catalog, module, tool_module]
-          |> Enum.map(&inspect/1)
-          |> Enum.sort_by(&String.downcase/1)
+        tool_name: tool
       ]
 
       igniter
-      |> Clementine.create_once(
+      |> Mix.Clementine.create_once(
         "clementine.gen.agent/agent.ex.eex",
         Igniter.Project.Module.proper_location(igniter, module),
         assigns
       )
-      |> Clementine.create_once(
+      |> Mix.Clementine.create_once(
         "clementine.gen.agent/tool.ex.eex",
         Igniter.Project.Module.proper_location(igniter, tool_module),
         assigns
       )
-      |> Clementine.create_once(
+      |> Mix.Clementine.create_once(
         "clementine.gen.agent/agent_test.exs.eex",
         Igniter.Project.Module.proper_location(
           igniter,
@@ -206,22 +192,38 @@ if Code.ensure_loaded?(Igniter) do
         ),
         assigns
       )
-      |> register(ctx, module)
+      |> register(module)
     end
 
-    # The catalog is a config list, so registering is an append that skips
-    # a module already listed: Igniter's strongest kind of edit.
-    defp register(igniter, ctx, module) do
-      catalog = Module.concat(ctx.agents, Catalog)
+    # The agents the runtime runs are the `agents:` list of its child, so
+    # registering is an append that skips a module already listed. A child
+    # whose options are not a literal keyword list (read from config, or
+    # built by a function) is left alone, with the edit to make by hand.
+    defp register(igniter, module) do
+      app = Mix.Clementine.app_module(igniter)
 
-      Igniter.Project.Config.configure(
-        igniter,
-        "config.exs",
-        ctx.app_name,
-        [catalog, :agents],
-        [module],
-        updater: &Igniter.Code.List.append_new_to_list(&1, module)
-      )
+      Igniter.Project.Module.find_and_update_module!(igniter, app, fn zipper ->
+        with {:ok, child} <- Mix.Clementine.find_child(zipper, Clementine),
+             {:ok, opts} <- Igniter.Code.Tuple.tuple_elem(child, 1),
+             {:ok, zipper} <-
+               Igniter.Code.Keyword.set_keyword_key(
+                 opts,
+                 :agents,
+                 [module],
+                 &Igniter.Code.List.append_new_to_list(&1, module)
+               ) do
+          {:ok, zipper}
+        else
+          _not_literal ->
+            {:warning,
+             """
+             Clementine could not list #{inspect(module)} in the agents: of the
+             {Clementine, ...} child in #{inspect(app)}. Add it by hand:
+
+                 agents: [..., #{inspect(module)}]
+             """}
+        end
+      end)
     end
   end
 else
