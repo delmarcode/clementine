@@ -20,8 +20,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       * `use Clementine.Agent` modules, listed in `agents:`.
 
     The optional `host:` module implements `Clementine.Host`: who may
-    resume a run, what happens when a run finishes, and how a subject
-    resolves. Nothing else is configurable.
+    resume a run, what commits with a run's end and what hears of it
+    after, and how a subject resolves. Nothing else is configurable.
+    Coding agents: the rules are in [`usage-rules.md`](usage-rules.md).
 
     Runs live in `agent_runs` and execute on Oban's `queue`, one job per
     execution (`Clementine.Runs.Worker`). Clementine owns the mechanism:
@@ -195,11 +196,22 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     runner honors at its next boundary (`{:ok, :flagged}`); a queued or
     waiting run finishes `cancelled` at once (`{:ok, :finished}`). Who may
     cancel which run is the app's decision: check it before calling.
+
+    Call it outside a transaction; inside one it raises. A run it ends
+    calls `c:Clementine.Host.run_committed/2` when its own write commits,
+    and inside the caller's transaction that write has not committed yet.
     """
     @spec cancel(Ecto.UUID.t()) ::
             {:ok, :flagged | :finished} | {:error, :already_terminal | :not_found | term()}
     def cancel(run_id) do
-      Config.fetch!()
+      %Config{repo: repo} = Config.fetch!()
+
+      if repo.in_transaction?() do
+        raise RuntimeError,
+              "Clementine.Runs.cancel/1 was called inside a transaction; call it after " <>
+                "the transaction commits, so the host's run_committed/2 never hears of " <>
+                "an end that rolls back"
+      end
 
       with {:ok, id} <- cast_id(run_id) do
         Protocol.request_cancel(Lifecycle, id, %{"code" => "cancelled"})

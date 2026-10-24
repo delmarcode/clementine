@@ -1,8 +1,12 @@
 defmodule Clementine.RunsTest do
   use Clementine.RunsCase
 
+  import Ecto.Query, only: [from: 2]
+  import ExUnit.CaptureLog
+
   alias Clementine.Result
   alias Clementine.Runs.Reaper
+  alias Clementine.RunsCase.Host
 
   setup do
     Process.register(self(), :clementine_runs_test)
@@ -175,6 +179,83 @@ defmodule Clementine.RunsTest do
       assert {:error, :not_waiting} = Runs.resume(run.id, {:approved, %{}})
       assert {:error, :not_found} = Runs.resume(Ecto.UUID.generate(), {:approved, %{}})
       assert %AgentRun{status: "queued"} = Runs.get(run.id)
+    end
+  end
+
+  describe "the host's finish hooks" do
+    test "run_finished/2 commits with the run's end, and run_committed/2 hears of it once, after" do
+      {:ok, run} = Runs.start(Echo, "Say hello")
+
+      expect_turn(text_events("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => run.id})
+
+      assert %AgentRun{status: "completed"} = Runs.get(run.id)
+      assert Host.host_writes(run.id) == ["run_finished"]
+      assert_received {:run_finished, _run, %Result.Completed{}}
+
+      assert_received {:run_committed,
+                       %AgentRun{status: "completed", result: %{"output" => "Hello."}},
+                       %Result.Completed{output: "Hello."}, false = _in_transaction?}
+
+      refute_received {:run_committed, _run, _result, _in_transaction?}
+    end
+
+    test "an end that rolls back takes run_finished/2's writes with it, and run_committed/2 never hears of it" do
+      {:ok, run} = Runs.start(Echo, "Never mind", metadata: %{"conformance_probe" => "raise"})
+
+      # run_finished/2 writes its row, then raises: the end rolls back.
+      assert_raise RuntimeError, "conformance probe", fn -> Runs.cancel(run.id) end
+
+      assert %AgentRun{status: "queued"} = Runs.get(run.id)
+      assert Host.host_writes(run.id) == []
+      refute_received {:run_committed, _run, _result, _in_transaction?}
+
+      # The next end commits, and run_committed/2 hears of that one alone.
+      {1, _} =
+        TestRepo.update_all(from(r in AgentRun, where: r.id == ^run.id), set: [metadata: %{}])
+
+      assert {:ok, :finished} = Runs.cancel(run.id)
+
+      assert Host.host_writes(run.id) == ["run_finished"]
+      assert_received {:run_committed, %AgentRun{status: "cancelled"}, %Result.Cancelled{}, false}
+      refute_received {:run_committed, _run, _result, _in_transaction?}
+    end
+
+    test "the reaper's interrupt reaches both hooks" do
+      run = insert_queued_run!()
+
+      assert %{interrupted: 1} = Reaper.sweep()
+
+      assert Host.host_writes(run.id) == ["run_finished"]
+
+      assert_received {:run_committed, %AgentRun{status: "interrupted"}, %Result.Interrupted{},
+                       false}
+    end
+
+    test "a raising run_committed/2 is logged, and the end stands" do
+      {:ok, run} = Runs.start(Echo, "Never mind", metadata: %{"committed_probe" => "raise"})
+
+      log = capture_log(fn -> assert {:ok, :finished} = Runs.cancel(run.id) end)
+
+      assert log =~ "Clementine.RunsCase.Host.run_committed/2 raised: committed probe"
+      assert %AgentRun{status: "cancelled"} = Runs.get(run.id)
+      assert Host.host_writes(run.id) == ["run_finished"]
+    end
+
+    test "cancel/1 refuses to run inside the caller's transaction" do
+      {:ok, run} = Runs.start(Echo, "Never mind")
+
+      # Were it allowed, run_committed/2 would hear of an end the caller's
+      # transaction then rolls back.
+      assert_raise RuntimeError, ~r/inside a transaction/, fn ->
+        TestRepo.transaction(fn ->
+          Runs.cancel(run.id)
+          TestRepo.rollback(:changed_my_mind)
+        end)
+      end
+
+      assert %AgentRun{status: "queued"} = Runs.get(run.id)
+      refute_received {:run_committed, _run, _result, _in_transaction?}
     end
   end
 

@@ -5,13 +5,17 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # agent_runs: the Ecto adapter's guarded compare-and-swap writes, with
     # the repo the child spec named. The projection runs inside the
     # transaction that makes a run terminal: it stores a completed run's
-    # output, then hands the result to the host's run_finished/2.
+    # output, queues the host's run_committed/2 for after the commit, and
+    # hands the result to the host's run_finished/2.
 
     @behaviour Clementine.Lifecycle
     @behaviour Clementine.Lifecycle.Ecto
 
     import Ecto.Query, only: [from: 2]
 
+    require Logger
+
+    alias Clementine.Emissions
     alias Clementine.Lifecycle.Ecto, as: EctoLifecycle
     alias Clementine.Result
     alias Clementine.Runs.{AgentRun, Config}
@@ -30,9 +34,14 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       %Config{repo: repo, host: host} = Config.fetch!()
       run = store_output(repo, result, run)
 
-      if host && function_exported?(host, :run_finished, 2) do
-        host.run_finished(run, result)
+      # The adapter brackets this transaction for emissions: this one
+      # fires once the transaction commits and is dropped if it rolls
+      # back, including when run_finished/2 raises below.
+      if exports?(host, :run_committed) do
+        Emissions.emit(fn -> run_committed(host, run, result) end)
       end
+
+      if exports?(host, :run_finished), do: host.run_finished(run, result)
 
       :ok
     end
@@ -47,5 +56,24 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     defp store_output(_repo, _result, run), do: run
+
+    defp exports?(nil, _callback), do: false
+    defp exports?(host, callback), do: function_exported?(host, callback, 2)
+
+    # The end is committed: a failing notification is logged and goes no
+    # further, or it would fail (and retry) a write that already happened.
+    defp run_committed(host, run, result) do
+      host.run_committed(run, result)
+    rescue
+      e ->
+        Logger.error(
+          "#{inspect(host)}.run_committed/2 raised: #{Exception.message(e)} (run: #{run.id})"
+        )
+    catch
+      kind, reason ->
+        Logger.error(
+          "#{inspect(host)}.run_committed/2 #{kind}: #{inspect(reason)} (run: #{run.id})"
+        )
+    end
   end
 end

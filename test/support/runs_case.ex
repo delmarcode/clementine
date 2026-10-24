@@ -151,15 +151,22 @@ end
 
 defmodule Clementine.RunsCase.Host do
   @moduledoc """
-  The test host. It refuses resumes decided `by: "mallory"`, reports every
-  finish to a process registered as `:clementine_runs_test`, raises for
-  the conformance suite's projection probe, and resolves `"ticket"`
-  subjects (a `"gone"` subject never resolves).
+  The test host. It refuses resumes decided `by: "mallory"`, and resolves
+  `"ticket"` subjects (a `"gone"` subject never resolves).
+
+  `run_finished/2` writes a row to its own table (`host_writes/1` reads
+  them) and then raises for the conformance suite's projection probe;
+  `run_committed/2` raises when the run's metadata says
+  `"committed_probe" => "raise"`. Both report to a process registered as
+  `:clementine_runs_test`, with whether they ran inside a transaction.
   """
 
   @behaviour Clementine.Host
 
+  import Ecto.Query, only: [from: 2]
+
   alias Clementine.Result
+  alias Clementine.TestRepo
 
   @impl true
   def authorize_resume(_run, {_verdict, %{by: "mallory"}}), do: {:error, :forbidden}
@@ -167,12 +174,34 @@ defmodule Clementine.RunsCase.Host do
 
   @impl true
   def run_finished(run, result) do
+    {1, _} =
+      TestRepo.insert_all("clementine_test_uuid_jobs", [
+        %{run_ref: Ecto.UUID.dump!(run.id), kind: "run_finished"}
+      ])
+
     :ok = probe(result, run.metadata)
+    report({:run_finished, run, result})
+  end
 
-    if pid = Process.whereis(:clementine_runs_test) do
-      send(pid, {:run_finished, run, result})
-    end
+  @impl true
+  def run_committed(run, result) do
+    if run.metadata["committed_probe"] == "raise", do: raise("committed probe")
+    report({:run_committed, run, result, TestRepo.in_transaction?()})
+  end
 
+  @doc "The kinds of the rows `run_finished/2` wrote for `run_id`, oldest first."
+  def host_writes(run_id) do
+    TestRepo.all(
+      from(j in "clementine_test_uuid_jobs",
+        where: j.run_ref == type(^run_id, Ecto.UUID),
+        order_by: j.id,
+        select: j.kind
+      )
+    )
+  end
+
+  defp report(message) do
+    if pid = Process.whereis(:clementine_runs_test), do: send(pid, message)
     :ok
   end
 
