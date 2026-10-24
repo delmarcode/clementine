@@ -159,18 +159,14 @@ defmodule Clementine.AgentServer do
       end
 
       @impl true
-      def handle_call({:run, prompt}, _from, state) do
+      def handle_call({:run, prompt}, from, state) do
         case running_task_ids(state) do
           [] ->
-            # Run synchronously, in this process — the ephemeral lifecycle
-            # is single-writer by construction.
-            case execute_turn(turn_rollout(state, prompt)) do
-              {:ok, %Clementine.Result.Completed{} = result} ->
-                {:reply, {:ok, result}, apply_history(state, result)}
-
-              {:error, _result} = error ->
-                {:reply, error, state}
-            end
+            # The turn runs in a task like an async one, with the caller as
+            # its waiter. Run in this process, it would hold off an exit
+            # signal (this process traps them) until the turn returned.
+            {_task_id, state} = start_turn(state, prompt, [{from, nil}])
+            {:noreply, state}
 
           task_ids ->
             {:reply, {:error, {:agent_busy, task_ids}}, state}
@@ -181,18 +177,8 @@ defmodule Clementine.AgentServer do
       def handle_call({:run_async, prompt}, _from, state) do
         case running_task_ids(state) do
           [] ->
-            task_id = generate_task_id()
-            rollout = turn_rollout(state, prompt)
-
-            # async_nolink so a crash in the turn doesn't take down the agent
-            task =
-              Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
-                execute_turn(rollout)
-              end)
-
-            entry = %{task: task, status: :running, waiters: []}
-            tasks = Map.put(state.tasks, task_id, entry)
-            {:reply, {:ok, task_id}, %{state | tasks: tasks}}
+            {task_id, state} = start_turn(state, prompt, [])
+            {:reply, {:ok, task_id}, state}
 
           task_ids ->
             {:reply, {:error, {:agent_busy, task_ids}}, state}
@@ -410,6 +396,22 @@ defmodule Clementine.AgentServer do
       end
 
       # Private helpers
+
+      # A turn in a task the agent tracks; finish_task/5 replies to its
+      # waiters. async_nolink so a crash in the turn doesn't take down the
+      # agent.
+      defp start_turn(state, prompt, waiters) do
+        rollout = turn_rollout(state, prompt)
+
+        task =
+          Task.Supervisor.async_nolink(Clementine.TaskSupervisor, fn ->
+            execute_turn(rollout)
+          end)
+
+        task_id = generate_task_id()
+        entry = %{task: task, status: :running, waiters: waiters}
+        {task_id, %{state | tasks: Map.put(state.tasks, task_id, entry)}}
+      end
 
       # One turn = one ephemeral run of the rollout, through the same
       # Agent/Rollout/Run/Runner path `Clementine.run/3` uses. Returns that
