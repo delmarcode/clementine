@@ -42,6 +42,8 @@ if postgres? do
     Clementine.Test.Ecto.CreateRecipeV1Runs
   )
 
+  Ecto.Migrator.up(Clementine.TestRepo, 20_261_023_000_001, Clementine.Test.Ecto.CreateAgentRuns)
+
   Ecto.Adapters.SQL.Sandbox.mode(Clementine.TestRepo, :manual)
 end
 

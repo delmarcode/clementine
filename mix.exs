@@ -21,6 +21,7 @@ defmodule Clementine.MixProject do
       extras: [
         "guides/getting-started.md": [title: "Getting Started"],
         "guides/durable-execution.md": [title: "Durable Execution"],
+        "guides/runtime.md": [title: "The Durable Runtime"],
         "guides/approvals.md": [title: "Approvals & Suspension"],
         "guides/observation.md": [title: "Observing Runs"],
         "guides/durable-loops.md": [title: "Durable Loops"],
@@ -30,6 +31,13 @@ defmodule Clementine.MixProject do
         Guides: ~r{guides/}
       ],
       groups_for_modules: [
+        "Durable runtime": [
+          Clementine.Runs,
+          Clementine.Runs.AgentRun,
+          Clementine.Runs.Worker,
+          Clementine.Host,
+          Clementine.Migration
+        ],
         Core: [
           Clementine,
           Clementine.Agent,
@@ -116,6 +124,10 @@ defmodule Clementine.MixProject do
       # Optional: the Ecto adapter's cancel push channel lights up only
       # when a host configures `pubsub:`.
       {:phoenix_pubsub, "~> 2.1", optional: true},
+      # Optional: the durable runtime (`{Clementine, ...}` and
+      # `Clementine.Runs`) executes runs on the host's Oban and compiles
+      # only when the host brings Oban and Ecto in.
+      {:oban, "~> 2.18", optional: true},
       {:nimble_options, "~> 1.1"},
       {:telemetry, "~> 1.0"},
       {:telemetry_metrics, "~> 1.0"},
@@ -125,9 +137,6 @@ defmodule Clementine.MixProject do
       {:igniter, "~> 0.8.4", optional: true},
       {:mox, "~> 1.1", only: :test},
       {:bypass, "~> 2.1", only: :test},
-      # Dev/test only: lets the guides' Oban-based host samples (workers,
-      # enqueue, reaper cron) compile-verify against the real macros.
-      {:oban, "~> 2.18", only: [:dev, :test]},
       {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
     ]

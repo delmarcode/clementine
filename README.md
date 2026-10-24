@@ -28,21 +28,24 @@ end
 
 ### Durable agents in a Phoenix app
 
-In a Phoenix app with Ecto and Oban, two generators write the durable
-runtime and your agents as ordinary code in your app. They need
+In a Phoenix app with Ecto and Oban, Clementine runs agents durably: it
+owns the `agent_runs` table, the Oban worker, the reaper, and the drain,
+and your app keeps a child spec, one migration, and its agent modules.
+Two generators write that glue. They need
 [Igniter](https://hexdocs.pm/igniter) as a dev dependency
 (`{:igniter, "~> 0.8", only: [:dev, :test]}`):
 
 ```bash
-mix clementine.install            # agent_runs table, lifecycle, worker, reaper, drain, tests
+mix clementine.install            # dependency, config, child spec, migration, test case
 mix ecto.migrate
 mix clementine.gen.agent Weather  # an agent, a tool, and a test that runs them
 ```
 
-Then `MyApp.Agents.Runs.start("weather", "Will it rain?")` starts a run
-that survives deploys and crashes. Running either task again changes
-nothing. The [Durable Execution](guides/durable-execution.md) guide
-explains what the generated code does and why.
+Then `Clementine.Runs.start(MyApp.Agents.Weather, "Will it rain?")` starts a
+run that survives deploys and crashes. Running either task again changes
+nothing. [The Durable Runtime](guides/runtime.md) guide covers the API, the
+host callbacks, and moving from a runtime an older installer copied into
+the app.
 
 ## Quick Start
 

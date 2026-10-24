@@ -25,8 +25,19 @@ defmodule Clementine do
 
       result.output
 
-  Production apps use the nouns explicitly: build a `Clementine.Run`, call
-  `Clementine.Runner.execute/2` from a host-owned worker with a durable
+  ## The durable runtime
+
+  Production apps run agents durably on Postgres and Oban: a child after
+  Oban in the supervision tree, one migration, and `use Clementine.Agent`
+  modules (`mix clementine.install` writes the glue):
+
+      {Clementine, repo: MyApp.Repo, agents: [MyApp.Agents.Weather]}
+
+      {:ok, run} = Clementine.Runs.start(MyApp.Agents.Weather, "Is it sunny?")
+
+  See `Clementine.Runs`. Apps with their own run tables use the nouns
+  explicitly instead: build a `Clementine.Run` and call
+  `Clementine.Runner.execute/2` from a worker with a durable
   `Clementine.Lifecycle` implementation. See the durable execution RFC in
   `docs/DURABLE_EXECUTION_RFC.md`.
 
@@ -102,6 +113,32 @@ defmodule Clementine do
 
   alias Clementine.{AgentServer, Events, Result, Rollout, Run, Runner}
   alias Clementine.Lifecycle.{Ephemeral, Facts}
+
+  @doc """
+  The durable runtime's child spec. Start it after Oban:
+
+      children = [
+        MyApp.Repo,
+        {Oban, Application.fetch_env!(:my_app, Oban)},
+        {Clementine, repo: MyApp.Repo, agents: [MyApp.Agents.Weather]}
+      ]
+
+  See `Clementine.Runs` for the options. It needs the optional `oban` and
+  `ecto_sql` dependencies.
+  """
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
+  def child_spec(opts) when is_list(opts) do
+    unless Code.ensure_loaded?(Clementine.Runs.Supervisor) do
+      raise ArgumentError,
+            "Clementine's durable runtime needs the oban and ecto_sql dependencies"
+    end
+
+    %{
+      id: __MODULE__,
+      start: {Clementine.Runs.Supervisor, :start_link, [opts]},
+      type: :supervisor
+    }
+  end
 
   @doc """
   Runs one rollout to a terminal result, in-process.
