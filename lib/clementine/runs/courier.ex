@@ -16,11 +16,12 @@ defmodule Clementine.Runs.Courier do
   # so every event emitted before a transition reaches the host before
   # the host hears of the transition.
   #
-  # The courier is linked to its run, so a run that is killed takes it
-  # along, even mid-callback, and the events still queued are dropped. A
-  # run that ends normally stops it (stop/1), and the courier's own exits
-  # never reach the run: callbacks cannot crash it, and the cut-off unlinks
-  # before it kills.
+  # The courier and its run are not linked, so nothing that happens to
+  # the courier reaches the run: not a raise in the callback, and not a
+  # crash of a process the callback linked to it. A guard process links
+  # them the other way: when the run dies, it kills the courier, even one
+  # blocked in a callback, and the events still queued are dropped. A run
+  # that ends normally has stopped its courier first (stop/1).
 
   @behaviour Clementine.Events
 
@@ -55,7 +56,8 @@ defmodule Clementine.Runs.Courier do
   @spec start(module(), struct(), keyword()) :: t()
   def start(host, run, opts \\ []) do
     owner = self()
-    pid = spawn_link(fn -> init(owner, host, run) end)
+    pid = spawn(fn -> loop(host, run) end)
+    spawn(fn -> guard(owner, pid) end)
 
     %__MODULE__{
       pid: pid,
@@ -111,7 +113,6 @@ defmodule Clementine.Runs.Courier do
     after
       timeout ->
         Process.demonitor(ref, [:flush])
-        Process.unlink(pid)
         Process.exit(pid, :kill)
 
         # A reply that raced the kill would otherwise sit in the run's
@@ -137,27 +138,29 @@ defmodule Clementine.Runs.Courier do
     :ok
   end
 
-  defp init(owner, host, run) do
-    loop(Process.monitor(owner), host, run)
+  # Kills the courier once its run is gone, and goes when the courier
+  # does. A monitor on a process already gone fires at once.
+  defp guard(owner, courier) do
+    owner_ref = Process.monitor(owner)
+    courier_ref = Process.monitor(courier)
+
+    receive do
+      {:DOWN, ^owner_ref, :process, _owner, _reason} -> Process.exit(courier, :kill)
+      {:DOWN, ^courier_ref, :process, _courier, _reason} -> :ok
+    end
   end
 
-  # Messages from the run arrive in the order it sent them, and before its
-  # DOWN, so a run that exits normally without stop/1 has its events
-  # delivered first.
-  defp loop(owner_ref, host, run) do
+  defp loop(host, run) do
     receive do
       {:event, event} ->
         call(host, run, event)
-        loop(owner_ref, host, run)
+        loop(host, run)
 
       {:sync, from, ref} ->
         send(from, {ref, :synced})
-        loop(owner_ref, host, run)
+        loop(host, run)
 
       :stop ->
-        :ok
-
-      {:DOWN, ^owner_ref, :process, _owner, _reason} ->
         :ok
     end
   end

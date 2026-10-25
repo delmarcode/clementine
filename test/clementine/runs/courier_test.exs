@@ -103,8 +103,6 @@ defmodule Clementine.Runs.CourierTest do
   test "a courier that is gone cuts the host off at the next wait" do
     courier = Courier.start(Host, run(), window: 1_000)
 
-    # Linked, its death would take the run along; this is the wait alone.
-    Process.unlink(courier.pid)
     Process.exit(courier.pid, :kill)
 
     log = capture_log(fn -> assert :ok = Courier.flush(courier) end)
@@ -129,22 +127,23 @@ defmodule Clementine.Runs.CourierTest do
     assert delivered() == [2]
   end
 
-  test "the courier delivers what its run sent, then stops with it" do
-    test = self()
+  test "a crash the callback links to the courier never reaches the run" do
+    courier = Courier.start(Host, run(), window: 1_000)
 
-    owner =
-      spawn(fn ->
-        courier = Courier.start(Host, %{id: "run-1", test: test})
-        send(test, {:courier, courier.pid})
-        for seq <- 1..3, do: Courier.deliver(courier, event(seq))
-      end)
+    # The callback's own child takes the courier down; the run hears of it
+    # only at its next wait, as a cut-off.
+    ref = Process.monitor(courier.pid)
 
-    assert_receive {:courier, pid}
-    ref = Process.monitor(pid)
-    # :noproc when it was already gone by the time the test looked.
-    assert_receive {:DOWN, ^ref, :process, ^pid, reason} when reason in [:normal, :noproc]
-    refute Process.alive?(owner)
-    assert delivered() == [1, 2, 3]
+    spawn(fn ->
+      Process.link(courier.pid)
+      exit(:callback_child_failed)
+    end)
+
+    assert_receive {:DOWN, ^ref, :process, _pid, :callback_child_failed}
+    log = capture_log(fn -> assert :ok = Courier.flush(courier) end)
+
+    assert log =~ ~r"run_event/2 stopped \(:(callback_child_failed|noproc)\)"
+    assert Process.alive?(self())
   end
 
   test "a run that is killed takes its courier along, even mid-callback" do
@@ -167,6 +166,19 @@ defmodule Clementine.Runs.CourierTest do
 
     Process.exit(owner, :kill)
     assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+  end
+
+  test "a run that ends without stopping its courier takes it along" do
+    test = self()
+
+    spawn(fn ->
+      courier = Courier.start(Host, %{id: "run-1", test: test})
+      send(test, {:courier, courier.pid})
+    end)
+
+    assert_receive {:courier, pid}
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, reason} when reason in [:killed, :noproc]
   end
 
   test "as a sink, it delivers through the courier in the lease's ctx and ignores any other" do
