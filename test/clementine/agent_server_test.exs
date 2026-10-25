@@ -739,4 +739,81 @@ defmodule Clementine.AgentServerTest do
              _message -> false
            end)
   end
+
+  describe "stopping the agent" do
+    test "stopping the agent stops its turn in flight" do
+      test_pid = self()
+
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        send(test_pid, {:stream_started, self()})
+        Process.sleep(:infinity)
+      end)
+
+      {:ok, agent} = TestAgent.start_link()
+      {:ok, _task_id} = Clementine.AgentServer.run_async(agent, "Long task")
+      assert_receive {:stream_started, turn}
+
+      GenServer.stop(agent)
+
+      refute Process.alive?(turn)
+    end
+
+    test "a supervisor's shutdown of the agent stops its turn in flight" do
+      test_pid = self()
+
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        send(test_pid, {:stream_started, self()})
+        Process.sleep(:infinity)
+      end)
+
+      agent = start_supervised!(TestAgent)
+      {:ok, _task_id} = Clementine.AgentServer.run_async(agent, "Long task")
+      assert_receive {:stream_started, turn}
+
+      stop_supervised!(TestAgent)
+
+      refute Process.alive?(turn)
+    end
+
+    test "a crashed parent stops a synchronous turn in flight" do
+      test_pid = self()
+
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        send(test_pid, {:stream_started, self()})
+        Process.sleep(:infinity)
+      end)
+
+      parent =
+        spawn(fn ->
+          {:ok, agent} = TestAgent.start_link()
+          send(test_pid, {:agent, agent})
+          Clementine.AgentServer.run(agent, "Long task")
+        end)
+
+      assert_receive {:agent, agent}
+      assert_receive {:stream_started, turn}
+      monitor = Process.monitor(agent)
+
+      Process.exit(parent, :boom)
+
+      assert_receive {:DOWN, ^monitor, :process, ^agent, :boom}
+      refute Process.alive?(turn)
+    end
+
+    test "a linked process's exit stops the agent only when it is abnormal" do
+      {:ok, agent} = TestAgent.start_link()
+      Process.unlink(agent)
+      monitor = Process.monitor(agent)
+
+      spawn(fn -> Process.link(agent) end)
+      refute_receive {:DOWN, ^monitor, :process, ^agent, _reason}, 50
+
+      spawn(fn ->
+        Process.link(agent)
+        exit(:boom)
+      end)
+
+      assert_receive {:DOWN, ^monitor, :process, ^agent, :boom}
+    end
+  end
 end
