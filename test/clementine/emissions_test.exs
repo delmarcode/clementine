@@ -91,4 +91,38 @@ defmodule Clementine.EmissionsTest do
     Emissions.drop(outer)
     assert fired() == []
   end
+
+  describe "after_commit/1" do
+    test "fires what the transaction emitted once it returns {:ok, _}" do
+      assert {:ok, :value} =
+               Emissions.after_commit(fn ->
+                 emit(:a)
+                 assert fired() == []
+                 {:ok, :value}
+               end)
+
+      assert fired() == [:a]
+    end
+
+    test "drops what it emitted when it returns anything else, or raises" do
+      assert {:error, :rolled_back} =
+               Emissions.after_commit(fn ->
+                 emit(:a)
+                 {:error, :rolled_back}
+               end)
+
+      assert_raise RuntimeError, fn ->
+        Emissions.after_commit(fn ->
+          emit(:b)
+          raise "boom"
+        end)
+      end
+
+      assert fired() == []
+
+      # Nothing is left open: emits fire at once again.
+      emit(:c)
+      assert fired() == [:c]
+    end
+  end
 end

@@ -45,6 +45,24 @@ defmodule Clementine.Emissions do
     token
   end
 
+  @doc false
+  # Runs `transaction` (a function returning a repo transaction's result)
+  # inside a bracket: what it emits fires once it returns `{:ok, _}`, and
+  # is dropped when it returns anything else or raises.
+  @spec after_commit((-> result)) :: result when result: term()
+  def after_commit(transaction) when is_function(transaction, 0) do
+    token = begin_deferral()
+
+    try do
+      with {:ok, _value} = committed <- transaction.() do
+        flush(token)
+        committed
+      end
+    after
+      drop(token)
+    end
+  end
+
   @spec flush(reference()) :: :ok
   def flush(token) do
     case Process.get(@key) do

@@ -43,6 +43,19 @@ defmodule Clementine.Agent do
   The fields given to `use` build the agent at compile time, so a typo in
   them fails the build. List the module in the child spec's `agents:`.
 
+  An agent that converses also writes `c:history/1`, which returns the
+  messages before the run's prompt from the app's own tables:
+
+      defmodule MyApp.Agents.Chat do
+        use Clementine.Agent,
+          key: "chat",
+          model: :claude_sonnet,
+          instructions: "You are a helpful assistant."
+
+        @impl true
+        def history(run), do: MyApp.Chat.messages(run.subject_id)
+      end
+
   Note: this module shadows Elixir's built-in `Agent` under a bare `alias`;
   prefer `alias Clementine.Agent, as: AgentDef` where the collision bites.
   The in-memory agent *process* lives at `Clementine.AgentServer`.
@@ -79,6 +92,28 @@ defmodule Clementine.Agent do
   """
   @callback agent(run :: Clementine.Runs.AgentRun.t()) :: t()
 
+  @doc """
+  The conversation before `run`'s prompt, oldest first, as
+  `Clementine.LLM.Message` structs: `UserMessage`, `AssistantMessage`, and
+  `ToolResultMessage`. The model sees them, then the prompt. Leave the
+  prompt itself out.
+
+  The messages are the app's data: store what a run said in
+  `c:Clementine.Host.run_finished/2` (`Result.Completed` carries the
+  prompt as `input_message` and the run's own turns as `messages`;
+  `Clementine.LLM.Message.to_map/1` and `from_map/1` round-trip them
+  through a `jsonb` column), and read them back here.
+
+  It is called when a run starts from its prompt, after the subject
+  resolves, so `run.subject` is set. A run that resumes after an approval
+  continues from its checkpoint, which already holds the conversation, so
+  it is not called again. Anything but a list of messages cancels the run
+  as unstartable. `use Clementine.Agent` defines it to return `[]`.
+  """
+  @callback history(run :: Clementine.Runs.AgentRun.t()) :: [Clementine.LLM.Message.message()]
+
+  @optional_callbacks history: 1
+
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do
       @behaviour Clementine.Agent
@@ -94,6 +129,11 @@ defmodule Clementine.Agent do
 
       @impl Clementine.Agent
       def key, do: @clementine_agent_key
+
+      @impl Clementine.Agent
+      def history(_run), do: []
+
+      defoverridable history: 1
 
       if fields != [] do
         @clementine_agent Clementine.Agent.new([id: key] ++ fields)

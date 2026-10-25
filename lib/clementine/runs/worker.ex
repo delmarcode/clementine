@@ -22,7 +22,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     import Ecto.Query, only: [from: 2]
 
     alias Clementine.Lifecycle.{Facts, Protocol}
-    alias Clementine.Runs.{AgentRun, Config, DrainNotifier, Lifecycle}
+    alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
+    alias Clementine.Runs.{AgentRun, Config, Courier, DrainNotifier, Lifecycle}
 
     # The wall-clock budget of one execution, minted fresh at every claim,
     # unless the agent sets `defaults: [max_duration: ...]`.
@@ -103,12 +104,29 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
         %AgentRun{} = row ->
           case build(config, row) do
-            {:ok, run} ->
-              Clementine.Runner.execute(run, lifecycle: Lifecycle, executor_id: executor_id)
-
-            {:error, reason} ->
-              cancel_unstartable(row.id, reason)
+            {:ok, run} -> execute_built(config, row, run, executor_id)
+            {:error, reason} -> cancel_unstartable(row.id, reason)
           end
+      end
+    end
+
+    # The lifecycle's ctx carries the row, so the host hears of this
+    # execution's transitions without another read, and the courier that
+    # carries its events to the host's run_event/2. Events come only from
+    # a claimed run, so the courier's copy says it is running.
+    defp execute_built(%Config{host: host}, row, run, executor_id) do
+      courier =
+        if exports?(host, :run_event, 2), do: Courier.start(host, %{row | status: "running"})
+
+      try do
+        Clementine.Runner.execute(run,
+          lifecycle: Lifecycle,
+          executor_id: executor_id,
+          events: if(courier, do: Courier, else: Clementine.Events.Null),
+          ctx: %{run: row, courier: courier}
+        )
+      after
+        if courier, do: Courier.stop(courier)
       end
     end
 
@@ -118,14 +136,16 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     defp build(config, %AgentRun{} = row) do
       with {:ok, module} <- fetch_agent(config, row.agent_key),
            {:ok, prompt} <- prompt(row),
-           {:ok, subject} <- resolve_subject(config.host, row) do
-        row = %{row | subject: subject}
+           {:ok, subject} <- resolve_subject(config.host, row),
+           row = %{row | subject: subject},
+           {:ok, history} <- history(module, row) do
         agent = module.agent(row)
 
         rollout =
           Clementine.Rollout.new(
             agent: agent,
             input: prompt,
+            messages: history,
             context: %{
               run_id: row.id,
               agent_key: row.agent_key,
@@ -168,6 +188,40 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     defp resolve_subject(_host, _row), do: {:ok, nil}
+
+    # A run resumed from a checkpoint continues from the messages the
+    # checkpoint holds, history and prompt included, so its history is
+    # read only when it starts from its prompt. The test mirrors the
+    # claim's: a suspension with a resume payload resumes.
+    defp history(_module, %AgentRun{suspension: suspension, resume: resume})
+         when is_map(suspension) and is_map(resume),
+         do: {:ok, []}
+
+    defp history(module, row) do
+      if function_exported?(module, :history, 1) do
+        row |> module.history() |> validate_history(module)
+      else
+        {:ok, []}
+      end
+    end
+
+    defp validate_history(messages, module) do
+      if is_list(messages) and Enum.all?(messages, &message?/1) do
+        {:ok, messages}
+      else
+        {:error,
+         "#{inspect(module)}.history/1 must return a list of Clementine.LLM.Message " <>
+           "structs, got: #{inspect(messages, limit: 3, printable_limit: 80)}"}
+      end
+    end
+
+    defp message?(%UserMessage{}), do: true
+    defp message?(%AssistantMessage{}), do: true
+    defp message?(%ToolResultMessage{}), do: true
+    defp message?(_other), do: false
+
+    defp exports?(nil, _function, _arity), do: false
+    defp exports?(module, function, arity), do: function_exported?(module, function, arity)
 
     defp default_limits(%Clementine.Agent{defaults: defaults}) do
       if Keyword.has_key?(defaults, :max_duration), do: [], else: [max_duration: @max_duration]

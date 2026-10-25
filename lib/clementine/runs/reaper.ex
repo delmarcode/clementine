@@ -16,6 +16,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     require Logger
 
+    alias Clementine.Emissions
     alias Clementine.Lifecycle.Ecto.Codec
     alias Clementine.Lifecycle.Ecto.Oban, as: JobCheck
     alias Clementine.Lifecycle.{Facts, Protocol}
@@ -130,7 +131,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     defp apply_verdict({:requeue, reason}, repo, facts, acc) do
-      case repo.transaction(fn -> requeue(repo, facts, reason) end) do
+      # The host hears of the requeue once its transaction commits, and
+      # never if it rolls back.
+      case Emissions.after_commit(fn ->
+             repo.transaction(fn -> requeue(repo, facts, reason) end)
+           end) do
         {:ok, :ok} -> %{acc | requeued: acc.requeued + 1}
         {:error, reason} when reason in [:stale, :effects_present] -> acc
         {:error, other} -> log_sweep_error(facts.ref, other, acc)

@@ -21,7 +21,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     The optional `host:` module implements `Clementine.Host`: who may
     resume a run, what commits with a run's end and what hears of it
-    after, and how a subject resolves. Nothing else is configurable.
+    after, what hears of its events and its other transitions, and how a
+    subject resolves. An agent that converses supplies its history with
+    `c:Clementine.Agent.history/1`. Nothing else is configurable.
     Coding agents: the rules are in [`usage-rules.md`](usage-rules.md).
 
     Runs live in `agent_runs` and execute on Oban's `queue`, one job per
@@ -37,6 +39,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     import Ecto.Query, only: [from: 2]
 
+    alias Clementine.Emissions
     alias Clementine.Lifecycle.Ecto.Codec
     alias Clementine.Lifecycle.{Facts, Protocol}
     alias Clementine.Runs.{AgentRun, Config, Lifecycle, Worker}
@@ -142,15 +145,24 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     between them would find a queued run whose only job is the one that
     completed when the run parked (or none, once Oban's pruner removed it)
     and interrupt it, losing the decision.
+
+    Call it outside a transaction; inside one it raises, for the reason
+    `cancel/1` gives: `c:Clementine.Host.run_transition/2` hears of the
+    resume when resume's own transaction commits.
     """
     @spec resume(Ecto.UUID.t(), Clementine.Host.decision()) ::
             :ok | {:error, :not_found | :not_waiting | term()}
     def resume(run_id, {verdict, meta} = decision)
         when verdict in [:approved, :denied] and is_map(meta) do
       %Config{repo: repo} = config = Config.fetch!()
+      refuse_transaction!(repo, "resume/2")
 
+      # The host hears of the resume once this transaction commits.
       with {:ok, id} <- cast_id(run_id),
-           {:ok, :ok} <- repo.transaction(fn -> resume_locked(config, id, decision) end) do
+           {:ok, :ok} <-
+             Emissions.after_commit(fn ->
+               repo.transaction(fn -> resume_locked(config, id, decision) end)
+             end) do
         :ok
       end
     end
@@ -198,24 +210,29 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     waiting run finishes `cancelled` at once (`{:ok, :finished}`). Who may
     cancel which run is the app's decision: check it before calling.
 
-    Call it outside a transaction; inside one it raises. A run it ends
-    calls `c:Clementine.Host.run_committed/2` when its own write commits,
-    and inside the caller's transaction that write has not committed yet.
+    Call it outside a transaction; inside one it raises. The host hears of
+    what it wrote (`c:Clementine.Host.run_committed/2` for an end,
+    `c:Clementine.Host.run_transition/2` for a flag) when its own write
+    commits, and inside the caller's transaction that write has not
+    committed yet.
     """
     @spec cancel(Ecto.UUID.t()) ::
             {:ok, :flagged | :finished} | {:error, :already_terminal | :not_found | term()}
     def cancel(run_id) do
       %Config{repo: repo} = Config.fetch!()
 
-      if repo.in_transaction?() do
-        raise RuntimeError,
-              "Clementine.Runs.cancel/1 was called inside a transaction; call it after " <>
-                "the transaction commits, so the host's run_committed/2 never hears of " <>
-                "an end that rolls back"
-      end
+      refuse_transaction!(repo, "cancel/1")
 
       with {:ok, id} <- cast_id(run_id) do
         Protocol.request_cancel(Lifecycle, id, %{"code" => "cancelled"})
+      end
+    end
+
+    defp refuse_transaction!(repo, function) do
+      if repo.in_transaction?() do
+        raise RuntimeError,
+              "Clementine.Runs.#{function} was called inside a transaction; call it after " <>
+                "the transaction commits, so the host never hears of a change that rolls back"
       end
     end
 
