@@ -223,7 +223,8 @@ events behind, and a callback still stuck five seconds later hears no
 more of that execution while the run goes on. Events are advisory: a UI
 that misses some recovers from the stored conversation and the run's
 end. `run_transition/2` hears every change short of the end, in
-whichever process wrote it; the end reaches only the two finish hooks.
+whichever process wrote it, with the run as that change committed it;
+the end reaches only the two finish hooks.
 
 Both finish hooks see every end (`Completed`, `Failed`, `Cancelled`,
 `Interrupted`), after the runtime stored a completed run's output in

@@ -141,9 +141,10 @@ follow from the stored conversation and the run's end.
 
 **Status: `run_transition/2`.** Every change short of the end, after it
 commits: `:claimed`, `:suspended`, `:resumed`, `:requeued`, or
-`:cancel_requested`, with `run.status` as it committed. It is
-best-effort, like `run_committed/2`, and the end never reaches it:
-broadcast the end from `run_committed/2`.
+`:cancel_requested`, with the run as the change committed it
+(`run.status`, `run.lease_epoch`, `run.cancel`, and the rest): never read
+the row again for them. It is best-effort, like `run_committed/2`, and
+the end never reaches it: broadcast the end from `run_committed/2`.
 
 ```elixir
 @impl true

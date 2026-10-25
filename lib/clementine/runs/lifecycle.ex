@@ -16,11 +16,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     require Logger
 
-    alias Clementine.Emissions
+    alias Clementine.{Emissions, Result}
     alias Clementine.Lifecycle.Ecto, as: EctoLifecycle
     alias Clementine.Lifecycle.Ecto.Codec
     alias Clementine.Lifecycle.{Facts, Transition}
-    alias Clementine.Result
     alias Clementine.Runs.{AgentRun, Config, Courier}
 
     # Liveness and the effects fence are the runtime's bookkeeping.
@@ -35,6 +34,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       requeue: :requeued,
       cancel_request: :cancel_requested
     }
+
+    @fields Codec.resolve_fields(:id, [])
 
     @doc false
     def __clementine_config__, do: Config.fetch!().lifecycle
@@ -82,13 +83,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @impl Clementine.Lifecycle.Ecto
     def after_transition(%Facts{} = facts, %Transition{op: op}, ctx)
         when op not in @quiet_ops do
-      %Config{repo: repo, host: host} = Config.fetch!()
+      config = Config.fetch!()
 
-      with true <- exports?(host, :run_transition),
-           false <- Facts.terminal?(facts),
-           {:ok, transition} <- Map.fetch(@transitions, op),
-           %AgentRun{} = run <- transition_run(repo, facts, ctx) do
-        run_transition(host, run, transition)
+      with false <- Facts.terminal?(facts),
+           {:ok, transition} <- Map.fetch(@transitions, op) do
+        hear(config, facts, transition, ctx)
       end
 
       :ok
@@ -96,9 +95,28 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     def after_transition(_facts, _transition, _ctx), do: :ok
 
-    # The worker's own writes carry the run in their ctx; the control
-    # plane's and the reaper's read it. Either way, its status is the one
-    # this transition committed.
+    # The host's run_transition/2 hears of the change, and after a claim
+    # the run's courier carries the claimed run to run_event/2.
+    defp hear(%Config{repo: repo, host: host}, facts, transition, ctx) do
+      courier = if transition == :claimed, do: courier(ctx)
+      host? = exports?(host, :run_transition)
+
+      if host? or courier do
+        with %AgentRun{} = run <- transition_run(repo, facts, ctx) do
+          if courier, do: Courier.put_run(courier, run)
+          if host?, do: run_transition(host, run, transition)
+        end
+      end
+    end
+
+    defp courier(%{courier: %Courier{} = courier}), do: courier
+    defp courier(_ctx), do: nil
+
+    # The run as this transition committed it. The worker's own writes
+    # carry its row in their ctx, as read before the claim; the control
+    # plane's and the reaper's read it after the commit, when a later write
+    # may already have landed. Either way the lifecycle columns come from
+    # the facts this transition committed.
     defp transition_run(repo, %Facts{} = facts, ctx) do
       run =
         case ctx do
@@ -106,7 +124,23 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           _other -> repo.get(AgentRun, facts.ref)
         end
 
-      run && %{run | status: Codec.encode_status(facts.status)}
+      run && put_facts(run, facts)
+    end
+
+    defp put_facts(run, facts) do
+      Enum.reduce(@fields, run, fn
+        {:ref, _column}, run -> run
+        {key, column}, run -> Map.put(run, column, column_value(key, Map.fetch!(facts, key)))
+      end)
+    end
+
+    # A value as its column loads it: the encoding the write stores, with a
+    # jsonb column's map in the shape its JSON round trip gives back.
+    defp column_value(key, value) do
+      case Codec.encode_value(key, value) do
+        %{} = map when not is_struct(map) -> map |> Jason.encode!() |> Jason.decode!()
+        encoded -> encoded
+      end
     end
 
     defp store_output(repo, %Result.Completed{output: output}, run) do
