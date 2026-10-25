@@ -70,6 +70,16 @@ defmodule Clementine.Runs.Courier do
   end
 
   @doc false
+  # Replaces the run the callback receives. The lifecycle sends the claimed
+  # run from the run's own process before its first event, so every event
+  # arrives with the run as its claim committed it.
+  @spec put_run(t(), struct()) :: :ok
+  def put_run(%__MODULE__{pid: pid}, run) do
+    send(pid, {:run, run})
+    :ok
+  end
+
+  @doc false
   @spec deliver(t(), Event.t()) :: :ok
   def deliver(%__MODULE__{} = courier, %Event{} = event) do
     if cut_off?(courier) do
@@ -152,6 +162,9 @@ defmodule Clementine.Runs.Courier do
 
   defp loop(host, run) do
     receive do
+      {:run, run} ->
+        loop(host, run)
+
       {:event, event} ->
         call(host, run, event)
         loop(host, run)

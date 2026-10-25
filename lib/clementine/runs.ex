@@ -28,9 +28,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     Runs live in `agent_runs` and execute on Oban's `queue`, one job per
     execution (`Clementine.Runs.Worker`). Clementine owns the mechanism:
-    claims, lease fencing, heartbeats, suspension and resume, the drain at
-    shutdown, and the reaper that finishes runs whose node died. Every
-    lifecycle write is a guarded compare-and-swap.
+    claims, lease fencing, heartbeats, suspension and resume, carrying a
+    cancel to the node that runs the run, the drain at shutdown, and the
+    reaper that finishes runs whose node died. Every lifecycle write is a
+    guarded compare-and-swap.
 
     ## Options of the child spec
 
@@ -205,10 +206,18 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     @doc """
-    Cancels a run. A running run gets the cooperative flag, which the
-    runner honors at its next boundary (`{:ok, :flagged}`); a queued or
-    waiting run finishes `cancelled` at once (`{:ok, :finished}`). Who may
-    cancel which run is the app's decision: check it before calling.
+    Cancels a run. A queued or waiting run finishes `cancelled` at once
+    (`{:ok, :finished}`). A running run gets the cooperative flag
+    (`{:ok, :flagged}`), and the flag goes on to the process running it,
+    on whichever node: the model call in flight is aborted, and the run
+    finishes `cancelled` within moments, mid-response. A run that was
+    already writing its end when the flag landed keeps that end. Should
+    the flag not reach the runner (another node behind a notifier that
+    cannot listen, say), the runner finds it at its next step.
+
+    Who may cancel which run is the app's decision: check it before
+    calling. A cancel of a run that has ended returns
+    `{:error, :already_terminal}` and changes nothing.
 
     Call it outside a transaction; inside one it raises. The host hears of
     what it wrote (`c:Clementine.Host.run_committed/2` for an end,

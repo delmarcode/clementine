@@ -108,7 +108,8 @@ defmodule Clementine.Host do
     * `:requeued` — a drain at shutdown (or the reaper) put it back in
       the queue before it touched the world; it is `queued`.
     * `:cancel_requested` — `Clementine.Runs.cancel/1` flagged it; it is
-      still `running` and stops at its next step.
+      still `running`, and the runner, told at once, stops it
+      mid-response. Its end follows, usually `cancelled`.
   """
   @type transition :: :claimed | :suspended | :resumed | :requeued | :cancel_requested
 
@@ -170,17 +171,21 @@ defmodule Clementine.Host do
   the run goes on. A raise is logged and the next event still arrives.
 
   Events are advisory and may be lost: what a UI shows from them must
-  also follow from the run's end (`c:run_committed/2`). `run.status` is
-  `"running"`, and `run.subject` is `nil` here.
+  also follow from the run's end (`c:run_committed/2`). `run` is the run
+  as its claim committed it (`run.status` is `"running"`, and
+  `run.lease_epoch` the execution's epoch), and `run.subject` is `nil`
+  here.
   """
   @callback run_event(AgentRun.t(), Clementine.Event.t()) :: any()
 
   @doc """
   A change to a run short of its end, after the transaction that wrote it
   commits: claimed, suspended, resumed, requeued, or flagged for
-  cancellation (see `t:transition/0`). `run.status` is the status the
-  change committed. The end reaches `c:run_finished/2` and
-  `c:run_committed/2` instead, never this callback.
+  cancellation (see `t:transition/0`). `run` is the run as the change
+  committed it: its `status`, `lease_epoch`, `executor_id`, `cancel`,
+  and every other column the runtime writes. The end reaches
+  `c:run_finished/2` and `c:run_committed/2` instead, never this
+  callback.
 
   Like `c:run_committed/2`, it runs in whichever process wrote the change
   (the run's worker, the caller of `Clementine.Runs.resume/2` or

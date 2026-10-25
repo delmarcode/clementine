@@ -6,6 +6,10 @@ defmodule Clementine.RunsCase do
   on a shared SQL sandbox (runs execute in more than one process:
   heartbeats, tools, racing sweeps). Model turns are scripted on
   `Clementine.LLM.MockClient` in global mode.
+
+  `@tag oban: [notifier: Oban.Notifiers.PG]` adds options to Oban's: the
+  default Postgres notifier sends nothing from inside the sandbox's
+  transaction, so a test of notifications between nodes uses `:pg`.
   """
 
   use ExUnit.CaseTemplate
@@ -39,7 +43,9 @@ defmodule Clementine.RunsCase do
     pid = Sandbox.start_owner!(TestRepo, shared: true)
     on_exit(fn -> Sandbox.stop_owner(pid) end)
 
-    start_supervised!({Oban, repo: TestRepo, testing: :manual})
+    start_supervised!(
+      {Oban, Keyword.merge([repo: TestRepo, testing: :manual], tags[:oban] || [])}
+    )
 
     unless tags[:runtime] == false do
       start_supervised!(

@@ -59,6 +59,26 @@ defmodule Clementine.Runs.EventsTest do
     assert courier != self()
   end
 
+  test "every event comes with the run as its claim committed it" do
+    {:ok, run} = Runs.start(Echo, "Say hello")
+    id = run.id
+
+    expect_turn(text_events("Hello."))
+    assert :ok = perform_job(Worker, %{"run_id" => run.id})
+
+    assert_received {:run_transition, claimed, :claimed, _in_transaction?}
+    assert_received {:run_event, ^claimed, %Event{type: :iteration_start}, _, _}
+    assert_received {:run_event, ^claimed, %Event{type: :text_delta}, _, _}
+
+    assert %AgentRun{
+             id: ^id,
+             lease_epoch: 1,
+             executor_id: "oban:" <> _,
+             heartbeat_at: %DateTime{}
+           } =
+             claimed
+  end
+
   test "a suspension is heard before the approval it asks for" do
     {:ok, run} = Runs.start(Approval, "Tell the team")
 

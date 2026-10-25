@@ -135,7 +135,12 @@ Clementine.Runs.get(run.id)
   resume and the run's new job commit in one transaction, so a sweep can
   never find the resumed run without a job.
 - `cancel/1` finishes a queued or waiting run at once and flags a running
-  one, which stops at its next boundary.
+  one. The flag goes on to the process running it, on whichever node, so
+  the model call in flight is aborted and the run ends `cancelled`
+  mid-response. On this node the runtime sends it directly; for another
+  it notifies every node through Oban's notifier, so a notifier that
+  cannot listen (Postgres behind a transaction pooler) leaves the run to
+  find the flag at its next step.
 
 ## The host module
 
@@ -223,7 +228,8 @@ events behind, and a callback still stuck five seconds later hears no
 more of that execution while the run goes on. Events are advisory: a UI
 that misses some recovers from the stored conversation and the run's
 end. `run_transition/2` hears every change short of the end, in
-whichever process wrote it; the end reaches only the two finish hooks.
+whichever process wrote it, with the run as that change committed it;
+the end reaches only the two finish hooks.
 
 Both finish hooks see every end (`Completed`, `Failed`, `Cancelled`,
 `Interrupted`), after the runtime stored a completed run's output in

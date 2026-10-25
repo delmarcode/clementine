@@ -20,8 +20,18 @@ defmodule Clementine.Runs.TransitionsTest do
     expect_turn(text_events("Hello."))
     assert :ok = perform_job(Worker, %{"run_id" => run.id})
 
-    assert_received {:run_transition, %AgentRun{id: ^id, status: "running", subject: nil},
-                     :claimed, false = _in_transaction?}
+    # The run as the claim committed it, not the row the worker read
+    # before claiming.
+    assert_received {:run_transition,
+                     %AgentRun{
+                       id: ^id,
+                       status: "running",
+                       lease_epoch: 1,
+                       executor_id: "oban:" <> _,
+                       heartbeat_at: %DateTime{},
+                       deadline: %DateTime{},
+                       subject: nil
+                     }, :claimed, false = _in_transaction?}
 
     assert_received {:run_committed, %AgentRun{status: "completed"}, %Result.Completed{}, false}
     refute_received {:run_transition, _run, _transition, _in_transaction?}
@@ -33,17 +43,27 @@ defmodule Clementine.Runs.TransitionsTest do
     expect_turn(tool_events("toolu_1", "send_note", %{text: "hello"}))
     assert :ok = perform_job(Worker, %{"run_id" => run.id})
 
-    assert_received {:run_transition, %AgentRun{status: "running"}, :claimed, false}
-    assert_received {:run_transition, %AgentRun{status: "waiting"}, :suspended, false}
+    assert_received {:run_transition, %AgentRun{status: "running", lease_epoch: 1}, :claimed,
+                     false}
+
+    # Nothing has written the run since it parked: the host got it as a
+    # read finds it now.
+    assert_received {:run_transition, %AgentRun{status: "waiting"} = waiting, :suspended, false}
+    assert waiting == Runs.get(run.id)
+    assert %{"reason" => %{"type" => "approval"}, "checkpoint" => %{}} = waiting.suspension
 
     # Resume writes inside its own transaction, with the run's new job; the
     # host hears of it once that commits.
     assert :ok = Runs.resume(run.id, {:approved, %{by: "alice"}})
-    assert_received {:run_transition, %AgentRun{status: "queued"}, :resumed, false}
+    assert_received {:run_transition, %AgentRun{status: "queued"} = resumed, :resumed, false}
+    assert resumed == Runs.get(run.id)
 
     expect_turn(text_events("Sent."))
     assert :ok = perform_job(Worker, %{"run_id" => run.id})
-    assert_received {:run_transition, %AgentRun{status: "running"}, :claimed, false}
+
+    assert_received {:run_transition, %AgentRun{status: "running", lease_epoch: 2}, :claimed,
+                     false}
+
     refute_received {:run_transition, _run, _transition, _in_transaction?}
   end
 
@@ -80,7 +100,12 @@ defmodule Clementine.Runs.TransitionsTest do
     end)
 
     assert :ok = perform_job(Worker, %{"run_id" => run.id})
-    assert_received {:run_transition, %AgentRun{status: "queued"}, :requeued, false}
+
+    assert_received {:run_transition, %AgentRun{status: "queued"} = requeued, :requeued, false}
+    assert %AgentRun{lease_epoch: 1, executor_id: nil, heartbeat_at: nil} = requeued
+
+    # The worker links the run's next job after the requeue commits.
+    assert %{requeued | oban_job_id: nil} == %{Runs.get(run.id) | oban_job_id: nil}
   end
 
   test "the reaper's requeue is heard after its commit" do
@@ -89,10 +114,14 @@ defmodule Clementine.Runs.TransitionsTest do
     dead_executor!(run)
 
     assert %{requeued: 1} = Reaper.sweep(Policy.new(retry: {:requeue, max_claims: 3}))
-    assert_received {:run_transition, %AgentRun{id: ^id, status: "queued"}, :requeued, false}
+
+    assert_received {:run_transition, %AgentRun{id: ^id, status: "queued"} = requeued, :requeued,
+                     false}
+
+    assert requeued == Runs.get(id)
   end
 
-  test "a cancel flag on a running run is heard" do
+  test "a cancel flag on a running run is heard, with the flag" do
     {:ok, run} = Runs.start(Echo, "Long answer")
     id = run.id
 
@@ -103,8 +132,18 @@ defmodule Clementine.Runs.TransitionsTest do
 
     assert :ok = perform_job(Worker, %{"run_id" => run.id})
 
-    assert_received {:run_transition, %AgentRun{id: ^id, status: "running"}, :cancel_requested,
-                     false}
+    assert_received {:run_transition,
+                     %AgentRun{
+                       id: ^id,
+                       status: "running",
+                       lease_epoch: 1,
+                       cancel: %{
+                         "reason" => %{"t" => "json", "v" => %{"code" => "cancelled"}},
+                         "requested_at" => requested_at
+                       }
+                     }, :cancel_requested, false}
+
+    assert {:ok, %DateTime{}, 0} = DateTime.from_iso8601(requested_at)
   end
 
   test "cancelling a queued run ends it, which only run_committed/2 hears" do

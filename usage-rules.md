@@ -36,8 +36,11 @@ lifecycle, or a reaper into the app.
   run; a denial's `meta[:message]` reaches the model. It returns
   `{:error, :not_found | :not_waiting}`, or the host's refusal.
 - `cancel/1` returns `{:ok, :finished}` for a queued or waiting run and
-  `{:ok, :flagged}` for a running one, which stops at its next step.
-  Check who may cancel before calling it.
+  `{:ok, :flagged}` for a running one. The flag reaches the run's process
+  on whichever node runs it, which aborts the model call in flight and
+  ends the run `cancelled`, unless it was already ending. A run that has
+  ended returns `{:error, :already_terminal}`. Check who may cancel before
+  calling it.
 - Call `resume/2` and `cancel/1` outside a transaction: inside one they
   raise.
 - `get/1` returns the run or `nil`. Read `agent_runs` freely; only
@@ -141,9 +144,10 @@ follow from the stored conversation and the run's end.
 
 **Status: `run_transition/2`.** Every change short of the end, after it
 commits: `:claimed`, `:suspended`, `:resumed`, `:requeued`, or
-`:cancel_requested`, with `run.status` as it committed. It is
-best-effort, like `run_committed/2`, and the end never reaches it:
-broadcast the end from `run_committed/2`.
+`:cancel_requested`, with the run as the change committed it
+(`run.status`, `run.lease_epoch`, `run.cancel`, and the rest): never read
+the row again for them. It is best-effort, like `run_committed/2`, and
+the end never reaches it: broadcast the end from `run_committed/2`.
 
 ```elixir
 @impl true
@@ -215,3 +219,8 @@ and script the model with `MyApp.AgentsCase`'s `expect_turn/1`,
 `text_events/1`, and `tool_events/3`. Every host callback, `run_event/2`
 included, has returned by the time `perform_job/2` does, so a test that
 subscribed first finds the broadcasts in its mailbox.
+
+To test a stop, run `perform_job/2` in a `Task`, wait until the model is
+answering, and call `cancel/1` from the test. Script that answer as a
+stream that arrives over time (an HTTP stub such as Bypass): a list from
+`expect_turn/1` is already whole, so the run completes it.

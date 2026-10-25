@@ -2,11 +2,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
   defmodule Clementine.Runs.Supervisor do
     @moduledoc false
     # What {Clementine, opts} starts: the validated config, the drain
-    # notifier, and the reaper.
+    # notifier, the cancel relay, and the reaper.
 
     use Supervisor
 
-    alias Clementine.Runs.{Config, DrainNotifier, Reaper}
+    alias Clementine.Runs.{CancelRelay, Config, DrainNotifier, Reaper}
 
     def start_link(opts) do
       Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
@@ -23,7 +23,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       # reaper, which would sweep from outside the test's sandbox.
       reaper = if oban.testing == :disabled, do: [Reaper], else: []
 
-      Supervisor.init([DrainNotifier | reaper], strategy: :one_for_one)
+      Supervisor.init([DrainNotifier, {CancelRelay, oban: config.oban} | reaper],
+        strategy: :one_for_one
+      )
     end
 
     # A run and its job commit in one transaction (start, resume, requeue),
