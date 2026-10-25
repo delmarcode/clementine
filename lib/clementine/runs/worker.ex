@@ -23,7 +23,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     alias Clementine.Lifecycle.{Facts, Protocol}
     alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
-    alias Clementine.Runs.{AgentRun, Config, Courier, DrainNotifier, Lifecycle}
+    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, DrainNotifier, Lifecycle}
 
     # The wall-clock budget of one execution, minted fresh at every claim,
     # unless the agent sets `defaults: [max_duration: ...]`.
@@ -113,7 +113,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # The lifecycle's ctx carries the row, so the host hears of this
     # execution's transitions without another read, and the courier that
     # carries its events to the host's run_event/2. Events come only from
-    # a claimed run, so the courier's copy says it is running.
+    # a claimed run, and the claim hands the courier the claimed run. The
+    # runner subscribes to cancels once it holds the run, and this process
+    # stops listening when it lets go.
     defp execute_built(%Config{host: host}, row, run, executor_id) do
       courier =
         if exports?(host, :run_event, 2), do: Courier.start(host, %{row | status: "running"})
@@ -126,6 +128,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           ctx: %{run: row, courier: courier}
         )
       after
+        CancelRelay.unsubscribe(row.id)
         if courier, do: Courier.stop(courier)
       end
     end

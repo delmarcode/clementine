@@ -106,9 +106,11 @@ defmodule Clementine.Runs.ReaperTest do
     end
 
     test "does not start while Oban runs in a testing mode" do
-      children = Supervisor.which_children(Clementine.Runs.Supervisor)
+      children =
+        for {id, _pid, :worker, _modules} <- Supervisor.which_children(Clementine.Runs.Supervisor),
+            do: id
 
-      assert [{Clementine.Runs.DrainNotifier, _pid, :worker, _}] = children
+      assert Enum.sort(children) == [Clementine.Runs.CancelRelay, Clementine.Runs.DrainNotifier]
     end
   end
 

@@ -108,7 +108,8 @@ defmodule Clementine.Host do
     * `:requeued` — a drain at shutdown (or the reaper) put it back in
       the queue before it touched the world; it is `queued`.
     * `:cancel_requested` — `Clementine.Runs.cancel/1` flagged it; it is
-      still `running` and stops at its next step.
+      still `running`, and the runner, told at once, stops it
+      mid-response. Its end follows, usually `cancelled`.
   """
   @type transition :: :claimed | :suspended | :resumed | :requeued | :cancel_requested
 

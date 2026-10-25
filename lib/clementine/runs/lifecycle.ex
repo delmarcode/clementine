@@ -7,7 +7,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # transaction that makes a run terminal: it stores a completed run's
     # output, queues the host's run_committed/2 for after the commit, and
     # hands the result to the host's run_finished/2. Every other committed
-    # change reaches the host's run_transition/2, after its commit.
+    # change reaches the host's run_transition/2, after its commit, and a
+    # committed cancel flag goes on to the run's runner (CancelRelay).
 
     @behaviour Clementine.Lifecycle
     @behaviour Clementine.Lifecycle.Ecto
@@ -16,11 +17,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     require Logger
 
-    alias Clementine.{Emissions, Result}
+    alias Clementine.{Emissions, Lease, Result}
     alias Clementine.Lifecycle.Ecto, as: EctoLifecycle
     alias Clementine.Lifecycle.Ecto.Codec
     alias Clementine.Lifecycle.{Facts, Transition}
-    alias Clementine.Runs.{AgentRun, Config, Courier}
+    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier}
 
     # Liveness and the effects fence are the runtime's bookkeeping.
     @quiet_ops [:heartbeat, :mark_effects]
@@ -48,6 +49,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       flush_events(transition, ctx)
       EctoLifecycle.apply_transition(__MODULE__, transition, ctx)
     end
+
+    # The runner subscribes once it holds the run: a cancel flag committed
+    # from then on reaches it at once, from any node.
+    @impl Clementine.Lifecycle
+    def subscribe_cancel(%Lease{run_ref: run_id, epoch: epoch}),
+      do: CancelRelay.subscribe(run_id, epoch)
 
     # Before the run's own process writes a transition, every event it
     # emitted has reached the host's run_event/2, so the host hears of the
@@ -80,14 +87,18 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # The adapter calls this once the transition's transaction commits
     # (the outermost one, while Clementine.Emissions brackets it). An end
     # reaches the host through run_committed/2 instead, with its result.
+    #
+    # A cancel flag reaches the host before its runner, so the host never
+    # hears of the flag after the end it causes.
     @impl Clementine.Lifecycle.Ecto
     def after_transition(%Facts{} = facts, %Transition{op: op}, ctx)
         when op not in @quiet_ops do
-      config = Config.fetch!()
+      %Config{oban: oban} = config = Config.fetch!()
 
       with false <- Facts.terminal?(facts),
            {:ok, transition} <- Map.fetch(@transitions, op) do
         hear(config, facts, transition, ctx)
+        if transition == :cancel_requested, do: CancelRelay.push(facts, oban)
       end
 
       :ok
