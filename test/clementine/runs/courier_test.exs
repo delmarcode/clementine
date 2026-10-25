@@ -100,8 +100,11 @@ defmodule Clementine.Runs.CourierTest do
     assert delivered() == []
   end
 
-  test "a courier that died cuts the host off at the next wait" do
+  test "a courier that is gone cuts the host off at the next wait" do
     courier = Courier.start(Host, run(), window: 1_000)
+
+    # Linked, its death would take the run along; this is the wait alone.
+    Process.unlink(courier.pid)
     Process.exit(courier.pid, :kill)
 
     log = capture_log(fn -> assert :ok = Courier.flush(courier) end)
@@ -142,6 +145,28 @@ defmodule Clementine.Runs.CourierTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, reason} when reason in [:normal, :noproc]
     refute Process.alive?(owner)
     assert delivered() == [1, 2, 3]
+  end
+
+  test "a run that is killed takes its courier along, even mid-callback" do
+    test = self()
+
+    owner =
+      spawn(fn ->
+        courier = Courier.start(Host, %{id: "run-1", test: test})
+        send(test, {:courier, courier.pid})
+        Courier.deliver(courier, event(1, %{hold: true}))
+
+        receive do
+          :never -> :ok
+        end
+      end)
+
+    assert_receive {:courier, pid}
+    assert_receive {:holding, ^pid}
+    ref = Process.monitor(pid)
+
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
   end
 
   test "as a sink, it delivers through the courier in the lease's ctx and ignores any other" do

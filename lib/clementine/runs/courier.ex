@@ -15,6 +15,12 @@ defmodule Clementine.Runs.Courier do
   # The lifecycle flushes before each write the run makes (Runs.Lifecycle),
   # so every event emitted before a transition reaches the host before
   # the host hears of the transition.
+  #
+  # The courier is linked to its run, so a run that is killed takes it
+  # along, even mid-callback, and the events still queued are dropped. A
+  # run that ends normally stops it (stop/1), and the courier's own exits
+  # never reach the run: callbacks cannot crash it, and the cut-off unlinks
+  # before it kills.
 
   @behaviour Clementine.Events
 
@@ -49,7 +55,7 @@ defmodule Clementine.Runs.Courier do
   @spec start(module(), struct(), keyword()) :: t()
   def start(host, run, opts \\ []) do
     owner = self()
-    pid = spawn(fn -> init(owner, host, run) end)
+    pid = spawn_link(fn -> init(owner, host, run) end)
 
     %__MODULE__{
       pid: pid,
@@ -105,6 +111,7 @@ defmodule Clementine.Runs.Courier do
     after
       timeout ->
         Process.demonitor(ref, [:flush])
+        Process.unlink(pid)
         Process.exit(pid, :kill)
 
         # A reply that raced the kill would otherwise sit in the run's
@@ -135,7 +142,8 @@ defmodule Clementine.Runs.Courier do
   end
 
   # Messages from the run arrive in the order it sent them, and before its
-  # DOWN, so a run that dies has its events delivered first.
+  # DOWN, so a run that exits normally without stop/1 has its events
+  # delivered first.
   defp loop(owner_ref, host, run) do
     receive do
       {:event, event} ->
