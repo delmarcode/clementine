@@ -195,9 +195,10 @@ decisive, and its samples pass `test/clementine/guides_test.exs`.
 - `test/mix/clementine.*_test.exs` drive the tasks through `Igniter.Test`
   (via `Clementine.IgniterCase`) and prove a second run changes nothing.
 - `scripts/installer-smoke.sh` generates a real Phoenix app, installs
-  twice, generates an agent twice, and runs the app's format, compile,
-  `credo --strict` (on the generated files), and tests; the generated test
-  runs the agent end to end through the runtime on Postgres. CI's
+  twice, generates an agent twice, adds the hand-written chat example in
+  `scripts/installer-smoke/chat` (history, events, transitions), and runs
+  the app's format, compile, `credo --strict` (on our files), and tests;
+  the tests run both agents end to end through the runtime on Postgres. CI's
   `installer` job runs it with a pinned `phx_new`; run it locally after
   changing a template.
 - The generated migration calls `Clementine.Migration.up(version: 1)`,

@@ -397,19 +397,53 @@ defmodule Clementine.RolloutExecuteTest do
       checkpoint = %Checkpoint{
         rollout_id: "r1",
         iteration: 2,
-        messages: [UserMessage.new("go"), UserMessage.new("prior turn")],
+        messages: [UserMessage.new("go"), AssistantMessage.text("working on it")],
         usage: %Usage{input_tokens: 10, output_tokens: 5}
       }
 
-      expect_stream(text_events("Resumed answer"))
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, messages, _tools, _opts ->
+        assert messages == checkpoint.messages
+        text_events("Resumed answer")
+      end)
 
       assert {:ok, %Result.Completed{} = result} =
                Rollout.execute(rollout(), resume: {checkpoint, {:approved, %{}}})
 
-      # rollout.messages is [] so only the input prefix is dropped; the
-      # checkpoint's later messages count as generated.
-      assert [%UserMessage{content: "prior turn"}, %{content: _}] = result.messages
+      assert [%AssistantMessage{} = working, %AssistantMessage{} = final] = result.messages
+      assert AssistantMessage.get_text(working) == "working on it"
+      assert AssistantMessage.get_text(final) == "Resumed answer"
       assert result.usage == %Usage{input_tokens: 17, output_tokens: 8}
+    end
+
+    test "generated messages begin after the checkpoint's input, whatever history the caller passes" do
+      checkpoint = %Checkpoint{
+        rollout_id: "r1",
+        messages: [
+          UserMessage.new("earlier question"),
+          AssistantMessage.text("earlier answer"),
+          UserMessage.new("question"),
+          AssistantMessage.text("thinking")
+        ]
+      }
+
+      # The history the run started with, none, or one that has grown
+      # since: the result holds what this run generated, and only that.
+      for history <- [
+            Enum.take(checkpoint.messages, 2),
+            [],
+            Enum.take(checkpoint.messages, 2) ++ [UserMessage.new("later"), UserMessage.new("x")]
+          ] do
+        expect_stream(text_events("Answer"))
+
+        assert {:ok, %Result.Completed{} = result} =
+                 Rollout.execute(rollout(messages: history, input: "question"),
+                   resume: {checkpoint, :elapsed}
+                 )
+
+        assert result.input_message == UserMessage.new("question")
+        assert [%AssistantMessage{} = thinking, %AssistantMessage{}] = result.messages
+        assert AssistantMessage.get_text(thinking) == "thinking"
+      end
     end
 
     test "preserves the iteration counter across the suspension" do

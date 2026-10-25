@@ -86,6 +86,28 @@ defmodule MyApp.Agents.Triage do
 end
 ```
 
+An agent that converses also writes `history/1`: the messages before the
+run's prompt, oldest first, read from the app's own tables. The runtime
+sends them to the model, then the prompt. It runs when a run starts from
+its prompt, not when a run resumes after an approval, whose checkpoint
+already holds the conversation:
+
+```elixir
+defmodule MyApp.Agents.Chat do
+  use Clementine.Agent,
+    key: "chat",
+    model: :claude_sonnet,
+    instructions: "You are a helpful assistant. Be brief."
+
+  @impl true
+  def history(run), do: MyApp.Chat.messages(run.subject_id)
+end
+```
+
+One turn is one run with the conversation as its subject, so a second
+turn while one is in flight is refused with `:active_run_exists`. The
+host's `run_finished/2` stores each turn (below).
+
 ## Running agents
 
 `Clementine.Runs` is the whole API:
@@ -117,7 +139,7 @@ Clementine.Runs.get(run.id)
 
 ## The host module
 
-Four questions belong to the app, and one optional module answers them.
+Six questions belong to the app, and one optional module answers them.
 Every callback is optional:
 
 ```elixir
@@ -134,10 +156,30 @@ defmodule MyApp.Agents.Host do
 
   def authorize_resume(_run, _decision), do: {:error, :forbidden}
 
+  # Tokens and tool activity while a run executes, for a UI. In a process
+  # of its own, in order, outside any transaction.
+  @impl true
+  def run_event(run, %Clementine.Event{type: :text_delta, payload: %{content: text}}) do
+    broadcast(run, {:run_text, run.id, text})
+  end
+
+  def run_event(_run, _event), do: :ok
+
+  # Every change short of the end: claimed, suspended, resumed, requeued,
+  # cancel requested. After the commit, best-effort.
+  @impl true
+  def run_transition(run, transition) do
+    broadcast(run, {:run_status, run.id, transition})
+  end
+
   # What must happen when a run ends. Inside the transaction that ends
   # it: these writes, and the mail job, commit with the run's end or not
-  # at all.
+  # at all. A chat turn stores its messages here.
   @impl true
+  def run_finished(%{agent_key: "chat"} = run, %Result.Completed{} = result) do
+    MyApp.Chat.append!(run.subject_id, [result.input_message | result.messages])
+  end
+
   def run_finished(run, %Result.Completed{output: output}) do
     MyApp.Tickets.record_triage!(run.subject_id, output)
     Oban.insert!(MyApp.Workers.TriageMail.new(%{"ticket_id" => run.subject_id}))
@@ -145,10 +187,10 @@ defmodule MyApp.Agents.Host do
 
   def run_finished(_run, _result), do: :ok
 
-  # Who hears of it. After the commit, once, best-effort.
+  # Who hears of the end. After the commit, once, best-effort.
   @impl true
   def run_committed(run, _result) do
-    Phoenix.PubSub.broadcast(MyApp.PubSub, "ticket:#{run.subject_id}", {:run_ended, run.id})
+    broadcast(run, {:run_ended, run.id})
   end
 
   # How a subject resolves, at every claim. An error cancels the run as
@@ -160,8 +202,28 @@ defmodule MyApp.Agents.Host do
       ticket -> {:ok, ticket}
     end
   end
+
+  def resolve_subject(_type, _id), do: {:ok, nil}
+
+  defp broadcast(run, message) do
+    Phoenix.PubSub.broadcast(MyApp.PubSub, "#{run.subject_type}:#{run.subject_id}", message)
+  end
 end
 ```
+
+A run reaches the host in order: its claim, its events, then the change
+that stops the execution (a suspension, a requeue, or the end), every
+event before the change that follows it. Only `run_finished/2` runs
+inside a transaction; everything else comes after a commit, never for a
+write that rolled back.
+
+`run_event/2` gets each `Clementine.Event` in a process of its own. The
+run does not wait for each call, but it waits once the callback falls 64
+events behind, and a callback still stuck five seconds later hears no
+more of that execution while the run goes on. Events are advisory: a UI
+that misses some recovers from the stored conversation and the run's
+end. `run_transition/2` hears every change short of the end, in
+whichever process wrote it; the end reaches only the two finish hooks.
 
 Both finish hooks see every end (`Completed`, `Failed`, `Cancelled`,
 `Interrupted`), after the runtime stored a completed run's output in
@@ -177,9 +239,9 @@ Both finish hooks see every end (`Completed`, `Failed`, `Cancelled`,
   `cancel/1`), and a raise there is logged. A node that dies between the
   commit and the call loses it.
 
-Keep both fast, and call `cancel/1` outside a transaction (it raises
-inside one, because its `run_committed/2` would fire before the caller's
-commit). The resolved subject reaches `agent/1` as `run.subject` and every
+Keep every callback fast, and call `resume/2` and `cancel/1` outside a
+transaction (they raise inside one, because the host would hear of their
+writes before the caller's commit). The resolved subject reaches `agent/1` as `run.subject` and every
 tool as `context.subject`.
 
 Coding agents working in the app get these rules from
@@ -309,6 +371,7 @@ by column first: version 1 names the agent column `agent_key`, stores
 `subject_id` as text, scopes the single-active index by
 `(agent_key, subject_type, subject_id)`, and inserts rows with no other
 required columns. Product columns may stay as long as they are nullable
-or have defaults. Broadcasts of a run's end move to `run_committed/2`.
-What such an app does on top (chat turns that load a conversation's
-history, broadcasts of every other transition) stays in the app.
+or have defaults. A chat turn's history moves to the agent's
+`history/1`, its token stream to `run_event/2`, broadcasts of its other
+transitions to `run_transition/2`, and broadcasts of its end to
+`run_committed/2`.

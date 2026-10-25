@@ -22,6 +22,11 @@ Observation travels **two roads**, and the split matters:
 
 A typical UI subscribes to one topic per run and receives both.
 
+Apps on the [durable runtime](runtime.md) get both roads from their host
+module: `run_event/2` is the event sink and `run_transition/2` the
+transition notifications (with a run's end in `run_committed/2`). The
+rest of this guide is for apps that run their own worker and lifecycle.
+
 ## The event sink
 
 The sink is a behaviour with one callback. Delivery is decoupled from

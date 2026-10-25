@@ -27,7 +27,7 @@ defmodule Clementine.RunsCase do
 
       alias Clementine.Runs
       alias Clementine.Runs.{AgentRun, Worker}
-      alias Clementine.RunsCase.{Approval, Echo, Lookup}
+      alias Clementine.RunsCase.{Approval, Chat, Echo, Lookup}
       alias Clementine.TestRepo
 
       setup :set_mox_global
@@ -45,7 +45,7 @@ defmodule Clementine.RunsCase do
       start_supervised!(
         {Clementine,
          repo: TestRepo,
-         agents: [__MODULE__.Echo, __MODULE__.Lookup, __MODULE__.Approval],
+         agents: [__MODULE__.Echo, __MODULE__.Lookup, __MODULE__.Approval, __MODULE__.Chat],
          host: __MODULE__.Host}
       )
     end
@@ -157,8 +157,12 @@ defmodule Clementine.RunsCase.Host do
   `run_finished/2` writes a row to its own table (`host_writes/1` reads
   them) and then raises for the conformance suite's projection probe;
   `run_committed/2` raises when the run's metadata says
-  `"committed_probe" => "raise"`. Both report to a process registered as
-  `:clementine_runs_test`, with whether they ran inside a transaction.
+  `"committed_probe" => "raise"`, and `run_transition/2` when it says
+  `"transition_probe" => "raise"`. `run_event/2` raises on the run's
+  events when it says `"event_probe" => "raise"`, and on its first event
+  waits for `{:release, run_id}` when it says `"event_probe" => "hold"`.
+  They report to a process registered as `:clementine_runs_test`, with
+  whether they ran inside a transaction.
   """
 
   @behaviour Clementine.Host
@@ -187,6 +191,32 @@ defmodule Clementine.RunsCase.Host do
   def run_committed(run, result) do
     if run.metadata["committed_probe"] == "raise", do: raise("committed probe")
     report({:run_committed, run, result, TestRepo.in_transaction?()})
+  end
+
+  @impl true
+  def run_transition(run, transition) do
+    if run.metadata["transition_probe"] == "raise", do: raise("transition probe")
+    report({:run_transition, run, transition, TestRepo.in_transaction?()})
+  end
+
+  @impl true
+  def run_event(run, event) do
+    case {run.metadata["event_probe"], event.seq} do
+      {"raise", _seq} ->
+        raise "event probe"
+
+      {"hold", 1} ->
+        report({:run_event_held, run.id, self()})
+
+        receive do
+          {:release, run_id} when run_id == run.id -> :ok
+        end
+
+      _other ->
+        :ok
+    end
+
+    report({:run_event, run, event, TestRepo.in_transaction?(), self()})
   end
 
   @doc "The kinds of the rows `run_finished/2` wrote for `run_id`, oldest first."
@@ -281,4 +311,31 @@ defmodule Clementine.RunsCase.Approval do
     model: :claude_sonnet,
     instructions: "Send notes.",
     tools: [SendNote]
+end
+
+defmodule Clementine.RunsCase.Chat do
+  @moduledoc """
+  A test agent that converses. Its history is the run's metadata
+  `"history"`, as `Clementine.LLM.Message.to_map/1` maps (anything else is
+  returned as is), and every call reports to the test process. Its one
+  tool needs approval.
+  """
+
+  use Clementine.Agent,
+    key: "test_chat",
+    model: :claude_sonnet,
+    instructions: "Chat.",
+    tools: [Clementine.RunsCase.Approval.SendNote]
+
+  alias Clementine.LLM.Message
+
+  @impl true
+  def history(run) do
+    if pid = Process.whereis(:clementine_runs_test), do: send(pid, {:history, run})
+
+    case Map.get(run.metadata, "history", []) do
+      [_ | _] = messages -> Enum.map(messages, &Message.from_map/1)
+      other -> other
+    end
+  end
 end

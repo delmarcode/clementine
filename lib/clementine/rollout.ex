@@ -74,7 +74,8 @@ defmodule Clementine.Rollout do
 
   - `:agent` (required) - a `Clementine.Agent` struct
   - `:input` (required) - the user prompt for this rollout
-  - `:messages` - starting message history (default `[]`)
+  - `:messages` - starting message history (default `[]`); a run that
+    resumes from a checkpoint continues from the checkpoint's messages
   - `:context` - context map passed to tools (default `%{}`)
   - `:limits` - `[max_iterations: pos_integer(), max_duration: pos_integer()]`;
     unset keys fall back to the agent's defaults
@@ -272,6 +273,7 @@ defmodule Clementine.Rollout do
       exec = %{
         exec
         | messages: checkpoint.messages,
+          prefix_len: resumed_prefix_len(checkpoint.messages, exec.prefix_len),
           iteration: checkpoint.iteration,
           usage: checkpoint.usage
       }
@@ -296,6 +298,18 @@ defmodule Clementine.Rollout do
              checkpoint
            )}
       end
+    end
+  end
+
+  # Where a checkpoint's generated messages begin: after its last user
+  # message, which is the input, since the loop appends only assistant
+  # turns and tool results. Read from the checkpoint, a resumed run's
+  # `Result.Completed.messages` stays exact whether or not the caller
+  # passes the starting history again, and whatever it holds by now.
+  defp resumed_prefix_len(messages, fallback) do
+    case messages |> Enum.reverse() |> Enum.find_index(&match?(%UserMessage{}, &1)) do
+      nil -> fallback
+      from_end -> length(messages) - from_end
     end
   end
 
