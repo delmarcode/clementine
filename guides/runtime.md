@@ -393,7 +393,13 @@ would leave old nodes failing on the missing column.
    the table exists. Add one that brings it to version 1, then one
    calling `Clementine.Migration.up(from: 1, version: 2)` (the runtime
    refuses to start against version 1, and says so). The hand-rolled
-   version 1 carries no version stamp; the upgrade stamps it:
+   version 1 carries no version stamp; the upgrade stamps it. The
+   upgrade adds `turn` as `false` on every row and backfills nothing,
+   because which keys are turn agents is the app's code: when the table
+   holds rows, set `turn` for the turn agents' rows in that same
+   migration, right after the upgrade
+   (`execute "UPDATE agent_runs SET turn = true WHERE agent_key IN ('chat')"`),
+   so an active turn keeps its thread the moment the lane index exists:
 
    ```elixir
    defmodule MyApp.Repo.Migrations.MatchClementineVersion1 do

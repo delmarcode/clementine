@@ -55,6 +55,16 @@ if Code.ensure_loaded?(Ecto.Migration) do
     predicate says so besides. The predicate has no `kind` term: a loop
     (version 3) occupies its lane like any run.
 
+    `up(from: 1, version: 2)` adds `turn` as `false` on every existing
+    row and backfills nothing: which keys belong to turn agents is the
+    host's code, not the table's. A host whose version 1 table holds
+    rows sets `turn` for its turn agents' rows in the same migration,
+    right after the upgrade, so the index swap and the backfill commit
+    together and an active turn keeps its thread:
+
+        Clementine.Migration.up(from: 1, version: 2)
+        execute "UPDATE agent_runs SET turn = true WHERE agent_key IN ('chat')"
+
     ## Version 1
 
     `agent_runs`, keyed by UUID:
@@ -121,10 +131,12 @@ if Code.ensure_loaded?(Ecto.Migration) do
             "obj_description(to_regclass('agent_runs'), 'pg_class')"
         )
 
-      cond do
-        is_nil(table) -> :missing
-        is_nil(comment) -> :unstamped
-        true -> String.to_integer(comment)
+      # A comment that is not a bare number is some earlier description of
+      # the table, not a stamp.
+      case {table, comment && Integer.parse(comment)} do
+        {nil, _comment} -> :missing
+        {_table, {version, ""}} when version > 0 -> version
+        {_table, _other} -> :unstamped
       end
     end
 

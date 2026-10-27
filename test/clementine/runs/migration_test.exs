@@ -184,6 +184,14 @@ defmodule Clementine.MigrationTest do
                    Migration.check!(TestRepo)
                  end
 
+    # A description someone left on the table is not a stamp either.
+    TestRepo.query!("COMMENT ON TABLE agent_runs IS 'The agents'' runs.'")
+    assert Migration.migrated_version(TestRepo) == :unstamped
+
+    TestRepo.query!("COMMENT ON TABLE agent_runs IS '2 (with notes)'")
+    assert Migration.migrated_version(TestRepo) == :unstamped
+    assert_raise RuntimeError, ~r/no version stamp/, fn -> Migration.check!(TestRepo) end
+
     # The code rolled back after a migration: the table is ahead, and
     # starts.
     TestRepo.query!("COMMENT ON TABLE agent_runs IS '3'")
