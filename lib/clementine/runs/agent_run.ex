@@ -94,7 +94,45 @@ if Code.ensure_loaded?(Ecto.Schema) do
         :metadata
       ])
       |> validate_required([:agent_key])
+      |> validate_turn_has_subject()
+      |> validate_typed(:subject_type, :subject_id)
+      |> validate_typed(:actor_type, :actor_id)
+      |> check_constraint(:agent_key,
+        name: :agent_runs_agent_key_present,
+        message: "can't be blank"
+      )
+      |> check_constraint(:subject_id,
+        name: :agent_runs_turn_has_subject,
+        message: "a turn needs a subject"
+      )
+      |> check_constraint(:subject_type,
+        name: :agent_runs_subject_typed,
+        message: "a subject id needs a type"
+      )
+      |> check_constraint(:actor_type,
+        name: :agent_runs_actor_typed,
+        message: "an actor id needs a type"
+      )
       |> unique_constraint([:agent_key, :subject_type, :subject_id], name: :agent_runs_lane_index)
+    end
+
+    # The table's checks, mirrored: a row that would slip out of its lane
+    # through a NULL is a changeset error before it is a constraint
+    # violation.
+    defp validate_turn_has_subject(changeset) do
+      if get_field(changeset, :turn) == true do
+        validate_required(changeset, [:subject_id], message: "a turn needs a subject")
+      else
+        changeset
+      end
+    end
+
+    defp validate_typed(changeset, type_field, id_field) do
+      if is_nil(get_field(changeset, id_field)) do
+        changeset
+      else
+        validate_required(changeset, [type_field], message: "an id needs a type")
+      end
     end
 
     @doc false

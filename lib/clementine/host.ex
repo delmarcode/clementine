@@ -236,8 +236,8 @@ defmodule Clementine.Host do
   `{:error, reason}` refuses the actor and cancels the run as unstartable
   with the reason: a run acting for an account suspended since it was
   started, or parked for approval, never starts or resumes. A run with no
-  actor (the system's) never reaches this callback; without it, `actor`
-  is `nil` and agents read `actor_type` and `actor_id` themselves. A check
+  actor type (the system's) never reaches this callback; without it,
+  `actor` is `nil` and agents read `actor_type` and `actor_id` themselves. A check
   that binds the two, such as the thread belonging to the actor, is a
   comparison of `run.subject` and `run.actor` in `agent/1` or a tool.
   """

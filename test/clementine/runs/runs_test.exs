@@ -230,6 +230,26 @@ defmodule Clementine.RunsTest do
       assert id == loop.id
     end
 
+    test "active/2 with kind: :loop is the subject's active loop, which is never a turn" do
+      {:ok, _task} = Runs.start(Echo, "Screen it", subject: {"conversation", 1})
+      {:ok, turn} = Runs.start(Chat, "Hi", subject: {"conversation", 1})
+
+      assert Runs.active({"conversation", 1}, kind: :loop) == nil
+
+      loop =
+        insert_queued_run!(%{subject_type: "conversation", subject_id: "1", agent_key: "thread"})
+
+      {1, _} =
+        TestRepo.update_all(from(r in AgentRun, where: r.id == ^loop.id), set: [kind: "loop"])
+
+      assert %AgentRun{id: id, kind: "loop", turn: false} =
+               Runs.active({"conversation", 1}, kind: :loop)
+
+      assert id == loop.id
+      assert %AgentRun{id: id} = Runs.active({"conversation", 1})
+      assert id == turn.id
+    end
+
     test "AgentRun.active?/1 and terminal?/1 read the status" do
       {:ok, run} = Runs.start(Echo, "Hi")
       assert AgentRun.active?(run)
@@ -257,6 +277,73 @@ defmodule Clementine.RunsTest do
 
       assert_raise RuntimeError, ~r/add \{Clementine, repo: MyApp.Repo/, fn ->
         Runs.start(Echo, "Hello")
+      end
+    end
+  end
+
+  describe "queued_attrs/4 and insert_queued/2" do
+    test "queued_attrs/4 is what start/3 inserts, checked the way start/3 checks it" do
+      config = Clementine.Runs.Config.fetch!()
+
+      assert {:ok,
+              %{
+                agent_key: "test_chat",
+                turn: true,
+                input: %{"prompt" => "Hi"},
+                subject_type: "conversation",
+                subject_id: "1",
+                actor_type: "user",
+                actor_id: "7",
+                metadata: %{"source" => "test"}
+              }} =
+               Runs.queued_attrs(config, Chat, "Hi",
+                 subject: {:conversation, 1},
+                 actor: {"user", 7},
+                 metadata: %{"source" => "test"}
+               )
+
+      assert {:ok, %{agent_key: "test_echo", turn: false, subject_id: nil, actor_type: nil}} =
+               Runs.queued_attrs(config, Echo, "Hi", [])
+
+      assert {:error, :unknown_agent} = Runs.queued_attrs(config, String, "Hi", [])
+      assert {:error, :blank_prompt} = Runs.queued_attrs(config, Echo, " ", [])
+      assert {:error, :subject_required} = Runs.queued_attrs(config, Chat, "Hi", [])
+    end
+
+    test "a row cannot slip out of its lane through a NULL: the changeset refuses it first" do
+      config = Clementine.Runs.Config.fetch!()
+      base = %{agent_key: "test_echo", input: %{"prompt" => "Hi"}}
+
+      for {attrs, field} <- [
+            {%{turn: true}, :subject_id},
+            {%{subject_id: "1"}, :subject_type},
+            {%{actor_id: "7"}, :actor_type}
+          ] do
+        assert {:error, %Ecto.Changeset{errors: errors}} =
+                 Runs.insert_queued(config, Map.merge(base, attrs))
+
+        assert Keyword.has_key?(errors, field)
+      end
+
+      assert {:ok, _run} = Runs.insert_queued(config, Map.merge(base, %{subject_type: "ticket"}))
+    end
+
+    test "and the table refuses it too" do
+      for {columns, values, constraint} <- [
+            {"agent_key, turn", "'test_echo', true", "agent_runs_turn_has_subject"},
+            {"agent_key, subject_id", "'test_echo', '1'", "agent_runs_subject_typed"},
+            {"agent_key, actor_id", "'test_echo', '7'", "agent_runs_actor_typed"},
+            {"agent_key", "''", "agent_runs_agent_key_present"}
+          ] do
+        sql =
+          "INSERT INTO agent_runs (id, inserted_at, updated_at, #{columns}) " <>
+            "VALUES (gen_random_uuid(), now(), now(), #{values})"
+
+        # A savepoint, so the refused statement does not abort the test's
+        # transaction.
+        assert_raise Postgrex.Error, ~r/#{constraint}/, fn ->
+          TestRepo.transaction(fn -> TestRepo.query!(sql) end)
+        end
       end
     end
   end

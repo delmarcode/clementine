@@ -81,8 +81,11 @@ defmodule Clementine.MigrationTest do
               ])
 
   @v2_constraints [
+    {"agent_runs_actor_typed", "CHECK (((actor_id IS NULL) OR (actor_type IS NOT NULL)))"},
     {"agent_runs_agent_key_present", "CHECK ((agent_key <> ''::text))"},
-    {"agent_runs_pkey", "PRIMARY KEY (id)"}
+    {"agent_runs_pkey", "PRIMARY KEY (id)"},
+    {"agent_runs_subject_typed", "CHECK (((subject_id IS NULL) OR (subject_type IS NOT NULL)))"},
+    {"agent_runs_turn_has_subject", "CHECK (((NOT turn) OR (subject_id IS NOT NULL)))"}
   ]
 
   @v1_constraints [{"agent_runs_pkey", "PRIMARY KEY (id)"}]

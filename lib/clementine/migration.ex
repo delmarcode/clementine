@@ -36,6 +36,9 @@ if Code.ensure_loaded?(Ecto.Migration) do
         actor_id      text               (`Clementine.Runs.start/3`, `actor:`)
         turn          boolean, not null  a run on a thread; false by default
         check agent_runs_agent_key_present (agent_key <> '')
+        check agent_runs_turn_has_subject  (not turn or subject_id is not null)
+        check agent_runs_subject_typed     (subject_id is null or subject_type is not null)
+        check agent_runs_actor_typed       (actor_id is null or actor_type is not null)
         unique index agent_runs_lane_index on
           ((case when turn then '' else agent_key end), subject_type, subject_id)
           where status in ('queued', 'running', 'waiting') and subject_id is not null
@@ -48,12 +51,14 @@ if Code.ensure_loaded?(Ecto.Migration) do
     whichever agent it belongs to, so two turns of different agents on one
     thread collide. A task's lane is `(agent_key, type, id)`, so tasks of
     different agents on one subject never collide, and neither do a turn
-    and a task. The check constraint keeps the two sets apart (a key is
-    never `''`), and three columns rather than one joined string keep ids
-    that contain colons from aliasing. A run with no subject id has no
-    lane and blocks nothing: NULLs are distinct in a unique index, and the
-    predicate says so besides. The predicate has no `kind` term: a loop
-    (version 3) occupies its lane like any run.
+    and a task. The first check keeps the two sets apart (a key is never
+    `''`), and three columns rather than one joined string keep ids that
+    contain colons from aliasing. A run with no subject id has no lane and
+    blocks nothing: NULLs are distinct in a unique index, and the
+    predicate says so besides. The other three checks keep a row from
+    slipping out of its lane through a NULL: a turn always has a subject
+    id, and a subject or actor id always has a type. The predicate has no
+    `kind` term: a loop (version 3) occupies its lane like any run.
 
     `up(from: 1, version: 2)` adds `turn` as `false` on every existing
     row and backfills nothing: which keys belong to turn agents is the
@@ -184,7 +189,9 @@ if Code.ensure_loaded?(Ecto.Migration) do
       {floor, version}
     end
 
-    # Frozen. A new version is a new pair of clauses, never an edit here.
+    # Frozen: a version's DDL never changes, and a new version is a new
+    # pair of clauses. The stamp is not DDL (stamp/1), which is how version
+    # 1 came to end with one.
     defp step_up(1) do
       create table(@table, primary_key: false) do
         add(:id, :binary_id, primary_key: true)
@@ -219,6 +226,28 @@ if Code.ensure_loaded?(Ecto.Migration) do
       end
 
       create(constraint(@table, :agent_runs_agent_key_present, check: "agent_key <> ''"))
+
+      # The lane is a tuple of three columns: a NULL in any of them would
+      # take a row out of the index, so a turn always has a subject id,
+      # and an id always has a type.
+      create(
+        constraint(@table, :agent_runs_turn_has_subject,
+          check: "NOT turn OR subject_id IS NOT NULL"
+        )
+      )
+
+      create(
+        constraint(@table, :agent_runs_subject_typed,
+          check: "subject_id IS NULL OR subject_type IS NOT NULL"
+        )
+      )
+
+      create(
+        constraint(@table, :agent_runs_actor_typed,
+          check: "actor_id IS NULL OR actor_type IS NOT NULL"
+        )
+      )
+
       drop(index(@table, [], name: :agent_runs_single_active_run_index))
 
       create(
@@ -243,6 +272,9 @@ if Code.ensure_loaded?(Ecto.Migration) do
         )
       )
 
+      drop(constraint(@table, :agent_runs_actor_typed))
+      drop(constraint(@table, :agent_runs_subject_typed))
+      drop(constraint(@table, :agent_runs_turn_has_subject))
       drop(constraint(@table, :agent_runs_agent_key_present))
 
       alter table(@table) do

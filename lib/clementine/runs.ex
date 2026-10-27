@@ -110,6 +110,21 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
                | Ecto.Changeset.t()}
     def start(agent, prompt, opts \\ []) when is_atom(agent) and is_binary(prompt) do
       config = Config.fetch!()
+
+      with {:ok, attrs} <- queued_attrs(config, agent, prompt, opts) do
+        insert_queued(config, attrs)
+      end
+    end
+
+    @doc false
+    # What `start/3` inserts, checked the way `start/3` checks it: the
+    # agent's key and turn, the prompt, and the subject and actor as text.
+    # A loop's step commit builds a child's attrs here, adds its parent
+    # and tag, and inserts through insert_queued/2.
+    @spec queued_attrs(Config.t(), module(), String.t(), keyword()) ::
+            {:ok, map()} | {:error, :unknown_agent | :blank_prompt | :subject_required}
+    def queued_attrs(%Config{} = config, agent, prompt, opts)
+        when is_atom(agent) and is_binary(prompt) do
       {subject_type, subject_id} = reference(Keyword.get(opts, :subject))
       {actor_type, actor_id} = reference(Keyword.get(opts, :actor))
 
@@ -117,16 +132,17 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
            :ok <- validate_prompt(prompt),
            turn = agent.turn(),
            :ok <- validate_lane(turn, subject_id) do
-        insert_queued(config, %{
-          agent_key: key,
-          turn: turn,
-          input: %{"prompt" => prompt},
-          subject_type: subject_type,
-          subject_id: subject_id,
-          actor_type: actor_type,
-          actor_id: actor_id,
-          metadata: Keyword.get(opts, :metadata, %{})
-        })
+        {:ok,
+         %{
+           agent_key: key,
+           turn: turn,
+           input: %{"prompt" => prompt},
+           subject_type: subject_type,
+           subject_id: subject_id,
+           actor_type: actor_type,
+           actor_id: actor_id,
+           metadata: Keyword.get(opts, :metadata, %{})
+         }}
       end
     end
 
@@ -354,7 +370,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     the thread's lane holds at most one. A subject with a `nil` id has no
     lane.
 
-    Takes `kind:` like `list/1`.
+    With `kind: :loop`, the subject's active loop instead: a loop is never
+    a turn, so the turn filter applies to rollouts alone. Where
+    controllers of several keys may each hold a loop on one subject,
+    `list/1` with `agent:` tells them apart.
     """
     @spec active(subject(), keyword()) :: AgentRun.t() | nil
     def active(subject, opts \\ []) do
@@ -365,14 +384,18 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           nil
 
         {type, id} ->
-          repo.one(
-            from(r in active_query(opts),
-              where: r.turn and r.subject_type == ^type and r.subject_id == ^id,
-              limit: 1
-            )
+          from(r in active_query(opts),
+            where: r.subject_type == ^type and r.subject_id == ^id,
+            limit: 1
           )
+          |> turns_only(Keyword.get(opts, :kind, :rollout))
+          |> repo.one()
       end
     end
+
+    # A turn is a rollout; a loop occupies its lane with `turn = false`.
+    defp turns_only(query, :rollout), do: from(r in query, where: r.turn)
+    defp turns_only(query, _kind), do: query
 
     @doc """
     The newest run on `subject`, active or ended, or `nil`. Takes the
