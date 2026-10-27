@@ -1,13 +1,14 @@
 defmodule Clementine.Host do
   @moduledoc """
   The host's say in the durable runtime: one optional module, named in the
-  child spec, with up to six callbacks. Every callback is optional;
+  child spec, with up to seven callbacks. Every callback is optional;
   leave out the ones the app has no opinion on.
 
   | Callback | Runs | Use it for |
   | --- | --- | --- |
   | `c:authorize_resume/2` | in `Clementine.Runs.resume/2`, on the locked run | who may approve or deny a waiting run |
   | `c:resolve_subject/2` | at every claim | turning the stored `{type, id}` into what the agent works on |
+  | `c:resolve_actor/2` | at every claim | turning the stored `{type, id}` into whose authority the run acts with, or refusing it |
   | `c:run_event/2` | while a run executes, in a process of its own | streaming tokens and tool activity to a UI |
   | `c:run_transition/2` | after each change short of the end commits | status broadcasts: running, waiting, queued again |
   | `c:run_finished/2` | inside the transaction that ends a run | database writes that must commit with the run's end, including the Oban job for mail or anything else that must happen |
@@ -85,6 +86,17 @@ defmodule Clementine.Host do
         end
 
         def resolve_subject(_type, _id), do: {:ok, nil}
+
+        @impl true
+        def resolve_actor("user", id) do
+          case MyApp.Accounts.get_user(id) do
+            %{suspended_at: nil} = user -> {:ok, user}
+            nil -> {:error, :user_not_found}
+            _suspended -> {:error, :user_suspended}
+          end
+        end
+
+        def resolve_actor(_type, _id), do: {:ok, nil}
 
         defp broadcast(run, message) do
           Phoenix.PubSub.broadcast(MyApp.PubSub, "ticket:" <> run.subject_id, message)
@@ -173,8 +185,8 @@ defmodule Clementine.Host do
   Events are advisory and may be lost: what a UI shows from them must
   also follow from the run's end (`c:run_committed/2`). `run` is the run
   as its claim committed it (`run.status` is `"running"`, and
-  `run.lease_epoch` the execution's epoch), and `run.subject` is `nil`
-  here.
+  `run.lease_epoch` the execution's epoch), and `run.subject` and
+  `run.actor` are `nil` here.
   """
   @callback run_event(AgentRun.t(), Clementine.Event.t()) :: any()
 
@@ -212,10 +224,31 @@ defmodule Clementine.Host do
   @callback resolve_subject(type :: String.t(), id :: String.t() | nil) ::
               {:ok, term()} | {:error, term()}
 
+  @doc """
+  Turns a run's stored actor (`{type, id}` as `Clementine.Runs.start/3`
+  took it, as strings), whose authority the run acts with, into the value
+  the agent and its tools act as. The same contract as
+  `c:resolve_subject/2`: it runs at every claim, the one after a resume
+  included, before the agent is built, and the value reaches
+  `c:Clementine.Agent.agent/1` and `c:Clementine.Agent.history/1` as
+  `run.actor` and every tool as `context.actor`.
+
+  `{:error, reason}` refuses the actor and cancels the run as unstartable
+  with the reason: a run acting for an account suspended since it was
+  started, or parked for approval, never starts or resumes. A run with no
+  actor (the system's) never reaches this callback; without it, `actor`
+  is `nil` and agents read `actor_type` and `actor_id` themselves. A check
+  that binds the two, such as the thread belonging to the actor, is a
+  comparison of `run.subject` and `run.actor` in `agent/1` or a tool.
+  """
+  @callback resolve_actor(type :: String.t(), id :: String.t() | nil) ::
+              {:ok, term()} | {:error, term()}
+
   @optional_callbacks authorize_resume: 2,
                       run_event: 2,
                       run_transition: 2,
                       run_finished: 2,
                       run_committed: 2,
-                      resolve_subject: 2
+                      resolve_subject: 2,
+                      resolve_actor: 2
 end

@@ -33,7 +33,19 @@ defmodule Clementine.Result do
   end
 
   defmodule Cancelled do
-    @moduledoc "A requested stop — user, control plane, or policy."
+    @moduledoc """
+    A requested stop — user, control plane, or policy.
+
+    `reason` is the cancel reason as it was stored on the run. On the
+    durable runtime (`Clementine.Runs`) it is a map with a `"code"` and,
+    when there is more to say, a `"detail"`: `%{"code" => "cancelled"}`
+    from `Clementine.Runs.cancel/1`, and
+    `%{"code" => "unstartable", "detail" => why}` when the run could not
+    be built at a claim (an agent, subject, actor, or history that no
+    longer resolves). Hosts read it from the result; nothing else decodes
+    it. On a lifecycle of the app's own it is whatever the app passed to
+    `Clementine.Lifecycle.Protocol.request_cancel/4`.
+    """
     defstruct reason: nil, usage: %Clementine.Usage{}
 
     @type t :: %__MODULE__{reason: term(), usage: Clementine.Usage.t()}

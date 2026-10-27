@@ -35,13 +35,26 @@ defmodule Clementine.RunsTest do
                        %Result.Completed{output: "Hello."}}
     end
 
-    test "each agent has at most one active run per subject" do
+    test "copies the agent's turn to the row" do
+      assert {:ok, %AgentRun{turn: true}} = Runs.start(Chat, "Hi", subject: {"conversation", 1})
+      assert {:ok, %AgentRun{turn: false}} = Runs.start(Echo, "Hi", subject: {"conversation", 1})
+    end
+
+    test "a turn needs a subject" do
+      assert {:error, :subject_required} = Runs.start(Chat, "Hi")
+      assert {:error, :subject_required} = Runs.start(Chat, "Hi", subject: {"conversation", nil})
+      assert {:ok, _run} = Runs.start(Chat, "Hi", subject: {"conversation", 1})
+    end
+  end
+
+  describe "lanes" do
+    test "a task's lane is its agent and subject: each agent has at most one active run per subject" do
       assert {:ok, _run} = Runs.start(Echo, "First", subject: {"ticket", 1})
       assert {:error, :active_run_exists} = Runs.start(Echo, "Second", subject: {"ticket", 1})
       assert {:ok, _run} = Runs.start(Echo, "Elsewhere", subject: {:ticket, 2})
     end
 
-    test "different agents on one subject both run" do
+    test "tasks of two agents on one subject don't collide" do
       assert {:ok, echo} = Runs.start(Echo, "Answer", subject: {"ticket", 1})
       assert {:ok, lookup} = Runs.start(Lookup, "Look it up", subject: {"ticket", 1})
       assert {:error, :active_run_exists} = Runs.start(Lookup, "Again", subject: {"ticket", 1})
@@ -56,10 +69,176 @@ defmodule Clementine.RunsTest do
       assert %AgentRun{agent_key: "test_lookup", status: "completed"} = Runs.get(lookup.id)
     end
 
-    test "a subject with no id stores NULL, so such runs never block each other" do
+    test "a turn's lane is its thread: turns of two agents on one thread collide" do
+      assert {:ok, chat} = Runs.start(Chat, "Hi", subject: {"conversation", 1})
+
+      assert {:error, :active_run_exists} =
+               Runs.start(Chat, "Again", subject: {"conversation", 1})
+
+      assert {:error, :active_run_exists} =
+               Runs.start(Handoff, "Take over", subject: {"conversation", 1})
+
+      assert {:ok, _elsewhere} = Runs.start(Handoff, "Take over", subject: {"conversation", 2})
+
+      # The thread frees up when its turn ends.
+      expect_turn(text_events("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => chat.id})
+      assert {:ok, _handoff} = Runs.start(Handoff, "Take over", subject: {"conversation", 1})
+    end
+
+    test "a turn parked for approval still holds its thread" do
+      {:ok, chat} = Runs.start(Chat, "Tell the team", subject: {"conversation", 1})
+
+      expect_turn(tool_events("toolu_1", "send_note", %{text: "hello"}))
+      assert :ok = perform_job(Worker, %{"run_id" => chat.id})
+      assert %AgentRun{status: "waiting"} = Runs.get(chat.id)
+
+      assert {:error, :active_run_exists} =
+               Runs.start(Handoff, "Take over", subject: {"conversation", 1})
+    end
+
+    test "a turn and a task on one subject don't collide" do
+      assert {:ok, _turn} = Runs.start(Chat, "Hi", subject: {"conversation", 1})
+      assert {:ok, _task} = Runs.start(Echo, "Screen it", subject: {"conversation", 1})
+      assert {:ok, _other_task} = Runs.start(Lookup, "Look it up", subject: {"conversation", 1})
+    end
+
+    test "subject-less runs have no lane and never block" do
       assert {:ok, first} = Runs.start(Echo, "One", subject: {"ticket", nil})
       assert {:ok, _second} = Runs.start(Echo, "Two", subject: {"ticket", nil})
+      assert {:ok, _third} = Runs.start(Echo, "Three")
+      assert {:ok, _fourth} = Runs.start(Echo, "Four")
       assert %AgentRun{subject_type: "ticket", subject_id: nil} = Runs.get(first.id)
+    end
+
+    test "ids that contain colons don't alias" do
+      # Joined into one string, Chat's turn on ("test_echo", "x:y") and
+      # Echo's task on ("x", "y") would share the lane "test_echo:x:y".
+      assert {:ok, _turn} = Runs.start(Chat, "Hi", subject: {"test_echo", "x:y"})
+      assert {:ok, _task} = Runs.start(Echo, "Hi", subject: {"x", "y"})
+
+      assert {:ok, _one} = Runs.start(Echo, "Hi", subject: {"ticket", "1:2"})
+      assert {:ok, _two} = Runs.start(Echo, "Hi", subject: {"ticket:1", "2"})
+    end
+
+    test "concurrent starts on one thread admit exactly one turn" do
+      results =
+        1..8
+        |> Task.async_stream(
+          fn n -> Runs.start(Handoff, "Go #{n}", subject: {"conversation", "race"}) end,
+          max_concurrency: 8
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.count(results, &match?({:ok, _run}, &1)) == 1
+      assert Enum.count(results, &(&1 == {:error, :active_run_exists})) == 7
+    end
+  end
+
+  describe "queries" do
+    test "active?/2 is a task's lane: whether the agent has an active run on the subject" do
+      refute Runs.active?(Echo, {"ticket", 1})
+
+      {:ok, run} = Runs.start(Echo, "Hi", subject: {"ticket", 1})
+      assert Runs.active?(Echo, {"ticket", 1})
+      assert Runs.active?(Echo, {:ticket, "1"})
+      refute Runs.active?(Lookup, {"ticket", 1})
+      refute Runs.active?(Echo, {"ticket", 2})
+      refute Runs.active?(Echo, {"ticket", nil})
+
+      expect_turn(text_events("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => run.id})
+      refute Runs.active?(Echo, {"ticket", 1})
+
+      assert_raise ArgumentError, ~r/String is not an agent the child spec lists/, fn ->
+        Runs.active?(String, {"ticket", 1})
+      end
+    end
+
+    test "active/1 is the thread's active turn, of whichever agent" do
+      assert Runs.active({"conversation", 1}) == nil
+
+      {:ok, _task} = Runs.start(Echo, "Screen it", subject: {"conversation", 1})
+      assert Runs.active({"conversation", 1}) == nil
+
+      {:ok, turn} = Runs.start(Handoff, "Take over", subject: {"conversation", 1})
+      assert %AgentRun{id: turn_id, turn: true} = Runs.active({"conversation", 1})
+      assert turn_id == turn.id
+      assert Runs.active({"conversation", nil}) == nil
+
+      assert {:ok, :finished} = Runs.cancel(turn.id)
+      assert Runs.active({"conversation", 1}) == nil
+    end
+
+    test "latest/2 is the newest run on the subject, active or ended, under the list filters" do
+      assert Runs.latest({"conversation", 1}) == nil
+
+      {:ok, first} = Runs.start(Chat, "One", subject: {"conversation", 1})
+      expect_turn(text_events("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => first.id})
+
+      {:ok, task} = Runs.start(Echo, "Screen it", subject: {"conversation", 1})
+      {:ok, second} = Runs.start(Chat, "Two", subject: {"conversation", 1})
+
+      assert %AgentRun{id: id} = Runs.latest({"conversation", 1})
+      assert id == second.id
+      assert %AgentRun{id: id} = Runs.latest({"conversation", 1}, turn: false)
+      assert id == task.id
+      assert %AgentRun{id: id} = Runs.latest({"conversation", 1}, agent: Echo)
+      assert id == task.id
+      assert Runs.latest({"conversation", 1}, agent: Lookup) == nil
+    end
+
+    test "list/1 filters by subject, agent, turn, and actor, newest first, with a limit" do
+      {:ok, turn} = Runs.start(Chat, "One", subject: {"conversation", 1}, actor: {"user", "ada"})
+      {:ok, task} = Runs.start(Echo, "Two", subject: {"conversation", 1})
+      {:ok, elsewhere} = Runs.start(Echo, "Three", subject: {"conversation", 2})
+      {:ok, nowhere} = Runs.start(Echo, "Four", subject: {"conversation", nil})
+
+      ids = fn runs -> Enum.map(runs, & &1.id) end
+
+      assert ids.(Runs.list()) == [nowhere.id, elsewhere.id, task.id, turn.id]
+      assert ids.(Runs.list(limit: 2)) == [nowhere.id, elsewhere.id]
+      assert ids.(Runs.list(subject: {"conversation", 1})) == [task.id, turn.id]
+      assert ids.(Runs.list(subject: {"conversation", 1}, turn: true)) == [turn.id]
+      assert ids.(Runs.list(subject: {"conversation", nil})) == [nowhere.id]
+      assert ids.(Runs.list(agent: Echo)) == [nowhere.id, elsewhere.id, task.id]
+      assert ids.(Runs.list(actor: {"user", "ada"})) == [turn.id]
+      assert ids.(Runs.list(turn: false, actor: {"user", "ada"})) == []
+
+      assert_raise ArgumentError, ~r/unknown filter \{:status, "queued"\}/, fn ->
+        Runs.list(status: "queued")
+      end
+    end
+
+    test "the queries take rollouts unless told kind: :loop" do
+      {:ok, task} = Runs.start(Echo, "Screen it", subject: {"conversation", 1})
+
+      loop =
+        insert_queued_run!(%{subject_type: "conversation", subject_id: "1", agent_key: "thread"})
+
+      {1, _} =
+        TestRepo.update_all(from(r in AgentRun, where: r.id == ^loop.id), set: [kind: "loop"])
+
+      assert [%AgentRun{id: id}] = Runs.list(subject: {"conversation", 1})
+      assert id == task.id
+      assert [%AgentRun{id: id}] = Runs.list(subject: {"conversation", 1}, kind: :loop)
+      assert id == loop.id
+      assert %AgentRun{id: id} = Runs.latest({"conversation", 1})
+      assert id == task.id
+      assert %AgentRun{id: id} = Runs.latest({"conversation", 1}, kind: :loop)
+      assert id == loop.id
+    end
+
+    test "AgentRun.active?/1 and terminal?/1 read the status" do
+      {:ok, run} = Runs.start(Echo, "Hi")
+      assert AgentRun.active?(run)
+      refute AgentRun.terminal?(run)
+
+      assert {:ok, :finished} = Runs.cancel(run.id)
+      ended = Runs.get(run.id)
+      refute AgentRun.active?(ended)
+      assert AgentRun.terminal?(ended)
     end
 
     test "stores metadata as given" do

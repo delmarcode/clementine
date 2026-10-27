@@ -121,8 +121,8 @@ end
 
 defmodule Clementine.Test.Ecto.CreateAgentRuns do
   @moduledoc """
-  The durable runtime's tables, the way a host builds them: `agent_runs`
-  from `Clementine.Migration`, and Oban's `oban_jobs`.
+  The durable runtime's tables, the way a host built them on version 1:
+  `agent_runs` from `Clementine.Migration`, and Oban's `oban_jobs`.
   """
 
   use Ecto.Migration
@@ -136,4 +136,18 @@ defmodule Clementine.Test.Ecto.CreateAgentRuns do
     Clementine.Migration.down(version: 1)
     Oban.Migration.down(version: 1)
   end
+end
+
+defmodule Clementine.Test.Ecto.UpgradeAgentRunsToVersion2 do
+  @moduledoc """
+  The migration a host on version 1 writes to adopt version 2. The runs
+  suite runs on the upgraded table, so the upgrade path is the one every
+  runtime test exercises; `Clementine.MigrationTest` proves it builds the
+  same table as `up(version: 2)` from scratch.
+  """
+
+  use Ecto.Migration
+
+  def up, do: Clementine.Migration.up(from: 1, version: 2)
+  def down, do: Clementine.Migration.down(to: 1, version: 2)
 end

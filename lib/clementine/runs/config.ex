@@ -83,7 +83,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       Enum.reduce(modules, %{}, fn module, acc ->
         loaded!(module, "agent")
 
-        unless function_exported?(module, :key, 0) and function_exported?(module, :agent, 1) do
+        unless function_exported?(module, :key, 0) and function_exported?(module, :turn, 0) and
+                 function_exported?(module, :agent, 1) do
           raise ArgumentError,
                 "#{inspect(module)} is not a Clementine.Agent (use Clementine.Agent)"
         end

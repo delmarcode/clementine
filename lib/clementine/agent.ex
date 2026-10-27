@@ -43,18 +43,43 @@ defmodule Clementine.Agent do
   The fields given to `use` build the agent at compile time, so a typo in
   them fails the build. List the module in the child spec's `agents:`.
 
-  An agent that converses also writes `c:history/1`, which returns the
-  messages before the run's prompt from the app's own tables:
+  ## Turns and tasks
+
+  A run is a **turn** or a **task**. A turn is a run on a thread: its
+  subject is the thread (a conversation, say), it reads the thread as its
+  history, and the host appends what it said in
+  `c:Clementine.Host.run_finished/2`. A task is any other run. The agent
+  declares which its runs are with `turn: true`, and `Clementine.Runs.start/3`
+  copies that to the row, so queries and the database see it and a later
+  change to the agent never relabels its history.
+
+  A turn agent must write `c:history/1`, the thread's messages before the
+  run's prompt, read from the app's own tables; leaving it out fails the
+  build. A task agent may write one too (a one-shot summarizer wanting the
+  transcript as history rather than through a tool); it defaults to `[]`.
 
       defmodule MyApp.Agents.Chat do
         use Clementine.Agent,
           key: "chat",
+          turn: true,
           model: :claude_sonnet,
           instructions: "You are a helpful assistant."
 
         @impl true
         def history(run), do: MyApp.Chat.messages(run.subject_id)
       end
+
+  Which a run is decides its **lane**, the key under which active runs are
+  exclusive. A turn's lane is its thread, whichever agent it belongs to:
+  one active turn per thread, so a second agent's turn on a thread in use
+  is refused too. A task's lane is its agent and subject: a chat turn and
+  a triage task on one conversation run side by side. A turn needs a
+  subject (`{:error, :subject_required}` without one); a task without one
+  has no lane and blocks nothing.
+
+  `c:agent/1` and `c:history/1` see `run.subject` and `run.actor` resolved
+  (`c:Clementine.Host.resolve_subject/2` and
+  `c:Clementine.Host.resolve_actor/2`).
 
   Note: this module shadows Elixir's built-in `Agent` under a bare `alias`;
   prefer `alias Clementine.Agent, as: AgentDef` where the collision bites.
@@ -85,9 +110,16 @@ defmodule Clementine.Agent do
   @callback key() :: String.t()
 
   @doc """
+  Whether this agent's runs are turns on a thread (`turn: true` on `use`).
+  `Clementine.Runs.start/3` copies it to the row's `turn` column.
+  """
+  @callback turn() :: boolean()
+
+  @doc """
   The agent for one execution of `run`: model, instructions, tools, and
   limits. Called at every claim, so it may read whatever the run needs;
-  `run.subject` holds what `c:Clementine.Host.resolve_subject/2` returned.
+  `run.subject` and `run.actor` hold what the host resolved
+  (`c:Clementine.Host.resolve_subject/2`, `c:Clementine.Host.resolve_actor/2`).
   `use Clementine.Agent` with the agent's fields defines it.
   """
   @callback agent(run :: Clementine.Runs.AgentRun.t()) :: t()
@@ -102,13 +134,16 @@ defmodule Clementine.Agent do
   `c:Clementine.Host.run_finished/2` (`Result.Completed` carries the
   prompt as `input_message` and the run's own turns as `messages`;
   `Clementine.LLM.Message.to_map/1` and `from_map/1` round-trip them
-  through a `jsonb` column), and read them back here.
+  through a `jsonb` column), and read them back here. Where the cutoff
+  falls (messages that arrived after the prompt, say) is the app's rule.
 
-  It is called when a run starts from its prompt, after the subject
-  resolves, so `run.subject` is set. A run that resumes after an approval
-  continues from its checkpoint, which already holds the conversation, so
-  it is not called again. Anything but a list of messages cancels the run
-  as unstartable. `use Clementine.Agent` defines it to return `[]`.
+  It is called when a run starts from its prompt, after the subject and
+  actor resolve, so `run.subject` and `run.actor` are set. A run that
+  resumes after an approval continues from its checkpoint, which already
+  holds the conversation, so it is not called again. Anything but a list
+  of messages cancels the run as unstartable. A turn agent (`turn: true`)
+  must define it; for any other `use Clementine.Agent` defines it to
+  return `[]`.
   """
   @callback history(run :: Clementine.Runs.AgentRun.t()) :: [Clementine.LLM.Message.message()]
 
@@ -117,23 +152,39 @@ defmodule Clementine.Agent do
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do
       @behaviour Clementine.Agent
+      @before_compile Clementine.Agent
 
       {key, fields} = Keyword.pop(opts, :key)
+      {turn, fields} = Keyword.pop(fields, :turn, false)
 
       unless is_binary(key) and key != "" do
         raise ArgumentError,
               "use Clementine.Agent needs a non-empty string key:, got: #{inspect(key)}"
       end
 
+      unless is_boolean(turn) do
+        raise ArgumentError,
+              "use Clementine.Agent takes turn: true or false, got: #{inspect(turn)}"
+      end
+
       @clementine_agent_key key
+      @clementine_agent_turn turn
 
       @impl Clementine.Agent
       def key, do: @clementine_agent_key
 
       @impl Clementine.Agent
-      def history(_run), do: []
+      def turn, do: @clementine_agent_turn
 
-      defoverridable history: 1
+      # A turn reads its thread as history, so a turn agent writes
+      # history/1 itself (__before_compile__ checks); a task defaults to
+      # none.
+      unless turn do
+        @impl Clementine.Agent
+        def history(_run), do: []
+
+        defoverridable history: 1
+      end
 
       if fields != [] do
         @clementine_agent Clementine.Agent.new([id: key] ++ fields)
@@ -143,6 +194,17 @@ defmodule Clementine.Agent do
 
         defoverridable agent: 1
       end
+    end
+  end
+
+  @doc false
+  defmacro __before_compile__(env) do
+    if Module.get_attribute(env.module, :clementine_agent_turn) and
+         not Module.defines?(env.module, {:history, 1}) do
+      raise ArgumentError,
+            "#{inspect(env.module)} is a turn agent (turn: true) and must define history/1, " <>
+              "the thread's messages before the run's prompt. An agent with no history to " <>
+              "read is a task: leave turn: out"
     end
   end
 

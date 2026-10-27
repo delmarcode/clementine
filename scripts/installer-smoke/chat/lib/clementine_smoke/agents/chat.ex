@@ -1,7 +1,7 @@
 defmodule ClementineSmoke.Agents.Chat do
   @moduledoc """
-  A chat agent. Each turn is one run whose subject is the conversation,
-  and the conversation so far is its history.
+  A chat agent: a turn agent. Each turn is one run whose subject is the
+  conversation, and the conversation so far is its history.
 
       Clementine.Runs.start(ClementineSmoke.Agents.Chat, text,
         subject: {"conversation", conversation_id}
@@ -10,6 +10,7 @@ defmodule ClementineSmoke.Agents.Chat do
 
   use Clementine.Agent,
     key: "chat",
+    turn: true,
     model: :claude_sonnet,
     instructions: "You are a friendly assistant. Answer in a sentence."
 

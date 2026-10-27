@@ -17,6 +17,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       config = Config.new!(opts)
       oban = oban_config!(config.oban)
       same_repo!(config, oban)
+      # The table and the code that writes it move together: a table
+      # behind the code's version refuses the start and names the
+      # migration to write.
+      :ok = Clementine.Migration.check!(config.repo)
       :ok = Config.put(config)
 
       # Oban's own plugins do not run in a testing mode; neither does the

@@ -9,32 +9,59 @@ the drain at shutdown.
 
 - One child after Oban, whose `repo` is Oban's repo:
   `{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: [MyApp.Agents.Triage], host: MyApp.Agents.Host}`.
-- One migration calling `Clementine.Migration.up(version: 1)`.
+- One migration calling `Clementine.Migration.up(version: 2)`. Each
+  version stamps the table, and the runtime refuses to start against a
+  table behind the code's version, naming the migration to write
+  (`Clementine.Migration.up(from: 1, version: 2)`).
 - Agent modules, each listed in `agents:`:
   `use Clementine.Agent, key: "triage", model: :claude_sonnet, instructions: "...", tools: [...]`.
-  Every run row stores the key, so never rename a key that has runs.
+  Every run row stores the key, so never rename a key that has runs. An
+  agent whose runs are turns on a thread says `turn: true` and writes
+  `history/1`.
 
 `mix clementine.install` writes the glue, and `mix clementine.gen.agent
 Triage` adds an agent with a tool and a test. Never copy a worker, a
 lifecycle, or a reaper into the app.
 
+## Subject, actor, turn, lane
+
+- A run's **subject** is what it is about: `subject: {"ticket", ticket.id}`,
+  stored as text. Its **actor** is whose authority it acts with:
+  `actor: {"user", user.id}`. The host resolves both at every claim
+  (`resolve_subject/2`, `resolve_actor/2`); a refusal cancels the run as
+  unstartable. A run with no actor is the system's.
+- A **turn** is a run on a thread: its subject is the thread, it reads
+  the thread as history, and the host appends what it said. The agent
+  declares it (`turn: true`), and `start/3` copies it to the row. Any
+  other run is a **task**.
+- The **lane** is the key under which active runs (queued, running, or
+  waiting) are exclusive, held by the `agent_runs_lane_index`. A turn's
+  lane is its thread, whichever agent: one active turn per thread. A
+  task's lane is its agent and subject: tasks of different agents on one
+  subject, and a turn and a task, run side by side. A run with no subject
+  has no lane and blocks nothing.
+- Busy means refused: a start in a busy lane returns
+  `{:error, :active_run_exists}`. Queueing is a loop's job, not the
+  runtime's.
+
 ## The API: `Clementine.Runs`
 
 ```elixir
-{:ok, run} = Clementine.Runs.start(MyApp.Agents.Triage, prompt, subject: {"ticket", ticket.id})
+{:ok, run} = Clementine.Runs.start(MyApp.Agents.Triage, prompt, subject: {"ticket", ticket.id}, actor: {"user", user.id})
 :ok = Clementine.Runs.resume(run.id, {:approved, %{by: user.id}})
 {:ok, :finished} = Clementine.Runs.cancel(run.id)
 %Clementine.Runs.AgentRun{status: "completed", result: %{"output" => output}} = Clementine.Runs.get(run.id)
 ```
 
-- `start/3` takes the agent module. Each agent has at most one queued,
-  running, or waiting run per subject: starting the same agent again
-  returns `{:error, :active_run_exists}`, and a different agent on the
-  same subject starts. It returns `:unknown_agent` or `:blank_prompt` for
-  bad input. `metadata: %{}` is stored as given.
+- `start/3` takes the agent module, `subject:`, `actor:`, and
+  `metadata: %{}`, stored as given. It returns `:unknown_agent` or
+  `:blank_prompt` for bad input, `:subject_required` for a turn without
+  a subject id, and `:active_run_exists` for a busy lane. Inside the
+  caller's transaction the run and its job commit with it.
 - `resume/2` takes `{:approved, meta}` or `{:denied, meta}` for a waiting
   run; a denial's `meta[:message]` reaches the model. It returns
-  `{:error, :not_found | :not_waiting}`, or the host's refusal.
+  `{:error, :not_found | :not_waiting}`, or the host's refusal. The claim
+  that follows resolves the subject and actor again.
 - `cancel/1` returns `{:ok, :finished}` for a queued or waiting run and
   `{:ok, :flagged}` for a running one. The flag reaches the run's process
   on whichever node runs it, which aborts the model call in flight and
@@ -45,35 +72,53 @@ lifecycle, or a reaper into the app.
   raise.
 - `get/1` returns the run or `nil`. Read `agent_runs` freely; only
   Clementine writes it.
+- The queries: `active?(agent, subject)` is a task's lane (does the agent
+  have an active run on the subject); `active(subject)` is the thread's
+  active turn, of whichever agent, or `nil`; `latest(subject, opts)` is
+  the newest run on it, active or ended; `list(opts)` takes `subject:`,
+  `agent:`, `turn:`, `actor:`, `kind:` (`:rollout` by default), and
+  `limit:`, newest first. `AgentRun.active?/1` and `terminal?/1` read a
+  run's status.
 
-## A conversation: `history/1`
+```elixir
+Clementine.Runs.active?(MyApp.Agents.Triage, {"conversation", id})   # a screen in flight?
+Clementine.Runs.active({"conversation", id})                         # the turn in flight, or nil
+Clementine.Runs.list(subject: {"conversation", id}, turn: true)      # the thread's turns
+Clementine.Runs.list(actor: {"user", id})                            # an account's runs
+```
 
-An agent that converses defines `history/1` on its module: the messages
-before the run's prompt, oldest first. The runtime sends them to the
-model, then the prompt.
+## A turn: `turn: true` and `history/1`
+
+An agent that converses is a turn agent: `turn: true`, and `history/1`
+on its module, the messages before the run's prompt, oldest first. The
+runtime sends them to the model, then the prompt.
 
 ```elixir
 defmodule MyApp.Agents.Chat do
-  use Clementine.Agent, key: "chat", model: :claude_sonnet, instructions: "Be brief."
+  use Clementine.Agent, key: "chat", turn: true, model: :claude_sonnet, instructions: "Be brief."
 
   @impl true
   def history(run), do: MyApp.Chat.messages(run.subject_id)
 end
 ```
 
+- A turn agent with no `history/1` fails the build. A task agent may
+  define one too; it defaults to `[]`.
 - Return `Clementine.LLM.Message` structs: `UserMessage`,
   `AssistantMessage`, and `ToolResultMessage`. Anything else cancels the
-  run as unstartable. Leave out the run's own prompt.
+  run as unstartable. Leave out the run's own prompt; where the cutoff
+  falls is the app's rule.
 - The conversation is the app's data, in its own table. Store each
   finished turn in `run_finished/2`: `result.input_message` (unless the
   app stored the user's message when it arrived) and `result.messages`,
   as `jsonb` through `Clementine.LLM.Message.to_map/1`. Read them back with
   `from_map/1`.
-- One turn is one run, with subject `{"conversation", id}`, so a second
-  turn while one is in flight returns `{:error, :active_run_exists}`.
-- `history/1` runs when a run starts, with `run.subject` resolved. A run
-  that resumes after an approval continues from its checkpoint and does
-  not call it.
+- One turn is one run with subject `{"conversation", id}`, so a second
+  turn while one is in flight, of this agent or another, returns
+  `{:error, :active_run_exists}`.
+- `history/1` runs when a run starts, with `run.subject` and `run.actor`
+  resolved. A run that resumes after an approval continues from its
+  checkpoint and does not call it.
 
 ## The host module: which callback
 
@@ -95,6 +140,9 @@ event arrives before the change that follows it, and
 When a run ends, ask whether losing the work matters. Both hooks see
 every end, as `Clementine.Result.Completed`, `Failed`, `Cancelled`, or
 `Interrupted`, after a completed run's output is stored in `run.result`.
+A `Cancelled` carries the stored reason: `%{"code" => "cancelled"}` from
+`cancel/1`, and `%{"code" => "unstartable", "detail" => why}` for a run
+the runtime could not build at a claim.
 
 **It matters: `run_finished/2`.** It runs inside the transaction that ends
 the run, so its writes commit with the run's end or not at all. Use it
@@ -114,7 +162,8 @@ def run_finished(_run, _result), do: :ok
 **It may be lost: `run_committed/2`.** It runs once, after the commit,
 and never for an end that rolled back. Use it for PubSub broadcasts,
 LiveView refreshes, and telemetry. A node that dies between the commit
-and the call loses it.
+and the call loses it. A `Clementine.RunView` closes on the run it hands
+over (`RunView.close(view, run)`); nothing else is needed.
 
 ```elixir
 @impl true
@@ -183,6 +232,30 @@ end
 def resolve_subject(_type, _id), do: {:ok, nil}
 ```
 
+`resolve_actor/2` is the same contract for the stored actor: whose
+authority the run acts with, as `run.actor` and `context.actor`. Refuse
+it for an account that may no longer act (suspended, gone), and the run
+is cancelled instead of started, or instead of resumed. A check that the
+thread belongs to the actor is a comparison of `run.subject` and
+`run.actor` in `agent/1` or a tool.
+
+```elixir
+@impl true
+def resolve_actor("user", id) do
+  case MyApp.Accounts.get_user(id) do
+    %{suspended_at: nil} = user -> {:ok, user}
+    nil -> {:error, :user_not_found}
+    _suspended -> {:error, :user_suspended}
+  end
+end
+
+def resolve_actor(_type, _id), do: {:ok, nil}
+```
+
+Tools see `context.run_id`, `context.agent_key`, `context.turn`,
+`context.subject`, and `context.actor` (with `subject_type`,
+`subject_id`, `actor_type`, and `actor_id` as stored).
+
 ## Never
 
 - Never send mail, call a service, broadcast, or write files in
@@ -201,6 +274,10 @@ def resolve_subject(_type, _id), do: {:ok, nil}
   yourself.
 - Never call `Clementine.Runs.resume/2` or `cancel/1` inside a
   transaction.
+- Never call `Clementine.Lifecycle.*` (the protocol, the Ecto adapter,
+  its codec, or its migration recipe) from an app on `Clementine.Runs`.
+  `Clementine.RunView.close/2` takes the run; `Result.Cancelled.reason`
+  is the stored reason.
 
 ## Not configurable
 

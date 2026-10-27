@@ -249,6 +249,16 @@ The second argument to `run/2` is a context map. Available keys:
 | `:capabilities` | map | Explicit built-in tool capabilities, e.g. `%{read: true, write: false, shell: false}` |
 | `:agent_pid` | pid | PID of the agent GenServer |
 
+On the durable runtime (`Clementine.Runs`) every tool also sees the run it serves:
+
+| Key | Type | Description |
+|---|---|---|
+| `:run_id` | string | The run's id |
+| `:agent_key` | string | The agent's key |
+| `:turn` | boolean | Whether the run is a turn on a thread |
+| `:subject` | term | What the run is about, as `Clementine.Host.resolve_subject/2` resolved it (`:subject_type` and `:subject_id` as stored) |
+| `:actor` | term | Whose authority the run acts with, as `Clementine.Host.resolve_actor/2` resolved it (`:actor_type` and `:actor_id` as stored) |
+
 You can pass additional context keys when starting the agent or calling `ToolRunner.execute/4` directly.
 
 ### Built-in tool capabilities
