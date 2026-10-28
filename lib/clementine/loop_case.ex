@@ -126,6 +126,25 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
           end
         end
 
+        describe "loop conformance: send if_idle" do
+          test "if_idle refuses :busy under a live child, a non-empty inbox, and a pending cancel; the refused message never reaches the loop" do
+            Battery.send_if_idle_refusals()
+          end
+
+          test "if_idle and a step serialize on the loop row lock: a send racing a park is refused whole or appended whole" do
+            Battery.send_if_idle_racing_a_step()
+          end
+
+          @tag racing_writers: true
+          test "if_idle sends racing each other: exactly one lands" do
+            Battery.send_if_idle_concurrent()
+          end
+
+          test "a :busy inside the caller's transaction is a return, not a rollback" do
+            Battery.send_if_idle_inside_a_transaction()
+          end
+        end
+
         describe "loop conformance: wrong-state calls" do
           test "every loop verb refuses a run that is not a loop; a parked rollout's suspension survives a miswired wake" do
             Battery.kind_guards()

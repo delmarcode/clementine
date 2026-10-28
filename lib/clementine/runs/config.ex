@@ -25,7 +25,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     @key {__MODULE__, :config}
 
-    defstruct [:repo, :oban, :queue, :agents, :host, :lifecycle]
+    defstruct [:repo, :oban, :queue, :agents, :host, :lifecycle, inline_steps: false]
 
     @type t :: %__MODULE__{
             repo: module(),
@@ -33,7 +33,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             queue: atom(),
             agents: %{String.t() => module()},
             host: module() | nil,
-            lifecycle: map()
+            lifecycle: map(),
+            inline_steps: boolean()
           }
 
     @doc false

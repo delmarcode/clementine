@@ -373,7 +373,7 @@ defmodule Clementine.Loop.Step do
   # The first claim runs init — state and actions land in the same commit
   # as the first drain, under the synthetic causal ref "init".
   defp initial_fold(module, nil, loop_args, vocab, plan, loop_ref) do
-    fold = new_fold(nil, plan, loop_ref)
+    fold = new_fold(module, nil, plan, loop_ref)
 
     case module.init(loop_args) do
       {:ok, state, actions} ->
@@ -395,7 +395,7 @@ defmodule Clementine.Loop.Step do
 
     with {:ok, dumped} <- stored_state(module, envelope, declared, vocab) do
       state = module.load(dumped)
-      {:ok, %{new_fold(envelope, plan, loop_ref) | state: state, initialized?: true}}
+      {:ok, %{new_fold(module, envelope, plan, loop_ref) | state: state, initialized?: true}}
     end
   end
 
@@ -413,8 +413,10 @@ defmodule Clementine.Loop.Step do
     upgrade_chain(module, envelope.state_version, declared, envelope.state, vocab)
   end
 
-  defp new_fold(envelope, plan, loop_ref) do
+  defp new_fold(module, envelope, plan, loop_ref) do
     %{
+      module: module,
+      vocab: module.__loop__(:vocabulary),
       loop_ref: loop_ref,
       state: nil,
       initialized?: false,
@@ -556,15 +558,22 @@ defmodule Clementine.Loop.Step do
   # A cancel names a live child: the commit flags it (a queued child ends
   # at once, a running one gets the cooperative flag), and its completion
   # arrives like any other, which is when the tag re-arms. A child spawned
-  # in this same drain has no row yet: cancelling it here would commit a
-  # child born cancelled, so a spawn is cancelled from a later input
-  # (invariant 12). No live child under the tag is a benign no-op.
-  defp apply_action(fold, %Action{kind: :cancel} = action, _causal, _index) do
+  # in this same drain has no row yet and never will: its spawn is
+  # retired before it exists, and since no row can report its end, the
+  # controller hears it here, inline, as the `Cancelled` completion the
+  # commit would otherwise have delivered later. A controller cannot tell
+  # whether the child it cancels was spawned in this fold (two messages in
+  # one batch, say) or in an earlier one, so both read the same. No live
+  # child under the tag is a benign no-op.
+  defp apply_action(fold, %Action{kind: :cancel} = action, causal, index) do
     cond do
       Enum.any?(fold.child_cargo, &(&1.tag_key == action.tag_key)) ->
-        raise ArgumentError,
-              "tag #{inspect(action.tag)} was spawned in this same step and cannot be " <>
-                "cancelled before its spawn commits; cancel it from a later input"
+        reason = %{"code" => "loop_cancel", "loop_id" => fold.loop_ref}
+
+        fold
+        |> Map.update!(:children, &Map.delete(&1, action.tag_key))
+        |> retire_cargo(:child_cargo, action.tag_key)
+        |> deliver_inline(Input.completed(action.tag, Result.cancelled(reason)), causal, index)
 
       Map.has_key?(fold.children, action.tag_key) ->
         %{fold | cancel_cargo: Enum.uniq(fold.cancel_cargo ++ [action.tag_key])}
@@ -623,8 +632,30 @@ defmodule Clementine.Loop.Step do
     %{fold | send_cargo: fold.send_cargo ++ [spec]}
   end
 
+  # The one input a fold hands `handle/2` that no row holds: the end of a
+  # child retired in this same fold. Its actions are causally the
+  # retiring action's, so their send keys stay replay-stable and distinct
+  # from the retiring input's own.
+  defp deliver_inline(fold, %Input{} = input, causal, index) do
+    case fold.module.handle(Input.to_callback(input), fold.state) do
+      {:ok, state, actions} ->
+        apply_actions(%{fold | state: state}, actions, {:inline, causal, index}, fold.vocab)
+
+      {:halt, result, state} ->
+        %{fold | state: state, halted: normalize_halt(result)}
+
+      other ->
+        raise ArgumentError,
+              "handle/2 must return {:ok, state, actions} | {:halt, result, state}, " <>
+                "got: #{inspect(other)}"
+    end
+  end
+
   defp causal_key(:init), do: "init"
   defp causal_key({:input, ref}), do: Codec.key(ref)
+
+  defp causal_key({:inline, causal, index}),
+    do: causal_key(causal) <> ":" <> Integer.to_string(index)
 
   defp normalize_halt(result) do
     case result do
@@ -717,7 +748,7 @@ defmodule Clementine.Loop.Step do
     entering? = envelope == nil or envelope.pending_halt == nil
 
     base = envelope || %Envelope{state_version: module.__loop__(:state_version), state: nil}
-    fold = %{new_fold(base, plan, loop_ref) | state: base.state}
+    fold = %{new_fold(module, base, plan, loop_ref) | state: base.state}
     fold = Enum.reduce(plan.batch, fold, &absorb(&2, &1, vocab))
 
     halt_result =

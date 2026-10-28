@@ -137,7 +137,9 @@ running, or waiting) are exclusive, held by one unique index:
 
 Busy means refused: `start/3` returns `{:error, :active_run_exists}`. A
 thread that should queue messages instead gets a loop, which holds the
-lane and starts one turn at a time: see [Durable Loops](durable-loops.md).
+lane and starts one turn at a time: `Clementine.Thread`, the controller
+that ships with the runtime, or one of your own; see
+[Durable Loops](durable-loops.md).
 
 ## Running agents
 

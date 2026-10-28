@@ -386,14 +386,67 @@ defmodule Clementine.Loop.StepTest do
       assert log(commit) == ["message:stop"]
     end
 
-    test "{:cancel, tag} for a child spawned in the same step raises toward the poison path" do
+    test "{:cancel, tag} for a child spawned in the same step retires the spawn and delivers its Cancelled end inline" do
       tag = {:reply, 1}
       envelope = scripted_envelope()
-      batch = [msg(1, %{"actions" => [{:run, tag, %{}}, {:cancel, tag}]})]
 
-      assert_raise ArgumentError, ~r/spawned in this same step/, fn ->
-        Step.drain(ScriptedLoop, envelope, Step.plan(envelope, batch), @opts)
+      batch = [
+        msg(1, %{"id" => "spawn", "actions" => [{:run, tag, %{}}]}),
+        msg(2, %{"id" => "stop", "actions" => [{:cancel, tag}]})
+      ]
+
+      commit = drain!(ScriptedLoop, envelope, Step.plan(envelope, batch))
+
+      # No child row, no cancel cargo: the child never comes to exist, and
+      # the tag is free again.
+      assert commit.children == []
+      assert commit.cancel_children == []
+      assert commit.set.envelope.children == %{}
+      assert commit.consumed == [1, 2]
+      assert commit.op == :park
+
+      # The controller heard the end in this very fold, as the Cancelled
+      # completion a row would otherwise have reported later.
+      assert log(commit) == ["message:spawn", "message:stop", "completed:{:reply, 1}"]
+    end
+
+    test "an inline Cancelled end carries the cancel's reason, and its actions get a causal key of their own" do
+      defmodule ReactsToCancel do
+        use Clementine.Loop, vocabulary: [:reply]
+
+        def init(_args), do: {:ok, %{"log" => []}, []}
+
+        def handle({:message, %{"actions" => actions}}, state), do: {:ok, state, actions}
+
+        def handle({:completed, {:reply, n}, %Clementine.Result.Cancelled{reason: reason}}, state) do
+          log = state["log"] ++ ["cancelled:#{n}:#{reason["code"]}"]
+          {:ok, %{state | "log" => log}, [{:send, 1, %{"from" => "completion"}}]}
+        end
       end
+
+      tag = {:reply, 1}
+
+      batch = [
+        msg(1, %{
+          "actions" => [{:send, 1, %{"from" => "input"}}, {:run, tag, %{}}, {:cancel, tag}]
+        })
+      ]
+
+      commit = drain!(ReactsToCancel, nil, Step.plan(nil, batch))
+
+      assert commit.children == []
+      assert commit.cancel_children == []
+
+      state = Codec.decode(commit.set.envelope.state, vocabulary: [:reply])
+      assert state["log"] == ["cancelled:1:loop_cancel"]
+
+      assert [
+               %{payload: %{"from" => "input"}, dedup_key: input_key},
+               %{payload: %{"from" => "completion"}, dedup_key: completion_key}
+             ] = commit.sends
+
+      assert input_key != completion_key
+      assert completion_key =~ ":2:0"
     end
 
     test "arming a tag that is already a pending timer raises toward the poison path" do

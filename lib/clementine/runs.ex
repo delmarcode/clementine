@@ -69,7 +69,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     alias Clementine.Lifecycle.{Facts, Protocol}
     alias Clementine.Loop
     alias Clementine.Loop.{Input, Report, StoredInput}
-    alias Clementine.Runs.{AgentRun, Config, Lifecycle, Loops, StepWorker, Worker}
+    alias Clementine.Runs.{AgentRun, Config, Lifecycle, Loops, StepSupervisor, StepWorker, Worker}
     alias Clementine.Suspension
     alias Ecto.Multi
 
@@ -379,18 +379,34 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @doc """
     Sends `payload` to the loop `loop_id`: appends it to the loop's inbox
     as a `{:message, payload}` input, wakes the loop if it is parked, and
-    enqueues its step, in one transaction. Inside the caller's transaction
-    they commit with it and the step runs on commit, and nothing announces
-    the append itself (no `:resumed` to the host, no
-    `[:clementine, :loop, :input]` event): either would describe a write
-    the caller may yet roll back. `payload` is a term under the
+    enqueues its step, in one transaction. `payload` is a term under the
     controller's `vocabulary:`; one it cannot store raises.
+
+    Outside a transaction, the loop's step then runs at once, in a task
+    on this node, and `send/3` returns without waiting for it: the step
+    job stays as the backstop and discards when the task's claim won.
+    The reply therefore carries no child id; a client learns of the turn
+    the step started from `c:Clementine.Host.run_transition/2`
+    (`:claimed`), from its events, or from `child/2`. Inside the caller's
+    transaction the input and the job commit with it and the job steps
+    the loop at the commit, since the append is not visible before; and
+    nothing announces the append itself (no `:resumed` to the host, no
+    `[:clementine, :loop, :input]` event): either would describe a write
+    the caller may yet roll back.
 
     ## Options
 
       * `:dedup_key` — a string unique among the loop's live and dead
         inbox rows (a provider's message id, say): a second send with the
         same key returns `{:ok, :duplicate}` and changes nothing.
+      * `:if_idle` — `true` refuses the message with `{:error, :busy}`
+        unless the loop is idle: no child of its is active (queued,
+        running, or waiting), nothing waits in its inbox, and no cancel is
+        pending on it. The check runs under the loop row's lock, which
+        every append and every step's park take, so a message that races
+        a step is either refused or appended whole, and the controller
+        never sees a refused one. For a prompt that should start a turn
+        only when the thread is quiet.
 
     Returns `{:ok, :appended}`, `{:ok, :duplicate}`, or
     `{:ok, :dead_lettered}` when the loop has ended and the message was
@@ -400,10 +416,22 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     """
     @spec send(Ecto.UUID.t(), term(), keyword()) ::
             {:ok, :appended | :duplicate | :dead_lettered}
-            | {:error, :not_found | :not_a_loop | term()}
+            | {:error, :not_found | :not_a_loop | :busy | term()}
     def send(loop_id, payload, opts \\ []) do
-      with {:ok, id} <- cast_id(loop_id) do
-        Loops.append(id, Input.message(payload), Keyword.get(opts, :dedup_key))
+      %Config{repo: repo} = config = Config.fetch!()
+
+      with {:ok, id} <- cast_id(loop_id),
+           {:ok, outcome} <-
+             Loops.append(id, Input.message(payload), Keyword.get(opts, :dedup_key),
+               if_idle: Keyword.get(opts, :if_idle, false)
+             ) do
+        # The step runs on what the append committed. Inside the caller's
+        # transaction nothing has, and a claim here would read past it;
+        # the job steps the loop at the commit instead.
+        if outcome == :appended and not repo.in_transaction?(),
+          do: StepSupervisor.step(config, id)
+
+        {:ok, outcome}
       end
     end
 

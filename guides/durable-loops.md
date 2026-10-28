@@ -67,6 +67,43 @@ implements both as single Postgres transactions:
 
 Together they close every lost-wakeup interleaving at the database lock.
 
+## Step 0 — The thread that ships
+
+Most threads need no controller of their own. `Clementine.Thread` is
+the one that ships with the runtime: one loop per conversation, one
+turn of the agent its args name per message, in order, with its
+policies as creation args: `"busy"` (`"queue"`, the default, or
+`"interrupt"`: a message during a turn cancels the turn and takes its
+place once the cancel completes), `"on_failure"` (`"surface"`, the
+default, or `"retry"` after `"retry_after_ms"`), and
+`"retry_interrupted"` (one immediate retry of a turn whose node died).
+Start it, feed it, and read its turns back:
+
+<!-- guide-sample: parse-only -->
+```elixir
+{:ok, loop} =
+  Clementine.Runs.start_loop(Clementine.Thread, %{"agent" => "chat"},
+    subject: {"conversation", conversation.id},
+    actor: {"user", user.id}
+  )
+
+{:ok, :appended} =
+  Clementine.Runs.send(
+    loop.id,
+    %{"prompt" => content, "id" => message.id, "metadata" => %{"message_id" => message.id}},
+    dedup_key: message.id
+  )
+
+Clementine.Runs.child(loop.id, {:turn, message.id})   # the message's turn, while it runs
+Clementine.Runs.turns(loop.id)                         # every turn, newest first
+```
+
+A message is `"prompt"` plus, optionally, `"id"` (the turn's tag id, the
+message's own), `"metadata"` for the turn's row, and `"actor"` for a
+turn that acts with another authority than the loop's. The rest of this
+guide is the controller underneath, for a thread whose policy differs
+and for the other shapes (the judge, the watcher).
+
 ## Step 1 — The controller
 
 The behaviour is decision logic only. `init/1` and `handle/2` are **pure
@@ -260,10 +297,18 @@ end
 `Runs.start_loop/3` is insert-or-get on the lane: a second start of the
 same controller on the same subject returns
 `{:ok, :already_exists, loop}` with the standing loop. `Runs.send/3`
-appends, wakes a parked loop, and enqueues its step in one transaction;
-inside the caller's transaction they commit with it. A loop that has
-ended answers `{:ok, :dead_lettered}`: the message was kept as evidence,
-never to be consumed, and the caller knows.
+appends, wakes a parked loop, and enqueues its step in one transaction.
+Inside the caller's transaction, as above, they commit with it and the
+job steps the loop at the commit; outside one, the step runs at once in
+a task on the sending node, with the job as its backstop, and `send/3`
+returns before the turn exists (a client learns of the turn from the
+host's `run_transition/2`, its events, or `Runs.child/2`). A loop that
+has ended answers `{:ok, :dead_lettered}`: the message was kept as
+evidence, never to be consumed, and the caller knows. `if_idle: true`
+refuses with `{:error, :busy}` unless the loop has no live child,
+nothing in its inbox, and no cancel pending, decided under the loop
+row's lock, so a prompt meant for a quiet thread never queues behind a
+turn, and the controller never sees a refused message.
 
 The rest of the surface: `Runs.cancel/1` on a loop flags it
 (`{:ok, :flagged}`) and wakes it, and the next step cancels its live

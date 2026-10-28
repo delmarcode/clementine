@@ -387,6 +387,116 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       assert Enum.sort(delivered) == Enum.sort(sent)
     end
 
+    ## send if_idle
+
+    def send_if_idle_refusals do
+      loop = parked!()
+
+      # Idle: nothing live, nothing pending.
+      assert {:ok, :appended} = Runs.send(loop.id, message("quiet"), if_idle: true)
+      assert {:parked, _} = step!(loop)
+      assert "message:quiet" in log!(loop)
+
+      # A live child: refused, and nothing of the message exists.
+      child = spawn_child!(loop, {:reply, 1})
+      assert {:error, :busy} = Runs.send(loop.id, message("busy-child"), if_idle: true)
+      assert pending!(loop) == []
+      assert fetch!(loop).status == :waiting
+
+      # The default never refuses: queueing is the controller's.
+      assert {:ok, :appended} = Runs.send(loop.id, message("queued-anyway"))
+      assert {:parked, _} = step!(loop)
+      assert "message:queued-anyway" in log!(loop)
+
+      # The child ends: its completion waits in the inbox, so still busy,
+      # until the step that folds it.
+      expect_turn(text_events("Done."))
+      assert :ok = perform_job(Worker, %{"run_id" => child.id})
+      assert [%StoredInput{input: %Input{kind: :completed}}] = pending!(loop)
+      assert {:error, :busy} = Runs.send(loop.id, message("busy-inbox"), if_idle: true)
+      assert {:parked, _} = step!(loop)
+      assert {:ok, :appended} = Runs.send(loop.id, message("quiet-again"), if_idle: true)
+      assert {:parked, _} = step!(loop)
+
+      # A pending cancel: the next step is a cascade that would never read
+      # the message.
+      assert {:ok, :flagged} = Runs.cancel(loop.id)
+      assert {:error, :busy} = Runs.send(loop.id, message("busy-cancel"), if_idle: true)
+      assert {:finished, %Facts{status: :cancelled}} = step!(loop)
+
+      # Ended: dead-lettered, as any send, so the sender knows which.
+      assert {:ok, :dead_lettered} = Runs.send(loop.id, message("late"), if_idle: true)
+
+      # Nothing refused ever reached the controller.
+      refute Enum.any?(log!(loop), &String.starts_with?(&1, "message:busy"))
+    end
+
+    def send_if_idle_racing_a_step do
+      loop = parked!()
+      send!(loop, message(1))
+
+      # A step in flight has drained its window but not yet committed:
+      # the input it read is still pending under the lock, so a send that
+      # wants idle is refused, and nothing of it lands for the park
+      # re-check to see.
+      lease = claim!(loop)
+      commit = commit!(loop, lease)
+      assert commit.op == :park
+      assert {:error, :busy} = Runs.send(loop.id, message("racer"), if_idle: true)
+      assert {:ok, %Facts{status: :waiting}} = Loops.apply_step(commit, nil)
+      assert pending!(loop) == []
+
+      # Once the park committed, the loop is idle and the send lands,
+      # waking it in the same unit.
+      assert {:ok, :appended} = Runs.send(loop.id, message("after"), if_idle: true)
+      assert fetch!(loop).status == :queued
+      assert {:parked, _} = step!(loop)
+      assert log!(loop) == ["init", "message:1", "message:after"]
+    end
+
+    def send_if_idle_concurrent do
+      loop = parked!()
+
+      tasks =
+        for i <- 1..@concurrent_appenders do
+          Elixir.Task.async(fn ->
+            receive do
+              :go -> Runs.send(loop.id, message(i), dedup_key: "idle:#{i}", if_idle: true)
+            end
+          end)
+        end
+
+      Enum.each(tasks, &send(&1.pid, :go))
+      results = Elixir.Task.await_many(tasks, 30_000)
+
+      # The first through the lock finds the loop idle; every other finds
+      # its message pending.
+      assert Enum.count(results, &(&1 == {:ok, :appended})) == 1
+      assert Enum.count(results, &(&1 == {:error, :busy})) == @concurrent_appenders - 1
+
+      assert {:parked, _} = step!(loop)
+      assert Enum.count(log!(loop), &String.starts_with?(&1, "message:")) == 1
+      assert pending!(loop) == []
+    end
+
+    def send_if_idle_inside_a_transaction do
+      loop = parked!()
+      _child = spawn_child!(loop, {:reply, 1})
+      repo = repo()
+
+      # The refusal leaves the caller's transaction good: the work after
+      # it commits.
+      assert {:ok, {:error, :busy}} =
+               repo.transaction(fn ->
+                 result = Runs.send(loop.id, message("busy"), if_idle: true)
+                 {:ok, :appended} = Runs.send(loop.id, message("kept"))
+                 result
+               end)
+
+      assert [%StoredInput{input: %Input{kind: :message, payload: %{"id" => "kept"}}}] =
+               pending!(loop)
+    end
+
     ## wrong-state calls
 
     def kind_guards do
