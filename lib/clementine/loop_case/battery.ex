@@ -405,8 +405,22 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
 
       # The default never refuses: queueing is the controller's.
       assert {:ok, :appended} = Runs.send(loop.id, message("queued-anyway"))
+
+      # A redelivery of a message the inbox already holds is a duplicate
+      # before it is a refusal, pending or consumed.
+      assert {:ok, :appended} = Runs.send(loop.id, message("keyed"), dedup_key: "keyed")
+
+      assert {:ok, :duplicate} =
+               Runs.send(loop.id, message("keyed"), dedup_key: "keyed", if_idle: true)
+
       assert {:parked, _} = step!(loop)
       assert "message:queued-anyway" in log!(loop)
+      assert "message:keyed" in log!(loop)
+
+      # Consumed, the row is gone and its key with it: the receipt for a
+      # redelivery after the drain is the app's, and this one is refused.
+      assert {:error, :busy} =
+               Runs.send(loop.id, message("keyed"), dedup_key: "keyed", if_idle: true)
 
       # The child ends: its completion waits in the inbox, so still busy,
       # until the step that folds it.

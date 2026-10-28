@@ -804,9 +804,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @doc false
     # `if_idle: true` refuses a message under the same lock, before any
     # write, when a child of the loop is active, an input waits in its
-    # inbox, or a cancel is pending on it. The refusal is a return, not a
-    # rollback: nothing was written, and a caller's enclosing transaction
-    # stays good.
+    # inbox, or a cancel is pending on it. A redelivery the dedup key
+    # already answered is `:duplicate` first, as it would be without the
+    # option: the message was accepted, whatever the loop is doing now.
+    # The refusal is a return, not a rollback: nothing was written, and a
+    # caller's enclosing transaction stays good.
     @spec append(Ecto.UUID.t(), Input.t(), String.t() | nil, keyword()) ::
             append_outcome() | {:error, :not_found | :not_a_loop | :busy | term()}
     def append(loop_id, %Input{} = input, dedup_key, opts \\ [])
@@ -838,7 +840,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
               )
 
             %AgentRun{kind: "loop"} = row ->
-              if busy?(config, row) do
+              if not delivered?(config, row, dedup_key) and busy?(config, row) do
                 :busy
               else
                 {kind, payload} =
@@ -860,6 +862,19 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         {:ok, :busy} -> {:error, :busy}
         other -> other
       end
+    end
+
+    # A dedup key the loop's inbox already holds, live or dead: the insert
+    # below would answer :duplicate, and a refusal must not come first.
+    defp delivered?(_config, _row, nil), do: false
+
+    defp delivered?(%Config{repo: repo}, %AgentRun{id: loop_id}, dedup_key) do
+      repo.exists?(
+        from(i in @inbox,
+          where: i.run_id == type(^loop_id, Ecto.UUID),
+          where: i.dedup_key == ^dedup_key
+        )
+      )
     end
 
     # Idle means the loop has nothing to do and nothing coming: no live
