@@ -138,6 +138,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       {actor_type, actor_id} = reference(Keyword.get(opts, :actor))
 
       with {:ok, key} <- registered_key(config, agent),
+           :ok <- agent_only(agent),
            :ok <- validate_prompt(prompt),
            turn = agent.turn(),
            :ok <- validate_lane(turn, subject_id) do
@@ -156,12 +157,16 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     # The child spec lists agents and loop controllers in one key
-    # namespace; only an agent starts as a run.
-    defp registered_key(%Config{agents: agents}, agent) do
-      case Enum.find(agents, fn {_key, module} -> module == agent end) do
-        {key, _module} -> if Config.agent?(agent), do: {:ok, key}, else: {:error, :unknown_agent}
+    # namespace: reads filter by either, and only an agent starts as a run.
+    defp registered_key(%Config{agents: agents}, module) do
+      case Enum.find(agents, fn {_key, listed} -> listed == module end) do
+        {key, _listed} -> {:ok, key}
         nil -> {:error, :unknown_agent}
       end
+    end
+
+    defp agent_only(module) do
+      if Config.agent?(module), do: :ok, else: {:error, :unknown_agent}
     end
 
     defp validate_prompt(prompt) do
@@ -813,7 +818,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           key
 
         {:error, :unknown_agent} ->
-          raise ArgumentError, "#{Kernel.inspect(agent)} is not an agent the child spec lists"
+          raise ArgumentError,
+                "#{Kernel.inspect(agent)} is not an agent or loop controller the child spec lists"
       end
     end
   end

@@ -463,11 +463,17 @@ defmodule Clementine.Lifecycle.Protocol do
         facts.status in [:queued, :waiting] ->
           result = Result.cancelled(reason, facts.usage || %Usage{})
 
+          # The row records why, as a flagged run's does: a cancelled run
+          # always carries its cancel.
           transition = %Transition{
             op: :cancel_request,
             run_ref: run_ref,
             expect: expect(facts),
-            set: %{status: :cancelled, finished_at: :now},
+            set: %{
+              status: :cancelled,
+              finished_at: :now,
+              cancel: %{reason: reason, requested_at: :now}
+            },
             result: result
           }
 

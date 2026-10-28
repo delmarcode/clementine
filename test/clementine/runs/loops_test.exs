@@ -133,6 +133,13 @@ defmodule Clementine.Runs.LoopsTest do
 
       assert turn.parent_id == loop.id
       assert turn.subject_id == "7"
+
+      # The reads filter by the controller as they do by an agent.
+      loop_id = loop.id
+      assert Runs.active?(Thread, {"ticket", 7}, kind: :loop)
+      assert %AgentRun{id: ^loop_id} = Runs.latest({"ticket", 7}, kind: :loop, agent: Thread)
+      assert [%AgentRun{id: ^loop_id}] = Runs.list(kind: :loop, agent: Thread)
+      assert Runs.list(kind: :loop, agent: Echo) == []
       assert_received {:run_transition, %AgentRun{id: loop_id, kind: "loop"}, :claimed, false}
       assert loop_id == loop.id
 

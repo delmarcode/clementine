@@ -1398,6 +1398,31 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       quiesce!(loop)
       assert Enum.count(log!(loop), &(&1 == "completed:{:reply, 3}:completed")) == 1
 
+      # A child cancelled before it ran: its row records the cancel's
+      # reason, and the synthesized completion carries it.
+      loop_id = loop.id
+      gone = spawn_child!(loop, {:reply, 4})
+      send!(loop, %{"id" => "stop-4", "actions" => [{:cancel, {:reply, 4}}]})
+      assert {:continued, _} = step!(loop)
+      assert %AgentRun{status: "cancelled"} = Runs.get(gone.id)
+      gone_key = InboxCodec.completion_dedup_key(tag_key({:reply, 4}), gone.id)
+      {1, _} = repo().delete_all(from(i in "agent_run_inbox", where: i.dedup_key == ^gone_key))
+      quiesce!(loop)
+      assert %{reconcile_children: 1} = Reaper.loop_sweep()
+
+      assert [
+               %StoredInput{
+                 input: %Input{
+                   result: %Result.Cancelled{
+                     reason: %{"code" => "loop_cancel", "loop_id" => ^loop_id}
+                   }
+                 }
+               }
+             ] = pending!(loop)
+
+      quiesce!(loop)
+      assert Enum.count(log!(loop), &(&1 == "completed:{:reply, 4}:cancelled")) == 1
+
       # The race: evidence gathered before a real delivery landed. The
       # healing append no-ops on the canonical key: observable noise, never
       # double delivery.
