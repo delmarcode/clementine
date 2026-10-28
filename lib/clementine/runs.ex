@@ -703,10 +703,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     def turns(loop_id), do: list(parent: loop_id, turn: true)
 
     @doc """
-    The loop's pending inputs, oldest first, up to `limit:` (default 50):
-    what its next step will drain, as `Clementine.Loop.StoredInput`
-    structs. For a UI showing queued messages, or the doctor. A run that
-    is not a loop has none.
+    The loop's raw inbox, oldest first, up to `limit:` (default 50): the
+    inputs its next step will drain, as `Clementine.Loop.StoredInput`
+    structs. Empty once a step has drained them into the controller's
+    state, so not what a thread holds: `Clementine.Thread.waiting/1` is.
+    For the doctor, and a controller's own tooling. A run that is not a
+    loop has none.
     """
     @spec pending(Ecto.UUID.t(), keyword()) :: [StoredInput.t()]
     def pending(loop_id, opts \\ []) do

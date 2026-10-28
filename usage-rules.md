@@ -174,6 +174,15 @@ the message.
   exists. The reply carries no run id: the turn is
   `Runs.child(loop.id, {:turn, message.id})` once it starts, and the host
   hears it as `run_transition(run, :claimed)` and then its events.
+- `Clementine.Thread.waiting(loop.id)` is the ids of the messages the
+  thread holds but has not started a turn for, in the order it will
+  answer them: the queue behind the current turn, then what no step has
+  drained from the inbox (a message sent without an id under the counter
+  id the thread will give it). The current turn's message is not in it,
+  nor a failed turn waiting out its retry, which is that turn retried
+  under its own id; a thread that is ending or has ended holds nothing.
+  `Runs.pending/2` is the raw inbox and empties as steps drain it, so it
+  is not what a thread holds.
 - `dedup_key:` makes a redelivery `{:ok, :duplicate}`. `if_idle: true`
   refuses with `{:error, :busy}` unless no turn is live, nothing waits in
   the inbox, and no cancel is pending, for a prompt that should only

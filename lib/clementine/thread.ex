@@ -69,6 +69,10 @@ defmodule Clementine.Thread do
   message, so a message the row would refuse never waits in the queue
   behind a turn whose completion would then take the blame.
 
+  `waiting/1` lists the messages the thread holds but has not answered,
+  in the order it will: the queue behind the current turn, then the inbox
+  no step has drained. The current turn is `Clementine.Runs.child/2`'s.
+
   ## Stopping
 
   `Clementine.Runs.cancel/1` on a turn stops that turn; the thread hears
@@ -322,5 +326,93 @@ defmodule Clementine.Thread do
       end
 
     {:run, {:turn, id}, child}
+  end
+
+  ## What the thread holds
+
+  @doc false
+  # The ids of the messages queued behind the current turn, in order, from
+  # a decoded state (nil before the first step). The current turn is not
+  # among them whatever its phase — running, cancelled for the next, or
+  # waiting out its retry delay: a retry is that turn again under its own
+  # id, not a message awaiting its first.
+  def queued_ids(nil), do: []
+  def queued_ids(%{"queue" => queue}), do: Enum.map(queue, & &1["id"])
+
+  if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
+    alias Clementine.Runs.AgentRun
+
+    @pending_window 10_000
+
+    @doc """
+    The ids of the messages the thread holds but has not started a turn
+    for, in the order it will answer them: the queue behind the current
+    turn, then what no step has drained from the inbox yet. A message
+    sent without an `"id"` is listed under the counter id the thread will
+    give it. Not in it: the current turn's message, running or cancelled
+    for the next (`Clementine.Runs.child/2` has the turn), and a failed
+    turn waiting out its retry delay, which is that turn retried under its
+    own id, not a message awaiting its first. A thread that is ending
+    (cancelled, its cascade in flight) or has ended answers nothing more
+    and holds nothing: `{:ok, []}`.
+
+    `{:error, :not_found}` for no such run; `{:error, :not_a_thread}` for
+    a run that is not a `Clementine.Thread` loop. Reads committed state: a
+    step in flight may be moving a message from the inbox into the queue,
+    or from the queue into a turn. `Clementine.Runs.pending/2` is the raw
+    inbox and empties as steps drain it.
+    """
+    @spec waiting(String.t()) ::
+            {:ok, [String.t() | integer()]} | {:error, :not_found | :not_a_thread}
+    def waiting(loop_id) do
+      case Clementine.Runs.get(loop_id) do
+        nil ->
+          {:error, :not_found}
+
+        %AgentRun{kind: "loop", agent_key: agent_key} = loop ->
+          cond do
+            agent_key != key() ->
+              {:error, :not_a_thread}
+
+            AgentRun.terminal?(loop) or loop.cancel != nil ->
+              {:ok, []}
+
+            true ->
+              state = stored_state(loop)
+              seq = (state && state["seq"]) || 0
+              {:ok, queued_ids(state) ++ pending_ids(loop.id, seq)}
+          end
+
+        %AgentRun{} ->
+          {:error, :not_a_thread}
+      end
+    end
+
+    defp stored_state(%AgentRun{envelope: nil}), do: nil
+
+    defp stored_state(%AgentRun{envelope: data}) do
+      case Clementine.Loop.Envelope.decode(data) do
+        {:ok, %Clementine.Loop.Envelope{state: state}} when is_map(state) ->
+          Clementine.Loop.Codec.decode(state, vocabulary: __loop__(:vocabulary))
+
+        _none_or_undecodable ->
+          nil
+      end
+    end
+
+    # The inbox's messages, in order, each under its id or the counter id
+    # the thread will give it when it drains them.
+    defp pending_ids(loop_id, seq) do
+      loop_id
+      |> Clementine.Runs.pending(limit: @pending_window)
+      |> Enum.filter(&(&1.input.kind == :message))
+      |> Enum.map_reduce(seq, fn stored, seq ->
+        case stored.input.payload do
+          %{"id" => id} when not is_nil(id) -> {id, seq}
+          _counted -> {seq + 1, seq + 1}
+        end
+      end)
+      |> elem(0)
+    end
   end
 end
