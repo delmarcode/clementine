@@ -69,6 +69,17 @@ lifecycle, or a reaper into the app.
   ends the run `cancelled`, unless it was already ending. A run that has
   ended returns `{:error, :already_terminal}`. Check who may cancel before
   calling it.
+- `purge/1` erases a subject's runs: `purge({"conversation", id})`
+  deletes every run whose subject that is and every descendant of a loop
+  among them (a child's subject may differ from its loop's), with their
+  inbox rows, and returns `{:ok, count}`. While any of them is queued,
+  running or waiting, loops included, it returns `{:error, :active}` and
+  deletes nothing: cancel the thread's loop first and purge once it has
+  ended, from `run_committed/2`. It works inside the caller's
+  transaction, so delete the subject's own row in the same unit; the
+  refusal is a return, not a rollback. Only Clementine writes
+  `agent_runs`, and this is how an app erases what a deleted thread's
+  prompts and replies left in `input` and `result`.
 - Call `resume/2` and `cancel/1` outside a transaction: inside one they
   raise.
 - `get/1` returns the run or `nil`. Read `agent_runs` freely; only
@@ -182,7 +193,8 @@ the message.
 - `Runs.cancel/1` on the turn (`Runs.active(subject)`) stops it and the
   thread answers the next message; on the loop, it ends the thread,
   cancels the turn in flight, and keeps queued messages as dead letters.
-  Both outside a transaction.
+  Both outside a transaction. Deleting the thread is `Runs.cancel(loop.id)`,
+  then `Runs.purge(subject)` once the loop has ended.
 - A turn's end is one rule, whichever way it comes. A turn cancelled in
   the step that spawned it (interrupt mode's double-send, or a halt
   behind a spawn) never exists: no row, no `run_finished/2`, no

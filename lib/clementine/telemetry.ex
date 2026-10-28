@@ -115,6 +115,15 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{}`
   - Metadata: `%{run_ref: term, epoch: non_neg_integer, code: Clementine.InterruptReason.code()}`
 
+  ### `[:clementine, :runs, :purge]`
+
+  `Clementine.Runs.purge/1` erased a subject's runs and their inbox rows,
+  for audit. Outside a transaction it fires after the delete commits;
+  inside the caller's, as the call returns.
+
+  - Measurements: `%{count: non_neg_integer}` — rows deleted
+  - Metadata: `%{subject_type: String.t(), subject_id: String.t() | nil}`
+
   ## Loop Events
 
   The loop layer owns the `:loop` prefix the engine rename vacated. Two
@@ -410,6 +419,8 @@ defmodule Clementine.Telemetry do
         tags: [:code],
         tag_values: &reaped_tag_values/1
       ),
+      # Rows erased by Runs.purge/1, for audit.
+      sum("clementine.runs.purge.count"),
 
       # Loops — alert on nonzero reconcile_children/wake_pending rates
       # where the substrate is transactional (LOOP_RFC §Operations).

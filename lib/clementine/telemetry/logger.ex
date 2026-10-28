@@ -45,6 +45,7 @@ defmodule Clementine.Telemetry.Logger do
     [:clementine, :run, :requeued],
     [:clementine, :run, :lease_lost],
     [:clementine, :run, :reaped],
+    [:clementine, :runs, :purge],
     [:clementine, :loop, :verdict],
     [:clementine, :loop, :step],
     [:clementine, :loop, :step_failed],
@@ -207,6 +208,13 @@ defmodule Clementine.Telemetry.Logger do
     end)
 
     _ = config
+  end
+
+  def handle_event([:clementine, :runs, :purge], %{count: count}, metadata, config) do
+    Logger.log(config.level, fn ->
+      "[Clementine] Runs purged subject=#{metadata.subject_type}:#{metadata.subject_id} " <>
+        "count=#{count}"
+    end)
   end
 
   # The self-healing pair is the alarm condition (should be ~zero on a

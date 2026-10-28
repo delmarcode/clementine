@@ -1,7 +1,8 @@
 if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
   defmodule Clementine.Runs do
     @moduledoc """
-    The durable runtime's API: start, resume, cancel, and read agent runs.
+    The durable runtime's API: start, resume, cancel, purge, and read agent
+    runs.
 
     A host app runs agents durably with three pieces of glue
     (`mix clementine.install` writes the first two, and
@@ -561,6 +562,110 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           {:error, :loop_run} -> Loops.cancel(id, reason)
           other -> other
         end
+      end
+    end
+
+    @doc """
+    Erases every run on `subject` (`{type, id}`): the runs whose subject
+    it is, and every descendant of a loop among them whatever its own
+    subject (a `{:run, ...}` action may name another), with their inbox
+    rows. Returns `{:ok, count}`. Only Clementine writes `agent_runs`, so
+    this is how an app erases what a deleted thread's prompts and replies
+    left in `input` and `result`.
+
+    It refuses with `{:error, :active}` while any run in that set is
+    queued, running or waiting, loops included, and then deletes nothing.
+    A thread's loop is active until it is cancelled, so the path is
+    `cancel/1` on the loop, then `purge/1` once it has ended (from
+    `c:Clementine.Host.run_committed/2` on the loop's end, say). The set
+    is locked for the check, so a step or a claim racing the purge waits
+    on the row and finds it gone.
+
+    It works inside the caller's transaction, so an app deletes its own
+    row in the same unit; the refusal is a return, never a rollback. It
+    emits `[:clementine, :runs, :purge]` with the count, for audit: after
+    its own transaction commits, or inside the caller's as it returns.
+    """
+    @spec purge({String.t() | atom(), String.t() | integer() | nil}) ::
+            {:ok, non_neg_integer()} | {:error, :active}
+    def purge({_type, _id} = subject) do
+      %Config{repo: repo} = Config.fetch!()
+      {subject_type, subject_id} = reference(subject)
+
+      {:ok, outcome} =
+        Emissions.after_commit(fn ->
+          repo.transaction(fn ->
+            rows = purge_set(repo, subject)
+
+            if Enum.any?(rows, &(&1.status in @active_statuses)) do
+              {:error, :active}
+            else
+              count = delete_children_first(repo, rows)
+
+              Emissions.emit(fn ->
+                :telemetry.execute(
+                  [:clementine, :runs, :purge],
+                  %{count: count},
+                  %{subject_type: subject_type, subject_id: subject_id}
+                )
+              end)
+
+              {:ok, count}
+            end
+          end)
+        end)
+
+      outcome
+    end
+
+    # The runs on the subject, then every descendant of any of them, each
+    # level locked as it is read.
+    defp purge_set(repo, subject) do
+      roots =
+        repo.all(
+          from(r in where_reference(AgentRun, :subject, subject),
+            lock: "FOR UPDATE",
+            select: %{id: r.id, parent_id: r.parent_id, status: r.status}
+          )
+        )
+
+      descendants(repo, roots, MapSet.new(roots, & &1.id), roots)
+    end
+
+    defp descendants(_repo, [], _seen, acc), do: acc
+
+    defp descendants(repo, parents, seen, acc) do
+      parent_ids = Enum.map(parents, & &1.id)
+
+      children =
+        repo.all(
+          from(r in AgentRun,
+            where: r.parent_id in ^parent_ids,
+            lock: "FOR UPDATE",
+            select: %{id: r.id, parent_id: r.parent_id, status: r.status}
+          )
+        )
+        |> Enum.reject(&MapSet.member?(seen, &1.id))
+
+      seen = Enum.reduce(children, seen, &MapSet.put(&2, &1.id))
+      descendants(repo, children, seen, acc ++ children)
+    end
+
+    # Children before parents: parent_id restricts the delete, so each
+    # pass removes the rows nothing left in the set points at.
+    defp delete_children_first(_repo, []), do: 0
+
+    defp delete_children_first(repo, rows) do
+      parents = MapSet.new(rows, & &1.parent_id)
+
+      case Enum.split_with(rows, &(not MapSet.member?(parents, &1.id))) do
+        {[], _rest} ->
+          raise "purge set has no leaf: parent_id forms a cycle among #{inspect(rows)}"
+
+        {leaves, rest} ->
+          ids = Enum.map(leaves, & &1.id)
+          {count, _} = repo.delete_all(from(r in AgentRun, where: r.id in ^ids))
+          count + delete_children_first(repo, rest)
       end
     end
 
