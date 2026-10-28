@@ -79,14 +79,16 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
+    # Agents and loop controllers share one key namespace: a run row's
+    # agent_key names either, and its kind says which.
     defp agents!(modules) do
       Enum.reduce(modules, %{}, fn module, acc ->
         loaded!(module, "agent")
 
-        unless function_exported?(module, :key, 0) and function_exported?(module, :turn, 0) and
-                 function_exported?(module, :agent, 1) do
+        unless agent?(module) or controller?(module) do
           raise ArgumentError,
-                "#{inspect(module)} is not a Clementine.Agent (use Clementine.Agent)"
+                "#{inspect(module)} is not a Clementine.Agent or a Clementine.Loop with a key " <>
+                  "(use Clementine.Agent, key: ..., or use Clementine.Loop, key: ...)"
         end
 
         key = module.key()
@@ -100,6 +102,19 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             Map.put(acc, key, module)
         end
       end)
+    end
+
+    @doc "True for a `use Clementine.Agent` module."
+    @spec agent?(module()) :: boolean()
+    def agent?(module) do
+      function_exported?(module, :key, 0) and function_exported?(module, :turn, 0) and
+        function_exported?(module, :agent, 1)
+    end
+
+    @doc "True for a `use Clementine.Loop, key: ...` module."
+    @spec controller?(module()) :: boolean()
+    def controller?(module) do
+      Clementine.Loop.loop?(module) and function_exported?(module, :key, 0)
     end
 
     defp host!(nil), do: nil

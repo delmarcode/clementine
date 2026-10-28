@@ -106,6 +106,26 @@ defmodule Clementine.Loop.CodecTest do
     end
   end
 
+  describe "split_tag/1" do
+    test "splits a child tag into its kind and id as text" do
+      assert Codec.split_tag({:turn, 42}) == {"turn", "42"}
+      assert Codec.split_tag({:reply, "msg_7"}) == {"reply", "msg_7"}
+    end
+
+    test "refuses anything but a two-part tag of an atom and a string or integer" do
+      for bad <- [
+            :poll,
+            {:retry, 7, :overloaded},
+            {"turn", 1},
+            {:turn, 1.5},
+            {:turn, nil},
+            {nil, 1}
+          ] do
+        assert_raise ArgumentError, ~r/two parts/, fn -> Codec.split_tag(bad) end
+      end
+    end
+  end
+
   describe "validate_json_map!/2" do
     test "accepts plain JSON maps" do
       assert Codec.validate_json_map!(%{"k" => [1, %{"n" => nil}]}, "args") == %{

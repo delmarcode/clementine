@@ -1,14 +1,22 @@
 if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
   defmodule Clementine.Runs.Reaper do
     @moduledoc false
-    # The periodic sweep that writes the terminal a dead executor could not.
+    # The periodic sweeps that write what a dead executor could not: two
+    # cadences in one process.
     #
-    # A dying node writes nothing on purpose; its runs' heartbeats stop, and
-    # every tick here interrupts (or, by policy, requeues) the runs that are
-    # no longer alive. Sweeps on several nodes need no coordination: every
-    # verdict lands as a compare-and-swap on the exact facts the sweep
-    # observed. It does not start while Oban runs in a testing mode, the
-    # way Oban's own plugins don't; tests call sweep/1.
+    # The rollout sweep, every sweep_interval: a dying node writes nothing
+    # on purpose; its runs' heartbeats stop, and every tick here
+    # interrupts (or, by policy, requeues) the runs that are no longer
+    # alive, a loop's children included. The loop sweep, every
+    # loop_sweep_interval over loop rows alone: a loop is a standing
+    # entity, so no verdict but the deadline belt ends one. A crashed step
+    # requeues, a lost step job is re-inserted, a child's lost completion
+    # is synthesized, and a park stranded over pending inputs is woken
+    # (LOOP_RFC amendment A3). Sweeps on several nodes need no
+    # coordination: every verdict lands as a compare-and-swap on the exact
+    # facts the sweep observed. Neither starts while Oban runs in a
+    # testing mode, the way Oban's own plugins don't; tests call sweep/1
+    # and loop_sweep/1.
 
     use GenServer
 
@@ -21,7 +29,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     alias Clementine.Lifecycle.Ecto.Oban, as: JobCheck
     alias Clementine.Lifecycle.{Facts, Protocol}
     alias Clementine.Reconciler
-    alias Clementine.Runs.{AgentRun, Config, Lifecycle, Worker}
+    alias Clementine.Runs.{AgentRun, Config, Lifecycle, Loops, Worker}
 
     @fields Codec.resolve_fields(:id, [])
     @active_statuses ~w(queued running waiting)
@@ -34,6 +42,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     def init(opts) do
       policy = Keyword.get_lazy(opts, :policy, &Reconciler.Policy.new/0)
       send(self(), :sweep)
+      send(self(), :loop_sweep)
       {:ok, %{policy: policy}}
     end
 
@@ -41,6 +50,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     def handle_info(:sweep, %{policy: policy} = state) do
       report(policy)
       Process.send_after(self(), :sweep, policy.sweep_interval)
+      {:noreply, state}
+    end
+
+    def handle_info(:loop_sweep, %{policy: policy} = state) do
+      report_loops(policy)
+      Process.send_after(self(), :loop_sweep, policy.loop_sweep_interval)
       {:noreply, state}
     end
 
@@ -58,6 +73,94 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       e -> Logger.error("Agent run sweep failed: " <> Exception.message(e))
     end
 
+    defp report_loops(policy) do
+      case Map.drop(loop_sweep(policy), [:healthy]) do
+        verdicts when map_size(verdicts) == 0 -> :ok
+        verdicts -> Logger.info("Agent loop sweep verdicts: #{inspect(verdicts)}")
+      end
+    rescue
+      e -> Logger.error("Agent loop sweep failed: " <> Exception.message(e))
+    end
+
+    @doc false
+    # The loop sweep: loop rows only, each judged on its facts plus, for a
+    # parked loop, the evidence its facts cannot carry (its live children
+    # against their rows and the inbox, the oldest pending input's age).
+    # Counts verdicts by name; every non-healthy verdict also emits
+    # [:clementine, :loop, :verdict] at judgment (Clementine.Reconciler).
+    @spec loop_sweep(Reconciler.Policy.t()) :: %{optional(atom()) => non_neg_integer()}
+    def loop_sweep(policy \\ Reconciler.Policy.new()) do
+      %Config{repo: repo} = Config.fetch!()
+      now = storage_now!(repo)
+
+      Enum.reduce(active_runs(repo, "loop"), %{}, fn row, acc ->
+        facts = Codec.to_facts(row, @fields)
+        evidence = if row.status == "waiting", do: Loops.evidence(row)
+        verdict = Reconciler.judge_loop(facts, evidence, now, policy)
+        apply_loop_verdict(verdict, repo, row, facts)
+        Map.update(acc, verdict_name(verdict), 1, &(&1 + 1))
+      end)
+    end
+
+    defp verdict_name(:healthy), do: :healthy
+    defp verdict_name({verdict, _detail}), do: verdict
+
+    # A3a: a crashed step requeues unconditionally, with its step job in
+    # the same transaction, as a resume does. A loop's epoch counts its
+    # lifetime claims, and the commit is replayable by construction.
+    defp apply_loop_verdict({:requeue, reason}, repo, _row, facts) do
+      case Emissions.after_commit(fn ->
+             repo.transaction(fn -> requeue_loop(repo, facts, reason) end)
+           end) do
+        {:ok, :ok} -> :ok
+        {:error, :stale} -> :ok
+        {:error, other} -> log_sweep_error(facts.ref, other, nil)
+      end
+    end
+
+    # A3b: claim-timeout evidence means the step job is lost, not that the
+    # loop should die. Re-insert it; a duplicate no-ops on the claim CAS.
+    defp apply_loop_verdict({:reenqueue, _reason}, _repo, _row, facts) do
+      Loops.enqueue_step(facts.ref, nil)
+    end
+
+    # A3c: a live child ended but its completion never reached the inbox.
+    # Synthesize it under the canonical key; a racing real delivery no-ops.
+    defp apply_loop_verdict({:reconcile_children, strands}, _repo, row, facts) do
+      Enum.each(strands, &reconcile_child(row, facts, &1))
+    end
+
+    # A3c: inputs sat past the threshold against a parked loop; the wake
+    # was lost. Take it now.
+    defp apply_loop_verdict({:wake_pending, _reason}, _repo, _row, facts) do
+      Loops.wake(facts.ref)
+    end
+
+    # The one terminal verdict a loop keeps: a live-wedged step runner past
+    # its deadline and the grace.
+    defp apply_loop_verdict({:interrupt, reason}, _repo, _row, facts) do
+      case Protocol.interrupt(Lifecycle, facts, reason) do
+        {:ok, _facts} -> :ok
+        {:error, :stale} -> :ok
+        {:error, other} -> log_sweep_error(facts.ref, other, nil)
+      end
+    end
+
+    defp apply_loop_verdict(:healthy, _repo, _row, _facts), do: :ok
+
+    defp reconcile_child(row, facts, strand) do
+      Loops.reconcile_child(row, strand)
+    rescue
+      e -> log_sweep_error(facts.ref, Exception.message(e), nil)
+    end
+
+    defp requeue_loop(repo, facts, reason) do
+      case Protocol.requeue(Lifecycle, facts, reason) do
+        {:ok, _facts} -> Loops.enqueue_step(facts.ref, nil)
+        {:error, reason} -> repo.rollback(reason)
+      end
+    end
+
     @doc false
     # One sweep: the query is agent_runs'; the judgment is the library's,
     # status-scoped, with the Oban cross-check for runs the clock alone
@@ -69,7 +172,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     def sweep(policy \\ Reconciler.Policy.new()) do
       %Config{repo: repo, oban: oban} = Config.fetch!()
       now = storage_now!(repo)
-      rows = active_runs(repo)
+      rows = active_runs(repo, "rollout")
       jobs = oban_jobs_by_id(repo, oban, rows)
 
       Enum.reduce(rows, %{interrupted: 0, requeued: 0}, fn row, acc ->
@@ -154,9 +257,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp active_runs(repo) do
+    defp active_runs(repo, kind) do
       AgentRun
-      |> where([r], r.kind == "rollout" and r.status in @active_statuses)
+      |> where([r], r.kind == ^kind and r.status in @active_statuses)
       |> repo.all()
     end
 

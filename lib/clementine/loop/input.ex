@@ -1,21 +1,24 @@
 defmodule Clementine.Loop.Input do
-  @moduledoc """
-  What wakes a loop (LOOP_RFC §Vocabulary): a message, a child completion,
-  a timer expiration, or the machinery's own poison evidence.
-
-  One struct, kind-discriminated — the durable value the inbox stores and
-  the host seam decodes. `handle/2` never sees the struct; it receives
-  `to_callback/1`'s tuple form:
-
-      {:message, payload}
-      {:completed, tag, Clementine.Result.t()}
-      {:elapsed, tag}
-      {:input_failed, input_ref, Clementine.Error.t()}
-
-  Tags and payloads are terms under the `Clementine.Loop.Codec` contract;
-  `result` and `error` are live structs, encoded by the host seam (the
-  inbox recipe), not by the loop codec.
-  """
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   What wakes a loop (LOOP_RFC §Vocabulary): a message, a child completion,
+  #   a timer expiration, or the machinery's own poison evidence.
+  #
+  #   One struct, kind-discriminated — the durable value the inbox stores and
+  #   the host seam decodes. `handle/2` never sees the struct; it receives
+  #   `to_callback/1`'s tuple form:
+  #
+  #       {:message, payload}
+  #       {:completed, tag, Clementine.Result.t()}
+  #       {:elapsed, tag}
+  #       {:input_failed, input_ref, Clementine.Error.t()}
+  #
+  #   Tags and payloads are terms under the `Clementine.Loop.Codec` contract;
+  #   `result` and `error` are live structs, encoded by the host seam (the
+  #   inbox recipe), not by the loop codec.
 
   alias Clementine.{Error, Result}
 

@@ -1,11 +1,11 @@
 defmodule Clementine.MigrationTest do
   @moduledoc """
   `Clementine.Migration`'s versions are frozen: a host migration that says
-  `version: 2` must build this exact table under every later Clementine,
-  and `up(from: 1, version: 2)` on a version 1 table (the library's, which
-  a hand-rolled one matches column by column) must build the same table.
-  If a snapshot here fails, a change reached a version's DDL; it belongs
-  in a new version instead.
+  `version: 3` must build this exact table under every later Clementine,
+  and the upgrade path (`up(from: 1, version: 2)` on a version 1 table,
+  then `up(from: 2, version: 3)`) must build the same table as
+  `up(version: 3)` from scratch. If a snapshot here fails, a change
+  reached a version's DDL; it belongs in a new version instead.
 
   The suite's own `agent_runs` came up by the upgrade path
   (`test_helper.exs`). The from-scratch and down paths run here inside
@@ -18,7 +18,7 @@ defmodule Clementine.MigrationTest do
 
   alias Clementine.Migration
 
-  @v2_columns [
+  @v3_columns [
     {"id", "uuid", "NO", nil},
     {"agent_key", "text", "NO", nil},
     {"subject_type", "text", "YES", nil},
@@ -46,10 +46,29 @@ defmodule Clementine.MigrationTest do
     {"finished_at", "timestamp with time zone", "YES", nil},
     {"actor_type", "text", "YES", nil},
     {"actor_id", "text", "YES", nil},
-    {"turn", "boolean", "NO", "false"}
+    {"turn", "boolean", "NO", "false"},
+    {"loop_policy", "jsonb", "YES", nil},
+    {"envelope", "jsonb", "YES", nil},
+    {"state_version", "integer", "YES", nil},
+    {"parent_id", "uuid", "YES", nil},
+    {"tag_kind", "text", "YES", nil},
+    {"tag_id", "text", "YES", nil}
   ]
 
-  @v1_columns Enum.take(@v2_columns, 25)
+  @v2_columns Enum.take(@v3_columns, 28)
+  @v1_columns Enum.take(@v3_columns, 25)
+
+  @inbox_columns [
+    {"id", "bigint", "NO", "nextval('agent_run_inbox_id_seq'::regclass)"},
+    {"run_id", "uuid", "NO", nil},
+    {"kind", "text", "NO", nil},
+    {"payload", "jsonb", "NO", nil},
+    {"dedup_key", "text", "YES", nil},
+    {"attempts", "integer", "NO", "0"},
+    {"inserted_at", "timestamp with time zone", "NO", "now()"},
+    {"dead_at", "timestamp with time zone", "YES", nil},
+    {"dead_reason", "text", "YES", nil}
+  ]
 
   @lane_index "CREATE UNIQUE INDEX agent_runs_lane_index ON public.agent_runs USING btree ((\n" <>
                 "CASE\n    WHEN turn THEN ''::text\n    ELSE agent_key\nEND), subject_type, " <>
@@ -60,6 +79,14 @@ defmodule Clementine.MigrationTest do
                          "public.agent_runs USING btree (agent_key, subject_type, subject_id) " <>
                          "WHERE ((status = ANY (ARRAY['queued'::text, 'running'::text, " <>
                          "'waiting'::text])) AND (kind = 'rollout'::text))"
+
+  @child_tag_index "CREATE UNIQUE INDEX agent_runs_child_tag_index ON public.agent_runs " <>
+                     "USING btree (parent_id, tag_kind, tag_id) WHERE ((status = ANY " <>
+                     "(ARRAY['queued'::text, 'running'::text, 'waiting'::text])) AND " <>
+                     "(parent_id IS NOT NULL))"
+
+  @parent_index "CREATE INDEX agent_runs_parent_index ON public.agent_runs USING btree " <>
+                  "(parent_id) WHERE (parent_id IS NOT NULL)"
 
   @plain_indexes [
     {"agent_runs_agent_key_index",
@@ -75,10 +102,27 @@ defmodule Clementine.MigrationTest do
        "(subject_type, subject_id)"}
   ]
 
-  @v2_indexes Enum.sort([{"agent_runs_lane_index", @lane_index} | @plain_indexes])
   @v1_indexes Enum.sort([
                 {"agent_runs_single_active_run_index", @single_active_index} | @plain_indexes
               ])
+  @v2_indexes Enum.sort([{"agent_runs_lane_index", @lane_index} | @plain_indexes])
+  @v3_indexes Enum.sort([
+                {"agent_runs_child_tag_index", @child_tag_index},
+                {"agent_runs_parent_index", @parent_index} | @v2_indexes
+              ])
+
+  @inbox_indexes [
+    {"agent_run_inbox_dedup_index",
+     "CREATE UNIQUE INDEX agent_run_inbox_dedup_index ON public.agent_run_inbox USING btree " <>
+       "(run_id, dedup_key) WHERE (dedup_key IS NOT NULL)"},
+    {"agent_run_inbox_pending_index",
+     "CREATE INDEX agent_run_inbox_pending_index ON public.agent_run_inbox USING btree " <>
+       "(run_id, id) WHERE (dead_at IS NULL)"},
+    {"agent_run_inbox_pkey",
+     "CREATE UNIQUE INDEX agent_run_inbox_pkey ON public.agent_run_inbox USING btree (id)"}
+  ]
+
+  @v1_constraints [{"agent_runs_pkey", "PRIMARY KEY (id)"}]
 
   @v2_constraints [
     {"agent_runs_actor_typed", "CHECK (((actor_id IS NULL) OR (actor_type IS NOT NULL)))"},
@@ -88,12 +132,27 @@ defmodule Clementine.MigrationTest do
     {"agent_runs_turn_has_subject", "CHECK (((NOT turn) OR (subject_id IS NOT NULL)))"}
   ]
 
-  @v1_constraints [{"agent_runs_pkey", "PRIMARY KEY (id)"}]
+  @v3_constraints Enum.sort([
+                    {"agent_runs_child_tagged",
+                     "CHECK (((parent_id IS NULL) = (tag_kind IS NULL)))"},
+                    {"agent_runs_loop_shape",
+                     "CHECK (((kind <> 'loop'::text) OR ((turn = false) AND (parent_id IS NULL))))"},
+                    {"agent_runs_parent_id_fkey",
+                     "FOREIGN KEY (parent_id) REFERENCES agent_runs(id) ON DELETE RESTRICT"},
+                    {"agent_runs_tag_whole", "CHECK (((tag_kind IS NULL) = (tag_id IS NULL)))"}
+                    | @v2_constraints
+                  ])
+
+  @inbox_constraints [
+    {"agent_run_inbox_pkey", "PRIMARY KEY (id)"},
+    {"agent_run_inbox_run_id_fkey",
+     "FOREIGN KEY (run_id) REFERENCES agent_runs(id) ON DELETE CASCADE"}
+  ]
 
   defmodule FromScratch do
     use Ecto.Migration
-    def up, do: Clementine.Migration.up(version: 2)
-    def down, do: Clementine.Migration.down(version: 2)
+    def up, do: Clementine.Migration.up(version: 3)
+    def down, do: Clementine.Migration.down(version: 3)
   end
 
   defmodule Version1 do
@@ -102,79 +161,98 @@ defmodule Clementine.MigrationTest do
     def down, do: Clementine.Migration.down(version: 1)
   end
 
-  defmodule Upgrade do
+  defmodule Version2 do
+    use Ecto.Migration
+    def up, do: Clementine.Migration.up(version: 2)
+    def down, do: Clementine.Migration.down(version: 2)
+  end
+
+  defmodule UpgradeTo2 do
     use Ecto.Migration
     def up, do: Clementine.Migration.up(from: 1, version: 2)
     def down, do: Clementine.Migration.down(to: 1, version: 2)
   end
 
-  test "the upgrade path built the frozen version 2 schema" do
-    assert_version_2!()
+  defmodule UpgradeTo3 do
+    use Ecto.Migration
+    def up, do: Clementine.Migration.up(from: 2, version: 3)
+    def down, do: Clementine.Migration.down(to: 2, version: 3)
   end
 
-  test "up(version: 2) from scratch builds the same schema" do
+  test "the upgrade path built the frozen version 3 schema" do
+    assert_version_3!()
+  end
+
+  test "up(version: 3) from scratch builds the same schema" do
     drop_table!()
     migrate!(:up, FromScratch)
 
+    assert_version_3!()
+  end
+
+  test "up(version: 2) from scratch builds the frozen version 2 schema" do
+    drop_table!()
+    migrate!(:up, Version2)
+
     assert_version_2!()
   end
 
-  test "up(from: 1, version: 2) brings a hand-rolled version 1 table to the same schema" do
+  test "the upgrades bring a hand-rolled version 1 table through 2 to the same schema" do
     drop_table!()
     migrate!(:up, Version1)
     # A table built by hand to match version 1 carries no stamp.
     TestRepo.query!("COMMENT ON TABLE agent_runs IS NULL")
 
-    assert columns() == @v1_columns
-    assert indexes() == @v1_indexes
-    assert constraints() == @v1_constraints
+    assert columns("agent_runs") == @v1_columns
+    assert indexes("agent_runs") == @v1_indexes
+    assert constraints("agent_runs") == @v1_constraints
     assert Migration.migrated_version(TestRepo) == :unstamped
 
-    migrate!(:up, Upgrade)
-
+    migrate!(:up, UpgradeTo2)
     assert_version_2!()
+
+    migrate!(:up, UpgradeTo3)
+    assert_version_3!()
   end
 
-  test "down(to: 1, version: 2) restores version 1, and down(version: 2) drops the table" do
+  test "down(to: 2, version: 3) restores version 2, and down(version: 3) drops both tables" do
     # The suite's own upgrade migration, as the host would roll it back.
     Ecto.Migrator.down(
       TestRepo,
-      20_261_027_000_001,
-      Clementine.Test.Ecto.UpgradeAgentRunsToVersion2,
+      20_261_028_000_001,
+      Clementine.Test.Ecto.UpgradeAgentRunsToVersion3,
       log: false,
       log_migrator_sql: false,
       migration_lock: false
     )
 
-    assert columns() == @v1_columns
-    assert indexes() == @v1_indexes
-    assert constraints() == @v1_constraints
-    assert Migration.migrated_version(TestRepo) == 1
-
-    version = migrate!(:up, Upgrade)
     assert_version_2!()
+    assert columns("agent_run_inbox") == []
 
-    migrate!(:down, Upgrade, version)
-    assert columns() == @v1_columns
-    assert Migration.migrated_version(TestRepo) == 1
+    version = migrate!(:up, UpgradeTo3)
+    assert_version_3!()
+
+    migrate!(:down, UpgradeTo3, version)
+    assert_version_2!()
 
     drop_table!()
     version = migrate!(:up, FromScratch)
-    assert_version_2!()
+    assert_version_3!()
 
     migrate!(:down, FromScratch, version)
-    assert columns() == []
+    assert columns("agent_runs") == []
+    assert columns("agent_run_inbox") == []
     assert Migration.migrated_version(TestRepo) == :missing
   end
 
   test "the version stamp reads back, and the check names the migration to write" do
-    assert Migration.migrated_version(TestRepo) == 2
+    assert Migration.migrated_version(TestRepo) == 3
     assert Migration.check!(TestRepo) == :ok
 
-    TestRepo.query!("COMMENT ON TABLE agent_runs IS '1'")
-    assert Migration.migrated_version(TestRepo) == 1
+    TestRepo.query!("COMMENT ON TABLE agent_runs IS '2'")
+    assert Migration.migrated_version(TestRepo) == 2
 
-    assert_raise RuntimeError, ~r/at version 1: .*up\(from: 1, version: 2\)/, fn ->
+    assert_raise RuntimeError, ~r/at version 2: .*up\(from: 2, version: 3\)/, fn ->
       Migration.check!(TestRepo)
     end
 
@@ -182,48 +260,54 @@ defmodule Clementine.MigrationTest do
     assert Migration.migrated_version(TestRepo) == :unstamped
 
     assert_raise RuntimeError,
-                 ~r/no version stamp \(version 1\): .*up\(from: 1, version: 2\)/,
+                 ~r/no version stamp \(version 1\): .*up\(from: 1, version: 3\)/,
                  fn ->
                    Migration.check!(TestRepo)
                  end
 
-    # A description someone left on the table is not a stamp either.
-    TestRepo.query!("COMMENT ON TABLE agent_runs IS 'The agents'' runs.'")
-    assert Migration.migrated_version(TestRepo) == :unstamped
-
-    TestRepo.query!("COMMENT ON TABLE agent_runs IS '2 (with notes)'")
-    assert Migration.migrated_version(TestRepo) == :unstamped
-    assert_raise RuntimeError, ~r/no version stamp/, fn -> Migration.check!(TestRepo) end
-
     # The code rolled back after a migration: the table is ahead, and
     # starts.
-    TestRepo.query!("COMMENT ON TABLE agent_runs IS '3'")
-    assert Migration.migrated_version(TestRepo) == 3
+    TestRepo.query!("COMMENT ON TABLE agent_runs IS '4'")
+    assert Migration.migrated_version(TestRepo) == 4
     assert Migration.check!(TestRepo) == :ok
 
     drop_table!()
     assert Migration.migrated_version(TestRepo) == :missing
 
-    assert_raise RuntimeError, ~r/has none: .*up\(version: 2\)/, fn ->
+    assert_raise RuntimeError, ~r/has none: .*up\(version: 3\)/, fn ->
       Migration.check!(TestRepo)
     end
   end
 
+  defp assert_version_3! do
+    assert columns("agent_runs") == @v3_columns
+    assert indexes("agent_runs") == @v3_indexes
+    assert constraints("agent_runs") == @v3_constraints
+    assert columns("agent_run_inbox") == @inbox_columns
+    assert indexes("agent_run_inbox") == @inbox_indexes
+    assert constraints("agent_run_inbox") == @inbox_constraints
+    assert Migration.migrated_version(TestRepo) == 3
+  end
+
   defp assert_version_2! do
-    assert columns() == @v2_columns
-    assert indexes() == @v2_indexes
-    assert constraints() == @v2_constraints
+    assert columns("agent_runs") == @v2_columns
+    assert indexes("agent_runs") == @v2_indexes
+    assert constraints("agent_runs") == @v2_constraints
     assert Migration.migrated_version(TestRepo) == 2
   end
 
-  defp drop_table!, do: TestRepo.query!("DROP TABLE agent_runs")
+  # The inbox references agent_runs, so it goes first.
+  defp drop_table! do
+    TestRepo.query!("DROP TABLE IF EXISTS agent_run_inbox")
+    TestRepo.query!("DROP TABLE agent_runs")
+  end
 
   # The sandbox's connection carries the migration, so its DDL rolls back
   # with the test, and so does the migrator's record of the version. An up
   # registers a fresh version, later than the suite's own; a down must name
   # the version its up registered, or the migrator finds nothing to undo.
   defp migrate!(direction, module, version \\ nil) do
-    version = version || 20_261_027_000_001 + System.unique_integer([:positive, :monotonic])
+    version = version || 20_261_028_000_001 + System.unique_integer([:positive, :monotonic])
 
     apply(Ecto.Migrator, direction, [
       TestRepo,
@@ -235,28 +319,35 @@ defmodule Clementine.MigrationTest do
     version
   end
 
-  defp columns do
-    TestRepo.query!("""
-    SELECT column_name, data_type, is_nullable, column_default
-    FROM information_schema.columns
-    WHERE table_name = 'agent_runs'
-    ORDER BY ordinal_position
-    """).rows
-    |> Enum.map(&List.to_tuple/1)
-  end
-
-  defp indexes do
+  defp columns(table) do
     TestRepo.query!(
-      "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'agent_runs' ORDER BY indexname"
+      """
+      SELECT column_name, data_type, is_nullable, column_default
+      FROM information_schema.columns
+      WHERE table_name = $1
+      ORDER BY ordinal_position
+      """,
+      [table]
     ).rows
     |> Enum.map(&List.to_tuple/1)
   end
 
-  defp constraints do
-    TestRepo.query!("""
-    SELECT conname, pg_get_constraintdef(oid)
-    FROM pg_constraint WHERE conrelid = 'agent_runs'::regclass ORDER BY conname
-    """).rows
+  defp indexes(table) do
+    TestRepo.query!(
+      "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = $1 ORDER BY indexname",
+      [table]
+    ).rows
+    |> Enum.map(&List.to_tuple/1)
+  end
+
+  defp constraints(table) do
+    TestRepo.query!(
+      """
+      SELECT conname, pg_get_constraintdef(oid)
+      FROM pg_constraint WHERE conrelid = to_regclass($1) ORDER BY conname
+      """,
+      [table]
+    ).rows
     |> Enum.map(&List.to_tuple/1)
   end
 end

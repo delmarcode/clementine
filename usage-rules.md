@@ -9,10 +9,10 @@ the drain at shutdown.
 
 - One child after Oban, whose `repo` is Oban's repo:
   `{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: [MyApp.Agents.Triage], host: MyApp.Agents.Host}`.
-- One migration calling `Clementine.Migration.up(version: 2)`. Each
+- One migration calling `Clementine.Migration.up(version: 3)`. Each
   version stamps the table, and the runtime refuses to start against a
   table behind the code's version, naming the migration to write
-  (`Clementine.Migration.up(from: 1, version: 2)`).
+  (`Clementine.Migration.up(from: 2, version: 3)`).
 - Agent modules, each listed in `agents:`:
   `use Clementine.Agent, key: "triage", model: :claude_sonnet, instructions: "...", tools: [...]`.
   Every run row stores the key, so never rename a key that has runs. An

@@ -14,7 +14,7 @@ defmodule Clementine.Lifecycle do
   That one conditional write is the entire correctness burden on the host.
   Everything subtle — which transitions are legal, when the epoch
   increments, what each operation expects and sets, how races resolve —
-  lives in `Clementine.Lifecycle.Protocol`, implemented once against this
+  lives in the library's lifecycle protocol, implemented once against this
   behaviour. Hosts on Ecto should reach for the adapter rather than
   hand-writing these callbacks; the conformance suite verifies either path.
 

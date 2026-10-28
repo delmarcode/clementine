@@ -49,7 +49,7 @@ defmodule Clementine.Telemetry do
   ## Run Events
 
   One event per committed lifecycle write, emitted by
-  `Clementine.Lifecycle.Protocol` after the guarded CAS succeeds. Terminal
+  the lifecycle protocol after the guarded CAS succeeds. Terminal
   observability splits by mechanism: `:finished` is a terminal written by a
   live execution (or a direct cancel of an unowned run); `:reaped` is a
   terminal written by reconciliation or an admin.
@@ -121,22 +121,20 @@ defmodule Clementine.Telemetry do
   emitters split the events by what they can honestly see: the **step
   runner** emits everything derivable from a committed `StepCommit`
   (`:step`, `:step_failed`, `:spawned`, `:cascade`, `:upgraded`) after —
-  never before — the host's atomic unit commits, and the **storage adapter**
-  (`Clementine.Loop.Ecto`) emits the inbox-side events (`:input`,
-  `:dead_letter`, `:inbox`) through the deferred-emission seam, so an
-  event describing an append or dead letter fires only when the
-  transaction that created it commits. Hand-written hosts get the runner
-  events for free; the inbox events are theirs to emit if they want the
-  same signals.
+  never before — the atomic unit commits, and the **durable runtime**
+  emits the inbox-side events (`:input`, `:dead_letter`, `:inbox`)
+  through the deferred-emission seam, so an event describing an append
+  or dead letter fires only when the transaction that created it
+  commits.
 
   ### Paging signals (LOOP_RFC §Operations)
 
   The operations story in one table — alert on these, drill down with
-  `Clementine.Loop.inspect/3`:
+  `Clementine.Runs.inspect/1`:
 
   | Signal | Source |
   |--------|--------|
-  | per-loop inbox depth / oldest-unconsumed-input age | `[:clementine, :loop, :inbox]` via `Clementine.Loop.Ecto.emit_inbox_depths/1` on a `:telemetry_poller` |
+  | per-loop inbox depth / oldest-unconsumed-input age | `[:clementine, :loop, :inbox]` via `Clementine.Runs.emit_inbox_depths/0` on a `:telemetry_poller` |
   | dead-letter creation rate by reason | `[:clementine, :loop, :dead_letter]`, `reason` tag |
   | appends-to-terminal rate | `[:clementine, :loop, :dead_letter]` with `reason: :terminal` |
   | `:reconcile_children` / `:wake_pending` firing rates | `[:clementine, :loop, :verdict]`, `verdict` tag — ~zero on Postgres; nonzero is a substrate or glue bug surfacing safely |
@@ -147,7 +145,7 @@ defmodule Clementine.Telemetry do
   Reconciliation judged a loop-kind run and the verdict was not
   `:healthy` (LOOP_RFC amendment A3). Emitted at judgment time by
   `Clementine.Reconciler.judge_loop/4` and by the Oban cross-check's
-  loop-kind verdicts (`Clementine.Lifecycle.Ecto.Oban.judge_job/2`):
+  loop-kind verdicts:
   three of the four loop verdicts are host actions with no lifecycle
   commit to ride, so the judgment is the one seam every firing crosses.
   Nonzero
@@ -163,9 +161,9 @@ defmodule Clementine.Telemetry do
   ### `[:clementine, :loop, :step]`
 
   One step committed (LOOP_RFC §The Step). Emitted by
-  `Clementine.Loop.Runner.step/2` after — never before — the host's
-  `apply_step` unit commits; the outcome names the committed facts, so a
-  park the host downgraded inside its unit reports `:continued`.
+  the step runner after — never before — the step's atomic unit
+  commits; the outcome names the committed facts, so a park the commit
+  downgraded inside its unit reports `:continued`.
 
   - Measurements: `%{duration: native}` — claim to commit
   - Metadata: `%{loop_ref: term, epoch: pos_integer, outcome: :parked | :continued | :finished, mode: :normal | :cascade, batch: non_neg_integer}` —
@@ -250,8 +248,8 @@ defmodule Clementine.Telemetry do
 
   The per-loop pending-inbox gauge — depth and oldest-unconsumed-input
   age, the stuck detector. Not event-driven: emitted by
-  `Clementine.Loop.Ecto.emit_inbox_depths/1`, which the host wires onto
-  a `:telemetry_poller` (one aggregate query per poll; loops with empty
+  `Clementine.Runs.emit_inbox_depths/0`, which the host wires onto a
+  `:telemetry_poller` (one aggregate query per poll; loops with empty
   pending windows emit nothing).
 
   - Measurements: `%{depth: non_neg_integer, oldest_age_ms: non_neg_integer}` —

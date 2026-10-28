@@ -24,65 +24,17 @@ defmodule Clementine.Test.Ecto.CreateRuns do
   end
 end
 
-defmodule Clementine.Test.Ecto.AddLoopSupport do
+defmodule Clementine.Test.Ecto.CreateUuidJobs do
   @moduledoc """
-  The loop-adoption migration, exercised for real (LOOP_RFC amendment A6):
-  an existing run table gains the loop and child columns, the scope and
-  dedup indexes, and the inbox — plus a plain jobs table standing in for
-  Oban, so tests prove job rows commit atomically with their units.
+  A plain table keyed by a run's UUID, standing in for the writes a host's
+  `run_finished/2` makes: `Clementine.RunsCase.Host` records what it wrote
+  here, so tests prove those writes commit, and roll back, with the run's
+  end.
   """
 
   use Ecto.Migration
 
   def change do
-    alter table(:clementine_test_runs) do
-      Clementine.Loop.Ecto.Migration.loop_columns()
-      Clementine.Loop.Ecto.Migration.child_columns()
-    end
-
-    Clementine.Loop.Ecto.Migration.loop_scope_index(:clementine_test_runs)
-    Clementine.Loop.Ecto.Migration.child_dedup_index(:clementine_test_runs)
-    Clementine.Loop.Ecto.Migration.create_inbox(:clementine_test_loop_inbox)
-
-    create table(:clementine_test_jobs) do
-      add(:run_ref, :bigint)
-      add(:kind, :text, null: false)
-      add(:args, :map)
-      add(:inserted_at, :timestamptz, null: false, default: fragment("now()"))
-    end
-  end
-end
-
-defmodule Clementine.Test.Ecto.CreateUuidRuns do
-  @moduledoc """
-  The same recipe on a uuid-keyed host table — the key shape Meli's
-  adoption runs (binary_id primary keys), which the integer-keyed table
-  cannot regress: refs cross the schemaless inbox boundary as UUID
-  strings and must dump through the adapter.
-  """
-
-  use Ecto.Migration
-
-  def change do
-    create table(:clementine_test_uuid_runs, primary_key: false) do
-      add(:id, :uuid, primary_key: true, default: fragment("gen_random_uuid()"))
-      add(:scope_id, :bigint)
-      add(:label, :text)
-    end
-
-    alter table(:clementine_test_uuid_runs) do
-      Clementine.Lifecycle.Ecto.Migration.run_columns()
-      Clementine.Loop.Ecto.Migration.loop_columns()
-      Clementine.Loop.Ecto.Migration.child_columns(type: :binary_id)
-    end
-
-    Clementine.Loop.Ecto.Migration.loop_scope_index(:clementine_test_uuid_runs)
-    Clementine.Loop.Ecto.Migration.child_dedup_index(:clementine_test_uuid_runs)
-
-    Clementine.Loop.Ecto.Migration.create_inbox(:clementine_test_uuid_loop_inbox,
-      loop_ref_type: :binary_id
-    )
-
     create table(:clementine_test_uuid_jobs) do
       add(:run_ref, :uuid)
       add(:kind, :text, null: false)
@@ -150,4 +102,18 @@ defmodule Clementine.Test.Ecto.UpgradeAgentRunsToVersion2 do
 
   def up, do: Clementine.Migration.up(from: 1, version: 2)
   def down, do: Clementine.Migration.down(to: 1, version: 2)
+end
+
+defmodule Clementine.Test.Ecto.UpgradeAgentRunsToVersion3 do
+  @moduledoc """
+  The migration a host on version 2 writes to adopt version 3: the loop
+  columns, the child tag, and the inbox. The runs suite runs on the
+  upgraded table; `Clementine.MigrationTest` proves it builds the same
+  table as `up(version: 3)` from scratch.
+  """
+
+  use Ecto.Migration
+
+  def up, do: Clementine.Migration.up(from: 2, version: 3)
+  def down, do: Clementine.Migration.down(to: 2, version: 3)
 end

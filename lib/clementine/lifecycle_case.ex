@@ -1,167 +1,170 @@
 defmodule Clementine.LifecycleCase do
-  @moduledoc """
-  The generated conformance suite for `Clementine.Lifecycle`
-  implementations (RFC §Deliverables: The Conformance Suite).
-
-  The entire correctness burden the contract places on a host is one
-  sentence — *the `apply` write must be atomic and conditional on
-  `(status, epoch)` exactly matching `expect`, with the projection in the
-  same atomic unit* — and this module exists to verify that sentence. A
-  host that hand-writes its lifecycle and forgets half the guard fails
-  this suite on day one:
-
-      defmodule Meli.ClementineLifecycleTest do
-        use Clementine.LifecycleCase,
-          lifecycle: Meli.ClementineLifecycle,
-          create_run: fn attrs -> Meli.Factory.queued_conversation_run(attrs).id end,
-          storage_now: &Meli.Runs.db_now!/0,
-          nonexistent_ref: -1,
-          moduletag: :postgres
-
-        # See "Racing writers and Ecto.Adapters.SQL.Sandbox" below.
-        setup do
-          pid = Ecto.Adapters.SQL.Sandbox.start_owner!(Meli.Repo, shared: true)
-          on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
-          :ok
-        end
-      end
-
-  ## Options
-
-    * `:lifecycle` (required) — the `Clementine.Lifecycle` implementation
-      under test.
-    * `:create_run` (required) — an arity-1 function receiving a keyword
-      list and returning the *run reference* (the value `fetch/2` accepts)
-      of a freshly inserted `queued` run. See the contract below.
-    * `:storage_now` (optional) — a zero-arity function returning the
-      storage clock's current `DateTime` (in Postgres, `SELECT now()`).
-      Enables the storage-clock battery: without it the suite cannot tell
-      the storage clock from the node clock, and those tests are not
-      generated.
-    * `:nonexistent_ref` (optional) — a run reference guaranteed to match
-      no run (for integer keys, `-1`; for UUIDs, the nil UUID). Enables the
-      `:not_found` tests; not generated when omitted.
-    * `:ctx` (optional, default `nil`) — the host context threaded through
-      every `fetch`/`apply`. A literal term, or a zero-arity function
-      evaluated per test (for per-test contexts).
-    * `:moduletag` (optional) — an atom or list of atoms applied as
-      `@moduletag` to the generated tests. Tags must ride this option: a
-      `@moduletag` written after `use` does not reach tests that were
-      already generated (ExUnit reads tags at test registration), while
-      `setup` blocks after `use` apply normally.
-    * `:async` (optional, default `false`) — forwarded to
-      `use ExUnit.Case`. Leave `false` unless every test in the module can
-      genuinely share storage with concurrent test modules.
-
-  ## The `create_run` contract
-
-  `create_run.(attrs)` inserts one queued run and returns its reference.
-  Repeated calls must not collide with the host's own uniqueness
-  constraints (a single-active-per-scope index means each call needs a
-  fresh scope). The row should stamp `queued_at` the way production
-  enqueue does (the column recipe defaults it to `now()`).
-
-  The suite passes two documented keys. The host's projection must honor
-  the first for the projection battery to run:
-
-    * `projection: :raise` — the returned run's projection raises on
-      every invocation.
-    * `projection: {:raise_on, variant}` with `variant` one of
-      `:completed | :failed | :cancelled | :interrupted` — the projection
-      raises exactly when invoked with that `Clementine.Result` variant.
-
-  And the second for the per-kind batteries (cancel refusal, external
-  park):
-
-    * `kind: :loop` — the returned run is loop-kind (the factory writes
-      the recipe's `kind` column); omitted means `:rollout`.
-
-  The projection convention costs a marker column (or any equivalent) the
-  projection can read; wiring it is fiddly exactly once, in this file's
-  factory. The probes are how a storage-agnostic suite observes
-  projections: an aborted commit proves the projection ran inside the
-  atomic unit and received precisely that result variant — no message
-  passing, no adapter hooks.
-
-  ## Racing writers and `Ecto.Adapters.SQL.Sandbox`
-
-  The concurrency battery runs genuinely racing writers — concurrent
-  processes each issuing their own claim — which the SQL sandbox cannot
-  host in its default `:manual` checkout (sibling processes are not
-  allowed onto the test's connection). Two documented setups work; both
-  are per-module, so the rest of the suite keeps its usual isolation:
-
-  Shared ownership (with `async: false`, the default) — the setup from
-  the example above:
-
-      setup do
-        pid = Ecto.Adapters.SQL.Sandbox.start_owner!(MyApp.Repo, shared: true)
-        on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
-        :ok
-      end
-
-  Racing processes then share one sandboxed connection: queries serialize
-  at the connection, but every logical interleaving the CAS must survive —
-  N claimers fetching the same epoch before any of them writes — still
-  occurs, and everything rolls back after each test. Under the sandbox
-  there is a bonus: `now()` is the transaction timestamp, frozen for the
-  whole test, so the storage-clock assertions tighten from a bracket to
-  exact equality.
-
-  A dedicated non-sandbox repo pointed at the test database is the
-  alternative — true connection-level parallelism, no rollback (rely on
-  per-run row isolation, which `create_run`'s fresh-scope rule provides):
-
-      setup do
-        # MyApp.ConformanceRepo: same database, pool: DBConnection.ConnectionPool
-        start_supervised!(MyApp.ConformanceRepo)
-        :ok
-      end
-
-  The racing tests are tagged `racing_writers: true`; a host whose
-  environment cannot run them excludes the tag
-  (`ExUnit.configure(exclude: [:racing_writers])`) rather than skipping
-  the suite.
-
-  ## What the battery covers
-
-  The full battery from the RFC, driven through
-  `Clementine.Lifecycle.Protocol` exactly as the runner, reaper, and
-  control plane drive production writes:
-
-    * N concurrent claimers — exactly one winner (matrix row 6's claim
-      CAS), losers told who holds the run.
-    * Zombie fencing after suspend/resume/re-claim and after
-      requeue/re-claim — status recurs, the epoch fences (matrix row 2),
-      probed at both the protocol surface and the raw `apply` guard.
-    * Double finish, finish-after-reap (`:already_terminal`), heartbeat
-      after an epoch bump (`:lost_lease`).
-    * Projection atomicity — a raising projection commits nothing — and
-      uniform firing with the correct `Result` variant for finish, reaper
-      interrupt, and direct cancel.
-    * Suspension round-trip (checkpoint stored bit-for-bit) and every
-      stale-token error variant (matrix row 7).
-    * External-park round-trip — a checkpoint-less `{:external, _}`
-      suspension (the loop park shape) stores `nil` exactly and resumes
-      by token (LOOP_RFC amendment A4).
-    * Cancel racing suspend, both orders, converging to `cancelled` and
-      never stranding a flagged run in `waiting` (matrix row 17).
-    * Cancel refusal per kind — `request_cancel` refuses a live loop-kind
-      run with `{:error, :loop_run}` in both flavors, writing nothing
-      (LOOP_RFC amendment A2, matrix L8 support); rollout runs keep the
-      shipped flavors.
-    * Requeue — `:effects_present` refusal (matrix row 18's guard),
-      `queued_at` stamping, epoch untouched until the next claim.
-    * Field hygiene after suspend and requeue — no `executor_id`,
-      `deadline`, or `heartbeat_at` left behind — plus the complement:
-      suspend re-stamps `queued_at`, the unowned-state entry time the
-      reaper's `max_wait` ceiling measures from.
-    * Reaper interrupt losing cleanly to a concurrent finish (matrix
-      row 3), with no projection side effects from the loser.
-    * With `:storage_now`, symbolic `:now`/`{:now_plus, ms}` resolution
-      against the storage clock — including stamps nested inside flag
-      values — asserted against the database's `now()`, never the node's.
-  """
+  @moduledoc false
+  # Hidden from the docs on purpose: nothing outside the library calls
+  # this from an app on Clementine.Runs (usage-rules.md says so). The
+  # text below is kept for the library's own readers.
+  #
+  #   The generated conformance suite for `Clementine.Lifecycle`
+  #   implementations (RFC §Deliverables: The Conformance Suite).
+  #
+  #   The entire correctness burden the contract places on a host is one
+  #   sentence — *the `apply` write must be atomic and conditional on
+  #   `(status, epoch)` exactly matching `expect`, with the projection in the
+  #   same atomic unit* — and this module exists to verify that sentence. A
+  #   host that hand-writes its lifecycle and forgets half the guard fails
+  #   this suite on day one:
+  #
+  #       defmodule Meli.ClementineLifecycleTest do
+  #         use Clementine.LifecycleCase,
+  #           lifecycle: Meli.ClementineLifecycle,
+  #           create_run: fn attrs -> Meli.Factory.queued_conversation_run(attrs).id end,
+  #           storage_now: &Meli.Runs.db_now!/0,
+  #           nonexistent_ref: -1,
+  #           moduletag: :postgres
+  #
+  #         # See "Racing writers and Ecto.Adapters.SQL.Sandbox" below.
+  #         setup do
+  #           pid = Ecto.Adapters.SQL.Sandbox.start_owner!(Meli.Repo, shared: true)
+  #           on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
+  #           :ok
+  #         end
+  #       end
+  #
+  #   ## Options
+  #
+  #     * `:lifecycle` (required) — the `Clementine.Lifecycle` implementation
+  #       under test.
+  #     * `:create_run` (required) — an arity-1 function receiving a keyword
+  #       list and returning the *run reference* (the value `fetch/2` accepts)
+  #       of a freshly inserted `queued` run. See the contract below.
+  #     * `:storage_now` (optional) — a zero-arity function returning the
+  #       storage clock's current `DateTime` (in Postgres, `SELECT now()`).
+  #       Enables the storage-clock battery: without it the suite cannot tell
+  #       the storage clock from the node clock, and those tests are not
+  #       generated.
+  #     * `:nonexistent_ref` (optional) — a run reference guaranteed to match
+  #       no run (for integer keys, `-1`; for UUIDs, the nil UUID). Enables the
+  #       `:not_found` tests; not generated when omitted.
+  #     * `:ctx` (optional, default `nil`) — the host context threaded through
+  #       every `fetch`/`apply`. A literal term, or a zero-arity function
+  #       evaluated per test (for per-test contexts).
+  #     * `:moduletag` (optional) — an atom or list of atoms applied as
+  #       `@moduletag` to the generated tests. Tags must ride this option: a
+  #       `@moduletag` written after `use` does not reach tests that were
+  #       already generated (ExUnit reads tags at test registration), while
+  #       `setup` blocks after `use` apply normally.
+  #     * `:async` (optional, default `false`) — forwarded to
+  #       `use ExUnit.Case`. Leave `false` unless every test in the module can
+  #       genuinely share storage with concurrent test modules.
+  #
+  #   ## The `create_run` contract
+  #
+  #   `create_run.(attrs)` inserts one queued run and returns its reference.
+  #   Repeated calls must not collide with the host's own uniqueness
+  #   constraints (a single-active-per-scope index means each call needs a
+  #   fresh scope). The row should stamp `queued_at` the way production
+  #   enqueue does (the column recipe defaults it to `now()`).
+  #
+  #   The suite passes two documented keys. The host's projection must honor
+  #   the first for the projection battery to run:
+  #
+  #     * `projection: :raise` — the returned run's projection raises on
+  #       every invocation.
+  #     * `projection: {:raise_on, variant}` with `variant` one of
+  #       `:completed | :failed | :cancelled | :interrupted` — the projection
+  #       raises exactly when invoked with that `Clementine.Result` variant.
+  #
+  #   And the second for the per-kind batteries (cancel refusal, external
+  #   park):
+  #
+  #     * `kind: :loop` — the returned run is loop-kind (the factory writes
+  #       the recipe's `kind` column); omitted means `:rollout`.
+  #
+  #   The projection convention costs a marker column (or any equivalent) the
+  #   projection can read; wiring it is fiddly exactly once, in this file's
+  #   factory. The probes are how a storage-agnostic suite observes
+  #   projections: an aborted commit proves the projection ran inside the
+  #   atomic unit and received precisely that result variant — no message
+  #   passing, no adapter hooks.
+  #
+  #   ## Racing writers and `Ecto.Adapters.SQL.Sandbox`
+  #
+  #   The concurrency battery runs genuinely racing writers — concurrent
+  #   processes each issuing their own claim — which the SQL sandbox cannot
+  #   host in its default `:manual` checkout (sibling processes are not
+  #   allowed onto the test's connection). Two documented setups work; both
+  #   are per-module, so the rest of the suite keeps its usual isolation:
+  #
+  #   Shared ownership (with `async: false`, the default) — the setup from
+  #   the example above:
+  #
+  #       setup do
+  #         pid = Ecto.Adapters.SQL.Sandbox.start_owner!(MyApp.Repo, shared: true)
+  #         on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
+  #         :ok
+  #       end
+  #
+  #   Racing processes then share one sandboxed connection: queries serialize
+  #   at the connection, but every logical interleaving the CAS must survive —
+  #   N claimers fetching the same epoch before any of them writes — still
+  #   occurs, and everything rolls back after each test. Under the sandbox
+  #   there is a bonus: `now()` is the transaction timestamp, frozen for the
+  #   whole test, so the storage-clock assertions tighten from a bracket to
+  #   exact equality.
+  #
+  #   A dedicated non-sandbox repo pointed at the test database is the
+  #   alternative — true connection-level parallelism, no rollback (rely on
+  #   per-run row isolation, which `create_run`'s fresh-scope rule provides):
+  #
+  #       setup do
+  #         # MyApp.ConformanceRepo: same database, pool: DBConnection.ConnectionPool
+  #         start_supervised!(MyApp.ConformanceRepo)
+  #         :ok
+  #       end
+  #
+  #   The racing tests are tagged `racing_writers: true`; a host whose
+  #   environment cannot run them excludes the tag
+  #   (`ExUnit.configure(exclude: [:racing_writers])`) rather than skipping
+  #   the suite.
+  #
+  #   ## What the battery covers
+  #
+  #   The full battery from the RFC, driven through
+  #   `Clementine.Lifecycle.Protocol` exactly as the runner, reaper, and
+  #   control plane drive production writes:
+  #
+  #     * N concurrent claimers — exactly one winner (matrix row 6's claim
+  #       CAS), losers told who holds the run.
+  #     * Zombie fencing after suspend/resume/re-claim and after
+  #       requeue/re-claim — status recurs, the epoch fences (matrix row 2),
+  #       probed at both the protocol surface and the raw `apply` guard.
+  #     * Double finish, finish-after-reap (`:already_terminal`), heartbeat
+  #       after an epoch bump (`:lost_lease`).
+  #     * Projection atomicity — a raising projection commits nothing — and
+  #       uniform firing with the correct `Result` variant for finish, reaper
+  #       interrupt, and direct cancel.
+  #     * Suspension round-trip (checkpoint stored bit-for-bit) and every
+  #       stale-token error variant (matrix row 7).
+  #     * External-park round-trip — a checkpoint-less `{:external, _}`
+  #       suspension (the loop park shape) stores `nil` exactly and resumes
+  #       by token (LOOP_RFC amendment A4).
+  #     * Cancel racing suspend, both orders, converging to `cancelled` and
+  #       never stranding a flagged run in `waiting` (matrix row 17).
+  #     * Cancel refusal per kind — `request_cancel` refuses a live loop-kind
+  #       run with `{:error, :loop_run}` in both flavors, writing nothing
+  #       (LOOP_RFC amendment A2, matrix L8 support); rollout runs keep the
+  #       shipped flavors.
+  #     * Requeue — `:effects_present` refusal (matrix row 18's guard),
+  #       `queued_at` stamping, epoch untouched until the next claim.
+  #     * Field hygiene after suspend and requeue — no `executor_id`,
+  #       `deadline`, or `heartbeat_at` left behind — plus the complement:
+  #       suspend re-stamps `queued_at`, the unowned-state entry time the
+  #       reaper's `max_wait` ceiling measures from.
+  #     * Reaper interrupt losing cleanly to a concurrent finish (matrix
+  #       row 3), with no projection side effects from the loser.
+  #     * With `:storage_now`, symbolic `:now`/`{:now_plus, ms}` resolution
+  #       against the storage clock — including stamps nested inside flag
+  #       values — asserted against the database's `now()`, never the node's.
 
   defmacro __using__(opts) do
     lifecycle = Keyword.fetch!(opts, :lifecycle)

@@ -69,9 +69,9 @@ defmodule Clementine.Runs.RuntimeTest do
       assert {:error, {%RuntimeError{message: message}, _stack}} =
                Clementine.Runs.Supervisor.start_link(repo: TestRepo)
 
-      assert message =~ "needs the agent_runs table at version 2"
+      assert message =~ "needs the agent_runs table at version 3"
       assert message =~ "has it at version 1"
-      assert message =~ "Clementine.Migration.up(from: 1, version: 2)"
+      assert message =~ "Clementine.Migration.up(from: 1, version: 3)"
 
       # A table built before stamps, or by hand to match version 1.
       TestRepo.query!("COMMENT ON TABLE agent_runs IS NULL")
@@ -80,7 +80,7 @@ defmodule Clementine.Runs.RuntimeTest do
                Clementine.Runs.Supervisor.start_link(repo: TestRepo)
 
       assert message =~ "with no version stamp (version 1)"
-      assert message =~ "Clementine.Migration.up(from: 1, version: 2)"
+      assert message =~ "Clementine.Migration.up(from: 1, version: 3)"
     end
 
     test "refuses a missing table, naming the migration to write" do
@@ -92,11 +92,11 @@ defmodule Clementine.Runs.RuntimeTest do
                Clementine.Runs.Supervisor.start_link(repo: TestRepo)
 
       assert message =~ "has none"
-      assert message =~ "Clementine.Migration.up(version: 2)"
+      assert message =~ "Clementine.Migration.up(version: 3)"
     end
 
     test "starts against a table ahead of the code's version" do
-      TestRepo.query!("COMMENT ON TABLE agent_runs IS '3'")
+      TestRepo.query!("COMMENT ON TABLE agent_runs IS '4'")
 
       assert {:ok, _pid} = start_supervised({Clementine, repo: TestRepo})
     end
@@ -164,14 +164,14 @@ defmodule Clementine.Runs.RuntimeTest do
 
   describe "Clementine.Migration" do
     test "names only versions that exist" do
-      assert Clementine.Migration.current_version() == 2
+      assert Clementine.Migration.current_version() == 3
 
-      assert_raise ArgumentError, ~r/versions run 1..2/, fn ->
-        Clementine.Migration.up(version: 3)
+      assert_raise ArgumentError, ~r/versions run 1..3/, fn ->
+        Clementine.Migration.up(version: 4)
       end
 
-      assert_raise ArgumentError, ~r/versions run 1..2/, fn ->
-        Clementine.Migration.up(from: 2, version: 1)
+      assert_raise ArgumentError, ~r/versions run 1..3/, fn ->
+        Clementine.Migration.up(from: 3, version: 1)
       end
 
       assert_raise KeyError, fn -> Clementine.Migration.up([]) end

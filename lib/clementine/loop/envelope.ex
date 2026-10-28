@@ -1,30 +1,33 @@
 defmodule Clementine.Loop.Envelope do
-  @moduledoc """
-  The machinery-owned durable wrapper around a loop's state (LOOP_RFC
-  §Vocabulary): envelope format version, the app's `state_version`, the
-  dumped state, live children (`tag_key => child run ref`), pending timers
-  (`tag_key => host meta`), the pending halt held during a cascade, and
-  machinery-aggregated usage.
-
-  The pure step core records new children and timers with placeholder
-  values (`nil` ref, empty meta); the host's `apply_step` fills real run
-  refs and schedule handles inside the same atomic unit it creates them.
-  Filled values survive later folds verbatim — the fold copies entries it
-  does not retire.
-
-  `encode/1`/`decode/1` are the storage doors for the envelope column.
-  State, children keys, and timer keys are canonical-codec territory;
-  the two open positions (child refs, the pending halt's `Result`) use the
-  tagged json/ETF convention the Ecto codec established for trusted open
-  `term()` storage — the envelope is written and read only by this
-  machinery, on the BEAM, whatever the substrate.
-
-  A stored envelope version this code does not know decodes to
-  `{:error, {:incompatible_state, detail}}` — the same clean-failure path
-  as an app `state_version` mismatch, because the operator story is
-  identical: park visibly, deploy compatible code (LOOP_RFC §The
-  Behaviour, matrix row L2).
-  """
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   The machinery-owned durable wrapper around a loop's state (LOOP_RFC
+  #   §Vocabulary): envelope format version, the app's `state_version`, the
+  #   dumped state, live children (`tag_key => child run ref`), pending timers
+  #   (`tag_key => host meta`), the pending halt held during a cascade, and
+  #   machinery-aggregated usage.
+  #
+  #   The pure step core records new children and timers with placeholder
+  #   values (`nil` ref, empty meta); the host's `apply_step` fills real run
+  #   refs and schedule handles inside the same atomic unit it creates them.
+  #   Filled values survive later folds verbatim — the fold copies entries it
+  #   does not retire.
+  #
+  #   `encode/1`/`decode/1` are the storage doors for the envelope column.
+  #   State, children keys, and timer keys are canonical-codec territory;
+  #   the two open positions (child refs, the pending halt's `Result`) use the
+  #   tagged json/ETF convention the Ecto codec established for trusted open
+  #   `term()` storage — the envelope is written and read only by this
+  #   machinery, on the BEAM, whatever the substrate.
+  #
+  #   A stored envelope version this code does not know decodes to
+  #   `{:error, {:incompatible_state, detail}}` — the same clean-failure path
+  #   as an app `state_version` mismatch, because the operator story is
+  #   identical: park visibly, deploy compatible code (LOOP_RFC §The
+  #   Behaviour, matrix row L2).
 
   alias Clementine.{Result, Usage}
 

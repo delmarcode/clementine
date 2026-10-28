@@ -21,7 +21,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     alias Clementine.Lifecycle.Ecto, as: EctoLifecycle
     alias Clementine.Lifecycle.Ecto.Codec
     alias Clementine.Lifecycle.{Facts, Transition}
-    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier}
+    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, Loops}
 
     # Liveness and the effects fence are the runtime's bookkeeping.
     @quiet_ops [:heartbeat, :mark_effects]
@@ -72,6 +72,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       %Config{repo: repo, host: host} = Config.fetch!()
       run = store_output(repo, result, run)
 
+      # A loop's child tells its loop inside this same transaction: the
+      # completion is exactly-once at source, because a terminal is a
+      # dead end (LOOP_RFC L12).
+      if run.parent_id, do: Loops.append_completion(run, result)
+
       # The adapter brackets this transaction for emissions: this one
       # fires once the transaction commits and is dropped if it rolls
       # back, including when run_finished/2 raises below.
@@ -86,25 +91,43 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     # The adapter calls this once the transition's transaction commits
     # (the outermost one, while Clementine.Emissions brackets it). An end
-    # reaches the host through run_committed/2 instead, with its result.
+    # reaches the host through run_committed/2 instead, with its result;
+    # a child's end also wakes its loop, best-effort, the completion
+    # being durable already.
     #
     # A cancel flag reaches the host before its runner, so the host never
     # hears of the flag after the end it causes.
     @impl Clementine.Lifecycle.Ecto
     def after_transition(%Facts{} = facts, %Transition{op: op}, ctx)
         when op not in @quiet_ops do
-      %Config{oban: oban} = config = Config.fetch!()
+      %Config{repo: repo, oban: oban} = config = Config.fetch!()
 
-      with false <- Facts.terminal?(facts),
-           {:ok, transition} <- Map.fetch(@transitions, op) do
-        hear(config, facts, transition, ctx)
-        if transition == :cancel_requested, do: CancelRelay.push(facts, oban)
+      if Facts.terminal?(facts) do
+        with %AgentRun{parent_id: parent_id} = run when is_binary(parent_id) <-
+               transition_run(repo, facts, ctx) do
+          Loops.wake_parent(run)
+        end
+      else
+        with {:ok, transition} <- Map.fetch(@transitions, op) do
+          hear(config, facts, transition, ctx)
+          if transition == :cancel_requested, do: CancelRelay.push(facts, oban)
+        end
       end
 
       :ok
     end
 
     def after_transition(_facts, _transition, _ctx), do: :ok
+
+    @doc false
+    # A change the loop machinery wrote outside the protocol (a wake, a
+    # loop's cancel flag), for the host's run_transition/2. Called after
+    # the write commits, or deferred until it does.
+    @spec notify_transition(Facts.t(), Clementine.Host.transition()) :: :ok
+    def notify_transition(%Facts{} = facts, transition) do
+      hear(Config.fetch!(), facts, transition, nil)
+      :ok
+    end
 
     # The host's run_transition/2 hears of the change, and after a claim
     # the run's courier carries the claimed run to run_event/2.

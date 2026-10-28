@@ -1,52 +1,55 @@
 defmodule Clementine.Loop.Local do
-  @moduledoc """
-  The script path (LOOP_RFC §Worked Examples): `Clementine.Loop.run_local/3`
-  animates one loop against an in-memory host, deterministically, in the
-  caller's process — the loop analog of `Clementine.run/3`.
-
-  Production shape is simulated, not approximated:
-
-  - **The inbox is the real contract.** An in-memory FIFO with identical
-    consumption semantics — append/wake/enqueue as one unit, consumption in
-    the step commit, dedup keys, dead letters — and every input round-trips
-    the production value codec (`Clementine.Loop.Ecto.Codec`), so a payload
-    outside the loop's declared vocabulary fails here exactly as it would
-    against real storage.
-  - **The hop is modeled.** Children are real rollout-runs executed by
-    `Clementine.Runner.execute/2`, and their completions are *enqueued as
-    inputs* by the terminal projection glue — never handed to `handle/2`
-    inline — so script and production ordering agree (the §Alternatives
-    verdict on inline execution).
-  - **Timers ride a virtual clock.** The loop's storage clock — loop-row
-    stamps, inbox rows, schedule deadlines — starts at wall now and only
-    ever jumps forward: to the next schedule's deadline, and only when the
-    loop is otherwise idle (no step to run, no child to run). A
-    five-minute retry timer costs nothing and fires in order. Child
-    rollout rows stamp on the wall clock instead: the rollout engine
-    enforces `max_duration` against `DateTime.utc_now/0`, and a virtual
-    jump must not slacken that belt.
-
-  Everything above the store is the shipped machinery unmodified:
-  `Clementine.Loop.Protocol.create/3`, `Clementine.Loop.Runner.step/2`, the
-  pure step core, and the rollout runner. Determinism follows from
-  single-threaded drive order (one FIFO job ledger: steps and children in
-  commit order, timers only at idle) plus the loop contract's own purity;
-  timestamps are anchors, not ordering inputs.
-
-  This is an eval harness, not a host: the loop lives exactly as long as
-  the call, `{:send, ...}` can only target the loop itself, and there is no
-  reaper because a single process cannot lose a lease. The module's
-  `Clementine.Lifecycle` and `Clementine.Loop.Host` callbacks exist for the
-  machinery it drives; `run/3` is the API.
-  """
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   The script path (LOOP_RFC §Worked Examples): `Clementine.Loop.run_local/3`
+  #   animates one loop against an in-memory host, deterministically, in the
+  #   caller's process — the loop analog of `Clementine.run/3`.
+  #
+  #   Production shape is simulated, not approximated:
+  #
+  #   - **The inbox is the real contract.** An in-memory FIFO with identical
+  #     consumption semantics — append/wake/enqueue as one unit, consumption in
+  #     the step commit, dedup keys, dead letters — and every input round-trips
+  #     the production value codec (`Clementine.Loop.InboxCodec`), so a payload
+  #     outside the loop's declared vocabulary fails here exactly as it would
+  #     against real storage.
+  #   - **The hop is modeled.** Children are real rollout-runs executed by
+  #     `Clementine.Runner.execute/2`, and their completions are *enqueued as
+  #     inputs* by the terminal projection glue — never handed to `handle/2`
+  #     inline — so script and production ordering agree (the §Alternatives
+  #     verdict on inline execution).
+  #   - **Timers ride a virtual clock.** The loop's storage clock — loop-row
+  #     stamps, inbox rows, schedule deadlines — starts at wall now and only
+  #     ever jumps forward: to the next schedule's deadline, and only when the
+  #     loop is otherwise idle (no step to run, no child to run). A
+  #     five-minute retry timer costs nothing and fires in order. Child
+  #     rollout rows stamp on the wall clock instead: the rollout engine
+  #     enforces `max_duration` against `DateTime.utc_now/0`, and a virtual
+  #     jump must not slacken that belt.
+  #
+  #   Everything above the store is the shipped machinery unmodified:
+  #   `Clementine.Loop.Runner.step/2`, the pure step core, and the rollout
+  #   runner. Determinism follows from single-threaded drive order (one FIFO
+  #   job ledger: steps and children in commit order, timers only at idle)
+  #   plus the loop contract's own purity; timestamps are anchors, not
+  #   ordering inputs.
+  #
+  #   This is an eval harness, not a host: the loop lives exactly as long as
+  #   the call, `{:send, ...}` can only target the loop itself, and there is no
+  #   reaper because a single process cannot lose a lease. The module's
+  #   `Clementine.Lifecycle` callbacks and the step runner's seam (`load/2`,
+  #   `pending/4`, `bump_attempts/2`, `apply_step/2`, `enqueue_step/2`) exist
+  #   for the machinery it drives; `run/3` is the API.
 
   @behaviour Clementine.Lifecycle
-  @behaviour Clementine.Loop.Host
 
   alias Clementine.Lifecycle.{Facts, Transition}
   alias Clementine.Loop
-  alias Clementine.Loop.Ecto.Codec, as: InboxCodec
-  alias Clementine.Loop.{Envelope, Input, StepCommit, StoredInput}
+  alias Clementine.Loop.InboxCodec
+  alias Clementine.Loop.{Codec, Envelope, Input, StepCommit, StoredInput}
   alias Clementine.{Result, Rollout, Run, Runner}
 
   @default_max_steps 1000
@@ -57,38 +60,28 @@ defmodule Clementine.Loop.Local do
   """
   @spec run(module(), map(), keyword()) :: {:ok, Result.t()} | {:error, term()}
   def run(module, args, opts \\ []) when is_atom(module) and is_map(args) do
-    store = start_store(Keyword.get(opts, :build_child), vocabulary(module))
+    with {:ok, resolved} <- Loop.resolve(module) do
+      store = start_store(Keyword.get(opts, :build_child), resolved.__loop__(:vocabulary))
 
-    spec = %{
-      module: module,
-      scope: "run_local",
-      args: args,
-      policy: Keyword.get(opts, :policy, %{})
-    }
+      # A spec is durable cargo: a value that cannot cross the storage
+      # boundary fails at the caller, not in a later step.
+      spec = %{
+        module: resolved,
+        args: Codec.validate_json_map!(args, "loop args"),
+        policy: Codec.validate_json_map!(Keyword.get(opts, :policy, %{}), "loop policy")
+      }
 
-    try do
-      case Loop.Protocol.create(__MODULE__, spec, ctx: store) do
-        {:ok, %Facts{ref: loop_ref}} ->
-          Enum.each(Keyword.get(opts, :messages, []), fn payload ->
-            {:ok, :appended} = append(loop_ref, Input.message(payload), nil, store)
-          end)
+      try do
+        {:ok, %Facts{ref: loop_ref}} = create(spec, store)
 
-          drive(store, loop_ref, Keyword.get(opts, :max_steps, @default_max_steps), 0)
+        Enum.each(Keyword.get(opts, :messages, []), fn payload ->
+          {:ok, :appended} = append(loop_ref, Input.message(payload), nil, store)
+        end)
 
-        {:error, reason} ->
-          {:error, reason}
+        drive(store, loop_ref, Keyword.get(opts, :max_steps, @default_max_steps), 0)
+      after
+        Agent.stop(store)
       end
-    after
-      Agent.stop(store)
-    end
-  end
-
-  defp vocabulary(module) do
-    case Loop.resolve(module) do
-      {:ok, resolved} -> resolved.__loop__(:vocabulary)
-      # Protocol.create refuses the module with the loop layer's clean
-      # error; the store just needs to outlive that refusal.
-      {:error, _} -> []
     end
   end
 
@@ -371,9 +364,9 @@ defmodule Clementine.Loop.Local do
     end
   end
 
-  ## Clementine.Loop.Host
+  ## The step runner's seam (load, pending, bump_attempts, apply_step, enqueue_step)
+  ## and the inbox verbs (create, append, cancel, dead_letters)
 
-  @impl Clementine.Loop.Host
   def create(spec, store) do
     Agent.get_and_update(store, fn state ->
       {ref, state} = mint_ref(state)
@@ -394,7 +387,6 @@ defmodule Clementine.Loop.Local do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def load(loop_ref, store) do
     Agent.get(store, fn state ->
       with {:ok, %Facts{} = facts} <- Map.fetch(state.runs, loop_ref),
@@ -416,7 +408,6 @@ defmodule Clementine.Loop.Local do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def cancel(loop_ref, reason, store) do
     Agent.get_and_update(store, fn state ->
       case Map.fetch(state.runs, loop_ref) do
@@ -439,7 +430,6 @@ defmodule Clementine.Loop.Local do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def append(loop_ref, %Input{} = input, dedup_key, store) do
     # Encode outside the update so a vocabulary violation raises at the
     # caller — the production seam's posture, loud and immediate.
@@ -474,7 +464,6 @@ defmodule Clementine.Loop.Local do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def pending(loop_ref, limit, scope, store) when scope in [:any, :completions] do
     Agent.get(store, fn state ->
       state.inbox
@@ -486,7 +475,6 @@ defmodule Clementine.Loop.Local do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def dead_letters(loop_ref, limit, store) when is_integer(limit) and limit > 0 do
     Agent.get(store, fn state ->
       state.inbox
@@ -521,7 +509,6 @@ defmodule Clementine.Loop.Local do
     %Input{kind: Enum.find(Input.kinds(), :message, &(Atom.to_string(&1) == kind))}
   end
 
-  @impl Clementine.Loop.Host
   def bump_attempts(refs, store) do
     Agent.update(store, fn state ->
       Enum.reduce(refs, state, fn ref, state ->
@@ -530,7 +517,6 @@ defmodule Clementine.Loop.Local do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def build_child(%Facts{} = facts, tag, child_args, store) do
     case Agent.get(store, & &1.build_child) do
       nil ->
@@ -557,7 +543,6 @@ defmodule Clementine.Loop.Local do
     end
   end
 
-  @impl Clementine.Loop.Host
   def enqueue_step(loop_ref, store) do
     Agent.update(store, &push_job(&1, {:step, loop_ref}))
   end
@@ -565,7 +550,6 @@ defmodule Clementine.Loop.Local do
   # The one atomic unit (atomicity sentence 1): the CAS fence first, then
   # every piece of cargo, the park re-check, the projection, and the
   # terminal sweep — all inside this single update.
-  @impl Clementine.Loop.Host
   def apply_step(%StepCommit{} = commit, store) do
     Agent.get_and_update(store, &do_apply_step(&1, commit))
   end

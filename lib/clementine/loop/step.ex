@@ -1,47 +1,50 @@
 defmodule Clementine.Loop.Step do
-  @moduledoc """
-  The pure step core (LOOP_RFC §The Step): given the decoded envelope, the
-  pending window, and a plan, compute the one `StepCommit` the host applies
-  atomically. This module is the loop design — every decision the RFC
-  makes about draining, dedup, blame, halt, and cascade lives here as a
-  pure function, property-testable with no database.
-
-  Two phases, split so the attempts bump can commit *before* `handle/2`
-  runs (Governing Invariant 3's one deliberate exception — a payload that
-  kills the VM must still advance toward its dead-letter threshold):
-
-      plan  = Step.plan(envelope, pending, cancel: facts_cancel, ...)
-      :ok   = host.bump_attempts(plan.bump, ctx)   # committed, pre-drain
-      {:ok, commit} = Step.drain(module, envelope, plan, loop_ref: ..., epoch: ...)
-      host.apply_step(commit, ctx)                 # the one atomic unit
-
-  ## Failure channels
-
-  Deploy-shaped problems return clean errors — `{:error,
-  {:incompatible_state, _}}` (stored `state_version` this code cannot
-  load: a version behind the declared one first takes the
-  `handle_upgrade/2` chain when the module exports it, see `upgrade/2`)
-  and `{:error, {:incompatible_spec, _}}` (not a loop module) — the
-  loop parks visibly until compatible code deploys (matrix row L2). Inputs
-  are innocent of deploys, so these never dead-letter anything.
-
-  App-contract violations raise (`ArgumentError`): actions outside the
-  closed set, tag collisions among live children or pending timers,
-  returns outside the callback contract, non-map `dump/1` output,
-  un-encodable payloads. A raise fails the step; the drain-time bump has
-  already counted it, so deterministic violations walk the poison path —
-  head-of-batch blame, batch-1 degrade, dead-letter at the threshold with
-  a synthesized `{:input_failed, ref, error}` — and the mailbox never jams
-  (matrix row L7). The threshold step itself consults none of the app's
-  doors: even a loop whose `init/1`, `load/1`, or `dump/1` is the
-  deterministic failure still commits its poison mark.
-
-  Cascade mode (facts cancel flag, or a pending halt in the envelope)
-  never invokes `handle/2`, `load/1`, or `dump/1`: completions are
-  absorbed into the envelope (usage included), non-completion inputs stay
-  unconsumed for the terminal sweep, and version incompatibilities cannot
-  block a cancellation.
-  """
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   The pure step core (LOOP_RFC §The Step): given the decoded envelope, the
+  #   pending window, and a plan, compute the one `StepCommit` the host applies
+  #   atomically. This module is the loop design — every decision the RFC
+  #   makes about draining, dedup, blame, halt, and cascade lives here as a
+  #   pure function, property-testable with no database.
+  #
+  #   Two phases, split so the attempts bump can commit *before* `handle/2`
+  #   runs (Governing Invariant 3's one deliberate exception — a payload that
+  #   kills the VM must still advance toward its dead-letter threshold):
+  #
+  #       plan  = Step.plan(envelope, pending, cancel: facts_cancel, ...)
+  #       :ok   = host.bump_attempts(plan.bump, ctx)   # committed, pre-drain
+  #       {:ok, commit} = Step.drain(module, envelope, plan, loop_ref: ..., epoch: ...)
+  #       host.apply_step(commit, ctx)                 # the one atomic unit
+  #
+  #   ## Failure channels
+  #
+  #   Deploy-shaped problems return clean errors — `{:error,
+  #   {:incompatible_state, _}}` (stored `state_version` this code cannot
+  #   load: a version behind the declared one first takes the
+  #   `handle_upgrade/2` chain when the module exports it, see `upgrade/2`)
+  #   and `{:error, {:incompatible_spec, _}}` (not a loop module) — the
+  #   loop parks visibly until compatible code deploys (matrix row L2). Inputs
+  #   are innocent of deploys, so these never dead-letter anything.
+  #
+  #   App-contract violations raise (`ArgumentError`): actions outside the
+  #   closed set, tag collisions among live children or pending timers,
+  #   returns outside the callback contract, non-map `dump/1` output,
+  #   un-encodable payloads. A raise fails the step; the drain-time bump has
+  #   already counted it, so deterministic violations walk the poison path —
+  #   head-of-batch blame, batch-1 degrade, dead-letter at the threshold with
+  #   a synthesized `{:input_failed, ref, error}` — and the mailbox never jams
+  #   (matrix row L7). The threshold step itself consults none of the app's
+  #   doors: even a loop whose `init/1`, `load/1`, or `dump/1` is the
+  #   deterministic failure still commits its poison mark.
+  #
+  #   Cascade mode (facts cancel flag, or a pending halt in the envelope)
+  #   never invokes `handle/2`, `load/1`, or `dump/1`: completions are
+  #   absorbed into the envelope (usage included), non-completion inputs stay
+  #   unconsumed for the terminal sweep, and version incompatibilities cannot
+  #   block a cancellation.
 
   alias Clementine.Loop.{Action, Codec, Envelope, Input, StepCommit, StoredInput}
   alias Clementine.{Error, Result, ResumeToken, Suspension, Usage}
@@ -61,14 +64,13 @@ defmodule Clementine.Loop.Step do
   def default_dead_letter_after, do: @default_dead_letter_after
 
   defmodule Plan do
-    @moduledoc """
-    The pre-drain phase of one step, computed pure from the pending window:
-    which ref to bump (the head, blamed for any pre-commit death), the
-    batch to fold (degraded to one after a failed step — the head's
-    attempts are the evidence), the at-threshold poison mark with its
-    synthesized `{:input_failed}`, and the window remainder the transition
-    computation reads.
-    """
+    @moduledoc false
+    # The pre-drain phase of one step, computed pure from the pending
+    # window: which ref to bump (the head, blamed for any pre-commit
+    # death), the batch to fold (degraded to one after a failed step — the
+    # head's attempts are the evidence), the at-threshold poison mark with
+    # its synthesized `{:input_failed}`, and the window remainder the
+    # transition computation reads.
 
     defstruct mode: :normal,
               cancel: nil,
@@ -424,6 +426,7 @@ defmodule Clementine.Loop.Step do
       marks: plan.dead,
       appends: plan.synthesize,
       child_cargo: [],
+      cancel_cargo: [],
       send_cargo: [],
       timer_cargo: [],
       cancel_timer_cargo: [],
@@ -544,6 +547,28 @@ defmodule Clementine.Loop.Step do
       | children: Map.put(fold.children, action.tag_key, nil),
         child_cargo: fold.child_cargo ++ [spec]
     }
+  end
+
+  # A cancel names a live child: the commit flags it (a queued child ends
+  # at once, a running one gets the cooperative flag), and its completion
+  # arrives like any other, which is when the tag re-arms. A child spawned
+  # in this same drain has no row yet: cancelling it here would commit a
+  # child born cancelled, and a controller that wants to interrupt cancels
+  # first and spawns on the completion, never both in one step (invariant
+  # 12). No live child under the tag is a benign no-op.
+  defp apply_action(fold, %Action{kind: :cancel} = action, _causal, _index) do
+    cond do
+      Enum.any?(fold.child_cargo, &(&1.tag_key == action.tag_key)) ->
+        raise ArgumentError,
+              "tag #{inspect(action.tag)} was spawned in this same step and cannot be " <>
+                "cancelled before its spawn commits; cancel it from a later input"
+
+      Map.has_key?(fold.children, action.tag_key) ->
+        %{fold | cancel_cargo: Enum.uniq(fold.cancel_cargo ++ [action.tag_key])}
+
+      true ->
+        fold
+    end
   end
 
   defp apply_action(fold, %Action{kind: :timer} = action, _causal, _index) do
@@ -843,6 +868,7 @@ defmodule Clementine.Loop.Step do
       marks: fold.marks,
       appends: fold.appends,
       children: fold.child_cargo,
+      cancel_children: fold.cancel_cargo,
       sends: fold.send_cargo,
       timers: fold.timer_cargo,
       cancel_timers: fold.cancel_timer_cargo,

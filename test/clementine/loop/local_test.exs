@@ -143,7 +143,7 @@ defmodule Clementine.Loop.LocalTest do
 
   alias Clementine.Lifecycle.Facts
   alias Clementine.Loop
-  alias Clementine.Loop.Ecto.Codec, as: InboxCodec
+  alias Clementine.Loop.InboxCodec
   alias Clementine.Loop.Input
   alias Clementine.Loop.Runner, as: LoopRunner
   alias Clementine.Test.{JudgeLoop, MemoryLoopHost, ScriptedLoop}
@@ -385,10 +385,9 @@ defmodule Clementine.Loop.LocalTest do
     store = MemoryLoopHost.start_store()
 
     {:ok, %Facts{ref: loop_ref}} =
-      Loop.Protocol.create(
-        MemoryLoopHost,
-        %{module: JudgeLoop, scope: "judge-production", args: args},
-        ctx: store
+      MemoryLoopHost.create(
+        %{module: JudgeLoop, scope: "judge-production", args: args, policy: %{}},
+        store
       )
 
     drive_production!(store, loop_ref, MapSet.new())

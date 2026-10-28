@@ -1,16 +1,19 @@
 defmodule Clementine.Lifecycle.Ecto.Oban do
-  @moduledoc """
-  The executor cross-check for Oban-backed runners, learned the hard way in
-  production: Oban can cancel, discard, or lose a job without the run ever
-  reaching a terminal status, and only a status-scoped judgment tells those
-  apart from healthy states.
-
-  The host correlates run to job through its own column (e.g. an
-  `oban_job_id` on the run row, updated at enqueue and every re-enqueue);
-  `executor_id` is a human/telemetry string and is never parsed for
-  correlation. The job argument is duck-typed on Oban's `state` field, so
-  this module carries no Oban dependency.
-  """
+  @moduledoc false
+  # Hidden from the docs on purpose: nothing outside the library calls
+  # this from an app on Clementine.Runs (usage-rules.md says so). The
+  # text below is kept for the library's own readers.
+  #
+  #   The executor cross-check for Oban-backed runners, learned the hard way in
+  #   production: Oban can cancel, discard, or lose a job without the run ever
+  #   reaching a terminal status, and only a status-scoped judgment tells those
+  #   apart from healthy states.
+  #
+  #   The host correlates run to job through its own column (e.g. an
+  #   `oban_job_id` on the run row, updated at enqueue and every re-enqueue);
+  #   `executor_id` is a human/telemetry string and is never parsed for
+  #   correlation. The job argument is duck-typed on Oban's `state` field, so
+  #   this module carries no Oban dependency.
 
   alias Clementine.InterruptReason
   alias Clementine.Lifecycle.Facts

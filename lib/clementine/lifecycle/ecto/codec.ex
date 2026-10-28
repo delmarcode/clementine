@@ -1,34 +1,37 @@
 defmodule Clementine.Lifecycle.Ecto.Codec do
-  @moduledoc """
-  The value-level mapping between `Clementine.Lifecycle.Facts` and the
-  column recipe: statuses as text, timestamps as columns, structured fields
-  as jsonb — encoded so that `fetch` round-trips `Facts` exactly.
-
-  Used by the Ecto adapter's generated `fetch`/`apply`, and public so
-  hand-written lifecycles (the documented escape hatch) can reuse the
-  per-field codecs instead of re-deriving them.
-
-  Open `term()` positions (cancel reasons, external tags, resume payload
-  metas, error `raw`) use a tagged encoding: values that survive a JSON
-  round trip unchanged are stored as plain JSON (inspectable in the
-  database); anything else is stored as Base64-encoded ETF. Decoding does
-  *not* use the `:safe` option: `:safe` refuses to intern new atoms, and an
-  atom this codec durably wrote may legitimately not be interned yet in a
-  freshly restarted VM — `fetch` must stay total on the codec's own writes
-  across restarts and deploys. The atom-creation surface is bounded by what
-  the host application itself stored: these columns are trusted storage,
-  not user input, and must never carry attacker-controlled bytes.
-
-  A stored suspension whose embedded checkpoint no longer decodes (a deploy
-  changed the checkpoint version between suspend and resume) keeps the raw
-  envelope map in `Suspension.checkpoint` instead of a `Checkpoint` struct:
-  `fetch` must stay total — a run with an unreadable checkpoint is still
-  cancellable and inspectable — and the rollout's resume path is where
-  `:incompatible_checkpoint` surfaces, per the RFC's snapshot doctrine.
-  Distinct from that escape: an `{:external, _}` park may carry no
-  checkpoint at all (LOOP_RFC amendment A4) — `nil` round-trips as `nil`,
-  and any other reason without a checkpoint is refused at encode.
-  """
+  @moduledoc false
+  # Hidden from the docs on purpose: nothing outside the library calls
+  # this from an app on Clementine.Runs (usage-rules.md says so). The
+  # text below is kept for the library's own readers.
+  #
+  #   The value-level mapping between `Clementine.Lifecycle.Facts` and the
+  #   column recipe: statuses as text, timestamps as columns, structured fields
+  #   as jsonb — encoded so that `fetch` round-trips `Facts` exactly.
+  #
+  #   Used by the Ecto adapter's generated `fetch`/`apply`, and public so
+  #   hand-written lifecycles (the documented escape hatch) can reuse the
+  #   per-field codecs instead of re-deriving them.
+  #
+  #   Open `term()` positions (cancel reasons, external tags, resume payload
+  #   metas, error `raw`) use a tagged encoding: values that survive a JSON
+  #   round trip unchanged are stored as plain JSON (inspectable in the
+  #   database); anything else is stored as Base64-encoded ETF. Decoding does
+  #   *not* use the `:safe` option: `:safe` refuses to intern new atoms, and an
+  #   atom this codec durably wrote may legitimately not be interned yet in a
+  #   freshly restarted VM — `fetch` must stay total on the codec's own writes
+  #   across restarts and deploys. The atom-creation surface is bounded by what
+  #   the host application itself stored: these columns are trusted storage,
+  #   not user input, and must never carry attacker-controlled bytes.
+  #
+  #   A stored suspension whose embedded checkpoint no longer decodes (a deploy
+  #   changed the checkpoint version between suspend and resume) keeps the raw
+  #   envelope map in `Suspension.checkpoint` instead of a `Checkpoint` struct:
+  #   `fetch` must stay total — a run with an unreadable checkpoint is still
+  #   cancellable and inspectable — and the rollout's resume path is where
+  #   `:incompatible_checkpoint` surfaces, per the RFC's snapshot doctrine.
+  #   Distinct from that escape: an `{:external, _}` park may carry no
+  #   checkpoint at all (LOOP_RFC amendment A4) — `nil` round-trips as `nil`,
+  #   and any other reason without a checkpoint is refused at encode.
 
   alias Clementine.Lifecycle.Facts
 

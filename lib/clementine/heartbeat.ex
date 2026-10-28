@@ -8,9 +8,9 @@ defmodule Clementine.Heartbeat do
   write returns — the write retries transient storage errors under a
   still-live lease instead of racing the reaper.
 
-  Each beat renews `heartbeat_at` through
-  `Clementine.Lifecycle.Protocol.heartbeat/2`,
-  piggybacking the stamper's accumulated usage so even interrupted runs
+  Each beat renews `heartbeat_at` through the lifecycle protocol's
+  heartbeat write, piggybacking the stamper's accumulated usage so even
+  interrupted runs
   carry billing-grade numbers. `:lost_lease` is definitive: the heartbeat
   sends `{:clementine, :lease_lost, lease}` to its `notify:` target — the
   rollout's blocking points match it and unwind — and stops. Any other

@@ -60,13 +60,11 @@ defmodule Clementine.MixProject do
           Clementine.Lease,
           Clementine.Heartbeat
         ],
-        "Ecto adapter": [
-          Clementine.Lifecycle.Ecto,
-          Clementine.Lifecycle.Ecto.Migration,
-          Clementine.Lifecycle.Ecto.Codec,
-          Clementine.Lifecycle.Ecto.Oban,
-          Clementine.LifecycleCase,
-          Clementine.LifecycleCase.Battery
+        "Durable runtime": [
+          Clementine.Runs,
+          Clementine.Runs.AgentRun,
+          Clementine.Host,
+          Clementine.Migration
         ],
         "Suspension & approval": [
           Clementine.Checkpoint,
@@ -83,9 +81,9 @@ defmodule Clementine.MixProject do
           Clementine.InterruptReason
         ],
         "Durable loops": [
-          ~r{Clementine\.Loop($|\.)},
-          Clementine.LoopCase,
-          Clementine.LoopCase.Battery
+          Clementine.Loop,
+          Clementine.Loop.Report,
+          Clementine.Loop.StoredInput
         ],
         "Events & observation": [
           Clementine.Event,

@@ -8,25 +8,67 @@ if Code.ensure_loaded?(Ecto.Migration) do
         defmodule MyApp.Repo.Migrations.AddClementine do
           use Ecto.Migration
 
-          def up, do: Clementine.Migration.up(version: 2)
-          def down, do: Clementine.Migration.down(version: 2)
+          def up, do: Clementine.Migration.up(version: 3)
+          def down, do: Clementine.Migration.down(version: 3)
         end
 
     Each version's DDL is frozen here: a migration that says `version: 1`
     builds the same table under every later Clementine. A host on an
     earlier version adopts a later one in a new migration with
-    `up(from: 1, version: 2)`.
+    `up(from: 2, version: 3)`.
 
     ## The version stamp
 
     Every version ends by stamping its number on the table
-    (`comment on table agent_runs is '2'`), and `migrated_version/1` reads
+    (`comment on table agent_runs is '3'`), and `migrated_version/1` reads
     it. The runtime checks the stamp as it starts and refuses to start
     against a table behind the code's version, naming the migration to
     write, so the table and the code that writes it move together. A
     table with no stamp was built before stamps, or by hand to match
     version 1; the check takes it for version 1. A table ahead of the code
     (the code rolled back after a migration) starts.
+
+    ## Version 3
+
+    Loops are runs (`Clementine.Runs.start_loop/3`): a loop's row has
+    `kind = 'loop'`, its controller's key in `agent_key`, its args in
+    `input`, and three columns of its own; a run a loop's step started
+    points at its parent and carries its tag; and the loop's inbox is a
+    table of its own.
+
+        loop_policy    jsonb     batch cap, dead-letter threshold, deadline_ms
+        envelope       jsonb     the controller's state as it last committed it
+        state_version  integer   the controller's declared state version then
+        parent_id      uuid      references agent_runs(id) on delete restrict
+        tag_kind       text      the child's tag, in two halves
+        tag_id         text
+        check agent_runs_tag_whole    ((tag_kind is null) = (tag_id is null))
+        check agent_runs_child_tagged ((parent_id is null) = (tag_kind is null))
+        check agent_runs_loop_shape   (kind <> 'loop' or (turn = false and parent_id is null))
+        unique index agent_runs_child_tag_index on (parent_id, tag_kind, tag_id)
+          where status in ('queued', 'running', 'waiting') and parent_id is not null
+        index agent_runs_parent_index on (parent_id) where parent_id is not null
+
+        agent_run_inbox
+          id           bigserial primary key
+          run_id       uuid, not null, references agent_runs(id) on delete cascade
+          kind         text, not null        message | completed | elapsed | input_failed
+          payload      jsonb, not null
+          dedup_key    text
+          attempts     integer, not null, default 0
+          inserted_at  timestamptz, not null, default now()
+          dead_at      timestamptz
+          dead_reason  text
+          index agent_run_inbox_pending_index on (run_id, id) where dead_at is null
+          unique index agent_run_inbox_dedup_index on (run_id, dedup_key) where dedup_key is not null
+
+    A loop occupies the lane like any run: `kind = 'loop'`, `turn = false`,
+    `agent_key = "thread"`, `subject = ("conversation", id)` gives lane
+    `("thread", "conversation", id)`, which is what makes `start_loop/3`
+    insert-or-get. Its turns, `turn = true` on the same subject, sit in
+    lane `('', "conversation", id)`, and a task of another agent in its
+    own; none collide. The child tag index is the other half of one live
+    child per tag: a tag re-arms once its child is terminal.
 
     ## Version 2
 
@@ -84,7 +126,7 @@ if Code.ensure_loaded?(Ecto.Migration) do
         inserted_at, updated_at
 
     plus the lifecycle columns of the column recipe
-    (`Clementine.Lifecycle.Ecto.Migration`, version 1) and its
+    (version 1) and its
     single-active index on `(agent_key, subject_type, subject_id)`, which
     counts queued, running, and waiting rollout runs as active.
     """
@@ -92,7 +134,8 @@ if Code.ensure_loaded?(Ecto.Migration) do
     import Ecto.Migration
 
     @table :agent_runs
-    @current_version 2
+    @inbox :agent_run_inbox
+    @current_version 3
 
     @doc "The newest version `up/1` can apply."
     @spec current_version() :: pos_integer()
@@ -258,6 +301,94 @@ if Code.ensure_loaded?(Ecto.Migration) do
           where: "status IN ('queued', 'running', 'waiting') AND subject_id IS NOT NULL"
         )
       )
+
+      stamp(2)
+    end
+
+    defp step_up(3) do
+      alter table(@table) do
+        add(:loop_policy, :map)
+        add(:envelope, :map)
+        add(:state_version, :integer)
+        add(:parent_id, references(@table, type: :binary_id, on_delete: :restrict))
+        add(:tag_kind, :text)
+        add(:tag_id, :text)
+      end
+
+      create(
+        constraint(@table, :agent_runs_tag_whole, check: "(tag_kind IS NULL) = (tag_id IS NULL)")
+      )
+
+      create(
+        constraint(@table, :agent_runs_child_tagged,
+          check: "(parent_id IS NULL) = (tag_kind IS NULL)"
+        )
+      )
+
+      create(
+        constraint(@table, :agent_runs_loop_shape,
+          check: "kind <> 'loop' OR (turn = false AND parent_id IS NULL)"
+        )
+      )
+
+      create(
+        unique_index(@table, [:parent_id, :tag_kind, :tag_id],
+          name: :agent_runs_child_tag_index,
+          where: "status IN ('queued', 'running', 'waiting') AND parent_id IS NOT NULL"
+        )
+      )
+
+      create(
+        index(@table, [:parent_id],
+          name: :agent_runs_parent_index,
+          where: "parent_id IS NOT NULL"
+        )
+      )
+
+      create table(@inbox) do
+        add(:run_id, references(@table, type: :binary_id, on_delete: :delete_all), null: false)
+        add(:kind, :text, null: false)
+        add(:payload, :map, null: false)
+        add(:dedup_key, :text)
+        add(:attempts, :integer, null: false, default: 0)
+        add(:inserted_at, :timestamptz, null: false, default: fragment("now()"))
+        add(:dead_at, :timestamptz)
+        add(:dead_reason, :text)
+      end
+
+      create(
+        index(@inbox, [:run_id, :id],
+          name: :agent_run_inbox_pending_index,
+          where: "dead_at IS NULL"
+        )
+      )
+
+      create(
+        unique_index(@inbox, [:run_id, :dedup_key],
+          name: :agent_run_inbox_dedup_index,
+          where: "dedup_key IS NOT NULL"
+        )
+      )
+
+      stamp(3)
+    end
+
+    defp step_down(3) do
+      drop(table(@inbox))
+      drop(index(@table, [], name: :agent_runs_parent_index))
+      drop(index(@table, [], name: :agent_runs_child_tag_index))
+      drop(constraint(@table, :agent_runs_loop_shape))
+      drop(constraint(@table, :agent_runs_child_tagged))
+      drop(constraint(@table, :agent_runs_tag_whole))
+
+      alter table(@table) do
+        remove(:tag_id)
+        remove(:tag_kind)
+        remove(:parent_id)
+        remove(:state_version)
+        remove(:envelope)
+        remove(:loop_policy)
+      end
 
       stamp(2)
     end

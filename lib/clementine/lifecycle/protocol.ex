@@ -1,33 +1,36 @@
 defmodule Clementine.Lifecycle.Protocol do
-  @moduledoc """
-  The lifecycle protocol: every named operation of durable execution —
-  claim, heartbeat, cancellation, effect fence, suspend, resume, cancel
-  request, finish, interrupt, requeue — implemented once against the
-  two-function `Clementine.Lifecycle` behaviour.
-
-  Every write is a compare-and-swap guarded by an exact `(status, epoch)`
-  pair; `claim` is the only operation that increments the epoch, so an
-  epoch names one execution and doubles as the attempt counter. Lease loss
-  is never detected proactively — it is discovered when a write returns
-  stale, and the epoch guard makes late discovery harmless.
-
-  Operations whose semantics depend on a flag re-fetch after their own
-  successful CAS (see `suspend/3`): a flag write commutes with a status
-  transition under an exact-pair guard, and the re-check is what keeps a
-  cancel request from stranding a freshly parked run.
-
-  Terminal writes (`finish`, `suspend`, direct cancels, `interrupt`) retry
-  transient storage errors bounded-with-backoff — a completed rollout must
-  not convert into a reaped `interrupted` because of a two-second database
-  blip. `:stale` is never retried; it is an answer, not an error.
-
-  Committed writes emit `[:clementine, :run, ...]` telemetry events after
-  their CAS succeeds (the two flag writes — the effect fence and the
-  cooperative cancel flag — are the deliberate exceptions), and every
-  lease-holding operation that discovers lease loss emits `:lease_lost` —
-  so run-level observability rides the protocol itself, not any
-  particular caller. Shapes are documented in `Clementine.Telemetry`.
-  """
+  @moduledoc false
+  # Hidden from the docs on purpose: nothing outside the library calls
+  # this from an app on Clementine.Runs (usage-rules.md says so). The
+  # text below is kept for the library's own readers.
+  #
+  #   The lifecycle protocol: every named operation of durable execution —
+  #   claim, heartbeat, cancellation, effect fence, suspend, resume, cancel
+  #   request, finish, interrupt, requeue — implemented once against the
+  #   two-function `Clementine.Lifecycle` behaviour.
+  #
+  #   Every write is a compare-and-swap guarded by an exact `(status, epoch)`
+  #   pair; `claim` is the only operation that increments the epoch, so an
+  #   epoch names one execution and doubles as the attempt counter. Lease loss
+  #   is never detected proactively — it is discovered when a write returns
+  #   stale, and the epoch guard makes late discovery harmless.
+  #
+  #   Operations whose semantics depend on a flag re-fetch after their own
+  #   successful CAS (see `suspend/3`): a flag write commutes with a status
+  #   transition under an exact-pair guard, and the re-check is what keeps a
+  #   cancel request from stranding a freshly parked run.
+  #
+  #   Terminal writes (`finish`, `suspend`, direct cancels, `interrupt`) retry
+  #   transient storage errors bounded-with-backoff — a completed rollout must
+  #   not convert into a reaped `interrupted` because of a two-second database
+  #   blip. `:stale` is never retried; it is an answer, not an error.
+  #
+  #   Committed writes emit `[:clementine, :run, ...]` telemetry events after
+  #   their CAS succeeds (the two flag writes — the effect fence and the
+  #   cooperative cancel flag — are the deliberate exceptions), and every
+  #   lease-holding operation that discovers lease loss emits `:lease_lost` —
+  #   so run-level observability rides the protocol itself, not any
+  #   particular caller. Shapes are documented in `Clementine.Telemetry`.
 
   alias Clementine.Lifecycle.{Facts, Transition}
   alias Clementine.{Checkpoint, InterruptReason, Lease, Result, ResumeToken, Suspension, Usage}

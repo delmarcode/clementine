@@ -147,7 +147,23 @@ defmodule Clementine.Agent do
   """
   @callback history(run :: Clementine.Runs.AgentRun.t()) :: [Clementine.LLM.Message.message()]
 
-  @optional_callbacks history: 1
+  @doc """
+  Releases what one execution of `run` held, after it ends however it
+  ends: a sandbox, a session with a tool server, a temporary directory.
+  `context` is the map the run's tools saw (`run_id`, `agent_key`,
+  `turn`, `subject`, `actor`, `parent_id`, `tag`); an `c:agent/1` that
+  opens a resource keeps its handle somewhere the tools and this callback
+  both reach, such as the process dictionary, or reads it back from
+  `run.id`.
+
+  It runs in the worker's process once `Clementine.Runner` has returned,
+  whether the execution finished, parked, was requeued, or crashed, and
+  its return value is ignored. A raise is logged and the execution's
+  outcome stands. Optional; most agents hold nothing.
+  """
+  @callback after_execution(run :: Clementine.Runs.AgentRun.t(), context :: map()) :: any()
+
+  @optional_callbacks history: 1, after_execution: 2
 
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do

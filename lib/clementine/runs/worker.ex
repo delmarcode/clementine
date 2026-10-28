@@ -1,25 +1,27 @@
 if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
   defmodule Clementine.Runs.Worker do
-    @moduledoc """
-    The Oban worker that executes one run. `Clementine.Runs.start/3`
-    enqueues it on the child spec's queue; in tests, run a job with
-    `Oban.Testing`:
-
-        assert :ok = perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})
-
-    Deliberately thin: load the row, build the agent and the rollout, call
-    `Clementine.Runner`, map its closed return union. Claims, lease
-    fencing, heartbeats, suspension, cancellation, and the terminal commit
-    are the runner's.
-
-    `max_attempts: 1` is correct. Retry is the reaper's decision, never
-    Oban's blind re-perform: a failed or interrupted run may already have
-    touched the world.
-    """
+    @moduledoc false
+    # The Oban worker that executes one run. Clementine.Runs.start/3 and a
+    # loop's step commit enqueue it on the child spec's queue; in tests,
+    # run a job with Oban.Testing:
+    #
+    #     assert :ok = perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})
+    #
+    # Deliberately thin: load the row, build the agent and the rollout,
+    # call Clementine.Runner, map its closed return union. Claims, lease
+    # fencing, heartbeats, suspension, cancellation, and the terminal
+    # commit are the runner's. A loop's child builds like any run: its
+    # history, its subject, and its actor resolve at the claim.
+    #
+    # max_attempts: 1 is correct. Retry is the reaper's decision, never
+    # Oban's blind re-perform: a failed or interrupted run may already
+    # have touched the world.
 
     use Oban.Worker, queue: :agents, max_attempts: 1
 
     import Ecto.Query, only: [from: 2]
+
+    require Logger
 
     alias Clementine.Lifecycle.{Facts, Protocol}
     alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
@@ -102,6 +104,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         nil ->
           {:discard, :run_not_found}
 
+        # A loop steps through Clementine.Runs.StepWorker; a job that
+        # names one here is miswired, and nothing may run it as a rollout.
+        %AgentRun{kind: "loop"} ->
+          {:discard, :loop_run}
+
         %AgentRun{} = row ->
           case build(config, row) do
             {:ok, run} -> execute_built(config, row, run, executor_id)
@@ -115,8 +122,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # carries its events to the host's run_event/2. Events come only from
     # a claimed run, and the claim hands the courier the claimed run. The
     # runner subscribes to cancels once it holds the run, and this process
-    # stops listening when it lets go.
-    defp execute_built(%Config{host: host}, row, run, executor_id) do
+    # stops listening when it lets go. Last, the agent releases what the
+    # execution held (after_execution/2), whatever the outcome.
+    defp execute_built(%Config{host: host} = config, row, run, executor_id) do
       courier =
         if exports?(host, :run_event, 2), do: Courier.start(host, %{row | status: "running"})
 
@@ -130,8 +138,32 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       after
         CancelRelay.unsubscribe(row.id)
         if courier, do: Courier.stop(courier)
+        after_execution(config, row, run)
       end
     end
+
+    # The outcome stands whatever the cleanup does: a raise here is logged.
+    defp after_execution(%Config{agents: agents}, %AgentRun{} = row, %Clementine.Run{} = run) do
+      module = Map.fetch!(agents, row.agent_key)
+
+      if function_exported?(module, :after_execution, 2) do
+        module.after_execution(row, run.rollout.context)
+      end
+    rescue
+      e ->
+        Logger.error(
+          "#{inspect(agent_module(agents, row))}.after_execution/2 raised: " <>
+            "#{Exception.message(e)} (run: #{row.id})"
+        )
+    catch
+      kind, reason ->
+        Logger.error(
+          "#{inspect(agent_module(agents, row))}.after_execution/2 #{kind}: " <>
+            "#{inspect(reason)} (run: #{row.id})"
+        )
+    end
+
+    defp agent_module(agents, %AgentRun{agent_key: key}), do: Map.get(agents, key)
 
     # The inert Clementine.Run for one execution. Agents are built at claim
     # time from code, so a deploy that changes an agent applies to the next
@@ -160,7 +192,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
               subject: subject,
               actor_type: row.actor_type,
               actor_id: row.actor_id,
-              actor: actor
+              actor: actor,
+              parent_id: row.parent_id,
+              tag: tag(row)
             },
             limits: default_limits(agent)
           )
@@ -174,10 +208,21 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       e in [ArgumentError, KeyError, FunctionClauseError] -> {:error, Exception.message(e)}
     end
 
+    # A loop's child sees its tag as the controller gave it, `{kind, id}`,
+    # with the id as the row stores it: text.
+    defp tag(%AgentRun{tag_kind: kind, tag_id: id}) when is_binary(kind) and is_binary(id) do
+      {String.to_atom(kind), id}
+    end
+
+    defp tag(%AgentRun{}), do: nil
+
     defp fetch_agent(%Config{agents: agents}, key) do
       case Map.fetch(agents, key) do
-        {:ok, module} -> {:ok, module}
-        :error -> {:error, :unknown_agent}
+        {:ok, module} ->
+          if Config.agent?(module), do: {:ok, module}, else: {:error, :unknown_agent}
+
+        :error ->
+          {:error, :unknown_agent}
       end
     end
 

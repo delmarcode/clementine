@@ -1,36 +1,39 @@
 defmodule Clementine.Loop.Codec do
-  @moduledoc """
-  The canonical, stable encoding for loop tags and payloads
-  (LOOP_RFC §Tags And Payloads).
-
-  Tags and payloads are terms, but they persist — in inbox rows, envelope
-  maps, and idempotency keys — so they cross storage through one canonical
-  codec rather than anything substrate-specific:
-
-  - JSON scalars (`nil`, booleans, numbers, valid-UTF-8 binaries) pass
-    through unchanged.
-  - Tuples encode as tagged arrays (`{:reply, 5}` → `["t", [..., 5]]`) —
-    the worked examples keep tuple tags, and this is why that is legal.
-  - Lists are tagged too (`["l", [...]]`), so a stored array is always
-    machinery-tagged and decoding is total on the codec's own writes.
-  - Atoms whitelist through the loop module's declared vocabulary
-    (`use Clementine.Loop, vocabulary: [...]`) and encode as `["a", name]`.
-    An undeclared atom is an encode-time error, not a silent ETF escape:
-    keys must be canonical across substrates and deploys.
-  - Maps pass through with string keys and encoded values. Atom or
-    composite keys are refused — payload maps are JSON objects.
-
-  Anything else — structs, pids, refs, functions, invalid binaries — is
-  outside the durable vocabulary and raises. `Clementine.Result` and
-  friends never pass through this codec; completion payloads are carried
-  as live structs in `Clementine.Loop.Input` and encoded by the host seam.
-
-  `key/2` is the canonical string form (`tag_key`) used by envelope maps,
-  the `(loop_ref, tag_key)` child dedup index, and idempotency keys. Keys
-  must be byte-stable across deploys and VM versions, so tags may not
-  contain maps (JSON object key order is not canonical); tag terms are
-  scalars, vocabulary atoms, and tuples/lists thereof.
-  """
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   The canonical, stable encoding for loop tags and payloads
+  #   (LOOP_RFC §Tags And Payloads).
+  #
+  #   Tags and payloads are terms, but they persist — in inbox rows, envelope
+  #   maps, and idempotency keys — so they cross storage through one canonical
+  #   codec rather than anything substrate-specific:
+  #
+  #   - JSON scalars (`nil`, booleans, numbers, valid-UTF-8 binaries) pass
+  #     through unchanged.
+  #   - Tuples encode as tagged arrays (`{:reply, 5}` → `["t", [..., 5]]`) —
+  #     the worked examples keep tuple tags, and this is why that is legal.
+  #   - Lists are tagged too (`["l", [...]]`), so a stored array is always
+  #     machinery-tagged and decoding is total on the codec's own writes.
+  #   - Atoms whitelist through the loop module's declared vocabulary
+  #     (`use Clementine.Loop, vocabulary: [...]`) and encode as `["a", name]`.
+  #     An undeclared atom is an encode-time error, not a silent ETF escape:
+  #     keys must be canonical across substrates and deploys.
+  #   - Maps pass through with string keys and encoded values. Atom or
+  #     composite keys are refused — payload maps are JSON objects.
+  #
+  #   Anything else — structs, pids, refs, functions, invalid binaries — is
+  #   outside the durable vocabulary and raises. `Clementine.Result` and
+  #   friends never pass through this codec; completion payloads are carried
+  #   as live structs in `Clementine.Loop.Input` and encoded by the host seam.
+  #
+  #   `key/2` is the canonical string form (`tag_key`) used by envelope maps,
+  #   the `(loop_ref, tag_key)` child dedup index, and idempotency keys. Keys
+  #   must be byte-stable across deploys and VM versions, so tags may not
+  #   contain maps (JSON object key order is not canonical); tag terms are
+  #   scalars, vocabulary atoms, and tuples/lists thereof.
 
   @type json_safe ::
           nil
@@ -72,6 +75,27 @@ defmodule Clementine.Loop.Codec do
     term
     |> encode_key_term(Keyword.get(opts, :vocabulary, []))
     |> Jason.encode!()
+  end
+
+  @doc """
+  Splits a child's tag into the two text columns its run row stores,
+  `(tag_kind, tag_id)`: `{:turn, 42}` becomes `{"turn", "42"}`. A child
+  tag has exactly two parts, a vocabulary atom and a string or integer
+  id; the envelope keeps the canonical `key/2` form, and only the row and
+  the one-live-child index speak kind and id. Ids compare as text there,
+  so `{:turn, 42}` and `{:turn, "42"}` name the same lane. Anything else
+  raises `ArgumentError`.
+  """
+  @spec split_tag(term()) :: {String.t(), String.t()}
+  def split_tag({kind, id})
+      when is_atom(kind) and kind not in [nil, true, false] and (is_binary(id) or is_integer(id)) do
+    {Atom.to_string(kind), to_string(id)}
+  end
+
+  def split_tag(other) do
+    raise ArgumentError,
+          "a child's tag has two parts, {kind :: atom, id :: String.t() | integer}, " <>
+            "got: #{inspect(other)}"
   end
 
   @doc """
