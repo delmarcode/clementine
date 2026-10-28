@@ -183,20 +183,21 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             agent: agent,
             input: prompt,
             messages: history,
-            context: %{
-              run_id: row.id,
-              agent_key: row.agent_key,
-              turn: row.turn,
-              subject_type: row.subject_type,
-              subject_id: row.subject_id,
-              subject: subject,
-              actor_type: row.actor_type,
-              actor_id: row.actor_id,
-              actor: actor,
-              parent_id: row.parent_id,
-              tag: tag(row),
-              metadata: row.metadata
-            },
+            context:
+              Map.merge(tool_context!(module, agent), %{
+                run_id: row.id,
+                agent_key: row.agent_key,
+                turn: row.turn,
+                subject_type: row.subject_type,
+                subject_id: row.subject_id,
+                subject: subject,
+                actor_type: row.actor_type,
+                actor_id: row.actor_id,
+                actor: actor,
+                parent_id: row.parent_id,
+                tag: tag(row),
+                metadata: row.metadata
+              }),
             limits: default_limits(agent)
           )
 
@@ -207,6 +208,19 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       # before any claim; left alone, the row would sit queued until the
       # reaper's claim timeout.
       e in [ArgumentError, KeyError, FunctionClauseError] -> {:error, Exception.message(e)}
+    end
+
+    # What the agent adds for its tools (a working_dir, a sandbox handle)
+    # goes under the runtime's keys, which always win: an agent adds to
+    # what its tools see, never changes what the run is. Anything but a
+    # map is a construction failure, cancelled as unstartable.
+    defp tool_context!(_module, %Clementine.Agent{tool_context: context}) when is_map(context),
+      do: context
+
+    defp tool_context!(module, %Clementine.Agent{tool_context: other}) do
+      raise ArgumentError,
+            "#{inspect(module)}.agent/1 returned a tool_context that is not a map: " <>
+              inspect(other)
     end
 
     # A loop's child sees its tag as the controller gave it, `{kind, id}`,

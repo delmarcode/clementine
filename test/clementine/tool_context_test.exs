@@ -30,6 +30,21 @@ defmodule Clementine.ToolContextTest do
       assert path == Path.join(@root, "lib/file.ex")
     end
 
+    test "an in-process context with no root resolves under the current directory" do
+      assert {:ok, path} = ToolContext.resolve_path("lib/file.ex", %{})
+      assert path == Path.expand("lib/file.ex", File.cwd!())
+    end
+
+    test "a durable run's context (it carries run_id) has no default root: refused without a working_dir" do
+      assert {:error, msg} = ToolContext.resolve_path("lib/file.ex", %{run_id: "r-1"})
+      assert msg =~ "No working_dir"
+
+      assert {:ok, path} =
+               ToolContext.resolve_path("lib/file.ex", %{run_id: "r-1", working_dir: @root})
+
+      assert path == Path.join(@root, "lib/file.ex")
+    end
+
     test "rejects parent traversal outside the workspace root" do
       assert {:error, msg} = ToolContext.resolve_path("../outside.ex", %{workspace_root: @root})
       assert msg =~ "escapes workspace root"

@@ -344,7 +344,14 @@ Tools see `context.run_id`, `context.agent_key`, `context.turn`,
 `context.subject`, and `context.actor` (with `subject_type`,
 `subject_id`, `actor_type`, and `actor_id` as stored), and
 `context.metadata`, the run's metadata as `start/3` stored it or, on a
-loop's child, as the `{:run, ...}` action set it.
+loop's child, as the `{:run, ...}` action set it. An agent adds to that
+through `agent/1`'s `tool_context:` (a `working_dir` and `capabilities`
+for the built-in file and shell tools, a sandbox handle for its own)
+under the runtime's keys, which always win. A built-in file or shell
+tool in a durable run resolves paths only under a `working_dir` (or
+`workspace_root`) set that way: there is no fallback to the app's own
+directory, unlike the in-process path, and without one the tool returns
+an error.
 
 ## Never
 
