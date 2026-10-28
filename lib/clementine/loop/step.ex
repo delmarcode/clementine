@@ -458,17 +458,7 @@ defmodule Clementine.Loop.Step do
     tag_key = Codec.key(input.tag, vocabulary: vocab)
 
     if Map.has_key?(fold.children, tag_key) do
-      # A cancel this batch asked for the child that just ended is moot,
-      # and retiring it keeps it from a successor the handler may spawn
-      # under the re-armed tag.
-      fold =
-        fold
-        |> Map.update!(:children, &Map.delete(&1, tag_key))
-        |> Map.update!(:usage, &Usage.add(&1, Result.usage(input.result)))
-        |> retire_cargo(:child_cargo, tag_key)
-        |> Map.update!(:cancel_cargo, &List.delete(&1, tag_key))
-
-      deliver(module, fold, stored, vocab)
+      deliver(module, end_child(fold, tag_key, input.result), stored, vocab)
     else
       mark(fold, stored, :unknown_tag)
     end
@@ -491,6 +481,22 @@ defmodule Clementine.Loop.Step do
 
   defp fold_one(module, fold, %StoredInput{} = stored, vocab) do
     deliver(module, fold, stored, vocab)
+  end
+
+  # A child's end, however it reaches the fold: a stored completion (a
+  # row's end, or one that leaked past a never-committed spawn on a crash
+  # replay) or the inline end of a child cancelled before its spawn
+  # committed. It retires everything the fold still holds for the tag:
+  # the live entry, so the tag re-arms; the spawn that never committed;
+  # and the cancel that never applied, which is moot once the child has
+  # ended and must not reach a successor spawned under the re-armed tag.
+  # The child's usage folds into the loop's.
+  defp end_child(fold, tag_key, result) do
+    fold
+    |> Map.update!(:children, &Map.delete(&1, tag_key))
+    |> Map.update!(:usage, &Usage.add(&1, Result.usage(result)))
+    |> retire_cargo(:child_cargo, tag_key)
+    |> Map.update!(:cancel_cargo, &List.delete(&1, tag_key))
   end
 
   defp deliver(module, fold, %StoredInput{ref: ref, input: input}, vocab) do
@@ -555,25 +561,27 @@ defmodule Clementine.Loop.Step do
     }
   end
 
-  # A cancel names a live child: the commit flags it (a queued child ends
-  # at once, a running one gets the cooperative flag), and its completion
-  # arrives like any other, which is when the tag re-arms. A child spawned
-  # in this same drain has no row yet and never will: its spawn is
-  # retired before it exists, and since no row can report its end, the
-  # controller hears it here, inline, as the `Cancelled` completion the
-  # commit would otherwise have delivered later. A controller cannot tell
-  # whether the child it cancels was spawned in this fold (two messages in
-  # one batch, say) or in an earlier one, so both read the same. No live
-  # child under the tag is a benign no-op.
+  # A cancel names a live child. One with a row (spawned in an earlier
+  # step) is cancel cargo: the commit flags it (a queued child ends at
+  # once, a running one gets the cooperative flag), and its completion
+  # arrives like any other, which is when the tag re-arms and the cancel,
+  # if it is still in this fold's cargo, is retired as moot. One spawned
+  # in this same drain has no row yet and never will: cancelling it is
+  # its end, now, so the fold ends the child as a completion would and
+  # hands the controller the `Cancelled` completion inline, since no row
+  # can report it later. A controller cannot tell whether the child it
+  # cancels was spawned in this fold (two messages in one batch, say) or
+  # in an earlier one, so both read the same. No live child under the
+  # tag is a benign no-op.
   defp apply_action(fold, %Action{kind: :cancel} = action, causal, index) do
     cond do
       Enum.any?(fold.child_cargo, &(&1.tag_key == action.tag_key)) ->
         reason = %{"code" => "loop_cancel", "loop_id" => fold.loop_ref}
+        result = Result.cancelled(reason)
 
         fold
-        |> Map.update!(:children, &Map.delete(&1, action.tag_key))
-        |> retire_cargo(:child_cargo, action.tag_key)
-        |> deliver_inline(Input.completed(action.tag, Result.cancelled(reason)), causal, index)
+        |> end_child(action.tag_key, result)
+        |> deliver_inline(Input.completed(action.tag, result), causal, index)
 
       Map.has_key?(fold.children, action.tag_key) ->
         %{fold | cancel_cargo: Enum.uniq(fold.cancel_cargo ++ [action.tag_key])}

@@ -410,6 +410,45 @@ defmodule Clementine.Loop.StepTest do
       assert log(commit) == ["message:spawn", "message:stop", "completed:{:reply, 1}"]
     end
 
+    test "a child's end re-arms its tag in every order: spawn-cancel-spawn commits the successor alone, and a cancel never crosses to it" do
+      tag = {:reply, 1}
+
+      # Spawned, cancelled, spawned again in one drain: the first never
+      # exists, the second is the commit's one child.
+      batch = [
+        msg(1, %{"id" => "a", "actions" => [{:run, tag, %{"n" => 1}}, {:cancel, tag}]}),
+        msg(2, %{"id" => "b", "actions" => [{:run, tag, %{"n" => 2}}]})
+      ]
+
+      commit = drain!(ScriptedLoop, scripted_envelope(), Step.plan(nil, batch))
+      assert [%{child_args: %{"n" => 2}}] = commit.children
+      assert commit.cancel_children == []
+      assert log(commit) == ["message:a", "completed:{:reply, 1}", "message:b"]
+
+      # A committed child cancelled, ended, re-spawned, and cancelled
+      # again in one drain: the first cancel is retired by the end, the
+      # second ends the successor inline. Nothing crosses generations.
+      envelope = scripted_envelope(children: %{key(tag) => 900})
+
+      batch = [
+        msg(1, %{"id" => "stop", "actions" => [{:cancel, tag}]}),
+        completed(2, tag),
+        msg(3, %{"id" => "again", "actions" => [{:run, tag, %{}}, {:cancel, tag}]})
+      ]
+
+      commit = drain!(ScriptedLoop, envelope, Step.plan(envelope, batch))
+      assert commit.children == []
+      assert commit.cancel_children == []
+      assert commit.set.envelope.children == %{}
+
+      assert log(commit) == [
+               "message:stop",
+               "completed:{:reply, 1}",
+               "message:again",
+               "completed:{:reply, 1}"
+             ]
+    end
+
     test "an inline Cancelled end carries the cancel's reason, and its actions get a causal key of their own" do
       defmodule ReactsToCancel do
         use Clementine.Loop, vocabulary: [:reply]
