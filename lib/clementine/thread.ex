@@ -76,6 +76,7 @@ defmodule Clementine.Thread do
 
   use Clementine.Loop, key: "thread", state_version: 1, vocabulary: [:turn, :retry]
 
+  alias Clementine.Loop.Codec
   alias Clementine.{Error, Result}
 
   @busy ~w(queue interrupt)
@@ -229,7 +230,12 @@ defmodule Clementine.Thread do
   ## Messages
 
   # A message outside the contract raises here, toward the poison path,
-  # before any of it reaches the state.
+  # before any of it reaches the state. The metadata is checked against
+  # the child action's plain-JSON contract, not for being a map: the
+  # inbox codec round-trips the loop's vocabulary, so a map holding a
+  # tagged tuple reaches here whole, and one accepted into the queue
+  # would only fail at its own {:run, ...}, in the drain that folds the
+  # running turn's completion, blaming that innocent input.
   defp message!(%{"prompt" => prompt} = message) when is_binary(prompt) do
     if String.trim(prompt) == "" do
       raise ArgumentError, "a thread message needs a \"prompt\", got a blank one"
@@ -242,10 +248,7 @@ defmodule Clementine.Thread do
             "a thread message's \"id\" is a string or an integer, got: #{inspect(id)}"
     end
 
-    unless is_map(Map.get(message, "metadata", %{})) do
-      raise ArgumentError,
-            "a thread message's \"metadata\" is a map, got: #{inspect(message["metadata"])}"
-    end
+    Codec.validate_json_map!(Map.get(message, "metadata", %{}), "a thread message's \"metadata\"")
 
     case Map.get(message, "actor") do
       nil ->

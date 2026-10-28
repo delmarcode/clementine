@@ -647,7 +647,11 @@ defmodule Clementine.Loop.StepTest do
     # what the commit inserts (child specs, by their "n"), whether it
     # flags r, what the tag is after (absent, pending its row, or still
     # live), the commit's op (:cascade is a park with the halt pending),
-    # what handle/2 saw, and any dead-letter mark.
+    # what handle/2 saw, and any dead-letter mark. The last row is matrix
+    # row L5, the one case a completion meets a pending spawn: a crash
+    # replay re-drains the spawn and the fast child's leaked completion
+    # together, so the spawn is retired, nothing is re-inserted, and the
+    # completion is delivered once.
     @rows [
       {"live r: K", :live, [:K], op: :park, tag: :absent, saw: ["completed:completed"]},
       {"live r: K, R", :live, [:K, :R],
@@ -667,7 +671,9 @@ defmodule Clementine.Loop.StepTest do
        inserts: [2], op: :park, tag: :pending, saw: ["completed:cancelled"]},
       {"absent: S, H", :absent, [:S, :H], op: :finish, tag: :absent, saw: []},
       {"absent: C", :absent, [:C], op: :park, tag: :absent, saw: []},
-      {"absent: K", :absent, [:K], op: :park, tag: :absent, saw: [], marks: [:unknown_tag]}
+      {"absent: K", :absent, [:K], op: :park, tag: :absent, saw: [], marks: [:unknown_tag]},
+      {"absent: S, K (crash replay, L5)", :absent, [:S, :K],
+       op: :park, tag: :absent, saw: ["completed:completed"]}
     ]
 
     for {name, start, events, expect} <- @rows do
