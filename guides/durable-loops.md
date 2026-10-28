@@ -192,7 +192,9 @@ The actions, as `Clementine.Loop` documents them:
   which lands on the child's row. One live child per tag; the tag re-arms
   once the child ends.
 - `{:cancel, tag}` flags the live child under the tag; its `Cancelled`
-  completion arrives like any other. A tag with no live child is a
+  completion arrives like any other. A child spawned earlier in the same
+  step never comes to exist — no row, no job — and the controller hears
+  its `Cancelled` end in the same fold. A tag with no live child is a
   no-op.
 - `{:timer, tag, ms_or_datetime}` schedules a durable timer that fires as
   `{:elapsed, tag}`; `{:cancel_timer, tag}` retires it.
@@ -407,8 +409,10 @@ end
 ```
 
 A halt with children still in flight enters the cascade automatically:
-children reach their ends first, the loop's end is last, leftovers
-sweep to dead letters. `{:halt, result}` is a decision like any other.
+children with rows reach their ends first, the loop's end is last,
+leftovers sweep to dead letters; a child spawned in the halting step is
+retired before it exists, and nobody hears it. `{:halt, result}` is a
+decision like any other.
 
 ## The watcher
 

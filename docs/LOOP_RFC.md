@@ -581,6 +581,61 @@ as the run worker maps `Runner.execute/2`.
   billing queries exclude loop-kind rows (`Facts.kind`) or they will count
   every token twice; the adoption section repeats this out loud.
 
+### The per-tag rule
+
+Within a drain, a child tag's commit cargo is the net of its events. The
+step core (`Clementine.Loop.Step`, one reducer) is the only place that
+reasons about tags; the host executes the cargo it is handed and nothing
+more. A tag is *absent*, *pending* (spawned in this drain, no row yet) or
+*live* (a row an earlier step committed).
+
+- A pending spawn plus a later cancel — an explicit `{:cancel, tag}` or
+  the halt's cascade — annihilate: no row, no job, no flag. In normal mode
+  `handle/2` hears `{:completed, tag, %Cancelled{}}` inline at the cancel
+  (reason `"code" => "loop_cancel"`, zero usage, no dead-letter
+  accounting). In a halt nobody hears it.
+- A live child plus a cancel is one flag; the `Cancelled` completion folds
+  on a later drain, when the tag re-arms.
+- A live child plus its completion retires the tag and any flag on it, so
+  a successor spawned under the re-armed tag is never cancelled.
+- A completion of a pending spawn happens only in crash replay (row L5):
+  the spawn is retired and the completion delivered once.
+- A halt flags live children only and finishes at once when none remain.
+  The host's `cancel_children` is one phase over the committed refs, run
+  before the step's spawns.
+
+One tag, one drain. K is a completion, R a re-spawn under the same tag, C
+a cancel, S a spawn, H a halt; "live r" is a child an earlier step
+committed.
+
+| Start | Events | Commit contains | `handle/2` sees |
+|---|---|---|---|
+| live r | K | consume | completed, now |
+| live r | K, R | consume + insert R | completed, then its own spawn |
+| live r | C | flag r (direct-terminal if unclaimed; completion appended in the unit, folds next step) | `Cancelled` next drain |
+| live r | C, K | consume; no flag | completed (real result) |
+| live r | C, K, R | consume + insert R; no flag | completed, spawn |
+| live r | C, S same tag | raise (tag live) | — |
+| live r | H | cascade: flag r, park pending halt | nothing, ever |
+| live r | K, H | consume; finish now | completed |
+| live r | K, R, H | nothing for R; finish now | completed |
+| absent | S | insert | — |
+| absent | S, C | nothing | `Cancelled` inline, at the cancel |
+| absent | S, C, R | insert R only | `Cancelled`, then spawn |
+| absent | S, H | nothing; finish now | nothing |
+| absent | C | nothing | nothing |
+| absent | K | dead-letter `:unknown_tag` | nothing |
+
+An inline `Cancelled` is indistinguishable from a real one to the
+controller: the same callback, the same reason map, zero usage. It is
+distinguishable to hosts: a retired turn has no row, no `run_finished/2`
+and no `stream_end`, so a client in interrupt mode must render the
+superseded message's turn as never having started. The inline delivery is
+bounded — a controller that cancels whatever its `Cancelled` handler spawns
+fails the step toward the poison path at depth 8 — and an inline
+`{:halt, _}` drops the retiring input's remaining actions, as a halting
+input drops the batch behind it.
+
 ## Timers
 
 Cargo like everything else: `apply_step` inserts the timer job atomically
@@ -638,7 +693,10 @@ after create returns.
   `handle/2` — `request_cancel`s live children (cargo), parks with the
   pending result held in the envelope, and on each wake folds arriving
   completions into the envelope (usage included) without invoking
-  `handle/2`. Non-completion inputs arriving mid-cascade stay unconsumed.
+  `handle/2`. A spawn of the halting drain is retired before it exists
+  (the per-tag rule, §Children), so the cascade has only rows to cancel,
+  and a halt with no committed child left finishes at once.
+  Non-completion inputs arriving mid-cascade stay unconsumed.
   When `children` empties: finish — result (the halt's, or
   `Result.cancelled(reason)`), terminal projection, and the **terminal
   sweep**: every remaining inbox row dead-letters in the same atomic unit.

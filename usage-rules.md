@@ -178,6 +178,15 @@ the message.
   thread answers the next message; on the loop, it ends the thread,
   cancels the turn in flight, and keeps queued messages as dead letters.
   Both outside a transaction.
+- A turn's end is one rule, whichever way it comes. A turn cancelled in
+  the step that spawned it (interrupt mode's double-send, or a halt
+  behind a spawn) never exists: no row, no `run_finished/2`, no
+  `stream_end`. The controller hears its `Cancelled` end inline, and a
+  client in interrupt mode renders the superseded message's turn as
+  never having started. A cancel of a turn with a row is one flag, and
+  its `Cancelled` completion arrives on a later step; a completion
+  retires the tag and any flag on it. A halt cancels turns with rows and
+  ends the loop at once when there are none.
 - A policy the thread lacks is a controller of your own:
   `use Clementine.Loop, key: "..."`, listed in `agents:` and started and
   fed the same way; the Durable Loops guide wires one.
