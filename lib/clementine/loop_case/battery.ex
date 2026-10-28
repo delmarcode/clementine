@@ -1111,6 +1111,29 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
                Runs.send(loop.id, %{"id" => "too-late"}, dedup_key: "late:sweep")
     end
 
+    def halt_in_the_spawning_step do
+      # One drain spawns a child and then halts the loop: the cascade
+      # cancels the child it has only just inserted, inside the same unit,
+      # and the loop ends after it.
+      loop = parked!()
+      send!(loop, spawn_payload({:reply, 1}))
+      send!(loop, %{"halt" => "done"})
+
+      assert {:continued, _} = step!(loop)
+      assert [%AgentRun{status: "cancelled"} = child] = Runs.list(parent: loop.id)
+
+      assert_received {:run_finished, %AgentRun{id: id},
+                       %Result.Cancelled{reason: %{"code" => "loop_cascade"}}}
+                      when id == child.id
+
+      # The cascade absorbs the completion without the controller, and the
+      # halt's result wins.
+      quiesce!(loop)
+      assert %AgentRun{status: "completed", result: %{"output" => "done"}} = Runs.get(loop.id)
+      assert envelope!(loop).children == %{}
+      assert Loops.dead_letters(loop.id, 50, nil) == []
+    end
+
     def cascade_completion_behind_long_backlog do
       loop = parked!(policy: %{"batch_cap" => 2})
       child = spawn_child!(loop, {:reply, 4})

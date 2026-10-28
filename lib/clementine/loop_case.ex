@@ -243,6 +243,10 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
             Battery.halt_with_children_in_flight()
           end
 
+          test "matrix row L9 (same step): a halt in the step that spawned a child cascades to the child it just inserted" do
+            Battery.halt_in_the_spawning_step()
+          end
+
           test "the cascade's :completions window reads past a backlog longer than the batch cap — never a livelock" do
             Battery.cascade_completion_behind_long_backlog()
           end
