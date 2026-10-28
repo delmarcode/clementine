@@ -67,6 +67,28 @@ defmodule Clementine.Loop.StepTest do
     def handle_upgrade(1, %{"fail" => "exit"}), do: exit(:shutdown)
   end
 
+  defmodule TagLoop do
+    @moduledoc """
+    Records what handle/2 sees of one tag's ends, and nothing else: a
+    message carries the actions to emit, or a halt. The log is the
+    per-tag table's "handle/2 sees" column.
+    """
+
+    use Clementine.Loop, vocabulary: [:reply]
+
+    def init(_args), do: {:ok, %{"saw" => []}, []}
+
+    def handle({:message, %{"halt" => output}}, state),
+      do: {:halt, Clementine.Result.completed(output: output), state}
+
+    def handle({:message, %{"actions" => actions}}, state), do: {:ok, state, actions}
+
+    def handle({:completed, {:reply, _id}, result}, state) do
+      seen = "completed:#{Clementine.Result.status(result)}"
+      {:ok, Map.update!(state, "saw", &(&1 ++ [seen])), []}
+    end
+  end
+
   defp vocab, do: ScriptedLoop.__loop__(:vocabulary)
   defp key(tag), do: Codec.key(tag, vocabulary: vocab())
 
@@ -93,6 +115,52 @@ defmodule Clementine.Loop.StepTest do
   defp log(%StepCommit{set: %{envelope: envelope}}) do
     Codec.decode(envelope.state, vocabulary: vocab())["log"]
   end
+
+  ## The per-tag rule's harness: one tag, {:reply, 1}, driven by TagLoop.
+
+  defp tag_envelope(start, tag_key) do
+    children = if start == :live, do: %{tag_key => 900}, else: %{}
+    state = Codec.encode(%{"saw" => []}, vocabulary: [:reply])
+    %Envelope{state_version: 1, state: state, children: children}
+  end
+
+  defp tag_batch(events, tag) do
+    Enum.with_index(events, fn event, index -> tag_input(event, tag, index + 1) end)
+  end
+
+  defp tag_input(:K, tag, ref), do: completed(ref, tag)
+  defp tag_input(:R, tag, ref), do: msg(ref, %{"actions" => [{:run, tag, %{"n" => 2}}]})
+  defp tag_input(:C, tag, ref), do: msg(ref, %{"actions" => [{:cancel, tag}]})
+  defp tag_input(:S, tag, ref), do: msg(ref, %{"actions" => [{:run, tag, %{"n" => 1}}]})
+  defp tag_input(:H, _tag, ref), do: msg(ref, %{"halt" => "done"})
+
+  defp tag_after(%StepCommit{set: %{envelope: envelope}}, tag_key) do
+    case Map.fetch(envelope.children, tag_key) do
+      :error -> :absent
+      {:ok, nil} -> :pending
+      {:ok, 900} -> :live
+    end
+  end
+
+  defp assert_op(commit, :cascade) do
+    assert commit.op == :park
+    assert commit.park_recheck == :completions
+    assert %{result: %Result.Completed{output: "done"}} = commit.set.envelope.pending_halt
+  end
+
+  defp assert_op(commit, :finish) do
+    assert commit.op == :finish
+    assert commit.terminal_sweep
+    assert %Result.Completed{output: "done"} = commit.result
+  end
+
+  defp assert_op(commit, op) do
+    assert commit.op == op
+    assert commit.set.envelope.pending_halt == nil
+  end
+
+  defp saw(%StepCommit{set: %{envelope: envelope}}),
+    do: Codec.decode(envelope.state, vocabulary: [:reply])["saw"]
 
   describe "plan/3" do
     test "empty window plans an empty step" do
@@ -571,6 +639,69 @@ defmodule Clementine.Loop.StepTest do
     end
   end
 
+  describe "the per-tag rule: one tag, one drain" do
+    # The natural-shape spec's table (amendment 2026-10-28), one test per
+    # row. K is a completion, R a re-spawn under the tag, C a cancel, S a
+    # spawn, H a halt; "live r" is a child an earlier step committed, ref
+    # 900. Each event is one input of the batch, in order. A row expects
+    # what the commit inserts (child specs, by their "n"), whether it
+    # flags r, what the tag is after (absent, pending its row, or still
+    # live), the commit's op (:cascade is a park with the halt pending),
+    # what handle/2 saw, and any dead-letter mark.
+    @rows [
+      {"live r: K", :live, [:K], op: :park, tag: :absent, saw: ["completed:completed"]},
+      {"live r: K, R", :live, [:K, :R],
+       inserts: [2], op: :park, tag: :pending, saw: ["completed:completed"]},
+      {"live r: C", :live, [:C], flag: true, op: :park, tag: :live, saw: []},
+      {"live r: C, K", :live, [:C, :K], op: :park, tag: :absent, saw: ["completed:completed"]},
+      {"live r: C, K, R", :live, [:C, :K, :R],
+       inserts: [2], op: :park, tag: :pending, saw: ["completed:completed"]},
+      {"live r: C, S same tag", :live, [:C, :S], raise: "already a live child"},
+      {"live r: H", :live, [:H], flag: true, op: :cascade, tag: :live, saw: []},
+      {"live r: K, H", :live, [:K, :H], op: :finish, tag: :absent, saw: ["completed:completed"]},
+      {"live r: K, R, H", :live, [:K, :R, :H],
+       op: :finish, tag: :absent, saw: ["completed:completed"]},
+      {"absent: S", :absent, [:S], inserts: [1], op: :park, tag: :pending, saw: []},
+      {"absent: S, C", :absent, [:S, :C], op: :park, tag: :absent, saw: ["completed:cancelled"]},
+      {"absent: S, C, R", :absent, [:S, :C, :R],
+       inserts: [2], op: :park, tag: :pending, saw: ["completed:cancelled"]},
+      {"absent: S, H", :absent, [:S, :H], op: :finish, tag: :absent, saw: []},
+      {"absent: C", :absent, [:C], op: :park, tag: :absent, saw: []},
+      {"absent: K", :absent, [:K], op: :park, tag: :absent, saw: [], marks: [:unknown_tag]}
+    ]
+
+    for {name, start, events, expect} <- @rows do
+      @row {start, events, expect}
+      test "#{name}" do
+        {start, events, expect} = @row
+        tag = {:reply, 1}
+        tag_key = Codec.key(tag, vocabulary: [:reply])
+        envelope = tag_envelope(start, tag_key)
+        plan = Step.plan(envelope, tag_batch(events, tag))
+
+        case Keyword.fetch(expect, :raise) do
+          {:ok, message} ->
+            error =
+              assert_raise(ArgumentError, fn -> Step.drain(TagLoop, envelope, plan, @opts) end)
+
+            assert error.message =~ message
+
+          :error ->
+            commit = drain!(TagLoop, envelope, plan)
+
+            assert Enum.map(commit.children, & &1.child_args["n"]) ==
+                     Keyword.get(expect, :inserts, [])
+
+            assert commit.cancel_children == if(expect[:flag], do: [tag_key], else: [])
+            assert tag_after(commit, tag_key) == expect[:tag]
+            assert_op(commit, expect[:op])
+            assert saw(commit) == expect[:saw]
+            assert Enum.map(commit.marks, & &1.reason) == Keyword.get(expect, :marks, [])
+        end
+      end
+    end
+  end
+
   describe "sends" do
     test "send dedup keys are causally derived and replay-stable" do
       batch = [
@@ -787,7 +918,7 @@ defmodule Clementine.Loop.StepTest do
       assert %{status: :failed, error: %{message: "gave up"}} = commit.set
     end
 
-    test "matrix rows L8/L9 (children in flight): halt enters the cascade — machinery cancel cargo, pending result parked, recheck :completions" do
+    test "matrix rows L8/L9 (children in flight): halt enters the cascade — the committed child is machinery cancel cargo, the pending result parked, recheck :completions; a spawn of the halting drain is retired" do
       spawn_and_halt = [
         msg(1, %{"id" => "s", "actions" => [{:run, {:reply, 1}, %{}}]}),
         msg(2, %{"halt" => "done"}),
@@ -803,9 +934,12 @@ defmodule Clementine.Loop.StepTest do
       assert commit.result == nil
       refute commit.terminal_sweep
 
-      # Every live child — stored and spawned this very drain — gets the
-      # machinery's cancel, deterministically ordered.
-      assert commit.cancel_children == Enum.sort([key({:reply, 0}), key({:reply, 1})])
+      # The committed child gets the machinery's cancel; the child spawned
+      # this very drain never comes to exist — no row, no job, no flag,
+      # and nobody hears it.
+      assert commit.cancel_children == [key({:reply, 0})]
+      assert commit.children == []
+      assert commit.set.envelope.children == %{key({:reply, 0}) => 900}
 
       # The pending result rides the envelope until the cascade completes.
       assert %{result: %Result.Completed{output: "done"}} = commit.set.envelope.pending_halt

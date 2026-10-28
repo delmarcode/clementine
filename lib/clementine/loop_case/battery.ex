@@ -1154,6 +1154,37 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       assert "message:again" in log!(loop)
     end
 
+    def spawn_cancelled_in_one_drain do
+      # A spawn and its cancel in one drain (interrupt mode's double-send):
+      # the spawn is retired before it is ever inserted — no row, no job,
+      # no completion — and the controller hears the child's Cancelled end
+      # inline, in the same fold, as a row would otherwise have reported
+      # it later. The tag re-arms at once: a third input re-spawning it in
+      # the same drain is the commit's one child.
+      loop = parked!()
+      send!(loop, spawn_payload({:reply, 1}))
+      send!(loop, %{"id" => "stop", "actions" => [{:cancel, {:reply, 1}}]})
+      send!(loop, spawn_payload({:reply, 1}, Task, %{"metadata" => %{"attempt" => 2}}))
+
+      assert {:parked, _} = step!(loop)
+
+      assert [%AgentRun{status: "queued", metadata: %{"attempt" => 2}} = child] =
+               Runs.list(parent: loop.id)
+
+      assert {:ok, %AgentRun{id: id}} = Runs.child(loop.id, {:reply, 1})
+      assert id == child.id
+      refute_received {:run_finished, %AgentRun{kind: "rollout"}, _result}
+
+      assert Enum.take(log!(loop), -4) == [
+               "message:spawn",
+               "message:stop",
+               "completed:{:reply, 1}:cancelled",
+               "message:spawn"
+             ]
+
+      assert Loops.dead_letters(loop.id, 50, nil) == []
+    end
+
     ## cancel/1
 
     def cascade_orders_queued_child do
@@ -1270,26 +1301,65 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
     end
 
     def halt_in_the_spawning_step do
-      # One drain spawns a child and then halts the loop: the cascade
-      # cancels the child it has only just inserted, inside the same unit,
-      # and the loop ends after it.
+      # One drain spawns a child and then halts the loop: the spawn is
+      # retired before it is ever inserted — no row, no job, no
+      # completion, and nobody hears it — and with nothing in flight the
+      # loop finishes in this very step, without a cascade.
       loop = parked!()
       send!(loop, spawn_payload({:reply, 1}))
       send!(loop, %{"halt" => "done"})
 
-      assert {:continued, _} = step!(loop)
-      assert [%AgentRun{status: "cancelled"} = child] = Runs.list(parent: loop.id)
+      assert {:finished, %Facts{status: :completed}} = step!(loop)
+      assert Runs.list(parent: loop.id) == []
+      refute_received {:run_finished, %AgentRun{kind: "rollout"}, _result}
 
-      assert_received {:run_finished, %AgentRun{id: id},
-                       %Result.Cancelled{reason: %{"code" => "loop_cascade"}}}
-                      when id == child.id
-
-      # The cascade absorbs the completion without the controller, and the
-      # halt's result wins.
-      quiesce!(loop)
       assert %AgentRun{status: "completed", result: %{"output" => "done"}} = Runs.get(loop.id)
       assert envelope!(loop).children == %{}
+      refute Enum.any?(log!(loop), &String.starts_with?(&1, "completed:"))
+      assert pending!(loop) == []
       assert Loops.dead_letters(loop.id, 50, nil) == []
+    end
+
+    def halt_behind_a_completion_in_one_drain do
+      # A committed child's completion and a halt in one drain: the
+      # completion retires the tag before the halt reaches it, so there is
+      # nothing to cascade over and the loop finishes in this step, the
+      # controller having heard the completion.
+      loop = parked!()
+      child = spawn_child!(loop, {:reply, 1})
+      assert {:ok, :finished} = Runs.cancel(child.id)
+      send!(loop, %{"halt" => "done"})
+
+      assert {:finished, %Facts{status: :completed}} = step!(loop)
+      assert Enum.take(log!(loop), -2) == ["completed:{:reply, 1}:cancelled", "halt:done"]
+      assert %AgentRun{status: "completed", result: %{"output" => "done"}} = Runs.get(loop.id)
+      assert envelope!(loop).children == %{}
+      assert pending!(loop) == []
+    end
+
+    def halt_behind_a_respawn_in_one_drain do
+      # A completion, a re-spawn under the re-armed tag, and a halt in one
+      # drain: the re-spawn is retired before it is inserted, nothing is
+      # inserted for it, and the loop finishes now. The first child's row
+      # is the only one that ever existed.
+      loop = parked!()
+      first = spawn_child!(loop, {:reply, 1})
+      assert {:ok, :finished} = Runs.cancel(first.id)
+      send!(loop, spawn_payload({:reply, 1}))
+      send!(loop, %{"halt" => "done"})
+
+      assert {:finished, %Facts{status: :completed}} = step!(loop)
+      assert [%AgentRun{id: id, status: "cancelled"}] = Runs.list(parent: loop.id)
+      assert id == first.id
+
+      assert Enum.take(log!(loop), -3) == [
+               "completed:{:reply, 1}:cancelled",
+               "message:spawn",
+               "halt:done"
+             ]
+
+      assert envelope!(loop).children == %{}
+      assert pending!(loop) == []
     end
 
     def cascade_completion_behind_long_backlog do

@@ -247,6 +247,10 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
           test "{:cancel, tag} ends a queued child at once; a tag with no live child is a no-op" do
             Battery.cancel_action_queued_child_and_no_op()
           end
+
+          test "a spawn and its cancel in one drain insert nothing: the controller hears the Cancelled end inline, and a re-spawn in the same drain is the one child" do
+            Battery.spawn_cancelled_in_one_drain()
+          end
         end
 
         describe "loop conformance: cancel/1" do
@@ -266,8 +270,16 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
             Battery.halt_with_children_in_flight()
           end
 
-          test "matrix row L9 (same step): a halt in the step that spawned a child cascades to the child it just inserted" do
+          test "matrix row L9 (same step): a halt in the step that spawned a child retires the spawn — no row, no job, nobody hears it — and finishes now" do
             Battery.halt_in_the_spawning_step()
+          end
+
+          test "a completion and a halt in one drain finish the loop now: nothing is left to cascade over" do
+            Battery.halt_behind_a_completion_in_one_drain()
+          end
+
+          test "a completion, a re-spawn, and a halt in one drain: the re-spawn is retired, nothing is inserted, and the loop finishes now" do
+            Battery.halt_behind_a_respawn_in_one_drain()
           end
 
           test "the cascade's :completions window reads past a backlog longer than the batch cap — never a livelock" do

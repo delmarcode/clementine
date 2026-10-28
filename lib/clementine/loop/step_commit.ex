@@ -8,10 +8,12 @@ defmodule Clementine.Loop.StepCommit do
   #   Contract): the guarded transition (exact `(status, epoch)` expectation
   #   and the partial facts to set, envelope included), the consumed input
   #   refs, dead-letter marks, synthesized appends, the dispatch cargo, and
-  #   the terminal-sweep flag. `cancel_children` names the live children this
+  #   the terminal-sweep flag. `cancel_children` names the children this
   #   commit cancels, by tag key: the ones `{:cancel, tag}` actions asked
   #   for, or every live child when a halt or a cancel flag enters the
-  #   cascade.
+  #   cascade. Every one of them has a row, its ref in the commit's
+  #   envelope: a spawn of the same drain is retired by the step core
+  #   instead (the per-tag rule), never named here.
   #
   #   The host's `apply_step/2` executes the *entire* value in one atomic
   #   unit — CAS transition, envelope, consumption, marks, appends, child rows

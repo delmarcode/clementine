@@ -257,13 +257,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
            :ok <- consume(config, commit),
            :ok <- mark_dead(config, commit),
            :ok <- insert_appends(config, commit),
-           :ok <- cancel_children(commit, :existing, %{}),
+           :ok <- cancel_children(commit),
            {:ok, children} <- spawn_children(config, row, commit),
            {:ok, timers} <- schedule_timers(config, row, commit),
            :ok <- retire_timers(config, row, commit),
            :ok <- execute_sends(config, row, commit),
            :ok <- write_envelope(config, commit, children, timers),
-           :ok <- cancel_children(commit, :spawned, children),
            :ok <- settle_transition(config, row, commit),
            :ok <- project_finish(config, commit, ctx),
            :ok <- terminal_sweep(config, commit) do
@@ -579,33 +578,26 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # runner once the unit commits. Already-terminal and missing children
     # are tolerated: their completions are en route, or the loop sweep's
     # :reconcile_children verdict will synthesize them.
-    # Cancels of the children the envelope already holds go before the
-    # step's spawns: a cancelled child that was never claimed ends inside
-    # this unit and frees its lane, so a controller interrupts it and
-    # starts its successor in one step, while a running child only takes
-    # the flag. A halt in the very step that spawned a child (the drain
-    # spawns, its next input halts) cascades to that child too; it has no
-    # ref until it is inserted, and its completion finds its tag through
-    # the parent's envelope, so those cancels follow the envelope write.
-    # A controller's own {:cancel, tag} for a same-step spawn never gets
-    # here: the step core retires the spawn and hands the controller the
-    # child's end inline, so only the cascade reaches the second phase.
-    defp cancel_children(%StepCommit{cancel_children: []}, _phase, _spawned), do: :ok
+    # Cancels run before the step's spawns: a cancelled child that was
+    # never claimed ends inside this unit and frees its lane, so a
+    # controller interrupts it and starts its successor in one step,
+    # while a running child only takes the flag. Every cancel names a
+    # child the commit's envelope holds with its ref: the step core
+    # retires a spawn of its own drain instead of cancelling it (the
+    # per-tag rule), so a missing ref is a core bug, never a race.
+    defp cancel_children(%StepCommit{cancel_children: []}), do: :ok
 
-    defp cancel_children(%StepCommit{cancel_children: tag_keys} = commit, phase, spawned) do
+    defp cancel_children(%StepCommit{cancel_children: tag_keys} = commit) do
       stored = StepCommit.envelope(commit)
       reason = cancel_reason(commit)
 
-      tag_keys
-      |> Enum.flat_map(fn tag_key ->
-        case {phase, stored && Map.get(stored.children, tag_key)} do
-          {:existing, nil} -> []
-          {:existing, ref} -> [ref]
-          {:spawned, nil} -> [spawned_ref!(spawned, tag_key)]
-          {:spawned, _ref} -> []
-        end
-      end)
-      |> Enum.reduce_while(:ok, fn ref, :ok ->
+      Enum.reduce_while(tag_keys, :ok, fn tag_key, :ok ->
+        ref =
+          (stored && Map.get(stored.children, tag_key)) ||
+            raise ArgumentError,
+                  "cancel for #{inspect(tag_key)} names no committed child: the step core " <>
+                    "cancels committed children only and retires a spawn of its own drain"
+
         case Protocol.request_cancel(Lifecycle, ref, reason) do
           {:ok, _} -> {:cont, :ok}
           {:error, :already_terminal} -> {:cont, :ok}
@@ -613,13 +605,6 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           {:error, reason} -> {:halt, {:error, {:cancel_child_failed, ref, reason}}}
         end
       end)
-    end
-
-    defp spawned_ref!(spawned, tag_key) do
-      Map.get(spawned, tag_key) ||
-        raise ArgumentError,
-              "cancel for #{inspect(tag_key)} names no child: the commit's envelope must " <>
-                "carry every live child"
     end
 
     # The loop's own end (a halt with children in flight, or a cancel flag)

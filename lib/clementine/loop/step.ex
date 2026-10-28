@@ -189,7 +189,8 @@ defmodule Clementine.Loop.Step do
   also retires that spawn's cargo: the input's existence proves the child
   ran (or the fire happened) on some substrate that leaked it past the
   commit, and re-dispatching would duplicate work the active-only dedup
-  index no longer guards.
+  index no longer guards. What each event does to a child tag's cargo is
+  the per-tag rule, `tag_event/3` below.
 
   Send dedup keys are causally derived and replay-stable —
   `"send:" <> loop_key <> ":" <> causal <> ":" <> index` where `causal` is
@@ -457,10 +458,9 @@ defmodule Clementine.Loop.Step do
        ) do
     tag_key = Codec.key(input.tag, vocabulary: vocab)
 
-    if Map.has_key?(fold.children, tag_key) do
-      deliver(module, end_child(fold, tag_key, input.result), stored, vocab)
-    else
-      mark(fold, stored, :unknown_tag)
+    case tag_event(fold, tag_key, {:completed, input.result}) do
+      {{:deliver, _result}, fold} -> deliver(module, fold, stored, vocab)
+      {:unknown_tag, fold} -> mark(fold, stored, :unknown_tag)
     end
   end
 
@@ -483,20 +483,116 @@ defmodule Clementine.Loop.Step do
     deliver(module, fold, stored, vocab)
   end
 
-  # A child's end, however it reaches the fold: a stored completion (a
-  # row's end, or one that leaked past a never-committed spawn on a crash
-  # replay) or the inline end of a child cancelled before its spawn
-  # committed. It retires everything the fold still holds for the tag:
-  # the live entry, so the tag re-arms; the spawn that never committed;
-  # and the cancel that never applied, which is moot once the child has
-  # ended and must not reach a successor spawned under the re-armed tag.
-  # The child's usage folds into the loop's.
-  defp end_child(fold, tag_key, result) do
+  ## The per-tag rule
+
+  # Within a drain, a child tag's commit cargo is the net of its events
+  # (LOOP_RFC §Children, "The per-tag rule"). A tag is absent; pending,
+  # spawned in this drain with no row yet (nil in `children`, its spec in
+  # `child_cargo`); or live, a row an earlier step committed (its ref in
+  # `children`). Four events reach a tag, and this reducer is the one
+  # place that says what each does to the cargo and what the controller
+  # hears. The caller delivers what the verdict names; the reducer never
+  # calls handle/2, and the host only executes the cargo that results.
+  #
+  #   tag      event      cargo                                 handle/2 hears
+  #   absent   spawn      arm: a row and its job at the commit  nothing yet
+  #   absent   cancel     nothing                               nothing
+  #   absent   completed  dead-letter :unknown_tag              nothing
+  #   absent   halt       nothing                               nothing
+  #   pending  spawn      raise: the tag is live                —
+  #   pending  cancel     retire: no row, no job, no flag       Cancelled, inline, now
+  #   pending  completed  retire (crash replay only, row L5)    the completion, once
+  #   pending  halt       retire                                nothing, ever
+  #   live     spawn      raise: the tag is live                —
+  #   live     cancel     flag                                  Cancelled, next drain
+  #   live     completed  retire, with any flag on it           the completion
+  #   live     halt       the cascade's flag                    nothing, ever
+  #
+  # "halt" is the loop's own end: `{:halt, _}` from the controller, or
+  # the cancel flag's cascade entry, which reduces every live tag the
+  # same way. A cancel of a pending spawn is the child's end, now: no row
+  # will ever report it, so the controller hears the `Cancelled`
+  # completion in this very fold, the same callback and reason map a
+  # row's cancel would bring later. A controller cannot tell whether the
+  # child it cancels was spawned in this fold (two messages in one batch,
+  # say) or in an earlier one, so both read the same.
+  defp tag_event(fold, tag_key, event) do
+    case {tag_state(fold, tag_key), event} do
+      {:absent, {:spawn, spec}} ->
+        {:ok, arm(fold, tag_key, spec)}
+
+      {:absent, {:completed, _result}} ->
+        {:unknown_tag, fold}
+
+      {:absent, _cancel_or_halt} ->
+        {:ok, fold}
+
+      {_pending_or_live, {:spawn, spec}} ->
+        raise ArgumentError,
+              "tag #{inspect(spec.tag)} is already a live child — tags are unique " <>
+                "among live children; retire it (completion) before re-spawning"
+
+      {:pending, :cancel} ->
+        result = Result.cancelled(%{"code" => "loop_cancel", "loop_id" => fold.loop_ref})
+        {{:deliver, result}, retire(fold, tag_key, result)}
+
+      {:pending, :halt} ->
+        {:ok, retire(fold, tag_key, nil)}
+
+      {:live, cancel_or_halt} when cancel_or_halt in [:cancel, :halt] ->
+        {:ok, flag(fold, tag_key)}
+
+      {_pending_or_live, {:completed, result}} ->
+        {{:deliver, result}, retire(fold, tag_key, result)}
+    end
+  end
+
+  defp tag_state(fold, tag_key) do
+    case Map.fetch(fold.children, tag_key) do
+      :error -> :absent
+      {:ok, nil} -> :pending
+      {:ok, _ref} -> :live
+    end
+  end
+
+  defp arm(fold, tag_key, spec) do
+    %{
+      fold
+      | children: Map.put(fold.children, tag_key, nil),
+        child_cargo: fold.child_cargo ++ [spec]
+    }
+  end
+
+  defp flag(fold, tag_key) do
+    %{fold | cancel_cargo: Enum.uniq(fold.cancel_cargo ++ [tag_key])}
+  end
+
+  # A tag's end, whatever ended it: the live entry goes, so the tag
+  # re-arms; the spawn that never committed goes; the cancel that never
+  # applied goes, moot once the child has ended and never to cross to a
+  # successor under the re-armed tag. A child that ran folds its usage
+  # into the loop's; one that never existed has none.
+  defp retire(fold, tag_key, result) do
+    usage = if result, do: Result.usage(result), else: %Usage{}
+
     fold
     |> Map.update!(:children, &Map.delete(&1, tag_key))
-    |> Map.update!(:usage, &Usage.add(&1, Result.usage(result)))
+    |> Map.update!(:usage, &Usage.add(&1, usage))
     |> retire_cargo(:child_cargo, tag_key)
     |> Map.update!(:cancel_cargo, &List.delete(&1, tag_key))
+  end
+
+  # The loop's own end reaches every tag the fold holds: a spawn of this
+  # drain is retired before it exists, a committed child gets the
+  # cascade's flag. The flags come out sorted, the same on every replay.
+  defp halt_tags(fold) do
+    fold =
+      Enum.reduce(Map.keys(fold.children), fold, fn tag_key, fold ->
+        {:ok, fold} = tag_event(fold, tag_key, :halt)
+        fold
+      end)
+
+    %{fold | cancel_cargo: Enum.sort(fold.cancel_cargo)}
   end
 
   defp deliver(module, fold, %StoredInput{ref: ref, input: input}, vocab) do
@@ -553,47 +649,21 @@ defmodule Clementine.Loop.Step do
   end
 
   defp apply_action(fold, %Action{kind: :run} = action, _causal, _index) do
-    if Map.has_key?(fold.children, action.tag_key) do
-      raise ArgumentError,
-            "tag #{inspect(action.tag)} is already a live child — tags are unique " <>
-              "among live children; retire it (completion) before re-spawning"
-    end
-
     spec = %{tag: action.tag, tag_key: action.tag_key, child_args: action.child_args}
-
-    %{
-      fold
-      | children: Map.put(fold.children, action.tag_key, nil),
-        child_cargo: fold.child_cargo ++ [spec]
-    }
+    {:ok, fold} = tag_event(fold, action.tag_key, {:spawn, spec})
+    fold
   end
 
-  # A cancel names a live child. One with a row (spawned in an earlier
-  # step) is cancel cargo: the commit flags it (a queued child ends at
-  # once, a running one gets the cooperative flag), and its completion
-  # arrives like any other, which is when the tag re-arms and the cancel,
-  # if it is still in this fold's cargo, is retired as moot. One spawned
-  # in this same drain has no row yet and never will: cancelling it is
-  # its end, now, so the fold ends the child as a completion would and
-  # hands the controller the `Cancelled` completion inline, since no row
-  # can report it later. A controller cannot tell whether the child it
-  # cancels was spawned in this fold (two messages in one batch, say) or
-  # in an earlier one, so both read the same. No live child under the
-  # tag is a benign no-op.
+  # The rule's verdict on a cancel: a committed child is flagged (a
+  # queued child ends at once, a running one gets the cooperative flag)
+  # and its completion arrives like any other; a spawn of this drain ends
+  # now, and the controller hears it inline; no live child is a no-op.
   defp apply_action(fold, %Action{kind: :cancel} = action, causal, index) do
-    cond do
-      Enum.any?(fold.child_cargo, &(&1.tag_key == action.tag_key)) ->
-        reason = %{"code" => "loop_cancel", "loop_id" => fold.loop_ref}
-        result = Result.cancelled(reason)
+    case tag_event(fold, action.tag_key, :cancel) do
+      {{:deliver, result}, fold} ->
+        deliver_inline(fold, Input.completed(action.tag, result), causal, index)
 
-        fold
-        |> end_child(action.tag_key, result)
-        |> deliver_inline(Input.completed(action.tag, result), causal, index)
-
-      Map.has_key?(fold.children, action.tag_key) ->
-        %{fold | cancel_cargo: Enum.uniq(fold.cancel_cargo ++ [action.tag_key])}
-
-      true ->
+      {:ok, fold} ->
         fold
     end
   end
@@ -722,11 +792,17 @@ defmodule Clementine.Loop.Step do
     end
   end
 
-  # A halt with children in flight enters the cascade: the machinery — not
-  # handle/2 — cancels live children as cargo, parks with the pending
+  # A halt is the loop's own end, and every tag hears it through the rule
+  # (`halt_tags/1`): a spawn this drain never committed is retired — no
+  # row, no job, and nobody hears it — and a committed child gets the
+  # cascade's flag. With nothing live after that the loop finishes now,
+  # terminal sweep included. Otherwise the machinery — not handle/2 —
+  # cancels the committed children as cargo, parks with the pending
   # result held in the envelope, and finishes when the last completion
-  # folds. With nothing in flight it finishes now, terminal sweep included.
+  # folds.
   defp halt_commit(module, fold, plan, loop_ref, epoch, vocab, declared) do
+    fold = halt_tags(fold)
+
     if map_size(fold.children) == 0 do
       result = put_usage(fold.halted, fold.usage)
       envelope = build_envelope(module, fold, vocab, declared)
@@ -736,11 +812,7 @@ defmodule Clementine.Loop.Step do
       fold = %{fold | pending_halt: %{result: fold.halted}}
       envelope = build_envelope(module, fold, vocab, declared)
       window = fold.leftover ++ plan.rest
-
-      %StepCommit{
-        cascade_park_or_continue(fold, plan, loop_ref, epoch, envelope, declared, window)
-        | cancel_children: fold.children |> Map.keys() |> Enum.sort()
-      }
+      cascade_park_or_continue(fold, plan, loop_ref, epoch, envelope, declared, window)
     end
   end
 
@@ -795,42 +867,36 @@ defmodule Clementine.Loop.Step do
         set = finish_set(envelope, base.state_version, result)
         commit(fold, plan, loop_ref, epoch, :finish, set, nil, result, true)
       else
+        # The flag's first drain cancels every live child; a later one
+        # already has, and only folds completions.
+        fold = if entering?, do: halt_tags(fold), else: fold
         fold = %{fold | pending_halt: %{result: halt_result}}
         envelope = cascade_envelope(fold, base)
         window = fold.leftover ++ plan.rest
-        cancel = if entering?, do: fold.children |> Map.keys() |> Enum.sort(), else: []
 
-        %StepCommit{
-          cascade_park_or_continue(
-            fold,
-            plan,
-            loop_ref,
-            epoch,
-            envelope,
-            base.state_version,
-            window
-          )
-          | cancel_children: cancel
-        }
+        cascade_park_or_continue(
+          fold,
+          plan,
+          loop_ref,
+          epoch,
+          envelope,
+          base.state_version,
+          window
+        )
       end
 
     {:ok, commit}
   end
 
-  # Completions absorb without handle/2; everything else stays unconsumed
-  # until the terminal sweep.
+  # Completions absorb without handle/2 — the rule's verdict is the row's
+  # consumption, never a delivery; everything else stays unconsumed until
+  # the terminal sweep.
   defp absorb(fold, %StoredInput{input: %Input{kind: :completed} = input} = stored, vocab) do
     tag_key = Codec.key(input.tag, vocabulary: vocab)
 
-    if Map.has_key?(fold.children, tag_key) do
-      %{
-        fold
-        | children: Map.delete(fold.children, tag_key),
-          usage: Usage.add(fold.usage, Result.usage(input.result)),
-          consumed: [stored.ref | fold.consumed]
-      }
-    else
-      mark(fold, stored, :unknown_tag)
+    case tag_event(fold, tag_key, {:completed, input.result}) do
+      {{:deliver, _result}, fold} -> %{fold | consumed: [stored.ref | fold.consumed]}
+      {:unknown_tag, fold} -> mark(fold, stored, :unknown_tag)
     end
   end
 

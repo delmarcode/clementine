@@ -247,15 +247,17 @@ defmodule Clementine.Loop.LocalTest do
       assert collect_steps() == [{:parked, :normal, 0}, {:finished, :normal, 2}]
     end
 
-    test "a queued child is cancelled by the cascade before its job runs" do
+    test "a halt in the step that spawned a child retires the spawn: no child job ever exists, and the loop finishes in that step" do
       attach_steps!()
 
-      # No :build_child: success proves the halt's cascade terminalized
-      # the child inside the commit, so its job was skipped, never built.
+      # No :build_child: success proves the child was never built. The
+      # spawn and the halt met in one drain, so the per-tag rule retired
+      # the spawn before any row or job existed: no cascade, no child
+      # completion, nothing for the controller to hear.
       assert {:ok, %Result.Completed{output: "stopped", usage: %Usage{input_tokens: 0}}} =
                Loop.run_local(CascadeLoop, %{}, messages: [%{"halt" => "stopped"}])
 
-      assert collect_steps() == [{:continued, :normal, 1}, {:finished, :cascade, 1}]
+      assert collect_steps() == [{:finished, :normal, 1}]
     end
   end
 
