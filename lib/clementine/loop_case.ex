@@ -221,6 +221,10 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
             Battery.cancel_action_stops_running_child()
           end
 
+          test "a cancel and its child's completion in one drain: the cancel retires, and a successor under the re-armed tag lives" do
+            Battery.cancel_retired_by_completion_in_one_batch()
+          end
+
           test "{:cancel, tag} ends a queued child at once; a tag with no live child is a no-op" do
             Battery.cancel_action_queued_child_and_no_op()
           end

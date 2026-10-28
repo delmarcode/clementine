@@ -972,6 +972,40 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       assert envelope!(loop).children == %{}
     end
 
+    def cancel_retired_by_completion_in_one_batch do
+      # One drain: a message cancelling the child, the child's own
+      # completion (it ended on its own meanwhile), and a message spawning
+      # a successor under the re-armed tag. The cancel is moot once the
+      # completion folds, and never reaches the successor.
+      loop = parked!()
+      first = spawn_child!(loop, {:reply, 1})
+      send!(loop, %{"id" => "stop", "actions" => [{:cancel, {:reply, 1}}]})
+      assert {:ok, :finished} = Runs.cancel(first.id)
+      send!(loop, spawn_payload({:reply, 1}))
+
+      assert {:parked, _} = step!(loop)
+      assert {:ok, %AgentRun{status: "queued"} = second} = Runs.child(loop.id, {:reply, 1})
+      assert second.id != first.id
+      assert %AgentRun{status: "cancelled"} = Runs.get(first.id)
+
+      assert Enum.take(log!(loop), -3) == [
+               "message:stop",
+               "completed:{:reply, 1}:cancelled",
+               "message:spawn"
+             ]
+
+      assert Loops.dead_letters(loop.id, 50, nil) == []
+
+      # Without a successor, the retired cancel is simply gone.
+      loop = parked!()
+      first = spawn_child!(loop, {:reply, 1})
+      send!(loop, %{"id" => "stop", "actions" => [{:cancel, {:reply, 1}}]})
+      assert {:ok, :finished} = Runs.cancel(first.id)
+      assert {:parked, _} = step!(loop)
+      assert envelope!(loop).children == %{}
+      assert "completed:{:reply, 1}:cancelled" in log!(loop)
+    end
+
     def cancel_action_queued_child_and_no_op do
       loop = parked!()
       child = spawn_child!(loop, {:reply, 1})

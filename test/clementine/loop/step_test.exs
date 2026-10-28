@@ -357,6 +357,25 @@ defmodule Clementine.Loop.StepTest do
       assert log(commit) == ["message:stop"]
     end
 
+    test "a cancel followed by its child's completion in one batch retires the cancel, so a successor under the re-armed tag is never cancelled" do
+      tag = {:reply, 1}
+      envelope = scripted_envelope(children: %{key(tag) => 900})
+
+      batch = [
+        msg(1, %{"id" => "stop", "actions" => [{:cancel, tag}]}),
+        completed(2, tag),
+        msg(3, %{"id" => "again", "actions" => [{:run, tag, %{}}]})
+      ]
+
+      commit = drain!(ScriptedLoop, envelope, Step.plan(envelope, batch))
+
+      assert commit.cancel_children == []
+      assert [%{tag_key: spawned}] = commit.children
+      assert spawned == key(tag)
+      assert commit.set.envelope.children == %{key(tag) => nil}
+      assert log(commit) == ["message:stop", "completed:{:reply, 1}", "message:again"]
+    end
+
     test "{:cancel, tag} with no live child under the tag is a benign no-op" do
       envelope = scripted_envelope()
       batch = [msg(1, %{"id" => "stop", "actions" => [{:cancel, {:reply, 1}}]})]

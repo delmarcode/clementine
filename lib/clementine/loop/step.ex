@@ -456,11 +456,15 @@ defmodule Clementine.Loop.Step do
     tag_key = Codec.key(input.tag, vocabulary: vocab)
 
     if Map.has_key?(fold.children, tag_key) do
+      # A cancel this batch asked for the child that just ended is moot,
+      # and retiring it keeps it from a successor the handler may spawn
+      # under the re-armed tag.
       fold =
         fold
         |> Map.update!(:children, &Map.delete(&1, tag_key))
         |> Map.update!(:usage, &Usage.add(&1, Result.usage(input.result)))
         |> retire_cargo(:child_cargo, tag_key)
+        |> Map.update!(:cancel_cargo, &List.delete(&1, tag_key))
 
       deliver(module, fold, stored, vocab)
     else
