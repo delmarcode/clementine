@@ -56,15 +56,18 @@ defmodule Clementine.Thread do
 
   A message is a map with `"prompt"`, the turn's prompt, and optionally:
 
-  - `"id"`: the turn's tag id (a string or integer; the message's own id,
-    usually). Without one the thread counts.
-  - `"metadata"`: a map stored on the turn's row, as `start/3` stores it.
-  - `"actor"`: `[type, id]`, whose authority this one turn acts with; the
-    loop's actor otherwise.
+  - `"id"`: the turn's tag id (a nonblank string or an integer; the
+    message's own id, usually). Without one the thread counts.
+  - `"metadata"`: a plain-JSON map stored on the turn's row, as `start/3`
+    stores it.
+  - `"actor"`: `[type, id]`, both nonblank, whose authority this one turn
+    acts with; the loop's actor otherwise.
 
-  A message without a prompt fails its step and walks the poison path:
-  dead-lettered at the threshold, the thread informed, the next message
-  answered.
+  A message outside this contract fails its step and walks the poison
+  path: dead-lettered at the threshold, the thread informed, the next
+  message answered. The check is the turn row's own, made at the
+  message, so a message the row would refuse never waits in the queue
+  behind a turn whose completion would then take the blame.
 
   ## Stopping
 
@@ -230,35 +233,34 @@ defmodule Clementine.Thread do
   ## Messages
 
   # A message outside the contract raises here, toward the poison path,
-  # before any of it reaches the state. The metadata is checked against
-  # the child action's plain-JSON contract, not for being a map: the
-  # inbox codec round-trips the loop's vocabulary, so a map holding a
-  # tagged tuple reaches here whole, and one accepted into the queue
-  # would only fail at its own {:run, ...}, in the drain that folds the
-  # running turn's completion, blaming that innocent input.
+  # before any of it reaches the state. The checks are the turn row's
+  # own refusals — a blank prompt, a blank tag id, an actor with a blank
+  # type or id, metadata that is not plain JSON — and not the looser "is
+  # a string, is a map": the inbox codec round-trips the loop's
+  # vocabulary and Ecto's cast turns "" into NULL, so a message the row
+  # would refuse reaches here whole, and one accepted into the queue
+  # would fail only at its own {:run, ...}, in the drain that folds the
+  # running turn's completion, blaming that innocent input and wedging
+  # the thread behind its dead letter.
   defp message!(%{"prompt" => prompt} = message) when is_binary(prompt) do
-    if String.trim(prompt) == "" do
+    unless nonblank?(prompt) do
       raise ArgumentError, "a thread message needs a \"prompt\", got a blank one"
     end
 
     id = Map.get(message, "id")
 
-    unless is_nil(id) or is_binary(id) or is_integer(id) do
+    unless is_nil(id) or nonblank?(id) do
       raise ArgumentError,
-            "a thread message's \"id\" is a string or an integer, got: #{inspect(id)}"
+            "a thread message's \"id\" is a nonblank string or an integer, got: #{inspect(id)}"
     end
 
     Codec.validate_json_map!(Map.get(message, "metadata", %{}), "a thread message's \"metadata\"")
 
-    case Map.get(message, "actor") do
-      nil ->
-        :ok
+    actor = Map.get(message, "actor")
 
-      [type, id] when is_binary(type) and (is_binary(id) or is_integer(id)) ->
-        :ok
-
-      other ->
-        raise ArgumentError, "a thread message's \"actor\" is [type, id], got: #{inspect(other)}"
+    unless is_nil(actor) or actor?(actor) do
+      raise ArgumentError,
+            "a thread message's \"actor\" is [type, id], both nonblank, got: #{inspect(actor)}"
     end
 
     message
@@ -268,6 +270,13 @@ defmodule Clementine.Thread do
     raise ArgumentError,
           "a thread message is a map with a \"prompt\" string, got: #{inspect(other)}"
   end
+
+  defp actor?([type, id]) when is_binary(type), do: nonblank?(type) and nonblank?(id)
+  defp actor?(_other), do: false
+
+  defp nonblank?(value) when is_integer(value), do: true
+  defp nonblank?(value) when is_binary(value), do: String.trim(value) != ""
+  defp nonblank?(_other), do: false
 
   defp identify(state, %{"id" => id} = message) when not is_nil(id), do: {state, message}
 

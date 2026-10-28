@@ -169,11 +169,15 @@ the message.
   start a turn on a quiet thread; the check runs under the loop's row
   lock, so the controller never sees a refused message. A loop that has
   ended answers `{:ok, :dead_lettered}`.
-- A message is `"prompt"` plus, optionally, `"id"` (the turn's tag id),
-  `"metadata"` (stored on the turn's row), and `"actor"` (`[type, id]`,
-  this one turn's authority). The thread holds no transcript: the turn
-  agent's `history/1` reads the thread, and `run_finished/2` stores what
-  the turn said with the turn's id.
+- A message is `"prompt"` plus, optionally, `"id"` (the turn's tag id, a
+  nonblank string or an integer), `"metadata"` (a plain-JSON map stored
+  on the turn's row), and `"actor"` (`[type, id]`, both nonblank, this
+  one turn's authority). The thread checks a message the way the turn's
+  row would, at the message, so one the row would refuse is dead-lettered
+  on its own and never waits in the queue behind a running turn. The
+  thread holds no transcript: the turn agent's `history/1` reads the
+  thread, and `run_finished/2` stores what the turn said with the turn's
+  id.
 - `Runs.cancel/1` on the turn (`Runs.active(subject)`) stops it and the
   thread answers the next message; on the loop, it ends the thread,
   cancels the turn in flight, and keeps queued messages as dead letters.

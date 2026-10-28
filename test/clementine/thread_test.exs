@@ -310,25 +310,33 @@ defmodule Clementine.ThreadTest do
             %{},
             %{"prompt" => "  "},
             %{"prompt" => "x", "id" => 1.5},
+            %{"prompt" => "x", "id" => " "},
             %{"prompt" => "x", "metadata" => "no"},
             %{"prompt" => "x", "metadata" => %{"extra" => {:turn, 1}}},
-            %{"prompt" => "x", "actor" => "user"}
+            %{"prompt" => "x", "actor" => "user"},
+            %{"prompt" => "x", "actor" => ["", "u-1"]},
+            %{"prompt" => "x", "actor" => ["user", ""]},
+            %{"prompt" => "x", "actor" => ["user", nil]}
           ] do
         assert_raise ArgumentError, fn -> Thread.handle({:message, bad}, idle()) end
       end
     end
 
-    test "a queued message's metadata must be plain JSON: the message is blamed, never the running turn's completion" do
-      # The inbox codec round-trips the loop's vocabulary, so a map that is
-      # not plain JSON reaches handle/2 whole. Accepted into the queue, it
-      # would only fail at its own {:run, ...}, in the drain that folds the
+    test "a queued message the turn's row would refuse is blamed at the message, never at the running turn's completion" do
+      # The inbox codec round-trips the loop's vocabulary and Ecto's cast
+      # turns "" into NULL, so each of these reaches handle/2 whole and
+      # would be refused only at the row's insert. Accepted into the queue,
+      # it would fail at its own {:run, ...}, in the drain that folds the
       # running turn's completion, blaming that innocent input and wedging
       # the thread behind a dead-lettered completion.
       {:ok, running, [_spawn]} = Thread.handle({:message, %{"prompt" => "a"}}, idle())
-      bad = %{"prompt" => "b", "metadata" => %{"extra" => {:turn, 1}}}
 
-      assert_raise ArgumentError, ~r/"metadata" must be a JSON-safe map/, fn ->
-        Thread.handle({:message, bad}, running)
+      for bad <- [
+            %{"prompt" => "b", "metadata" => %{"extra" => {:turn, 1}}},
+            %{"prompt" => "b", "id" => ""},
+            %{"prompt" => "b", "actor" => ["", "u-1"]}
+          ] do
+        assert_raise ArgumentError, fn -> Thread.handle({:message, bad}, running) end
       end
     end
   end
