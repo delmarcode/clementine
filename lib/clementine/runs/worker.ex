@@ -194,7 +194,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
               actor_id: row.actor_id,
               actor: actor,
               parent_id: row.parent_id,
-              tag: tag(row)
+              tag: tag(row),
+              metadata: row.metadata
             },
             limits: default_limits(agent)
           )

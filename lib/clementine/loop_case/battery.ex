@@ -924,13 +924,13 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
 
     def child_builds_at_claim do
       loop = parked!(subject: {"thread", "t-build"}, actor: {"user", "u-1"})
-      send!(loop, spawn_payload({:reply, 1}, Turn))
+      send!(loop, spawn_payload({:reply, 1}, Turn, %{"metadata" => %{"today" => "2026-10-28"}}))
       assert {:parked, _} = step!(loop)
       {:ok, child} = Runs.child(loop.id, {:reply, 1})
 
       # The child builds like any run: history/1 with the subject and actor
-      # resolved, and its tool sees the run's context, parent and tag
-      # included.
+      # resolved, and its tool sees the run's context, parent, tag and the
+      # metadata the {:run, ...} action set included.
       expect_turn(tool_events("toolu_1", "context", %{}))
       expect_turn(text_events("Answered."))
       assert :ok = perform_job(Worker, %{"run_id" => child.id})
@@ -946,6 +946,7 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       assert context.actor == %{user: "u-1"}
       assert context.parent_id == loop.id
       assert context.tag == {:reply, "1"}
+      assert context.metadata == %{"today" => "2026-10-28"}
 
       assert %AgentRun{status: "completed", result: %{"output" => "Answered."}} =
                Runs.get(child.id)

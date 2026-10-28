@@ -206,7 +206,7 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
             Battery.child_inserted_through_the_start_path()
           end
 
-          test "the child builds at its claim like any run: history/1 sees run.subject resolved, both resolvers run, tools see parent_id and tag" do
+          test "the child builds at its claim like any run: history/1 sees run.subject resolved, both resolvers run, tools see parent_id, tag, and the action's metadata" do
             Battery.child_builds_at_claim()
           end
 

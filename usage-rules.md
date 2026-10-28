@@ -171,7 +171,8 @@ the message.
   ended answers `{:ok, :dead_lettered}`.
 - A message is `"prompt"` plus, optionally, `"id"` (the turn's tag id, a
   nonblank string or an integer), `"metadata"` (a plain-JSON map stored
-  on the turn's row), and `"actor"` (`[type, id]`, both nonblank, this
+  on the turn's row, which its tools see as `context.metadata`), and
+  `"actor"` (`[type, id]`, both nonblank, this
   one turn's authority). The thread checks a message the way the turn's
   row would, at the message, so one the row would refuse is dead-lettered
   on its own and never waits in the queue behind a running turn. The
@@ -329,7 +330,9 @@ def resolve_actor(_type, _id), do: {:ok, nil}
 
 Tools see `context.run_id`, `context.agent_key`, `context.turn`,
 `context.subject`, and `context.actor` (with `subject_type`,
-`subject_id`, `actor_type`, and `actor_id` as stored).
+`subject_id`, `actor_type`, and `actor_id` as stored), and
+`context.metadata`, the run's metadata as `start/3` stored it or, on a
+loop's child, as the `{:run, ...}` action set it.
 
 ## Never
 

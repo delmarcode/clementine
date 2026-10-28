@@ -313,7 +313,8 @@ transaction (they raise inside one, because the host would hear of their
 writes before the caller's commit). The resolved subject and actor reach
 `agent/1` and `history/1` as `run.subject` and `run.actor`, and every
 tool as `context.subject` and `context.actor`, beside `context.run_id`,
-`context.agent_key`, and `context.turn`.
+`context.agent_key`, `context.turn`, and `context.metadata` (the run's
+metadata as `start/3` stored it).
 
 Coding agents working in the app get these rules from
 [`usage-rules.md`](../usage-rules.md), which the

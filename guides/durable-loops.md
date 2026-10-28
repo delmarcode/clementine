@@ -342,7 +342,8 @@ matches on the kind.
   built at its claim like any run: its agent from its key, its subject
   and actor through the host's resolvers, its history through the turn
   agent's `history/1`. Tools see `context.parent_id` and `context.tag`
-  beside the rest. When it ends, however it ends, its terminal transaction
+  beside the rest, and `context.metadata` is what the `{:run, ...}`
+  action set. When it ends, however it ends, its terminal transaction
   appends `{:completed, tag, result}` to the loop's inbox, exactly once,
   and the loop wakes after the commit.
 - **Timers** are Oban jobs scheduled in the step's commit

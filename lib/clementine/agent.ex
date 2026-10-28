@@ -151,7 +151,8 @@ defmodule Clementine.Agent do
   Releases what one execution of `run` held, after it ends however it
   ends: a sandbox, a session with a tool server, a temporary directory.
   `context` is the map the run's tools saw (`run_id`, `agent_key`,
-  `turn`, `subject`, `actor`, `parent_id`, `tag`); an `c:agent/1` that
+  `turn`, `subject`, `actor`, `parent_id`, `tag`, `metadata`); an
+  `c:agent/1` that
   opens a resource keeps its handle somewhere the tools and this callback
   both reach, such as the process dictionary, or reads it back from
   `run.id`.
