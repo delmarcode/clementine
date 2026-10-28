@@ -1342,17 +1342,39 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
 
       assert [
                %StoredInput{
-                 input: %Input{kind: :completed, result: %Result.Interrupted{}},
+                 input: %Input{kind: :completed, result: %Result.Interrupted{} = synthesized},
                  dedup_key: ^key
                }
              ] = pending!(loop)
 
+      # It carries what the child's row holds, as the lost delivery did.
+      assert %InterruptReason{code: :lease_expired} = synthesized.reason
       assert fetch!(loop).status == :queued
 
       quiesce!(loop)
       assert Enum.count(log!(loop), &(&1 == "completed:{:reply, 1}:interrupted")) == 1
       assert envelope!(loop).children == %{}
       assert %{healthy: 1} = Reaper.loop_sweep()
+
+      # A completed child: the synthesized completion carries the output
+      # the child stored, so a controller deciding on it decides the same.
+      done = spawn_child!(loop, {:reply, 3})
+      expect_turn(text_events("The answer"))
+      assert :ok = perform_job(Worker, %{"run_id" => done.id})
+
+      assert %AgentRun{status: "completed", result: %{"output" => "The answer"}} =
+               Runs.get(done.id)
+
+      done_key = InboxCodec.completion_dedup_key(tag_key({:reply, 3}), done.id)
+      {1, _} = repo().delete_all(from(i in "agent_run_inbox", where: i.dedup_key == ^done_key))
+      quiesce!(loop)
+      assert %{reconcile_children: 1} = Reaper.loop_sweep()
+
+      assert [%StoredInput{input: %Input{result: %Result.Completed{output: "The answer"}}}] =
+               pending!(loop)
+
+      quiesce!(loop)
+      assert Enum.count(log!(loop), &(&1 == "completed:{:reply, 3}:completed")) == 1
 
       # The race: evidence gathered before a real delivery landed. The
       # healing append no-ops on the canonical key: observable noise, never

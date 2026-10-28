@@ -1190,14 +1190,29 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       :ok
     end
 
+    # The child's terminal row holds what the lost delivery carried: the
+    # output a completed run stored, the error, the cancel reason, the
+    # interrupt reason, and the usage. The synthesized completion folds as
+    # the lost one would have, so the controller decides the same way.
     defp synthesized_result(%AgentRun{} = child) do
-      usage = Clementine.Usage.from_map(child.usage || %{})
+      facts = facts(child)
+      usage = facts.usage || %Clementine.Usage{}
 
-      case child.status do
-        "completed" -> Result.completed(usage: usage)
-        "failed" -> Result.failed(%Clementine.Error{message: "child failed"}, usage)
-        "cancelled" -> Result.cancelled(%{"code" => "reconciled"}, usage)
-        "interrupted" -> Result.interrupted({:app, :reconciled}, usage)
+      case facts.status do
+        :completed ->
+          Result.completed(output: child.result && child.result["output"], usage: usage)
+
+        :failed ->
+          Result.failed(facts.error || %Clementine.Error{message: "child failed"}, usage)
+
+        :cancelled ->
+          Result.cancelled(
+            (facts.cancel && facts.cancel.reason) || %{"code" => "reconciled"},
+            usage
+          )
+
+        :interrupted ->
+          Result.interrupted(facts.interrupt || {:app, :reconciled}, usage)
       end
     end
 
