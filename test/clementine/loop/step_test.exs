@@ -449,6 +449,56 @@ defmodule Clementine.Loop.StepTest do
              ]
     end
 
+    test "an inline halt ends the fold's decisions: the retiring input's remaining actions are dropped" do
+      defmodule HaltsOnCancel do
+        use Clementine.Loop, vocabulary: [:reply]
+
+        def init(_args), do: {:ok, %{}, []}
+        def handle({:message, %{"actions" => actions}}, state), do: {:ok, state, actions}
+
+        def handle({:completed, {:reply, _n}, %Clementine.Result.Cancelled{}}, state) do
+          {:halt, Clementine.Result.completed(output: "stopped"), state}
+        end
+      end
+
+      tag = {:reply, 1}
+
+      batch = [
+        msg(1, %{
+          "actions" => [{:run, tag, %{}}, {:cancel, tag}, {:send, 1, %{"after" => true}}]
+        }),
+        msg(2, %{"actions" => [{:send, 1, %{"later" => true}}]})
+      ]
+
+      commit = drain!(HaltsOnCancel, nil, Step.plan(nil, batch))
+
+      assert commit.op == :finish
+      assert %Result.Completed{output: "stopped"} = commit.result
+      assert commit.sends == []
+      assert commit.children == []
+      assert commit.consumed == [1]
+    end
+
+    test "a controller that cancels what its Cancelled handler spawns fails the step toward the poison path" do
+      defmodule CancelsForever do
+        use Clementine.Loop, vocabulary: [:reply]
+
+        def init(_args), do: {:ok, %{}, []}
+        def handle({:message, %{"actions" => actions}}, state), do: {:ok, state, actions}
+
+        def handle({:completed, {:reply, n}, %Clementine.Result.Cancelled{}}, state) do
+          {:ok, state, [{:run, {:reply, n}, %{}}, {:cancel, {:reply, n}}]}
+        end
+      end
+
+      tag = {:reply, 1}
+      batch = [msg(1, %{"actions" => [{:run, tag, %{}}, {:cancel, tag}]})]
+
+      assert_raise ArgumentError, ~r/cancels what its Cancelled handler spawns/, fn ->
+        Step.drain(CancelsForever, nil, Step.plan(nil, batch), @opts)
+      end
+    end
+
     test "an inline Cancelled end carries the cancel's reason, and its actions get a causal key of their own" do
       defmodule ReactsToCancel do
         use Clementine.Loop, vocabulary: [:reply]

@@ -533,11 +533,18 @@ defmodule Clementine.Loop.Step do
     end)
   end
 
+  # A halt ends the fold's decisions: once one has landed (from an inline
+  # delivery an action caused), the actions after it are dropped, as
+  # fold_batch drops the inputs after a halting one.
   defp apply_actions(fold, actions, causal, vocab) when is_list(actions) do
     actions
     |> Enum.with_index()
-    |> Enum.reduce(fold, fn {action, index}, fold ->
-      apply_action(fold, Action.normalize(action, vocabulary: vocab), causal, index)
+    |> Enum.reduce_while(fold, fn {action, index}, fold ->
+      if fold.halted do
+        {:halt, fold}
+      else
+        {:cont, apply_action(fold, Action.normalize(action, vocabulary: vocab), causal, index)}
+      end
     end)
   end
 
@@ -644,7 +651,18 @@ defmodule Clementine.Loop.Step do
   # child retired in this same fold. Its actions are causally the
   # retiring action's, so their send keys stay replay-stable and distinct
   # from the retiring input's own.
+  # Bounded: a controller that cancels whatever its Cancelled handler
+  # spawns would recurse here until the stack died; past the bound the
+  # step fails toward the poison path instead.
+  @inline_depth 8
+
   defp deliver_inline(fold, %Input{} = input, causal, index) do
+    if inline_depth(causal) >= @inline_depth do
+      raise ArgumentError,
+            "cancelling #{inspect(input.tag)} ended #{@inline_depth} children spawned and " <>
+              "cancelled in one step: the controller cancels what its Cancelled handler spawns"
+    end
+
     case fold.module.handle(Input.to_callback(input), fold.state) do
       {:ok, state, actions} ->
         apply_actions(%{fold | state: state}, actions, {:inline, causal, index}, fold.vocab)
@@ -658,6 +676,9 @@ defmodule Clementine.Loop.Step do
                 "got: #{inspect(other)}"
     end
   end
+
+  defp inline_depth({:inline, causal, _index}), do: 1 + inline_depth(causal)
+  defp inline_depth(_causal), do: 0
 
   defp causal_key(:init), do: "init"
   defp causal_key({:input, ref}), do: Codec.key(ref)
