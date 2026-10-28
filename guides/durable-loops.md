@@ -166,9 +166,11 @@ Three contract points:
 - **The lane holds inside a loop.** A turn child occupies the thread's
   lane like any turn, so a step whose commit would start a second active
   turn on the thread fails, and the input that asked for it walks the
-  poison path. A controller that wants to interrupt cancels the running
-  turn first and starts the next one when the cancelled child's
-  completion folds, never both in one step.
+  poison path. Cancels run before spawns in a step's commit: a turn that
+  was never claimed ends inside the commit and frees the lane, so
+  `{:cancel, tag}` and the next `{:run, ...}` in one step interrupts it;
+  a running turn only takes the flag, so its successor starts when its
+  `Cancelled` completion folds.
 - **`state_version`** is recorded in every commit. When a deploy bumps
   it, ship one `handle_upgrade/2` clause per bump, the `code_change`
   analog: `handle_upgrade(n, dumped_map)` returns `{:ok, map}` at

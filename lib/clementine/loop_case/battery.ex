@@ -280,27 +280,49 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
 
     def send_inside_a_transaction do
       loop = parked!()
+      loop_id = loop.id
       repo = repo()
+      handler = "loop-input-#{System.unique_integer([:positive])}"
+      test = self()
 
-      # A rolled-back transaction takes the input and the job with it.
-      {:error, :changed_my_mind} =
-        repo.transaction(fn ->
-          {:ok, :appended} = Runs.send(loop.id, %{"id" => "never"})
-          repo.rollback(:changed_my_mind)
-        end)
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:clementine, :loop, :input],
+          fn _event, _measurements, meta, _config -> send(test, {:loop_input, meta}) end,
+          nil
+        )
 
-      assert pending!(loop) == []
-      assert fetch!(loop).status == :waiting
-      refute_received {:run_transition, %AgentRun{id: _}, :resumed}
+      try do
+        # A rolled-back transaction takes the input and the job with it.
+        {:error, :changed_my_mind} =
+          repo.transaction(fn ->
+            {:ok, :appended} = Runs.send(loop.id, %{"id" => "never"})
+            repo.rollback(:changed_my_mind)
+          end)
 
-      # A committed one lands both, and the host hears the claim that
-      # follows rather than the wake.
-      {:ok, _} = repo.transaction(fn -> Runs.send(loop.id, %{"id" => "kept"}) end)
-      assert [%StoredInput{}] = pending!(loop)
-      assert fetch!(loop).status == :queued
-      refute_received {:run_transition, %AgentRun{id: _}, :resumed}
-      assert {:parked, _} = step!(loop)
-      assert "message:kept" in log!(loop)
+        assert pending!(loop) == []
+        assert fetch!(loop).status == :waiting
+        refute_received {:run_transition, %AgentRun{id: _}, :resumed}
+        refute_received {:loop_input, %{loop_ref: ^loop_id}}
+
+        # A committed one lands both; the host hears the claim that
+        # follows rather than the wake, and no input event describes the
+        # append, since nothing of the runtime runs at the caller's commit.
+        {:ok, _} = repo.transaction(fn -> Runs.send(loop.id, %{"id" => "kept"}) end)
+        assert [%StoredInput{}] = pending!(loop)
+        assert fetch!(loop).status == :queued
+        refute_received {:run_transition, %AgentRun{id: _}, :resumed}
+        refute_received {:loop_input, %{loop_ref: ^loop_id}}
+        assert {:parked, _} = step!(loop)
+        assert "message:kept" in log!(loop)
+
+        # Outside a transaction the event fires once the unit commits.
+        send!(loop, message("outside"))
+        assert_received {:loop_input, %{loop_ref: ^loop_id, kind: :message, outcome: :appended}}
+      after
+        :telemetry.detach(handler)
+      end
     end
 
     def concurrent_appends do
@@ -1608,27 +1630,40 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
     end
 
     def lane_interrupt_two_phase do
-      loop = parked!()
-      first = spawn_child!(loop, {:reply, 1}, Turn)
-
-      # Cancel-and-spawn in one step: the running child still holds the
-      # thread's lane, so the spawn fails the step.
-      send!(loop, %{
+      interrupt = %{
         "id" => "interrupt-at-once",
         "actions" => [{:cancel, {:reply, 1}}, {:run, {:reply, 2}, child(Turn)}]
-      })
+      }
+
+      # An unclaimed child ends inside the step's own unit when cancelled,
+      # which frees the thread's lane before the spawn: one step
+      # interrupts it and starts its successor. Its Cancelled completion
+      # lands in the same unit, so the park downgrades to a continue.
+      loop = parked!()
+      first = spawn_child!(loop, {:reply, 1}, Turn)
+      send!(loop, interrupt)
+      assert {:continued, _} = step!(loop)
+      assert %AgentRun{status: "cancelled"} = Runs.get(first.id)
+      assert {:ok, %AgentRun{status: "queued", turn: true}} = Runs.child(loop.id, {:reply, 2})
+      quiesce!(loop)
+      assert "completed:{:reply, 1}:cancelled" in log!(loop)
+
+      # A running child only takes the flag, so its lane holds and the
+      # spawn fails the step; nothing of it lands, not even the flag.
+      loop = parked!()
+      first = spawn_child!(loop, {:reply, 1}, Turn)
+      lease = claim!(first)
+      send!(loop, interrupt)
 
       ExUnit.CaptureLog.capture_log(fn ->
         assert {:error, %Error{message: message}} = step!(loop)
         assert message =~ "turn lane"
       end)
 
-      # Nothing of that step landed: the first child is still live and
-      # unflagged.
-      assert %Facts{status: :queued, cancel: nil} = fetch!(first)
+      assert %Facts{status: :running, cancel: nil} = fetch!(first)
       assert Runs.list(parent: loop.id) |> length() == 1
 
-      # Two steps: cancel first, spawn on the completion. The failed
+      # Two phases: cancel first, spawn on the completion. The failed
       # input stays at the head; the cancel comes behind it. Dead-letter
       # the poison quickly so the two-phase story drains.
       repo().update_all(from(r in AgentRun, where: r.id == ^loop.id),
@@ -1639,9 +1674,14 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       assert {:parked, _} = step!(loop)
 
       send!(loop, %{"id" => "interrupt", "actions" => [{:cancel, {:reply, 1}}]})
-      assert {:continued, _} = step!(loop)
-      assert %AgentRun{status: "cancelled"} = Runs.get(first.id)
       assert {:parked, _} = step!(loop)
+      assert %Facts{status: :running, cancel: %{reason: reason}} = fetch!(first)
+      assert %{"code" => "loop_cancel"} = reason
+
+      # The child's runner finds the flag and ends cancelled; its
+      # completion wakes the loop, and the successor starts on it.
+      {:ok, _} = Protocol.finish(lease, Result.cancelled(reason))
+      quiesce!(loop)
       assert "completed:{:reply, 1}:cancelled" in log!(loop)
 
       send!(loop, spawn_payload({:reply, 2}, Turn))

@@ -553,9 +553,8 @@ defmodule Clementine.Loop.Step do
   # at once, a running one gets the cooperative flag), and its completion
   # arrives like any other, which is when the tag re-arms. A child spawned
   # in this same drain has no row yet: cancelling it here would commit a
-  # child born cancelled, and a controller that wants to interrupt cancels
-  # first and spawns on the completion, never both in one step (invariant
-  # 12). No live child under the tag is a benign no-op.
+  # child born cancelled, so a spawn is cancelled from a later input
+  # (invariant 12). No live child under the tag is a benign no-op.
   defp apply_action(fold, %Action{kind: :cancel} = action, _causal, _index) do
     cond do
       Enum.any?(fold.child_cargo, &(&1.tag_key == action.tag_key)) ->

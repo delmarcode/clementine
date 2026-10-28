@@ -295,9 +295,13 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
               {:created, run}
 
             :conflict ->
+              # The lane's loop ended between the insert and the read.
+              # Nothing was written on this path, so it returns rather
+              # than rolls back: a caller's transaction stays good for the
+              # retry.
               case existing_loop(config, attrs) do
                 %AgentRun{} = run -> {:existing, run}
-                nil -> repo.rollback(:lost_race)
+                nil -> :lost_race
               end
           end
         end)
@@ -305,8 +309,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       case result do
         {:ok, {:created, run}} -> {:ok, run}
         {:ok, {:existing, run}} -> {:ok, :already_exists, run}
-        {:error, :lost_race} when attempts > 1 -> insert_or_get_loop(config, attrs, attempts - 1)
-        {:error, :lost_race} -> {:error, :active_run_exists}
+        {:ok, :lost_race} when attempts > 1 -> insert_or_get_loop(config, attrs, attempts - 1)
+        {:ok, :lost_race} -> {:error, :active_run_exists}
         {:error, reason} -> {:error, reason}
       end
     end
@@ -371,9 +375,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     Sends `payload` to the loop `loop_id`: appends it to the loop's inbox
     as a `{:message, payload}` input, wakes the loop if it is parked, and
     enqueues its step, in one transaction. Inside the caller's transaction
-    they commit with it, and the step runs on commit. `payload` is a term
-    under the controller's `vocabulary:`; one it
-    cannot store raises.
+    they commit with it and the step runs on commit, and nothing announces
+    the append itself (no `:resumed` to the host, no
+    `[:clementine, :loop, :input]` event): either would describe a write
+    the caller may yet roll back. `payload` is a term under the
+    controller's `vocabulary:`; one it cannot store raises.
 
     ## Options
 

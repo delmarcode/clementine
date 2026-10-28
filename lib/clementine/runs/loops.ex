@@ -256,10 +256,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
            :ok <- consume(config, commit),
            :ok <- mark_dead(config, commit),
            :ok <- insert_appends(config, commit),
+           :ok <- cancel_children(commit),
            {:ok, children} <- spawn_children(config, row, commit),
            {:ok, timers} <- schedule_timers(config, row, commit),
            :ok <- retire_timers(config, row, commit),
-           :ok <- cancel_children(commit, children),
            :ok <- execute_sends(config, row, commit),
            :ok <- write_envelope(config, commit, children, timers),
            :ok <- settle_transition(config, row, commit),
@@ -577,14 +577,20 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # runner once the unit commits. Already-terminal and missing children
     # are tolerated: their completions are en route, or the loop sweep's
     # :reconcile_children verdict will synthesize them.
-    defp cancel_children(%StepCommit{cancel_children: []}, _children), do: :ok
+    # Cancels go before spawns: a cancelled child that was never claimed
+    # ends inside this unit and frees its lane, so a controller interrupts
+    # an unclaimed child and starts its successor in one step. A running
+    # child only takes the flag, and its lane holds until it ends. A cancel
+    # never names a tag spawned in this same step (the step core refuses
+    # it), so the stored envelope carries every child a cancel can name.
+    defp cancel_children(%StepCommit{cancel_children: []}), do: :ok
 
-    defp cancel_children(%StepCommit{cancel_children: tag_keys} = commit, children) do
+    defp cancel_children(%StepCommit{cancel_children: tag_keys} = commit) do
       stored = StepCommit.envelope(commit)
       reason = cancel_reason(commit)
 
       Enum.reduce_while(tag_keys, :ok, fn tag_key, :ok ->
-        ref = Map.get(children, tag_key) || (stored && Map.get(stored.children, tag_key))
+        ref = stored && Map.get(stored.children, tag_key)
 
         if ref == nil do
           raise ArgumentError,
@@ -789,9 +795,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
       # Inside a caller's transaction the row and the job commit with it,
       # and the host hears of the wake through the claim that follows: a
-      # notification here would describe a write the caller may yet roll
-      # back.
-      notify? = not repo.in_transaction?()
+      # notification or an input event here would describe a write the
+      # caller may yet roll back, and nothing of ours runs at its commit.
+      announce? = not repo.in_transaction?()
 
       in_unit(repo, fn ->
         repo.transaction(fn ->
@@ -803,7 +809,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
               {kind, payload} =
                 InboxCodec.encode_input(input, vocabulary: vocabulary(config, row))
 
-              deliver_locked(config, row, kind, payload, dedup_key, wake?: true, notify?: notify?)
+              deliver_locked(config, row, kind, payload, dedup_key,
+                wake?: true,
+                notify?: announce?,
+                emit?: announce?
+              )
 
             %AgentRun{} ->
               repo.rollback(:not_a_loop)
@@ -822,14 +832,15 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     defp deliver_locked(config, %AgentRun{} = row, kind, payload, dedup_key, opts) do
       repo = config.repo
+      emit? = Keyword.get(opts, :emit?, true)
 
       cond do
         row.status in @terminal_statuses ->
-          if insert_input(repo, row.id, kind, payload, dedup_key, dead: "terminal"),
+          if insert_input(repo, row.id, kind, payload, dedup_key, dead: "terminal", emit?: emit?),
             do: :dead_lettered,
             else: :duplicate
 
-        not insert_input(repo, row.id, kind, payload, dedup_key) ->
+        not insert_input(repo, row.id, kind, payload, dedup_key, emit?: emit?) ->
           :duplicate
 
         row.status == "waiting" and opts[:wake?] ->
@@ -852,7 +863,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     # true = inserted; false = the dedup index already holds the key. Every
     # row's birth emits exactly one deferred event: :input for a pending
-    # row (or a dedup hit), :dead_letter for a row born dead.
+    # row (or a dedup hit), :dead_letter for a row born dead; `emit?: false`
+    # is the append nested in a caller's transaction, where no bracket of
+    # ours fires at the commit.
     defp insert_input(repo, loop_id, kind, payload, dedup_key, opts \\ []) do
       row = %{
         run_id: Ecto.UUID.dump!(loop_id),
@@ -869,10 +882,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
       {count, _} = repo.insert_all(@inbox, [row], on_conflict: :nothing)
 
-      case {count, opts[:dead]} do
-        {1, nil} -> emit_input(loop_id, kind, :appended)
-        {1, reason} -> emit_dead_letter(loop_id, InboxCodec.decode_dead_reason(reason), 1)
-        {0, _} -> emit_input(loop_id, kind, :duplicate)
+      case {count, opts[:dead], Keyword.get(opts, :emit?, true)} do
+        {_count, _dead, false} -> :ok
+        {1, nil, _emit?} -> emit_input(loop_id, kind, :appended)
+        {1, reason, _emit?} -> emit_dead_letter(loop_id, InboxCodec.decode_dead_reason(reason), 1)
+        {0, _dead, _emit?} -> emit_input(loop_id, kind, :duplicate)
       end
 
       count == 1

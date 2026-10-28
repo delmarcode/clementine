@@ -209,9 +209,13 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     # A loop's child sees its tag as the controller gave it, `{kind, id}`,
-    # with the id as the row stores it: text.
+    # with the id as the row stores it: text. The kind is the controller's
+    # vocabulary atom; one no loaded code declares stays text rather than
+    # mint an atom from a column.
     defp tag(%AgentRun{tag_kind: kind, tag_id: id}) when is_binary(kind) and is_binary(id) do
-      {String.to_atom(kind), id}
+      {String.to_existing_atom(kind), id}
+    rescue
+      ArgumentError -> {kind, id}
     end
 
     defp tag(%AgentRun{}), do: nil

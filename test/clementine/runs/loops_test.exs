@@ -229,6 +229,34 @@ defmodule Clementine.Runs.LoopsTest do
       assert_enqueued(worker: StepWorker, args: %{"run_id" => loop.id})
     end
 
+    test "a child's tag reaches its agent as {kind, id}; a kind no loaded code declares stays text" do
+      {:ok, loop} = Runs.start_loop(Thread, %{"agent" => "test_echo"}, subject: {"ticket", 15})
+      kind = "kind_no_code_declares_#{System.unique_integer([:positive])}"
+
+      child =
+        insert_queued_run!(%{
+          agent_key: "test_tidy",
+          input: %{"prompt" => "Tidy up"},
+          subject_type: "ticket",
+          subject_id: "15",
+          parent_id: loop.id,
+          tag_kind: kind,
+          tag_id: "1"
+        })
+
+      expect_turn(text_events("Tidied."))
+      assert :ok = perform_job(Worker, %{"run_id" => child.id})
+
+      assert_received {:after_execution, %AgentRun{id: id}, %{parent_id: parent_id, tag: tag}, _}
+      assert id == child.id
+      assert parent_id == loop.id
+      assert tag == {kind, "1"}
+      assert %AgentRun{status: "completed"} = Runs.get(child.id)
+
+      # Its completion still reached the loop's inbox, under the row's tag.
+      assert [%{input: %{kind: :completed}}] = Runs.pending(loop.id)
+    end
+
     test "a timer job for a deleted loop or a rollout cancels itself" do
       assert {:cancel, "loop row deleted"} =
                perform_job(TimerWorker, %{"run_id" => Ecto.UUID.generate(), "tag_key" => "t"})
