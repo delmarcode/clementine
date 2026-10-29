@@ -104,6 +104,9 @@ claude_opus: [
 
 - `id` is the Anthropic model id (`claude-sonnet-5`, `claude-opus-4-8`, ...).
 - Endpoint override: `config :clementine, anthropic_base_url: ...`.
+- An agent's `deferred:` tools go out with `defer_loading: true` beside
+  the Messages API's tool search tool (`tool_search_tool_regex_20251119`);
+  every other provider sends them as ordinary tools.
 
 ### `:openai` — first-party OpenAI (Responses API)
 

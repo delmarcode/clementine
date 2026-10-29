@@ -23,6 +23,10 @@ defmodule Clementine.LLM.StreamParser do
   - `{:redacted_thinking, data}` - Complete encrypted thinking block
   - `{:tool_use_start, id, name}` - Start of tool use
   - `{:input_json_delta, id, json_chunk}` - Tool input JSON chunk
+  - `{:server_tool_use_start, id, name}` - Start of a call the API runs
+    itself (the tool search for deferred tools)
+  - `{:server_tool_input_delta, id, json_chunk}` - That call's input JSON chunk
+  - `{:server_tool_result, block}` - Its complete result block, as sent
   - `{:content_block_stop, index}` - End of content block
   - `{:message_delta, delta, usage}` - Message update (stop_reason)
   - `{:message_stop}` - End of message
@@ -38,6 +42,9 @@ defmodule Clementine.LLM.StreamParser do
           | {:redacted_thinking, String.t()}
           | {:tool_use_start, String.t(), String.t()}
           | {:input_json_delta, String.t(), String.t()}
+          | {:server_tool_use_start, String.t(), String.t()}
+          | {:server_tool_input_delta, String.t(), String.t()}
+          | {:server_tool_result, map()}
           | {:content_block_stop, non_neg_integer()}
           | {:message_delta, map(), map()}
           | {:message_stop}
@@ -48,7 +55,8 @@ defmodule Clementine.LLM.StreamParser do
     @moduledoc false
     defstruct buffer: "",
               current_block_index: nil,
-              current_tool_id: nil
+              current_tool_id: nil,
+              current_tool_kind: nil
   end
 
   @doc """
@@ -116,17 +124,25 @@ defmodule Clementine.LLM.StreamParser do
   defp exception_message(%_{} = reason), do: Exception.message(reason)
   defp exception_message(reason), do: inspect(reason)
 
-  # Enrich raw events with tracked state (attaches tool IDs to input_json_delta)
+  # Enrich raw events with tracked state: attaches the open call's id to
+  # input_json_delta, and keeps a server tool's input apart from a client
+  # tool's, since the engine executes only the latter.
   defp enrich_events(events, state) do
     Enum.map_reduce(events, state, fn
       {:tool_use_start, id, _name} = event, state ->
-        {event, %{state | current_tool_id: id}}
+        {event, %{state | current_tool_id: id, current_tool_kind: :client}}
+
+      {:server_tool_use_start, id, _name} = event, state ->
+        {event, %{state | current_tool_id: id, current_tool_kind: :server}}
+
+      {:input_json_delta, json}, %State{current_tool_kind: :server} = state ->
+        {{:server_tool_input_delta, state.current_tool_id, json}, state}
 
       {:input_json_delta, json}, state ->
         {{:input_json_delta, state.current_tool_id, json}, state}
 
       {:content_block_stop, _} = event, state ->
-        {event, %{state | current_tool_id: nil}}
+        {event, %{state | current_tool_id: nil, current_tool_kind: nil}}
 
       event, state ->
         {event, state}
@@ -227,6 +243,25 @@ defmodule Clementine.LLM.StreamParser do
     [{:content_block_start, index, :redacted_thinking}, {:redacted_thinking, data}]
   end
 
+  # A call the API runs itself (the tool search for deferred tools). Its
+  # input streams as input_json_delta, like a client tool's.
+  defp convert_event("content_block_start", %{
+         "index" => index,
+         "content_block" => %{"type" => "server_tool_use", "id" => id, "name" => name}
+       }) do
+    [{:content_block_start, index, :server_tool_use}, {:server_tool_use_start, id, name}]
+  end
+
+  # The search's result arrives complete in the start event, once the
+  # search has run; no deltas follow.
+  defp convert_event("content_block_start", %{
+         "index" => index,
+         "content_block" =>
+           %{"type" => "tool_search_tool_result", "tool_use_id" => _, "content" => _} = block
+       }) do
+    [{:content_block_start, index, :server_tool_result}, {:server_tool_result, block}]
+  end
+
   defp convert_event("content_block_delta", %{
          "index" => _index,
          "delta" => %{"type" => "text_delta", "text" => text}
@@ -289,11 +324,21 @@ defmodule Clementine.LLM.StreamParser do
 
     This is useful when you want to collect all stream events
     and get the final message content.
+
+    Content keeps the order the provider streamed it in. A replayed
+    assistant turn must match what the model produced: a tool search's
+    result follows its call, the text on either side of a search stays on
+    its side, and a provider that binds a thinking block to what precedes
+    it sees exactly that.
     """
 
-    defstruct text: "",
-              tool_uses: [],
-              thinking_blocks: [],
+    alias Clementine.LLM.Message.Content
+    alias Clementine.LLM.Response
+
+    # `blocks` holds finished content blocks, newest first. `text` is the
+    # open text run: any other block's start closes it into `blocks`.
+    defstruct blocks: [],
+              text: "",
               current_thinking: nil,
               open_tools: %{},
               open_tool_ids: [],
@@ -310,11 +355,18 @@ defmodule Clementine.LLM.StreamParser do
     end
 
     def process(%__MODULE__{} = acc, {:content_block_start, _index, :thinking}) do
-      %{acc | current_thinking: %{thinking: "", signature: nil}}
+      %{close_text(acc) | current_thinking: %{thinking: "", signature: nil}}
     end
 
-    def process(%__MODULE__{} = acc, {:thinking_delta, text}) do
-      current = acc.current_thinking || %{thinking: "", signature: nil}
+    def process(%__MODULE__{} = acc, {:content_block_start, _index, _kind}) do
+      close_text(acc)
+    end
+
+    def process(%__MODULE__{current_thinking: nil} = acc, {:thinking_delta, _} = event) do
+      process(%{close_text(acc) | current_thinking: %{thinking: "", signature: nil}}, event)
+    end
+
+    def process(%__MODULE__{current_thinking: current} = acc, {:thinking_delta, text}) do
       %{acc | current_thinking: %{current | thinking: current.thinking <> text}}
     end
 
@@ -324,33 +376,34 @@ defmodule Clementine.LLM.StreamParser do
     end
 
     def process(%__MODULE__{} = acc, {:redacted_thinking, data}) do
-      %{acc | thinking_blocks: acc.thinking_blocks ++ [{:redacted, data}]}
+      push(close_text(acc), Content.redacted_thinking(data))
     end
 
     # Open tool calls are tracked by id: the Chat Completions parser can
     # stream several calls in one turn before any stop event, and their
     # input deltas may interleave. Ids route the deltas; stops close calls
-    # oldest-first, matching every parser's stop order.
+    # oldest-first, matching every parser's stop order. A server tool's
+    # call (the API's tool search) is tracked the same way and closes into
+    # its own block, which the engine never executes.
     def process(%__MODULE__{} = acc, {:tool_use_start, id, name}) do
-      if Map.has_key?(acc.open_tools, id) do
-        acc
-      else
-        %{
-          acc
-          | open_tools: Map.put(acc.open_tools, id, %{id: id, name: name, input: ""}),
-            open_tool_ids: acc.open_tool_ids ++ [id]
-        }
-      end
+      open_tool(acc, id, name, :client)
+    end
+
+    def process(%__MODULE__{} = acc, {:server_tool_use_start, id, name}) do
+      open_tool(acc, id, name, :server)
     end
 
     def process(%__MODULE__{} = acc, {:input_json_delta, id, json}) do
-      case acc.open_tools do
-        %{^id => tool} ->
-          %{acc | open_tools: Map.put(acc.open_tools, id, %{tool | input: tool.input <> json})}
+      append_input(acc, id, json)
+    end
 
-        _ ->
-          acc
-      end
+    def process(%__MODULE__{} = acc, {:server_tool_input_delta, id, json}) do
+      append_input(acc, id, json)
+    end
+
+    def process(%__MODULE__{} = acc, {:server_tool_result, block}) do
+      %{"type" => block_type, "tool_use_id" => id, "content" => content} = block
+      push(close_text(acc), Content.server_tool_result(id, block_type, content))
     end
 
     def process(%__MODULE__{open_tool_ids: [id | rest]} = acc, {:content_block_stop, _}) do
@@ -359,10 +412,7 @@ defmodule Clementine.LLM.StreamParser do
 
       case decode_tool_input(tool.input) do
         {:ok, parsed_input} ->
-          %{
-            acc
-            | tool_uses: acc.tool_uses ++ [%{id: tool.id, name: tool.name, input: parsed_input}]
-          }
+          push(acc, tool_block(tool, parsed_input))
 
         {:error, reason} ->
           %{acc | error: acc.error || tool_input_error(tool, reason)}
@@ -374,16 +424,13 @@ defmodule Clementine.LLM.StreamParser do
           {:content_block_stop, _}
         )
         when thinking != nil do
-      %{
-        acc
-        | thinking_blocks:
-            acc.thinking_blocks ++ [{:thinking, thinking.thinking, thinking.signature}],
-          current_thinking: nil
-      }
+      acc
+      |> push(Content.thinking(thinking.thinking, thinking.signature))
+      |> Map.put(:current_thinking, nil)
     end
 
     def process(%__MODULE__{} = acc, {:content_block_stop, _}) do
-      acc
+      close_text(acc)
     end
 
     def process(%__MODULE__{} = acc, {:message_delta, %{"stop_reason" => reason}, usage}) do
@@ -405,6 +452,44 @@ defmodule Clementine.LLM.StreamParser do
 
     def process(%__MODULE__{} = acc, _event) do
       acc
+    end
+
+    defp open_tool(%__MODULE__{} = acc, id, name, kind) do
+      if Map.has_key?(acc.open_tools, id) do
+        acc
+      else
+        acc = close_text(acc)
+
+        %{
+          acc
+          | open_tools: Map.put(acc.open_tools, id, %{id: id, name: name, input: "", kind: kind}),
+            open_tool_ids: acc.open_tool_ids ++ [id]
+        }
+      end
+    end
+
+    defp append_input(%__MODULE__{} = acc, id, json) do
+      case acc.open_tools do
+        %{^id => tool} ->
+          %{acc | open_tools: Map.put(acc.open_tools, id, %{tool | input: tool.input <> json})}
+
+        _ ->
+          acc
+      end
+    end
+
+    defp tool_block(%{kind: :client} = tool, input),
+      do: Content.tool_use(tool.id, tool.name, input)
+
+    defp tool_block(%{kind: :server} = tool, input),
+      do: Content.server_tool_use(tool.id, tool.name, input)
+
+    defp push(%__MODULE__{} = acc, block), do: %{acc | blocks: [block | acc.blocks]}
+
+    defp close_text(%__MODULE__{text: ""} = acc), do: acc
+
+    defp close_text(%__MODULE__{} = acc) do
+      %{push(acc, Content.text(acc.text)) | text: ""}
     end
 
     defp decode_tool_input(""), do: {:ok, %{}}
@@ -443,26 +528,14 @@ defmodule Clementine.LLM.StreamParser do
     def error?(%__MODULE__{error: nil}), do: false
     def error?(%__MODULE__{}), do: true
 
-    @doc "Returns the accumulated response as a Response struct"
+    @doc """
+    Returns the accumulated response as a Response struct: the finished
+    blocks in the order they streamed, then any text still open. A call
+    or thinking block whose stop never arrived is left out.
+    """
     def to_response(%__MODULE__{} = acc) do
-      alias Clementine.LLM.Message.Content
-      alias Clementine.LLM.Response
-
-      # Thinking blocks lead the content, as the API returns them and as a
-      # replayed assistant turn expects them; each keeps its own signature.
-      thinking_content =
-        Enum.map(acc.thinking_blocks, fn
-          {:thinking, thinking, signature} -> Content.thinking(thinking, signature)
-          {:redacted, data} -> Content.redacted_thinking(data)
-        end)
-
-      text_content = if acc.text != "", do: [Content.text(acc.text)], else: []
-
-      tool_content =
-        Enum.map(acc.tool_uses, fn t -> Content.tool_use(t.id, t.name, t.input) end)
-
       content =
-        case thinking_content ++ text_content ++ tool_content do
+        case Enum.reverse(close_text(acc).blocks) do
           [] -> [Content.text("")]
           content -> content
         end

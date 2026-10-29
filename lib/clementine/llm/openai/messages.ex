@@ -41,12 +41,20 @@ defmodule Clementine.LLM.OpenAI.Messages do
           items = flush_text_message(role, text_buffer, items)
           {[tool_result_to_openai(block) | items], []}
 
-        # Anthropic reasoning artifacts have no Responses API encoding;
-        # a history carried across providers drops them rather than crashing.
+        # Anthropic reasoning artifacts and the tool searches the API ran
+        # itself have no Responses API encoding; a history carried across
+        # providers drops them rather than crashing. The calls a search
+        # led to stay: this provider got every deferred tool up front.
         %Content.Thinking{}, acc ->
           acc
 
         %Content.RedactedThinking{}, acc ->
+          acc
+
+        %Content.ServerToolUse{}, acc ->
+          acc
+
+        %Content.ServerToolResult{}, acc ->
           acc
       end)
 

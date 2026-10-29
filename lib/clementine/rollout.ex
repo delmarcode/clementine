@@ -106,7 +106,8 @@ defmodule Clementine.Rollout do
     [
       model: agent.model,
       system: agent.instructions,
-      tools: agent.tools,
+      tools: agent.tools ++ agent.deferred,
+      deferred: agent.deferred,
       context: rollout.context,
       messages: rollout.messages,
       max_iterations: Keyword.get(limits(rollout), :max_iterations, @default_max_iterations),
@@ -125,6 +126,7 @@ defmodule Clementine.Rollout do
       :model,
       :system,
       :tools,
+      :deferred,
       :context,
       :max_iterations,
       :emit,
@@ -228,6 +230,7 @@ defmodule Clementine.Rollout do
       model: Keyword.fetch!(config, :model),
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
+      deferred: Keyword.get(config, :deferred, []),
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       emit: Keyword.get(opts, :emit),
@@ -692,22 +695,30 @@ defmodule Clementine.Rollout do
     %{exec | usage: Clementine.Usage.add(exec.usage, delta)}
   end
 
+  # A turn the provider paused mid-way through its own tools (a long tool
+  # search) goes back as it stands, and the provider resumes it: one more
+  # gather, bounded by the iteration cap like any other.
   defp act(%Execution{} = exec, response) do
     exec = %{exec | messages: exec.messages ++ [AssistantMessage.new(response.content)]}
 
-    if LLM.tool_use?(response) do
-      act_on_tools(exec, LLM.get_tool_uses(response))
-    else
-      conclude(
-        exec,
-        {:ok,
-         Clementine.Result.completed(
-           input_message: exec.input_message,
-           messages: Enum.drop(exec.messages, exec.prefix_len),
-           output: LLM.get_text(response),
-           usage: exec.usage
-         )}
-      )
+    cond do
+      LLM.tool_use?(response) ->
+        act_on_tools(exec, LLM.get_tool_uses(response))
+
+      LLM.paused?(response) ->
+        boundary(exec)
+
+      true ->
+        conclude(
+          exec,
+          {:ok,
+           Clementine.Result.completed(
+             input_message: exec.input_message,
+             messages: Enum.drop(exec.messages, exec.prefix_len),
+             output: LLM.get_text(response),
+             usage: exec.usage
+           )}
+        )
     end
   end
 
@@ -951,11 +962,15 @@ defmodule Clementine.Rollout do
     end)
   end
 
-  defp stream_opts(%Execution{deadline: nil}), do: []
+  defp stream_opts(%Execution{deadline: nil, deferred: deferred}), do: deferred_opts(deferred)
 
-  defp stream_opts(%Execution{deadline: deadline}) do
-    [receive_timeout: min(@provider_receive_timeout, remaining_ms(deadline))]
+  defp stream_opts(%Execution{deadline: deadline, deferred: deferred}) do
+    [receive_timeout: min(@provider_receive_timeout, remaining_ms(deadline))] ++
+      deferred_opts(deferred)
   end
+
+  defp deferred_opts([]), do: []
+  defp deferred_opts(deferred), do: [deferred: deferred]
 
   defp batch_opts(%Execution{deadline: nil}), do: []
 

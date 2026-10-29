@@ -141,6 +141,34 @@ decision — see [Approvals](approvals.md)) and `retry:` (declare a tool
 safe to re-execute — see the effect fence in
 [Durable Execution](durable-execution.md)).
 
+### Many tools
+
+The model chooses among a few tools well and among dozens badly, and
+every tool's schema costs context on every call. When an agent needs a
+large catalog (several MCP servers, say), keep the few it always uses in
+`tools:` and list the rest as `deferred:`:
+
+<!-- guide-sample: parse-only -->
+```elixir
+agent =
+  Clementine.Agent.new(
+    model: :claude_sonnet,
+    instructions: "You help customers with their orders.",
+    tools: [MyApp.Tools.LookupOrder],
+    deferred: [MyApp.Tools.IssueRefund, MyApp.Tools.ChangeAddress, MyApp.Tools.CancelOrder]
+  )
+```
+
+On an Anthropic model the deferred tools go to the Messages API's tool
+search: the model starts out seeing `tools:` and searches the deferred
+tools' names and descriptions for the few it needs, which then load
+into its context. A found tool runs like any other, approval gate and
+all. The search itself is part of the turn's messages
+(`Clementine.LLM.Message.Content.ServerToolUse` and `ServerToolResult`),
+so history that stores and replays a turn's messages keeps the tools it
+found. Providers without tool search get deferred tools as ordinary
+tools.
+
 ## Streaming
 
 `Clementine.stream/3` returns a lazy enumerable of `Clementine.Event`

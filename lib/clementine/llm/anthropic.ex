@@ -27,6 +27,19 @@ defmodule Clementine.LLM.Anthropic do
   `:reasoning` translates to the Messages API `thinking` and
   `output_config` request fields (see `Clementine.LLM.Reasoning`); a
   `:reasoning` entry in request opts overrides the configured value.
+
+  ## Deferred tools
+
+  Tools named in the `:deferred` request option (a subset of `tools`)
+  go with `defer_loading: true`, beside the API's tool search tool
+  (`tool_search_tool_regex_20251119`): Claude sees only the tools that
+  are not deferred until a search loads the ones it needs. The search's
+  `server_tool_use` and `tool_search_tool_result` blocks come back as
+  `Clementine.LLM.Message.Content.ServerToolUse` and `ServerToolResult`
+  and must be replayed with the turn, which history does. The search runs
+  inside the response, so its stream emits `{:server_tool_use_start, id,
+  name}`, `{:server_tool_input_delta, id, json}`, and
+  `{:server_tool_result, block}` rather than the client tool events.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -268,7 +281,7 @@ defmodule Clementine.LLM.Anthropic do
 
     body =
       if tools != nil and tools != [] do
-        Map.put(body, "tools", format_tools(tools))
+        Map.put(body, "tools", Tools.encode_all(tools, Keyword.get(opts, :deferred, [])))
       else
         body
       end
@@ -320,10 +333,6 @@ defmodule Clementine.LLM.Anthropic do
     Messages.encode_all(messages)
   end
 
-  defp format_tools(tools) do
-    Tools.encode_all(tools)
-  end
-
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do
     %Response{
       content: Enum.flat_map(content, &parse_content_block/1),
@@ -348,6 +357,16 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp parse_content_block(%{"type" => "redacted_thinking"} = block) do
+    [Messages.decode_content(block)]
+  end
+
+  # A tool search the API ran for deferred tools: kept, in place, so the
+  # turn replays as produced and the tools it loaded stay loaded.
+  defp parse_content_block(%{"type" => "server_tool_use"} = block) do
+    [Messages.decode_content(block)]
+  end
+
+  defp parse_content_block(%{"type" => "tool_search_tool_result"} = block) do
     [Messages.decode_content(block)]
   end
 

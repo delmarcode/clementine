@@ -40,6 +40,75 @@ defmodule Clementine.LLM.MessageSerializationTest do
       assert Content.from_map(Content.to_map(block)) == block
     end
 
+    test "server_tool_use" do
+      block =
+        Content.server_tool_use("srvtoolu_1", "tool_search_tool_regex", %{"pattern" => "refund"})
+
+      assert Content.from_map(Content.to_map(block)) == block
+    end
+
+    test "server_tool_result keeps the provider's block type and payload" do
+      block =
+        Content.server_tool_result("srvtoolu_1", "tool_search_tool_result", %{
+          "type" => "tool_search_tool_search_result",
+          "tool_references" => [%{"type" => "tool_reference", "tool_name" => "issue_refund"}]
+        })
+
+      assert Content.to_map(block) == %{
+               "type" => "server_tool_result",
+               "tool_use_id" => "srvtoolu_1",
+               "block_type" => "tool_search_tool_result",
+               "content" => %{
+                 "type" => "tool_search_tool_search_result",
+                 "tool_references" => [
+                   %{"type" => "tool_reference", "tool_name" => "issue_refund"}
+                 ]
+               }
+             }
+
+      assert Content.from_map(Content.to_map(block)) == block
+    end
+
+    test "server_tool_result payloads may be lists" do
+      block = Content.server_tool_result("srvtoolu_1", "web_search_tool_result", [%{"a" => 1}])
+      assert Content.from_map(Content.to_map(block)) == block
+    end
+
+    test "server tool blocks reject extra keys, missing fields, and unsafe payloads" do
+      assert_raise ArgumentError, ~r/unexpected server_tool_result content field/, fn ->
+        Content.from_map(%{
+          "type" => "server_tool_result",
+          "tool_use_id" => "s1",
+          "block_type" => "tool_search_tool_result",
+          "content" => %{},
+          "extra" => true
+        })
+      end
+
+      assert_raise ArgumentError, ~r/"content"/, fn ->
+        Content.from_map(%{
+          "type" => "server_tool_result",
+          "tool_use_id" => "s1",
+          "block_type" => "tool_search_tool_result"
+        })
+      end
+
+      assert_raise ArgumentError, ~r/server_tool_use.input to be a JSON object/, fn ->
+        Content.from_map(%{
+          "type" => "server_tool_use",
+          "id" => "s1",
+          "name" => "n",
+          "input" => []
+        })
+      end
+
+      assert_raise ArgumentError, ~r/JSON-safe/, fn ->
+        Content.to_map(
+          Content.server_tool_result("s1", "tool_search_tool_result", %{"a" => self()})
+        )
+      end
+    end
+
     test "to_map produces string-keyed, tagged maps" do
       assert Content.to_map(Content.text("hi")) == %{"type" => "text", "text" => "hi"}
 
@@ -216,6 +285,25 @@ defmodule Clementine.LLM.MessageSerializationTest do
 
     test "ToolResultMessage" do
       msg = ToolResultMessage.new([{"id1", {:ok, "done", is_error: false}}])
+      assert jason_round_trip(msg) == msg
+    end
+
+    test "AssistantMessage with a tool search, in the order it streamed" do
+      msg =
+        AssistantMessage.new([
+          Content.text("Let me find a tool."),
+          Content.server_tool_use("srvtoolu_1", "tool_search_tool_regex", %{
+            "pattern" => "refund",
+            "limit" => 3
+          }),
+          Content.server_tool_result("srvtoolu_1", "tool_search_tool_result", %{
+            "type" => "tool_search_tool_search_result",
+            "tool_references" => [%{"type" => "tool_reference", "tool_name" => "issue_refund"}]
+          }),
+          Content.text("Found it."),
+          Content.tool_use("toolu_1", "issue_refund", %{"order" => "A1"})
+        ])
+
       assert jason_round_trip(msg) == msg
     end
 

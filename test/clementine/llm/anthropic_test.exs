@@ -189,6 +189,160 @@ defmodule Clementine.LLM.AnthropicTest do
     end
   end
 
+  describe "deferred tools" do
+    alias Clementine.Test.Tools.{Add, Echo, GatedDeploy}
+
+    test "stream/5 sends deferred tools with defer_loading, beside the tool search tool", %{
+      bypass: bypass
+    } do
+      test = self()
+
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test, {:request, Jason.decode!(body)})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.resp(200, Clementine.Test.Fixtures.sse_text_stream("ok"))
+      end)
+
+      :claude_test
+      |> Anthropic.stream("system", [UserMessage.new("Hi")], [Echo, Add, GatedDeploy],
+        deferred: [Add, GatedDeploy]
+      )
+      |> Stream.run()
+
+      assert_received {:request, request}
+
+      assert [
+               %{
+                 "type" => "tool_search_tool_regex_20251119",
+                 "name" => "tool_search_tool_regex"
+               } = search,
+               %{"name" => "echo"} = echo,
+               %{"name" => "add", "defer_loading" => true, "input_schema" => %{}},
+               %{"name" => "gated_deploy", "defer_loading" => true, "description" => _}
+             ] = request["tools"]
+
+      refute Map.has_key?(search, "defer_loading")
+      refute Map.has_key?(echo, "defer_loading")
+    end
+
+    test "call/5 without deferred tools sends neither the search tool nor defer_loading", %{
+      bypass: bypass
+    } do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        assert [%{"name" => "echo"} = echo, %{"name" => "add"} = add] = request["tools"]
+        refute Map.has_key?(echo, "defer_loading")
+        refute Map.has_key?(add, "defer_loading")
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("ok"))
+      end)
+
+      assert {:ok, %Response{}} =
+               Anthropic.call(:claude_test, "system", [UserMessage.new("Hi")], [Echo, Add],
+                 deferred: []
+               )
+    end
+
+    test "stream/5 collects a tool search turn in the order the API sent it", %{bypass: bypass} do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.resp(200, Clementine.Test.Fixtures.sse_tool_search_stream())
+      end)
+
+      assert {:ok, %Response{stop_reason: "tool_use", content: content}} =
+               :claude_test
+               |> Anthropic.stream("system", [UserMessage.new("Weather in SF?")], [Echo, Add],
+                 deferred: [Add]
+               )
+               |> Clementine.LLM.collect_stream()
+
+      assert [
+               %Content.Text{},
+               %Content.ServerToolUse{id: "srvtoolu_01ABC123", input: %{"pattern" => "weather"}},
+               %Content.ServerToolResult{
+                 tool_use_id: "srvtoolu_01ABC123",
+                 block_type: "tool_search_tool_result"
+               },
+               %Content.Text{},
+               %Content.ToolUse{id: "toolu_01XYZ789", name: "get_weather"}
+             ] = content
+    end
+
+    test "call/5 parses a tool search turn's blocks in place", %{bypass: bypass} do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, Jason.encode!(tool_search_response()))
+      end)
+
+      assert {:ok, %Response{} = response} =
+               Anthropic.call(:claude_test, "system", [UserMessage.new("Weather?")], [Echo])
+
+      assert [
+               %Content.Text{text: "I'll search for tools to help with the weather information."},
+               %Content.ServerToolUse{
+                 id: "srvtoolu_01ABC123",
+                 name: "tool_search_tool_regex",
+                 input: %{"pattern" => "weather", "limit" => 10}
+               },
+               %Content.ServerToolResult{
+                 tool_use_id: "srvtoolu_01ABC123",
+                 block_type: "tool_search_tool_result"
+               },
+               %Content.Text{},
+               %Content.ToolUse{id: "toolu_01XYZ789", name: "get_weather"}
+             ] = response.content
+
+      assert Clementine.LLM.get_tool_uses(response) == [List.last(response.content)]
+    end
+
+    test "call/5 replays a tool search turn exactly as the API sent it", %{bypass: bypass} do
+      assistant_turn = %{"role" => "assistant", "content" => tool_search_response()["content"]}
+
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        assert [
+                 %{"role" => "user", "content" => "Weather?"},
+                 ^assistant_turn,
+                 %{
+                   "role" => "user",
+                   "content" => [
+                     %{
+                       "type" => "tool_result",
+                       "tool_use_id" => "toolu_01XYZ789",
+                       "content" => "Sunny"
+                     }
+                   ]
+                 }
+               ] = request["messages"]
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("It's sunny."))
+      end)
+
+      assistant = Clementine.LLM.Anthropic.Messages.decode_assistant(assistant_turn)
+
+      messages = [
+        UserMessage.new("Weather?"),
+        assistant,
+        %ToolResultMessage{content: [Content.tool_result("toolu_01XYZ789", "Sunny")]}
+      ]
+
+      assert {:ok, %Response{}} = Anthropic.call(:claude_test, "system", messages, [Echo])
+    end
+  end
+
   describe "streaming errors" do
     test "stream/5 surfaces the provider error body on a non-200 response", %{bypass: bypass} do
       error_body =
@@ -205,6 +359,45 @@ defmodule Clementine.LLM.AnthropicTest do
 
       assert [{:error, {:api_error, 404, ^error_body}}] = events
     end
+  end
+
+  # The response format of the Messages API's tool search documentation.
+  defp tool_search_response do
+    %{
+      "role" => "assistant",
+      "content" => [
+        %{
+          "type" => "text",
+          "text" => "I'll search for tools to help with the weather information."
+        },
+        %{
+          "type" => "server_tool_use",
+          "id" => "srvtoolu_01ABC123",
+          "name" => "tool_search_tool_regex",
+          "input" => %{"pattern" => "weather", "limit" => 10}
+        },
+        %{
+          "type" => "tool_search_tool_result",
+          "tool_use_id" => "srvtoolu_01ABC123",
+          "content" => %{
+            "type" => "tool_search_tool_search_result",
+            "tool_references" => [%{"type" => "tool_reference", "tool_name" => "get_weather"}]
+          }
+        },
+        %{
+          "type" => "text",
+          "text" => "I found a weather tool. Let me get the weather for San Francisco."
+        },
+        %{
+          "type" => "tool_use",
+          "id" => "toolu_01XYZ789",
+          "name" => "get_weather",
+          "input" => %{"location" => "San Francisco", "unit" => "fahrenheit"}
+        }
+      ],
+      "stop_reason" => "tool_use",
+      "usage" => %{"input_tokens" => 30, "output_tokens" => 40}
+    }
   end
 
   defp text_response(text) do

@@ -377,6 +377,32 @@ tool in a durable run resolves paths only under a `working_dir` (or
 directory, unlike the in-process path, and without one the tool returns
 an error.
 
+## Many tools: `deferred:`
+
+An agent with more tools than a model chooses among well (tens, or
+several MCP servers' worth) lists the ones it rarely needs as
+`deferred:`, beside `tools:`:
+
+```elixir
+use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "...",
+  tools: [MyApp.Tools.LookupOrder], deferred: [MyApp.Tools.IssueRefund, MyApp.Tools.CancelOrder]
+```
+
+- On an Anthropic model, deferred tools go to the API's tool search: the
+  model sees `tools:` up front and loads the deferred tools it needs by
+  searching their names, descriptions, and argument names, so write
+  those to be found. Any other provider gets them as ordinary tools.
+- Once found, a deferred tool is an ordinary tool: `approval:`,
+  `retry:`, and the tool context apply, and a gated one parks the run.
+- A tool is in `tools:` or `deferred:`, never both; the build fails.
+- The search is part of the turn: `result.messages` carries it as
+  `Content.ServerToolUse` and `Content.ServerToolResult`, which
+  `to_map/1` and `from_map/1` round-trip. Store and replay them with the
+  rest; the API reads them to keep the tools the search loaded.
+- Keep `deferred:` stable across a thread's turns, as `tools:`: history
+  names the tools a search loaded, and the API refuses a name the
+  request no longer carries.
+
 ## Never
 
 - Never send mail, call a service, broadcast, or write files in

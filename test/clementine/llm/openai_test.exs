@@ -169,6 +169,56 @@ defmodule Clementine.LLM.OpenAITest do
     assert encoded == [%{"type" => "message", "role" => "assistant", "content" => "Answer."}]
   end
 
+  test "message encoding skips a tool search the Anthropic API ran, keeping the call it led to" do
+    alias Clementine.LLM.Message.AssistantMessage
+
+    encoded =
+      Clementine.LLM.OpenAI.Messages.encode_all([
+        %AssistantMessage{
+          content: [
+            Content.server_tool_use("srvtoolu_1", "tool_search_tool_regex", %{"pattern" => "x"}),
+            Content.server_tool_result("srvtoolu_1", "tool_search_tool_result", %{}),
+            Content.tool_use("toolu_1", "echo", %{"message" => "hi"})
+          ]
+        }
+      ])
+
+    assert [%{"type" => "function_call", "call_id" => "toolu_1", "name" => "echo"}] = encoded
+  end
+
+  test "call/5 sends deferred tools as ordinary tools: no tool search here", %{bypass: bypass} do
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+
+      assert [%{"name" => "echo"} = echo, %{"name" => "add"} = add] = request["tools"]
+      refute Map.has_key?(echo, "defer_loading")
+      refute Map.has_key?(add, "defer_loading")
+
+      response = %{
+        "id" => "resp_3",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => "ok"}]
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 1}
+      }
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, Jason.encode!(response))
+    end)
+
+    tools = [Clementine.Test.Tools.Echo, Clementine.Test.Tools.Add]
+
+    assert {:ok, %Response{}} =
+             OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], tools,
+               deferred: [Clementine.Test.Tools.Add]
+             )
+  end
+
   test "call/5 parses tool calls", %{bypass: bypass} do
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       response = %{

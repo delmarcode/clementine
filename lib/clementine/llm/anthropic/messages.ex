@@ -53,6 +53,18 @@ defmodule Clementine.LLM.Anthropic.Messages do
     Content.redacted_thinking(data)
   end
 
+  def decode_content(%{"type" => "server_tool_use", "id" => id, "name" => name} = data) do
+    Content.server_tool_use(id, name, Map.get(data, "input", %{}))
+  end
+
+  def decode_content(%{
+        "type" => "tool_search_tool_result" = type,
+        "tool_use_id" => id,
+        "content" => content
+      }) do
+    Content.server_tool_result(id, type, content)
+  end
+
   defp encode_content(%Content.Text{text: text}) do
     %{"type" => "text", "text" => text}
   end
@@ -73,5 +85,19 @@ defmodule Clementine.LLM.Anthropic.Messages do
 
   defp encode_content(%Content.RedactedThinking{data: data}) do
     %{"type" => "redacted_thinking", "data" => data}
+  end
+
+  # Replayed as the provider sent them: the API reads a tool search's
+  # references from history to keep the tools it loaded in context.
+  defp encode_content(%Content.ServerToolUse{id: id, name: name, input: input}) do
+    %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
+  end
+
+  defp encode_content(%Content.ServerToolResult{} = result) do
+    %{
+      "type" => result.block_type,
+      "tool_use_id" => result.tool_use_id,
+      "content" => result.content
+    }
   end
 end

@@ -8,6 +8,9 @@ defmodule Clementine.LLM.ClientBehaviour do
   @type model :: Clementine.LLM.ModelRegistry.model_ref()
   @type messages :: [Clementine.LLM.Message.message()]
   @type tools :: [module()]
+  # `:deferred` names tools in `tools` the model may load on demand; a
+  # client without tool search sends them as ordinary tools (see
+  # `Clementine.LLM.call/5`).
   @type opts :: keyword()
 
   @type response :: Clementine.LLM.Response.t()

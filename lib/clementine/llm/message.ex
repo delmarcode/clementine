@@ -76,12 +76,61 @@ defmodule Clementine.LLM.Message do
       @type t :: %__MODULE__{data: String.t()}
     end
 
+    defmodule ServerToolUse do
+      @moduledoc """
+      A call the provider ran itself (Anthropic `server_tool_use`), such
+      as the tool search that loads deferred tools.
+
+      Clementine never executes it and never answers it with a tool
+      result: the provider settled it within the same response. It stays
+      in history so the assistant turn replays exactly as produced.
+      """
+      @enforce_keys [:id, :name, :input]
+      defstruct [:id, :name, :input]
+
+      @type t :: %__MODULE__{
+              id: String.t(),
+              name: String.t(),
+              input: Content.json_object()
+            }
+    end
+
+    defmodule ServerToolResult do
+      @moduledoc """
+      The provider's own result for a `ServerToolUse`, such as the tool
+      references an Anthropic tool search returns.
+
+      `block_type` is the provider's block type
+      (`"tool_search_tool_result"`) and `content` its payload, both kept
+      as the provider sent them: the provider reads them again when the
+      turn is replayed (a tool search's references are how later turns
+      still see the tools it loaded).
+      """
+      @enforce_keys [:tool_use_id, :block_type, :content]
+      defstruct [:tool_use_id, :block_type, :content]
+
+      @type t :: %__MODULE__{
+              tool_use_id: String.t(),
+              block_type: String.t(),
+              content: Content.json_value()
+            }
+    end
+
     @type text :: Text.t()
     @type tool_use :: ToolUse.t()
     @type tool_result :: ToolResult.t()
     @type thinking :: Thinking.t()
     @type redacted_thinking :: RedactedThinking.t()
-    @type t :: text() | tool_use() | tool_result() | thinking() | redacted_thinking()
+    @type server_tool_use :: ServerToolUse.t()
+    @type server_tool_result :: ServerToolResult.t()
+    @type t ::
+            text()
+            | tool_use()
+            | tool_result()
+            | thinking()
+            | redacted_thinking()
+            | server_tool_use()
+            | server_tool_result()
     @type json_object :: %{String.t() => json_value()}
 
     @doc "Creates a text content block"
@@ -111,17 +160,36 @@ defmodule Clementine.LLM.Message do
       %RedactedThinking{data: data}
     end
 
+    @doc "Creates a server tool use content block (a call the provider ran itself)"
+    def server_tool_use(id, name, input)
+        when is_binary(id) and is_binary(name) and is_map(input) do
+      %ServerToolUse{id: id, name: name, input: input}
+    end
+
+    @doc """
+    Creates a server tool result content block: the provider's `block_type`
+    and its `content`, as the provider sent them.
+    """
+    def server_tool_result(tool_use_id, block_type, content)
+        when is_binary(tool_use_id) and is_binary(block_type) do
+      %ServerToolResult{tool_use_id: tool_use_id, block_type: block_type, content: content}
+    end
+
     @doc "Checks whether a struct is a known message content variant."
     def valid?(%Text{}), do: true
     def valid?(%ToolUse{}), do: true
     def valid?(%ToolResult{}), do: true
     def valid?(%Thinking{}), do: true
     def valid?(%RedactedThinking{}), do: true
+    def valid?(%ServerToolUse{}), do: true
+    def valid?(%ServerToolResult{}), do: true
     def valid?(_other), do: false
 
     @doc """
     Converts a content block into a JSON-safe, string-keyed map tagged with a
-    `"type"` discriminator (`"text"`, `"tool_use"`, or `"tool_result"`).
+    `"type"` discriminator (`"text"`, `"tool_use"`, `"tool_result"`,
+    `"thinking"`, `"redacted_thinking"`, `"server_tool_use"`, or
+    `"server_tool_result"`).
 
     The output contains only JSON-serializable values, so it survives
     `Jason.encode!/1`/`Jason.decode!/1` round trips and storage in Postgres
@@ -153,6 +221,22 @@ defmodule Clementine.LLM.Message do
 
     def to_map(%RedactedThinking{data: data}) do
       %{"type" => "redacted_thinking", "data" => data}
+    end
+
+    def to_map(%ServerToolUse{id: id, name: name, input: input}) do
+      validate_json_object!(input, "server_tool_use.input")
+      %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
+    end
+
+    def to_map(%ServerToolResult{tool_use_id: id, block_type: block_type, content: content}) do
+      validate_json_value!(content, "server_tool_result.content")
+
+      %{
+        "type" => "server_tool_result",
+        "tool_use_id" => id,
+        "block_type" => block_type,
+        "content" => content
+      }
     end
 
     @doc """
@@ -208,6 +292,30 @@ defmodule Clementine.LLM.Message do
           data
           |> fetch_binary!("data", "redacted thinking data")
           |> redacted_thinking()
+
+        "server_tool_use" ->
+          validate_keys!(data, ["type", "id", "name", "input"], "server_tool_use content")
+          input = fetch_json_object!(data, "input", "server_tool_use.input")
+
+          data
+          |> fetch_binary!("id", "server tool use id")
+          |> server_tool_use(fetch_binary!(data, "name", "server tool use name"), input)
+
+        "server_tool_result" ->
+          validate_keys!(
+            data,
+            ["type", "tool_use_id", "block_type", "content"],
+            "server_tool_result content"
+          )
+
+          content = fetch_json_value!(data, "content", "server_tool_result.content")
+
+          data
+          |> fetch_binary!("tool_use_id", "server tool result tool_use_id")
+          |> server_tool_result(
+            fetch_binary!(data, "block_type", "server tool result block_type"),
+            content
+          )
 
         _other ->
           raise ArgumentError, "unknown content type: #{inspect(type)}"
@@ -275,6 +383,17 @@ defmodule Clementine.LLM.Message do
 
         {:ok, value} ->
           raise ArgumentError, "expected #{label} to be a JSON object, got: #{inspect(value)}"
+
+        :error ->
+          raise ArgumentError, "expected content map to include #{inspect(key)}"
+      end
+    end
+
+    defp fetch_json_value!(map, key, label) do
+      case Map.fetch(map, key) do
+        {:ok, value} ->
+          validate_json_value!(value, label)
+          value
 
         :error ->
           raise ArgumentError, "expected content map to include #{inspect(key)}"
