@@ -136,6 +136,57 @@ defmodule Clementine.OutputSchemaTest do
       assert error.raw["stop_reason"] == "max_tokens"
     end
 
+    test "prose before a tool search, then the JSON: the answer is what the turn wrote last" do
+      json = ~s({"verdict": "pass", "score": 8, "reasons": ["on rubric"]})
+      expect_turn(searched_turn("Let me find the rubric.", json, "end_turn"))
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(rollout(tools: [Echo], output_schema: @verdict))
+
+      assert result.output == %{"verdict" => "pass", "score" => 8, "reasons" => ["on rubric"]}
+
+      assert [
+               %AssistantMessage{
+                 content: [
+                   %Content.Text{text: "Let me find the rubric."},
+                   %Content.ServerToolUse{id: "srvtoolu_1"},
+                   %Content.ServerToolResult{tool_use_id: "srvtoolu_1"},
+                   %Content.Text{text: ^json}
+                 ]
+               }
+             ] = result.messages
+    end
+
+    test "a mismatch after a search fails, and raw keeps all of the turn's text" do
+      expect_turn(searched_turn("Let me find the rubric.", ~s({"verdict": "pass"}), "end_turn"))
+
+      assert {:error, %Clementine.Error{code: :invalid_output} = error} =
+               Rollout.execute(rollout(tools: [Echo], output_schema: @verdict))
+
+      assert error.message =~ ~s(/: missing required property "score")
+      refute error.message =~ "not JSON"
+      assert error.raw["output"] == ~s(Let me find the rubric.\n\n{"verdict": "pass"})
+    end
+
+    test "JSON the provider split across a paused turn and its continuation decodes whole" do
+      expect_turn(searched_turn("Let me look.", ~s({"verdict": "pass", ), "pause_turn"))
+
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, messages, _tools, opts ->
+        assert opts[:output_schema] == @verdict
+        assert [%UserMessage{}, %AssistantMessage{}] = messages
+        text_events(~s("score": 7, "reasons": []}))
+      end)
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(rollout(tools: [Echo], output_schema: @verdict))
+
+      assert result.output == %{"verdict" => "pass", "score" => 7, "reasons" => []}
+
+      # One turn, one message: the continuation joined the paused turn.
+      assert [%AssistantMessage{content: [_text, _search, _result, _head, _tail]}] =
+               result.messages
+    end
+
     test "fails as a Result.Failed through the runner" do
       expect_turn(text_events("I would rather not."))
 
@@ -166,6 +217,21 @@ defmodule Clementine.OutputSchemaTest do
 
       assert message =~ "the answer is empty"
       assert message =~ "(the model refused)"
+    end
+  end
+
+  describe "decode/3 on a turn's blocks" do
+    test "a turn that ends on a block other than text has no answer; raw keeps its text" do
+      blocks = [
+        Content.text("Searching."),
+        Content.server_tool_use("srvtoolu_1", "tool_search_tool_regex", %{"pattern" => "x"})
+      ]
+
+      assert {:error, %Clementine.Error{message: message, raw: raw}} =
+               OutputSchema.decode(%{"type" => "object"}, blocks)
+
+      assert message =~ "the answer is empty"
+      assert raw["output"] == "Searching."
     end
   end
 
@@ -310,6 +376,34 @@ defmodule Clementine.OutputSchemaTest do
       {:input_json_delta, id, Jason.encode!(input)},
       {:content_block_stop, 0},
       {:message_delta, %{"stop_reason" => "tool_use"},
+       %{"input_tokens" => 7, "output_tokens" => 3}}
+    ]
+  end
+
+  # A final turn as the engine receives it from the Anthropic client: text,
+  # a tool search the API ran, its result, then more text, ending with
+  # `stop_reason`.
+  defp searched_turn(prose, answer, stop_reason) do
+    [
+      {:content_block_start, 0, :text},
+      {:text_delta, prose},
+      {:content_block_stop, 0},
+      {:content_block_start, 1, :server_tool_use},
+      {:server_tool_use_start, "srvtoolu_1", "tool_search_tool_regex"},
+      {:server_tool_input_delta, "srvtoolu_1", ~s({"pattern":"rubric"})},
+      {:content_block_stop, 1},
+      {:content_block_start, 2, :server_tool_result},
+      {:server_tool_result,
+       %{
+         "type" => "tool_search_tool_result",
+         "tool_use_id" => "srvtoolu_1",
+         "content" => %{"type" => "tool_search_tool_search_result", "tool_references" => []}
+       }},
+      {:content_block_stop, 2},
+      {:content_block_start, 3, :text},
+      {:text_delta, answer},
+      {:content_block_stop, 3},
+      {:message_delta, %{"stop_reason" => stop_reason},
        %{"input_tokens" => 7, "output_tokens" => 3}}
     ]
   end

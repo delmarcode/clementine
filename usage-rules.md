@@ -420,7 +420,9 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   stores, and what a loop's `{:completed, tag, result}` carries. Match
   on it; never parse text. Without `output_schema:`, `output` is text.
 - The run uses its tools freely; only the final answer is constrained,
-  through the provider's own structured output.
+  through the provider's own structured output. The answer is the text
+  the final turn writes last: prose before a tool search in that turn
+  is not part of it.
 - The root is an object; the build fails otherwise. Put
   `"additionalProperties": false` on every object, and for OpenAI list
   every property in `required` (type an optional one

@@ -11,8 +11,9 @@ defmodule Clementine.OutputSchema do
   The schema goes to the provider as its native structured output
   (Anthropic's `output_config.format`, OpenAI's `text.format`, the Chat
   Completions dialect's `response_format`), which constrains the model's
-  decoding to it. The engine then decodes the answer and checks it here
-  as well, because a provider's constraint gives way when the model
+  decoding to it. The engine then decodes the answer, the text the final
+  turn wrote last (after any tool search or thinking, and across a
+  paused turn's continuation), and checks it here as well, because a provider's constraint gives way when the model
   refuses or runs out of tokens, and an OpenAI-compatible server may not
   constrain at all. An answer that is not JSON, or does not match, fails
   the run with a `Clementine.Error` of code `:invalid_output`.
@@ -22,6 +23,8 @@ defmodule Clementine.OutputSchema do
   `allOf`, and `$ref` into the schema itself. Other keywords (`format`,
   `pattern`, `minimum`, ...) are the provider's to enforce or refuse.
   """
+
+  alias Clementine.LLM.Message.Content
 
   @typedoc "A JSON schema with string keys, its root an object."
   @type t :: %{required(String.t()) => term()}
@@ -63,18 +66,43 @@ defmodule Clementine.OutputSchema do
 
   @doc """
   Decodes a final answer against `schema`: `{:ok, map}`, or
-  `{:error, %Clementine.Error{code: :invalid_output}}` when the text is
+  `{:error, %Clementine.Error{code: :invalid_output}}` when the answer is
   not JSON or does not match. `stop_reason` is the provider's, which
   explains an answer cut off (`"max_tokens"`) or refused (`"refusal"`).
+
+  The answer is text, or the final turn's content blocks. From blocks,
+  the answer is the text after the last block that is not text: a turn
+  may say something before a tool search or a thinking block, and the
+  JSON is what it writes last. Adjacent text blocks run together, so an
+  answer the provider split across a paused turn and its continuation
+  decodes whole. The error's `raw["output"]` keeps all of the turn's
+  text.
   """
-  @spec decode(t(), String.t(), String.t() | nil) :: {:ok, map()} | {:error, Clementine.Error.t()}
-  def decode(schema, text, stop_reason \\ nil) when is_map(schema) and is_binary(text) do
-    with {:ok, value} <- parse(text),
+  @spec decode(t(), String.t() | [Content.t()], String.t() | nil) ::
+          {:ok, map()} | {:error, Clementine.Error.t()}
+  def decode(schema, answer, stop_reason \\ nil)
+
+  def decode(schema, blocks, stop_reason) when is_map(schema) and is_list(blocks),
+    do: decode_answer(schema, final_text(blocks), Content.join_text(blocks), stop_reason)
+
+  def decode(schema, text, stop_reason) when is_map(schema) and is_binary(text),
+    do: decode_answer(schema, text, text, stop_reason)
+
+  defp decode_answer(schema, answer, text, stop_reason) do
+    with {:ok, value} <- parse(answer),
          :ok <- validate(schema, value) do
       {:ok, value}
     else
       {:error, problems} -> {:error, invalid_output(problems, text, stop_reason)}
     end
+  end
+
+  defp final_text(blocks) do
+    blocks
+    |> Enum.reverse()
+    |> Enum.take_while(&match?(%Content.Text{}, &1))
+    |> Enum.reverse()
+    |> Enum.map_join("", & &1.text)
   end
 
   defp parse(text) do

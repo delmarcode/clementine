@@ -741,18 +741,14 @@ defmodule Clementine.Rollout do
 
   # The output is the final turn's text, the paused turn's included. An
   # agent with an output_schema answers in JSON: the output is the decoded
-  # map, and an answer that does not decode or match fails the run
+  # map of what the turn wrote last, after any search or thinking, and an
+  # answer that does not decode or match fails the run
   # (Clementine.OutputSchema).
   defp final_output(%Execution{output_schema: nil}, %AssistantMessage{} = turn, _response),
     do: {:ok, AssistantMessage.get_text(turn)}
 
   defp final_output(%Execution{output_schema: schema}, %AssistantMessage{} = turn, response),
-    do:
-      Clementine.OutputSchema.decode(
-        schema,
-        AssistantMessage.get_text(turn),
-        response.stop_reason
-      )
+    do: Clementine.OutputSchema.decode(schema, turn.content, response.stop_reason)
 
   # A signal that arrived during the gather is already in the mailbox:
   # honor it before the fence write and before any tool starts — a
