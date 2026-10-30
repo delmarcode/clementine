@@ -8,14 +8,14 @@ if Code.ensure_loaded?(Ecto.Migration) do
         defmodule MyApp.Repo.Migrations.AddClementine do
           use Ecto.Migration
 
-          def up, do: Clementine.Migration.up(version: 3)
-          def down, do: Clementine.Migration.down(version: 3)
+          def up, do: Clementine.Migration.up(version: 4)
+          def down, do: Clementine.Migration.down(version: 4)
         end
 
     Each version's DDL is frozen here: a migration that says `version: 1`
     builds the same table under every later Clementine. A host on an
     earlier version adopts a later one in a new migration with
-    `up(from: 2, version: 3)`.
+    `up(from: 3, version: 4)`.
 
     ## The version stamp
 
@@ -27,6 +27,25 @@ if Code.ensure_loaded?(Ecto.Migration) do
     table with no stamp was built before stamps, or by hand to match
     version 1; the check takes it for version 1. A table ahead of the code
     (the code rolled back after a migration) starts.
+
+    ## Version 4
+
+    The run's trace (`Clementine.Runs.trace/1`), a table of its own that
+    only Clementine writes:
+
+        agent_run_trace
+          id           bigserial primary key
+          run_id       uuid, not null, references agent_runs(id) on delete cascade
+          epoch        integer, not null   the execution that recorded the entry
+          seq          integer, not null   its number within that execution
+          kind         text, not null      execution | model_call | tool_call
+          payload      jsonb, not null
+          inserted_at  timestamptz, not null, default now()
+          index agent_run_trace_run_index on (run_id, id)
+
+    The cascade erases a run's trace with the run, so `Clementine.Runs.purge/1`
+    takes it. `up(from: 3, version: 4)` creates the table and touches no
+    row of `agent_runs`.
 
     ## Version 3
 
@@ -135,7 +154,8 @@ if Code.ensure_loaded?(Ecto.Migration) do
 
     @table :agent_runs
     @inbox :agent_run_inbox
-    @current_version 3
+    @trace :agent_run_trace
+    @current_version 4
 
     @doc "The newest version `up/1` can apply."
     @spec current_version() :: pos_integer()
@@ -370,6 +390,25 @@ if Code.ensure_loaded?(Ecto.Migration) do
         )
       )
 
+      stamp(3)
+    end
+
+    defp step_up(4) do
+      create table(@trace) do
+        add(:run_id, references(@table, type: :binary_id, on_delete: :delete_all), null: false)
+        add(:epoch, :integer, null: false)
+        add(:seq, :integer, null: false)
+        add(:kind, :text, null: false)
+        add(:payload, :map, null: false)
+        add(:inserted_at, :timestamptz, null: false, default: fragment("now()"))
+      end
+
+      create(index(@trace, [:run_id, :id], name: :agent_run_trace_run_index))
+      stamp(4)
+    end
+
+    defp step_down(4) do
+      drop(table(@trace))
       stamp(3)
     end
 

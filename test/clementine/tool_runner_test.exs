@@ -318,6 +318,8 @@ defmodule Clementine.ToolRunnerTest do
   describe "run_batch/4" do
     alias Clementine.Test.Tools.{SafePush, UnsafeSlow}
 
+    defp pairs(results), do: Map.new(results, fn {id, result, _ms} -> {id, result} end)
+
     @batch_tools @tools ++ [SafePush, UnsafeSlow]
 
     test "with no signal, matches execute/4: parallel, ordered, crash-isolated" do
@@ -328,9 +330,9 @@ defmodule Clementine.ToolRunnerTest do
       ]
 
       assert {:ok, results} = ToolRunner.run_batch(@batch_tools, calls, %{})
-      assert Enum.map(results, fn {id, _} -> id end) == ["call_1", "call_2", "call_3"]
+      assert Enum.map(results, fn {id, _, _} -> id end) == ["call_1", "call_2", "call_3"]
 
-      result_map = Map.new(results)
+      result_map = pairs(results)
       assert {:ok, %ToolResult{content: "Echo: first", is_error: false}} = result_map["call_1"]
       assert {:error, _} = result_map["call_2"]
       assert {:ok, %ToolResult{content: "Echo: third", is_error: false}} = result_map["call_3"]
@@ -344,10 +346,25 @@ defmodule Clementine.ToolRunnerTest do
 
       assert {:ok, results} = ToolRunner.run_batch(@batch_tools, calls, %{}, timeout: 100)
 
-      result_map = Map.new(results)
+      result_map = pairs(results)
       assert {:error, message} = result_map["call_1"]
       assert message =~ "timed out after 100ms"
       assert {:ok, %ToolResult{content: "Echo: hello"}} = result_map["call_2"]
+    end
+
+    test "each result carries how long its call took, from spawn to result" do
+      calls = [
+        %{id: "call_1", name: "slow", input: %{"delay_ms" => 60}},
+        %{id: "call_2", name: "echo", input: %{"message" => "hello"}},
+        %{id: "call_3", name: "slow", input: %{"delay_ms" => 5_000}}
+      ]
+
+      assert {:ok, [{"call_1", _, slow}, {"call_2", _, fast}, {"call_3", _, timed_out}]} =
+               ToolRunner.run_batch(@batch_tools, calls, %{}, timeout: 200)
+
+      assert slow >= 60 and slow < 200
+      assert fast < slow
+      assert timed_out >= 200
     end
 
     test "timeout telemetry matches execute/4's shape" do

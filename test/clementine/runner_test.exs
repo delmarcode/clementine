@@ -494,9 +494,12 @@ defmodule Clementine.RunnerTest do
     test "matrix row 16: transient storage failures at the terminal write are retried to success",
          %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
-      # Fault script by apply order: claim passes, the first two finish
-      # attempts blip, the third (empty queue) commits.
-      faults = FlakyLifecycle.start_faults([:pass, {:fail, :db_blip}, {:fail, :db_blip}])
+      # Fault script by apply order: the claim and the first boundary's
+      # trace write pass, the first two finish attempts blip, the third
+      # (empty queue) commits.
+      faults =
+        FlakyLifecycle.start_faults([:pass, :pass, {:fail, :db_blip}, {:fail, :db_blip}])
+
       expect_stream(text_events("Persisted"))
 
       assert {:finished, %Facts{status: :completed}} =
@@ -515,6 +518,7 @@ defmodule Clementine.RunnerTest do
 
       faults =
         FlakyLifecycle.start_faults([
+          :pass,
           :pass,
           {:fail, :db_blip},
           {:fail, :db_blip},

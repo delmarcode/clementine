@@ -18,11 +18,18 @@ defmodule Clementine.Lifecycle.Transition do
     node's. This keeps staleness arithmetic on a single time source.
   - When `result` is present, the host projection runs in the same atomic
     unit; if the projection raises, the transition must not commit.
+  - `trace` holds `Clementine.Trace.Entry` values for the run's trace,
+    written in the same atomic unit as the state write and only if it
+    commits: the `:record_trace` write at an iteration boundary, and the
+    tail on a terminal or suspend write. A lifecycle that keeps no trace
+    ignores them; `:record_trace` is then a guarded liveness write like
+    `:heartbeat`.
   """
 
   @ops [
     :claim,
     :heartbeat,
+    :record_trace,
     :mark_effects,
     :suspend,
     :resume,
@@ -33,11 +40,12 @@ defmodule Clementine.Lifecycle.Transition do
   ]
 
   @enforce_keys [:op, :run_ref, :expect, :set]
-  defstruct op: nil, run_ref: nil, expect: nil, set: %{}, result: nil, meta: %{}
+  defstruct op: nil, run_ref: nil, expect: nil, set: %{}, result: nil, meta: %{}, trace: []
 
   @type op ::
           :claim
           | :heartbeat
+          | :record_trace
           | :mark_effects
           | :suspend
           | :resume
@@ -59,7 +67,8 @@ defmodule Clementine.Lifecycle.Transition do
           expect: expect(),
           set: map(),
           result: Clementine.Result.t() | nil,
-          meta: map()
+          meta: map(),
+          trace: [Clementine.Trace.Entry.t()]
         }
 
   @spec ops() :: [op()]

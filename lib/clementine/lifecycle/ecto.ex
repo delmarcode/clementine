@@ -189,6 +189,19 @@ if Code.ensure_loaded?(Ecto.Query) do
     """
     @callback after_transition(Facts.t(), Transition.t(), ctx :: term()) :: any()
 
+    @doc """
+    Stores a transition's trace entries (`Clementine.Trace.Entry`), inside
+    the transaction of the state write, after its compare-and-swap and
+    before the projection: they commit only with the write, and a
+    projection reading the run's trace sees them. Called only for a
+    transition that carries entries. Optional: a lifecycle that keeps no
+    trace leaves it out, and the entries are dropped.
+    """
+    @callback record_trace([Clementine.Trace.Entry.t()], row :: Ecto.Schema.t(), ctx :: term()) ::
+                any()
+
+    @optional_callbacks record_trace: 3
+
     defmacro __using__(opts) do
       quote bind_quoted: [opts: opts] do
         @behaviour Clementine.Lifecycle
@@ -318,6 +331,7 @@ if Code.ensure_loaded?(Ecto.Query) do
 
             case cas_update(config, transition, now) do
               {:ok, row} ->
+                record_trace(module, transition, row, ctx)
                 if transition.result, do: module.project(transition.result, row, ctx)
                 row
 
@@ -347,6 +361,15 @@ if Code.ensure_loaded?(Ecto.Query) do
         {:error, reason} ->
           {:error, reason}
       end
+    end
+
+    defp record_trace(_module, %Transition{trace: []}, _row, _ctx), do: :ok
+
+    defp record_trace(module, %Transition{trace: entries}, row, ctx) do
+      if function_exported?(module, :record_trace, 3),
+        do: module.record_trace(entries, row, ctx)
+
+      :ok
     end
 
     # Post-commit emissions route through the shared seam (see

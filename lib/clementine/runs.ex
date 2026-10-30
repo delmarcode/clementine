@@ -17,7 +17,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
              agents: [MyApp.Agents.Weather],
              host: MyApp.Agents.Host}
 
-      * one migration calling `Clementine.Migration.up(version: 3)`;
+      * one migration calling `Clementine.Migration.up(version: 4)`;
       * `use Clementine.Agent` modules, listed in `agents:`.
 
     The optional `host:` module implements `Clementine.Host`: who may
@@ -569,9 +569,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     Erases every run on `subject` (`{type, id}`): the runs whose subject
     it is, and every descendant of a loop among them whatever its own
     subject (a `{:run, ...}` action may name another), with their inbox
-    rows. Returns `{:ok, count}`. Only Clementine writes `agent_runs`, so
-    this is how an app erases what a deleted thread's prompts and replies
-    left in `input` and `result`.
+    rows and their traces. Returns `{:ok, count}`. Only Clementine writes
+    `agent_runs` and `agent_run_trace`, so this is how an app erases what
+    a deleted thread's prompts and replies left in `input`, `result`, and
+    the trace.
 
     It refuses with `{:error, :active}` while any run in that set is
     queued, running or waiting, loops included, and then deletes nothing.
@@ -778,6 +779,55 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       case cast_id(run_id) do
         {:ok, id} -> repo.get(AgentRun, id)
         {:error, :not_found} -> nil
+      end
+    end
+
+    @doc """
+    The trace of the run with `id`, oldest first: a
+    `Clementine.Trace.Entry` for each execution (when it started, and
+    again on each resume), each call to the model, and each tool call,
+    with what it kept by the agent's `trace:` (`Clementine.Trace` lists the
+    payloads). `[]` for a run that does not exist or has not executed.
+
+    A run that ended through its runner has its whole trace, committed
+    with its end; a run reaped after its node died has its trace up to its
+    last iteration boundary. The trace goes with the run (`purge/1`).
+
+    Like `get/1`, it checks nothing: who may read a run's trace is the
+    app's decision, by the run's subject or actor.
+    """
+    @spec trace(Ecto.UUID.t()) :: [Clementine.Trace.Entry.t()]
+    def trace(run_id) do
+      %Config{repo: repo} = Config.fetch!()
+
+      case cast_id(run_id) do
+        {:ok, id} ->
+          repo.all(
+            from(t in "agent_run_trace",
+              where: t.run_id == type(^id, Ecto.UUID),
+              order_by: t.id,
+              select: %{
+                epoch: t.epoch,
+                seq: t.seq,
+                kind: t.kind,
+                payload: t.payload,
+                at: type(t.inserted_at, :utc_datetime_usec)
+              }
+            )
+          )
+          |> Enum.map(fn row ->
+            %Clementine.Trace.Entry{
+              run_id: id,
+              epoch: row.epoch,
+              seq: row.seq,
+              at: row.at,
+              kind: Clementine.Trace.Entry.decode_kind(row.kind),
+              payload: row.payload
+            }
+          end)
+
+        {:error, :not_found} ->
+          []
       end
     end
 

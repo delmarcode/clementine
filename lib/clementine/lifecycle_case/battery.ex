@@ -193,6 +193,7 @@ defmodule Clementine.LifecycleCase.Battery do
 
     # Every protocol operation the zombie can attempt discovers the loss.
     assert {:error, :lost_lease} = Protocol.heartbeat(zombie)
+    assert {:error, :lost_lease} = Protocol.record_trace(zombie, [])
     assert {:error, :lost_lease} = Protocol.mark_effects(zombie)
     assert {:error, :lost_lease} = Protocol.cancellation(zombie)
     assert {:error, :lost_lease} = Protocol.suspend(zombie, suspension_request(), cursor: {1, 9})
@@ -201,6 +202,7 @@ defmodule Clementine.LifecycleCase.Battery do
 
     # The successor is untouched by any of it.
     assert :ok = Protocol.heartbeat(successor)
+    assert :ok = Protocol.record_trace(successor, [])
     {:ok, done} = Protocol.finish(successor, Result.completed())
     assert done.status == :completed
     assert done.epoch == 2

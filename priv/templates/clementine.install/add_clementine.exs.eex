@@ -1,6 +1,6 @@
-# The agent_runs table of Clementine's durable runtime. Version 3's DDL is
+# The agent_runs table of Clementine's durable runtime. Version 4's DDL is
 # frozen in Clementine, so this builds the same table under every later
 # release; a later version arrives as a new migration calling
-# Clementine.Migration.up(from: 3, version: 4).
-def up, do: Clementine.Migration.up(version: 3)
-def down, do: Clementine.Migration.down(version: 3)
+# Clementine.Migration.up(from: 4, version: 5).
+def up, do: Clementine.Migration.up(version: 4)
+def down, do: Clementine.Migration.down(version: 4)

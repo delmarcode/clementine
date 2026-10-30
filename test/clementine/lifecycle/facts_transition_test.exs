@@ -96,6 +96,7 @@ defmodule Clementine.Lifecycle.FactsTransitionTest do
                Enum.sort([
                  :claim,
                  :heartbeat,
+                 :record_trace,
                  :mark_effects,
                  :suspend,
                  :resume,

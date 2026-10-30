@@ -81,6 +81,18 @@ defmodule Clementine.Agent do
   (`c:Clementine.Host.resolve_subject/2` and
   `c:Clementine.Host.resolve_actor/2`).
 
+  ## The trace
+
+  Every run records a trace (`Clementine.Runs.trace/1`): the model and
+  tools each execution offered, each model call, and each tool call with
+  its arguments. `trace:` says how much of the content it keeps.
+  `:content`, the default, keeps the system prompt, what the model said,
+  and what each tool returned. `:facts` keeps names, arguments, ids,
+  timing, usage, and the agent's fingerprint, and none of the text: right
+  for a turn agent whose host stores the conversation already.
+
+      use Clementine.Agent, key: "chat", turn: true, trace: :facts, ...
+
   Note: this module shadows Elixir's built-in `Agent` under a bare `alias`;
   prefer `alias Clementine.Agent, as: AgentDef` where the collision bites.
   The in-memory agent *process* lives at `Clementine.AgentServer`.
@@ -93,7 +105,8 @@ defmodule Clementine.Agent do
             tools: [],
             defaults: [],
             policy: %{},
-            tool_context: %{}
+            tool_context: %{},
+            trace: :content
 
   @type t :: %__MODULE__{
           id: term(),
@@ -102,7 +115,8 @@ defmodule Clementine.Agent do
           tools: [module()],
           defaults: keyword(),
           policy: map(),
-          tool_context: map()
+          tool_context: map(),
+          trace: Clementine.Trace.fidelity()
         }
 
   @doc """
@@ -251,7 +265,13 @@ defmodule Clementine.Agent do
     `capabilities:`, an app's own handles), under the runtime's keys, which
     win; on the durable runtime, the one place a built-in file tool's
     `working_dir` comes from
+  - `:trace` - how much content the run's trace keeps: `:content`
+    (default) or `:facts` (`Clementine.Trace`)
   """
   @spec new(keyword()) :: t()
-  def new(opts) when is_list(opts), do: struct!(__MODULE__, opts)
+  def new(opts) when is_list(opts) do
+    agent = struct!(__MODULE__, opts)
+    Clementine.Trace.validate_fidelity!(agent.trace)
+    agent
+  end
 end

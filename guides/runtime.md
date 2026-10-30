@@ -9,7 +9,7 @@ reaches every host as a dependency bump.
 The host keeps three things:
 
 - a child after Oban in its supervision tree;
-- one migration calling `Clementine.Migration.up(version: 3)`;
+- one migration calling `Clementine.Migration.up(version: 4)`;
 - `use Clementine.Agent` modules.
 
 `mix clementine.install` writes them (plus the config and a test case),
@@ -45,22 +45,23 @@ commit in one transaction. `oban` defaults to `Oban`, `queue` to `:agents`
 none, and `host` to none. Nothing else is configurable.
 
 The migration builds `agent_runs`, keyed by UUID, with the column recipe,
-the subject, the actor, the turn flag, and the lane index:
+the subject, the actor, the turn flag, and the lane index, plus the
+loop inbox and the run trace beside it:
 
 ```elixir
 defmodule MyApp.Repo.Migrations.AddClementine do
   use Ecto.Migration
 
-  def up, do: Clementine.Migration.up(version: 3)
-  def down, do: Clementine.Migration.down(version: 3)
+  def up, do: Clementine.Migration.up(version: 4)
+  def down, do: Clementine.Migration.down(version: 4)
 end
 ```
 
 Each version's DDL is frozen in `Clementine.Migration`, and each stamps
 its number on the table. The runtime checks the stamp as it starts and
 refuses to start against a table behind the code's version, naming the
-migration to write: a host on version 2 adds one calling
-`Clementine.Migration.up(from: 2, version: 3)`.
+migration to write: a host on version 3 adds one calling
+`Clementine.Migration.up(from: 3, version: 4)`.
 
 An agent is a module with a stable key, the string its run rows store:
 
@@ -171,6 +172,7 @@ Clementine.Runs.list(actor: {"user", id}, limit: 50)                # an account
   `{:error, :subject_required}`.
 - `get/1` returns the row. Read it freely; only the runtime writes it.
   `AgentRun.active?/1` and `terminal?/1` read its status.
+- `trace/1` returns the run's trace, below.
 - `active?/2`, `active/1`, `latest/2`, and `list/1` read runs by subject,
   agent, turn, and actor, newest first, rollouts unless told
   `kind: :loop`.
@@ -187,6 +189,57 @@ Clementine.Runs.list(actor: {"user", id}, limit: 50)                # an account
   it notifies every node through Oban's notifier, so a notifier that
   cannot listen (Postgres behind a transaction pooler) leaves the run to
   find the flag at its next step.
+
+## The trace
+
+Every run records what it did, and `Clementine.Runs.trace/1` reads it
+back, oldest first, as `Clementine.Trace.Entry` structs:
+
+<!-- guide-sample: parse-only -->
+```elixir
+Clementine.Runs.trace(run.id)
+#=> [
+#=>   %Clementine.Trace.Entry{epoch: 1, seq: 1, kind: :execution,
+#=>     payload: %{"model" => "claude-sonnet-5", "tools" => ["lookup"],
+#=>                "agent_fingerprint" => "33e5…", "instructions" => "…", "resumed" => false}},
+#=>   %Clementine.Trace.Entry{epoch: 1, seq: 2, kind: :model_call,
+#=>     payload: %{"iteration" => 1, "stop_reason" => "tool_use", "duration_ms" => 812,
+#=>                "usage" => %{"input_tokens" => 1204, "output_tokens" => 38}, "content" => […]}},
+#=>   %Clementine.Trace.Entry{epoch: 1, seq: 3, kind: :tool_call,
+#=>     payload: %{"name" => "lookup", "args" => %{"query" => "…"}, "result" => "…",
+#=>                "is_error" => false, "duration_ms" => 40, "approval" => nil, …}},
+#=>   …
+#=> ]
+
+tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine.Runs.trace(run.id), do: name
+```
+
+- An `:execution` entry opens each execution: when the run starts, and
+  again, `"resumed" => true`, when it resumes after an approval, under
+  the next epoch. Its `"agent_fingerprint"` is a sha256 over the system
+  prompt, the tool schemas, and the model id, so runs that offered the
+  model the same thing group together.
+- A `:model_call` entry records each call to the model, a call cut off
+  by a cancel included, with the usage it had reported. A `:tool_call`
+  entry records each tool call settled, with the arguments it ran with,
+  and the decision it waited on (`"approval" => %{"verdict" => "approved",
+  "by" => ...}`).
+- The runner writes new entries at every iteration boundary, fenced on
+  the epoch like the heartbeat, and the rest with the run's end or park,
+  in the same transaction: `run_finished/2` already sees the whole trace.
+  A run reaped after its node died has its trace up to its last
+  boundary.
+- `trace: :facts` on the agent keeps names, arguments, ids, timing,
+  usage, and the fingerprint, and leaves out the system prompt, what the
+  model said, and what each tool returned. A turn agent whose host stores
+  the conversation loses nothing by it; a task agent keeps the default,
+  `:content`, because nothing else holds its trajectory.
+- The trace lives in `agent_run_trace`, which only Clementine writes, and
+  goes with the run: `purge/1` erases it. It is not your audit log: a
+  security event that must outlive a purged conversation goes in your
+  own table, from the tool or the context function that caused it.
+- `trace/1` checks nothing, like `get/1`: check the run's subject or actor
+  before showing a trace to anyone.
 
 ## The host module
 
@@ -427,7 +480,7 @@ would leave old nodes failing on the missing column.
    end
    ```
 
-   Any later version arrives the same way, `up(from: 2, version: 3)`.
+   Any later version arrives the same way, `up(from: 3, version: 4)`.
 7. Keep `RunWorker` for one deploy, reduced to a forwarder. Jobs queued
    before the switch name it, and so do jobs the old nodes requeued while
    they drained; without it they fail, and the reaper interrupts their

@@ -9,10 +9,10 @@ the drain at shutdown.
 
 - One child after Oban, whose `repo` is Oban's repo:
   `{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: [MyApp.Agents.Triage], host: MyApp.Agents.Host}`.
-- One migration calling `Clementine.Migration.up(version: 3)`. Each
+- One migration calling `Clementine.Migration.up(version: 4)`. Each
   version stamps the table, and the runtime refuses to start against a
   table behind the code's version, naming the migration to write
-  (`Clementine.Migration.up(from: 2, version: 3)`).
+  (`Clementine.Migration.up(from: 3, version: 4)`).
 - Agent modules, each listed in `agents:`:
   `use Clementine.Agent, key: "triage", model: :claude_sonnet, instructions: "...", tools: [...]`.
   Every run row stores the key, so never rename a key that has runs. An
@@ -72,7 +72,7 @@ lifecycle, or a reaper into the app.
 - `purge/1` erases a subject's runs: `purge({"conversation", id})`
   deletes every run whose subject that is and every descendant of a loop
   among them (a child's subject may differ from its loop's), with their
-  inbox rows, and returns `{:ok, count}`. While any of them is queued,
+  inbox rows and traces, and returns `{:ok, count}`. While any of them is queued,
   running or waiting, loops included, it returns `{:error, :active}` and
   deletes nothing: cancel the thread's loop first and purge once it has
   ended, from `run_committed/2`. It works inside the caller's
@@ -84,6 +84,16 @@ lifecycle, or a reaper into the app.
   raise.
 - `get/1` returns the run or `nil`. Read `agent_runs` freely; only
   Clementine writes it.
+- `trace/1` returns the run's trace, oldest first: a
+  `Clementine.Trace.Entry` for each execution (`:execution`: the model,
+  the tools offered, the agent's fingerprint, the system prompt), each
+  model call (`:model_call`: usage, timing, what it said), and each tool
+  call (`:tool_call`: name, arguments, result, timing, and the approval
+  it waited on). It commits with the run's end, so `run_finished/2` can
+  read it. Read tool names in order from it rather than storing your
+  own: `for %{kind: :tool_call, payload: %{"name" => name}} <- trace,
+  do: name`. Like `get/1` it checks nothing: check the subject or actor
+  before showing it.
 - The queries: `active?(agent, subject)` is a task's lane (does the agent
   have an active run on the subject); `active(subject)` is the thread's
   active turn, of whichever agent, or `nil`; `latest(subject, opts)` is
@@ -131,6 +141,11 @@ end
 - `history/1` runs when a run starts, with `run.subject` and `run.actor`
   resolved. A run that resumes after an approval continues from its
   checkpoint and does not call it.
+- A turn agent whose `run_finished/2` stores the conversation says
+  `trace: :facts`: its trace keeps tool names, arguments, timing, and
+  usage, and none of the text the app already holds. A task agent keeps
+  the default, `trace: :content`, because its trace is the only record of
+  what it read and said.
 
 ## A thread: `Clementine.Thread` and `Runs.send/3`
 
@@ -376,8 +391,10 @@ an error.
   job inserted in `run_finished/2`.
 - Never write the database from `run_event/2`. Store the conversation
   from the run's result in `run_finished/2`.
-- Never write `agent_runs` or `agent_run_inbox`, or insert, cancel, or
-  retry a run's or a loop's Oban job yourself. `send/3` steps a loop.
+- Never write `agent_runs`, `agent_run_inbox`, or `agent_run_trace`, or
+  insert, cancel, or retry a run's or a loop's Oban job yourself.
+  `send/3` steps a loop. A column of your own on `agent_runs` (a tool
+  trace, say) is the same mistake: read `Runs.trace/1`.
 - Never call `Clementine.Runs.resume/2` or `cancel/1` inside a
   transaction.
 - Never call `Clementine.Lifecycle.*` (the protocol, the Ecto adapter,

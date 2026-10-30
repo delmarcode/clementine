@@ -107,12 +107,14 @@ defmodule Clementine.ToolRunner do
     superseded or draining executor must unwind *now*: every task is
     killed and `:lost_lease` / `:drained` returns immediately.
 
-  With no signal, returns `{:ok, results}` shaped exactly like
-  `execute/4`. All calls run concurrently (no `:max_concurrency`); each
-  task's timeout counts from spawn.
+  With no signal, returns `{:ok, results}`: `execute/4`'s `{id, result}`
+  pairs, in call order, each with the milliseconds from its spawn to its
+  result as a third element (`{id, result, duration_ms}`). All calls run
+  concurrently (no `:max_concurrency`); each task's timeout counts from
+  spawn.
   """
   @spec run_batch([module()], [map()], map(), keyword()) ::
-          {:ok, [{String.t(), term()}]}
+          {:ok, [{String.t(), term(), non_neg_integer()}]}
           | {:cancelled, reason :: term()}
           | :lost_lease
           | :drained
@@ -132,7 +134,9 @@ defmodule Clementine.ToolRunner do
           task: task,
           timer: Process.send_after(self(), {__MODULE__, :timeout, task.ref}, timeout),
           killable?: killable?(tools, call),
-          result: nil
+          started: System.monotonic_time(),
+          result: nil,
+          duration_ms: nil
         }
       end)
 
@@ -147,7 +151,7 @@ defmodule Clementine.ToolRunner do
 
   defp await_batch(%{awaiting: awaiting} = state) when map_size(awaiting) == 0 do
     case state.cancelled do
-      nil -> {:ok, Enum.map(state.entries, fn e -> {e.call.id, e.result} end)}
+      nil -> {:ok, Enum.map(state.entries, fn e -> {e.call.id, e.result, e.duration_ms} end)}
       reason -> {:cancelled, reason}
     end
   end
@@ -188,10 +192,15 @@ defmodule Clementine.ToolRunner do
   defp settle(state, ref, result) do
     {index, awaiting} = Map.pop!(state.awaiting, ref)
     drop_timer(Enum.at(state.entries, index))
+    now = System.monotonic_time()
 
     %{
       state
-      | entries: List.update_at(state.entries, index, &%{&1 | result: result}),
+      | entries:
+          List.update_at(state.entries, index, fn entry ->
+            duration_ms = System.convert_time_unit(now - entry.started, :native, :millisecond)
+            %{entry | result: result, duration_ms: duration_ms}
+          end),
         awaiting: awaiting
     }
   end

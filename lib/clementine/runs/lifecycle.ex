@@ -23,8 +23,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     alias Clementine.Lifecycle.{Facts, Transition}
     alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, Loops}
 
-    # Liveness and the effects fence are the runtime's bookkeeping.
-    @quiet_ops [:heartbeat, :mark_effects]
+    # Liveness, the trace, and the effects fence are the runtime's
+    # bookkeeping.
+    @quiet_ops [:heartbeat, :record_trace, :mark_effects]
+
+    @trace "agent_run_trace"
 
     # What the host's run_transition/2 hears for each other write that
     # leaves a run unfinished.
@@ -66,6 +69,29 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
          do: Courier.flush(courier)
 
     defp flush_events(_transition, _ctx), do: :ok
+
+    # A write's trace entries go to agent_run_trace in its transaction, so
+    # they commit with the write and the projection below sees them.
+    # inserted_at is the storage clock's, as the column's default.
+    @impl Clementine.Lifecycle.Ecto
+    def record_trace(entries, %AgentRun{id: run_id}, _ctx) do
+      %Config{repo: repo} = Config.fetch!()
+      id = Ecto.UUID.dump!(run_id)
+
+      rows =
+        Enum.map(entries, fn entry ->
+          %{
+            run_id: id,
+            epoch: entry.epoch,
+            seq: entry.seq,
+            kind: to_string(entry.kind),
+            payload: entry.payload
+          }
+        end)
+
+      {_count, _} = repo.insert_all(@trace, rows)
+      :ok
+    end
 
     @impl Clementine.Lifecycle.Ecto
     def project(result, %AgentRun{} = run, _ctx) do

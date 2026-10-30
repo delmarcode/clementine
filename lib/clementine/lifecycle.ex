@@ -21,7 +21,10 @@ defmodule Clementine.Lifecycle do
   Additional obligations on `apply/2`, stated in full in the `Transition`
   moduledoc: absent `set` keys are left untouched while explicit `nil`
   writes NULL, and symbolic timestamps (`:now`, `{:now_plus, ms}`) resolve
-  against the *storage* clock, never the app node's.
+  against the *storage* clock, never the app node's. A transition may
+  carry the run's trace entries (`Clementine.Trace`): a lifecycle that
+  keeps a trace stores them in the same atomic unit, only if the write
+  commits; one that keeps none ignores them.
 
   Because every transition — runner-driven or not — flows through
   `apply/2`, it is the one universal observation point: hosts broadcast
