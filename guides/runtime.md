@@ -221,18 +221,23 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 
 - An `:execution` entry opens each execution: when the run starts, and
   again, `"resumed" => true`, when it resumes after an approval, under
-  the next epoch. `"tools"` names every tool offered, and `"deferred"`
-  the ones among them the model loads through tool search. Its
-  `"agent_fingerprint"` is a sha256 over the system prompt, the tool
-  schemas, the model id, which tools are deferred, and the output
-  schema, so runs that offered the model the same thing group together.
+  the next epoch. `"tools"` names every tool offered, `"deferred"` the
+  ones among them the model loads through tool search, and `"skills"` the
+  skills it may load. Its `"agent_fingerprint"` is a sha256 over the
+  system prompt, the tool schemas, the model id, which tools are
+  deferred, the output schema, and the skills offered (names,
+  descriptions, and their tools' schemas), so runs that offered the
+  model the same thing group together.
 - A `:model_call` entry records each call to the model, a call cut off
   by a cancel included, with the usage it had reported. A `:tool_call`
   entry records each tool call started, with the arguments it ran with
   and the decision it waited on (`"approval" => %{"verdict" => "approved",
   "by" => ...}`). A call a cancel or a drain cut off is there too: with
   its result if it had one, and `"killed" => true` if it was killed
-  before it answered, so what it did is unknown.
+  before it answered, so what it did is unknown. A `:skill_load` entry
+  records each skill the model loaded (`Clementine.Skill`), with the
+  tools it brought and a sha256 of the body the model read, just before
+  the `use_skill` call that loaded it.
 - The runner writes new entries at every iteration boundary, fenced on
   the epoch like the heartbeat, and the rest with the run's end or park,
   in the same transaction: `run_finished/2` already sees the whole trace.

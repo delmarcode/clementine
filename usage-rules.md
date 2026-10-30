@@ -87,9 +87,10 @@ lifecycle, or a reaper into the app.
 - `trace/1` returns the run's trace, oldest first: a
   `Clementine.Trace.Entry` for each execution (`:execution`: the model,
   the tools offered, the agent's fingerprint, the system prompt), each
-  model call (`:model_call`: usage, timing, what it said), and each tool
+  model call (`:model_call`: usage, timing, what it said), each tool
   call (`:tool_call`: name, arguments, result, timing, and the approval
-  it waited on). It commits with the run's end, so `run_finished/2` can
+  it waited on), and each skill loaded (`:skill_load`: its name, the
+  tools it brought, and a hash of the body it read). It commits with the run's end, so `run_finished/2` can
   read it. Read tool names in order from it rather than storing your
   own: `for %{kind: :tool_call, payload: %{"name" => name}} <- trace,
   do: name`. Like `get/1` it checks nothing: check the subject or actor
@@ -146,6 +147,47 @@ end
   usage, and none of the text the app already holds. A task agent keeps
   the default, `trace: :content`, because its trace is the only record of
   what it read and said.
+
+## Skills: `skills:`
+
+A procedure the agent needs only for some tasks, with the tools it
+needs, is a skill, not more system prompt and not more `tools:`:
+
+```elixir
+defmodule MyApp.Skills.Refunds do
+  use Clementine.Skill,
+    name: "refunds",
+    description: "Review or issue a refund. Use when the customer asks for money back.",
+    tools: [MyApp.Tools.LookupOrder, MyApp.Tools.IssueRefund]
+
+  @impl true
+  def body(_context), do: MyApp.Skills.read!("refunds.md")
+end
+```
+
+`use Clementine.Agent, ..., skills: [MyApp.Skills.Refunds]`, or in
+`agent/1`, `skills: Enum.map(rows, &Clementine.Skill.new(name: &1.name,
+description: &1.description, body: &1.body, tools: ...))`.
+
+- The model sees a `use_skill` tool listing each skill's name and
+  description. A load returns the body and offers the skill's tools from
+  the next model call on; the system prompt never changes. Write the
+  description so the model knows when to load the skill from it alone.
+- `body/1` runs at load, in the run's process, with the tools' context
+  (`subject`, `actor`, `metadata`, ...). Keep it quick; a raise, an
+  exit, or a throw is an error the model reads, and the skill stays
+  unloaded.
+- `agent/1` decides which skills a run may load, with its subject and
+  actor resolved: tenancy and authority go there, never in the body.
+- A skill's tools are ordinary tools: `approval:` parks the run, and the
+  resume offers the loaded skills' tools again. Keep offering a skill
+  while runs that loaded it may be parked: a resume whose agent dropped
+  it fails as `:incompatible_checkpoint`.
+- Every tool the agent may offer, its own and each skill's, has a name
+  of its own, and none is named `use_skill`; the build fails otherwise,
+  and a run whose `agent/1` sets `skills` past `Agent.new/1` fails as
+  `:invalid_skills` before anything runs. Two skills may share a tool
+  module.
 
 ## A thread: `Clementine.Thread` and `Runs.send/3`
 

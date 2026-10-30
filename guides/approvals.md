@@ -219,3 +219,8 @@ Two product consequences worth deciding up front:
   understands fails the run with error code `:incompatible_checkpoint` —
   a clean `Failed` terminal, never a crash — and your app chooses the
   recovery (surface it, or start a fresh run from the original input).
+  The same goes for what the checkpoint refers to: a gated tool the agent
+  no longer carries, or a skill (`Clementine.Skill`) the run had loaded
+  that the agent no longer offers. A run that loaded skills resumes with
+  them loaded, so keep offering them while runs that loaded them may be
+  parked.

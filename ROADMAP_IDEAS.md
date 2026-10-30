@@ -67,27 +67,15 @@ config :clementine, :persistence,
 
 ## Medium Priority
 
-### Multi-Agent Orchestration
+### Coordinating agents
 
-Following Anthropic's guidance: "give each subagent one job, let an orchestrator coordinate."
-
-```elixir
-defmodule MyOrchestrator do
-  use Clementine.Orchestrator,
-    agents: [
-      planner: MyPlannerAgent,
-      coder: MyCodingAgent,
-      reviewer: MyReviewerAgent
-    ],
-    strategy: :sequential  # or :parallel, :dynamic
-end
-```
-
-**Implementation notes:**
-- Orchestrator is itself an agent with read-only tools
-- Each subagent handles a specific domain
-- Results flow back through orchestrator
-- Subagents can run in parallel for independent tasks
+A loop (`Clementine.Loop`) is already the coordinator: fan-out is N
+`{:run, tag, child}` actions, fan-in is the loop's state, and a handoff is
+a send to another thread. What is missing is a model that asks another
+agent and waits for the answer: `delegate`, an engine tool beside
+`use_skill` that parks the run until its children end, as an approval
+does. There will be no `use Clementine.Orchestrator` macro; the loop is
+that already.
 
 ### OpenAI Provider
 
@@ -300,6 +288,11 @@ combined = Clementine.compose([
 Things we explicitly don't want to add:
 
 - **Complex orchestration graphs**: Keep the loop simple
+- **A tool or skill graph**: no dependency graph between skills, no
+  satisfiability check, and no `search_*` or `inspect_*` meta-tools. A
+  skill is a value `agent/1` offers at each claim (`Clementine.Skill`),
+  and a body may name another skill in prose. A catalog too large for the
+  prompt belongs to the provider's own tool search.
 - **Plugin systems**: Just use Elixir modules
 - **GUI/Dashboard**: Use existing observability tools
 - **Proprietary formats**: Stick to standard Elixir patterns
