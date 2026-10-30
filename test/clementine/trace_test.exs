@@ -43,6 +43,22 @@ defmodule Clementine.TraceTest do
     end
   end
 
+  defmodule Witness do
+    @moduledoc false
+    # MemoryLifecycle storage that tells the test which write carried how
+    # many trace entries.
+    @behaviour Clementine.Lifecycle
+
+    @impl true
+    def fetch(run_ref, %{store: store}), do: MemoryLifecycle.fetch(run_ref, store)
+
+    @impl true
+    def apply(transition, %{store: store, test: test}) do
+      send(test, {:applied, transition.op, Enum.map(transition.trace, & &1.kind)})
+      MemoryLifecycle.apply(transition, store)
+    end
+  end
+
   defp agent(opts) do
     Clementine.Agent.new(
       Keyword.merge([model: :claude_sonnet, instructions: "Trace me.", tools: []], opts)
@@ -297,7 +313,7 @@ defmodule Clementine.TraceTest do
              } = ran
     end
 
-    test "a drained run writes its trace before it is requeued", %{store: store, ref: ref} do
+    test "a drained run's trace commits with its requeue", %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
 
       expect_stream([
@@ -305,7 +321,16 @@ defmodule Clementine.TraceTest do
         {:signal, {:clementine, :drain}}
       ])
 
-      assert {:finished, %Facts{status: :queued}} = execute(build_run(ref), store)
+      assert {:finished, %Facts{status: :queued}} =
+               execute(build_run(ref), store,
+                 lifecycle: Witness,
+                 ctx: %{store: store, test: self()}
+               )
+
+      # The requeue itself carried the cut-off call: no separate write
+      # whose failure could lose it.
+      assert_received {:applied, :record_trace, [:execution]}
+      assert_received {:applied, :requeue, [:model_call]}
 
       assert kinds(MemoryLifecycle.trace(store, ref)) ==
                [{1, 1, :execution}, {1, 2, :model_call}]

@@ -30,8 +30,8 @@ defmodule Clementine.Runner do
   rollout records each entry into a buffer the runner owns and writes the
   new ones at every iteration boundary, fenced on the epoch; the terminal
   or suspend write carries whatever is left, so it commits with the end,
-  even when the rollout raised. A drain writes it before the requeue. A
-  lost lease writes nothing.
+  even when the rollout raised; so does a drain's requeue. A lost lease
+  writes nothing.
 
   Cooperative cancellation reaches the run two ways: the rollout's boundary
   poll (the guarantee — worst-case latency is one iteration) and, when the
@@ -260,18 +260,11 @@ defmodule Clementine.Runner do
   # Drain resolution: requeue when nothing external happened — the run
   # silently survives the deploy — else the one sanctioned runner-side
   # interrupt, an immediate labeled outcome instead of a reaped mystery.
-  # The trace of what this execution did is written first: a requeued run
+  # The requeue carries the trace of what this execution did: the run
   # starts again from its prompt under a new epoch, and what it read here
   # stays on the record.
   defp requeue(lease, stamper, recorder) do
-    case Recorder.flush(recorder) do
-      :ok -> requeue_flushed(lease, stamper, recorder)
-      :lost_lease -> {:discard, :lost_lease}
-    end
-  end
-
-  defp requeue_flushed(lease, stamper, recorder) do
-    case Protocol.requeue(lease, :drain) do
+    case Protocol.requeue(lease, :drain, trace: Recorder.pending(recorder)) do
       {:ok, facts} ->
         {:finished, facts}
 

@@ -646,15 +646,25 @@ defmodule Clementine.Lifecycle.Protocol do
   the world is exactly what this design exists to prevent. The epoch is
   untouched (the next claim increments it, and because epochs count claims
   they double as the attempt counter). Field hygiene clears the executor
-  fields. This arity is the drain flavor, fired by the runner holding the
-  lease; see `requeue/4` for the reaper flavor.
+  fields. This flavor, `requeue(lease, reason, opts)`, is the drain's,
+  fired by the runner holding the lease; `trace:` carries the trace
+  entries the execution has not written, which commit with the requeue.
+  `requeue(lifecycle, facts, reason)` and `requeue/4` are the reaper
+  flavor.
   """
   @spec requeue(Lease.t(), term()) ::
           {:ok, Facts.t()} | {:error, :effects_present | :lost_lease | term()}
-  def requeue(%Lease{} = lease, reason) do
+  def requeue(%Lease{} = lease, reason), do: requeue(lease, reason, [])
+
+  @spec requeue(Lease.t(), term(), keyword()) ::
+          {:ok, Facts.t()} | {:error, :effects_present | :lost_lease | term()}
+  @spec requeue(module(), Facts.t(), term()) ::
+          {:ok, Facts.t()}
+          | {:error, :effects_present | {:not_requeueable, Facts.status()} | :stale | term()}
+  def requeue(%Lease{} = lease, reason, opts) when is_list(opts) do
     case lease.lifecycle.fetch(lease.run_ref, lease.ctx) do
       {:ok, %Facts{status: :running, epoch: epoch} = facts} when epoch == lease.epoch ->
-        do_requeue(lease.lifecycle, facts, reason, lease.ctx)
+        do_requeue(lease.lifecycle, facts, reason, lease.ctx, Keyword.get(opts, :trace, []))
 
       {:ok, %Facts{}} ->
         emit(:lease_lost, %{}, lease_metadata(lease))
@@ -672,24 +682,24 @@ defmodule Clementine.Lifecycle.Protocol do
   stale-fetched terminal snapshot) is refused with a clean error, for the
   same reason `interrupt/4` refuses terminal facts.
   """
+  def requeue(lifecycle, %Facts{} = facts, reason), do: requeue(lifecycle, facts, reason, nil)
+
   @spec requeue(module(), Facts.t(), term(), term()) ::
           {:ok, Facts.t()}
           | {:error, :effects_present | {:not_requeueable, Facts.status()} | :stale | term()}
-  def requeue(lifecycle, facts, reason, ctx \\ nil)
-
   def requeue(lifecycle, %Facts{status: :running} = facts, reason, ctx) do
-    do_requeue(lifecycle, facts, reason, ctx)
+    do_requeue(lifecycle, facts, reason, ctx, [])
   end
 
   def requeue(_lifecycle, %Facts{} = facts, _reason, _ctx) do
     {:error, {:not_requeueable, facts.status}}
   end
 
-  defp do_requeue(_lifecycle, %Facts{effects?: true}, _reason, _ctx) do
+  defp do_requeue(_lifecycle, %Facts{effects?: true}, _reason, _ctx, _trace) do
     {:error, :effects_present}
   end
 
-  defp do_requeue(lifecycle, %Facts{} = facts, reason, ctx) do
+  defp do_requeue(lifecycle, %Facts{} = facts, reason, ctx, trace) do
     transition = %Transition{
       op: :requeue,
       run_ref: facts.ref,
@@ -701,7 +711,8 @@ defmodule Clementine.Lifecycle.Protocol do
         deadline: nil,
         heartbeat_at: nil
       },
-      meta: %{reason: reason}
+      meta: %{reason: reason},
+      trace: trace
     }
 
     case lifecycle.apply(transition, ctx) do
