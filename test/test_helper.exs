@@ -3,12 +3,13 @@
 # database is recreated from scratch each run — a change to the column
 # recipe must reach a database migrated before it, and the migration's own
 # down/0 can't reverse a definition the old table never had. Only a database
-# named disposable by convention (suffixed "_test") is ever dropped:
+# named disposable by convention ("_test" as its last word or one of its
+# words, as in clementine_test or clementine_test_ops138) is ever dropped:
 # PGDATABASE may point anywhere, and a schema refresh must not cost anyone
 # a real database.
 repo_config = Clementine.TestRepo.config()
 
-if String.ends_with?(repo_config[:database], "_test") do
+if repo_config[:database] =~ ~r/_test(_|$)/ do
   _ = Ecto.Adapters.Postgres.storage_down(repo_config)
 else
   IO.warn(
@@ -43,6 +44,12 @@ if postgres? do
   )
 
   Ecto.Migrator.up(Clementine.TestRepo, 20_261_023_000_001, Clementine.Test.Ecto.CreateAgentRuns)
+
+  Ecto.Migrator.up(
+    Clementine.TestRepo,
+    20_261_027_000_001,
+    Clementine.Test.Ecto.UpgradeAgentRunsToVersion2
+  )
 
   Ecto.Adapters.SQL.Sandbox.mode(Clementine.TestRepo, :manual)
 end

@@ -7,6 +7,11 @@ defmodule Clementine.RunsCase do
   heartbeats, tools, racing sweeps). Model turns are scripted on
   `Clementine.LLM.MockClient` in global mode.
 
+  The agents: `Echo` and `Lookup` are tasks, `Approval` a task whose tool
+  needs approval, and `Chat` and `Handoff` turns (two agents that may act
+  on one thread). `Lookup` and `Handoff` carry the `Context` tool, which
+  reports what a tool sees of its run.
+
   `@tag oban: [notifier: Oban.Notifiers.PG]` adds options to Oban's: the
   default Postgres notifier sends nothing from inside the sandbox's
   transaction, so a test of notifications between nodes uses `:pg`.
@@ -31,7 +36,7 @@ defmodule Clementine.RunsCase do
 
       alias Clementine.Runs
       alias Clementine.Runs.{AgentRun, Worker}
-      alias Clementine.RunsCase.{Approval, Chat, Echo, Lookup}
+      alias Clementine.RunsCase.{Approval, Chat, Context, Echo, Handoff, Lookup}
       alias Clementine.TestRepo
 
       setup :set_mox_global
@@ -51,7 +56,13 @@ defmodule Clementine.RunsCase do
       start_supervised!(
         {Clementine,
          repo: TestRepo,
-         agents: [__MODULE__.Echo, __MODULE__.Lookup, __MODULE__.Approval, __MODULE__.Chat],
+         agents: [
+           __MODULE__.Echo,
+           __MODULE__.Lookup,
+           __MODULE__.Approval,
+           __MODULE__.Chat,
+           __MODULE__.Handoff
+         ],
          host: __MODULE__.Host}
       )
     end
@@ -157,8 +168,10 @@ end
 
 defmodule Clementine.RunsCase.Host do
   @moduledoc """
-  The test host. It refuses resumes decided `by: "mallory"`, and resolves
-  `"ticket"` subjects (a `"gone"` subject never resolves).
+  The test host. It refuses resumes decided `by: "mallory"`, resolves
+  `"ticket"` subjects (a `"gone"` subject never resolves), and resolves
+  `"user"` actors (a `"suspended"` actor never resolves, and neither does
+  a user `revoke_actor!/1` revoked since).
 
   `run_finished/2` writes a row to its own table (`host_writes/1` reads
   them) and then raises for the conformance suite's projection probe;
@@ -177,6 +190,8 @@ defmodule Clementine.RunsCase.Host do
 
   alias Clementine.Result
   alias Clementine.TestRepo
+
+  @revoked :clementine_runs_test_revoked_actors
 
   @impl true
   def authorize_resume(_run, {_verdict, %{by: "mallory"}}), do: {:error, :forbidden}
@@ -246,6 +261,30 @@ defmodule Clementine.RunsCase.Host do
   def resolve_subject("gone", _id), do: {:error, :subject_gone}
   def resolve_subject(_type, _id), do: {:ok, nil}
 
+  @impl true
+  def resolve_actor("user", id) do
+    if revoked?(id), do: {:error, :actor_revoked}, else: {:ok, %{user: id}}
+  end
+
+  def resolve_actor("suspended", _id), do: {:error, :actor_suspended}
+  def resolve_actor(_type, _id), do: {:ok, nil}
+
+  @doc """
+  Revokes the `"user"` actor `id` for the rest of the test: the registry
+  belongs to the calling test process and goes with it.
+  """
+  def revoke_actor!(id) do
+    if :ets.whereis(@revoked) == :undefined,
+      do: :ets.new(@revoked, [:named_table, :public, :set])
+
+    true = :ets.insert(@revoked, {id})
+    :ok
+  end
+
+  defp revoked?(id) do
+    :ets.whereis(@revoked) != :undefined and :ets.member(@revoked, id)
+  end
+
   defp probe(result, %{"conformance_probe" => probe}) do
     case {probe, result} do
       {"raise", _result} -> raise "conformance probe"
@@ -260,6 +299,23 @@ defmodule Clementine.RunsCase.Host do
   defp probe(_result, _metadata), do: :ok
 end
 
+defmodule Clementine.RunsCase.Context do
+  @moduledoc """
+  A test tool that reports what a tool sees of its run: `run_id`,
+  `agent_key`, `turn`, `subject`, and `actor`, as `inspect/1` renders them.
+  """
+  use Clementine.Tool,
+    name: "context",
+    description: "Reports the run's context.",
+    retry: :safe,
+    parameters: []
+
+  @impl true
+  def run(_args, context) do
+    {:ok, inspect(Map.take(context, [:run_id, :agent_key, :turn, :subject, :actor]))}
+  end
+end
+
 defmodule Clementine.RunsCase.Echo do
   @moduledoc "A test agent with no tools: one model turn answers."
   use Clementine.Agent, key: "test_echo", model: :claude_sonnet, instructions: "Answer."
@@ -268,7 +324,8 @@ end
 defmodule Clementine.RunsCase.Lookup do
   @moduledoc """
   A test agent whose one tool is safe to repeat, so its runs can be
-  requeued. It writes its own agent/1, which sees the resolved subject.
+  requeued. It writes its own agent/1, which sees the resolved subject and
+  actor.
   """
   use Clementine.Agent, key: "test_lookup"
 
@@ -290,8 +347,8 @@ defmodule Clementine.RunsCase.Lookup do
   def agent(run) do
     Clementine.Agent.new(
       model: :claude_sonnet,
-      instructions: "Look up #{inspect(run.subject)}.",
-      tools: [Tool]
+      instructions: "Look up #{inspect(run.subject)} for #{inspect(run.actor)}.",
+      tools: [Tool, Clementine.RunsCase.Context]
     )
   end
 end
@@ -321,14 +378,15 @@ end
 
 defmodule Clementine.RunsCase.Chat do
   @moduledoc """
-  A test agent that converses. Its history is the run's metadata
-  `"history"`, as `Clementine.LLM.Message.to_map/1` maps (anything else is
-  returned as is), and every call reports to the test process. Its one
-  tool needs approval.
+  A test agent that converses: a turn agent. Its history is the run's
+  metadata `"history"`, as `Clementine.LLM.Message.to_map/1` maps
+  (anything else is returned as is), and every call reports to the test
+  process. Its one tool needs approval.
   """
 
   use Clementine.Agent,
     key: "test_chat",
+    turn: true,
     model: :claude_sonnet,
     instructions: "Chat.",
     tools: [Clementine.RunsCase.Approval.SendNote]
@@ -344,4 +402,21 @@ defmodule Clementine.RunsCase.Chat do
       other -> other
     end
   end
+end
+
+defmodule Clementine.RunsCase.Handoff do
+  @moduledoc """
+  A second turn agent, for a thread another agent may be on: a handoff.
+  Its one tool reports the run's context.
+  """
+
+  use Clementine.Agent,
+    key: "test_handoff",
+    turn: true,
+    model: :claude_sonnet,
+    instructions: "Take over.",
+    tools: [Clementine.RunsCase.Context]
+
+  @impl true
+  def history(_run), do: []
 end

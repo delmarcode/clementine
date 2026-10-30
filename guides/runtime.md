@@ -9,7 +9,7 @@ reaches every host as a dependency bump.
 The host keeps three things:
 
 - a child after Oban in its supervision tree;
-- one migration calling `Clementine.Migration.up(version: 1)`;
+- one migration calling `Clementine.Migration.up(version: 2)`;
 - `use Clementine.Agent` modules.
 
 `mix clementine.install` writes them (plus the config and a test case),
@@ -44,17 +44,23 @@ commit in one transaction. `oban` defaults to `Oban`, `queue` to `:agents`
 (declare it in the Oban config: `queues: [agents: 10]`), `agents` to
 none, and `host` to none. Nothing else is configurable.
 
-The migration builds `agent_runs`, keyed by UUID, with the column recipe
-and the single-active index on `(agent_key, subject_type, subject_id)`:
+The migration builds `agent_runs`, keyed by UUID, with the column recipe,
+the subject, the actor, the turn flag, and the lane index:
 
 ```elixir
 defmodule MyApp.Repo.Migrations.AddClementine do
   use Ecto.Migration
 
-  def up, do: Clementine.Migration.up(version: 1)
-  def down, do: Clementine.Migration.down(version: 1)
+  def up, do: Clementine.Migration.up(version: 2)
+  def down, do: Clementine.Migration.down(version: 2)
 end
 ```
+
+Each version's DDL is frozen in `Clementine.Migration`, and each stamps
+its number on the table. The runtime checks the stamp as it starts and
+refuses to start against a table behind the code's version, naming the
+migration to write: a host on version 1 adds one calling
+`Clementine.Migration.up(from: 1, version: 2)`.
 
 An agent is a module with a stable key, the string its run rows store:
 
@@ -86,16 +92,17 @@ defmodule MyApp.Agents.Triage do
 end
 ```
 
-An agent that converses also writes `history/1`: the messages before the
-run's prompt, oldest first, read from the app's own tables. The runtime
-sends them to the model, then the prompt. It runs when a run starts from
-its prompt, not when a run resumes after an approval, whose checkpoint
-already holds the conversation:
+An agent that converses is a turn agent: `turn: true`, and `history/1`,
+the messages before the run's prompt, oldest first, read from the app's
+own tables. The runtime sends them to the model, then the prompt. It
+runs when a run starts from its prompt, not when a run resumes after an
+approval, whose checkpoint already holds the conversation:
 
 ```elixir
 defmodule MyApp.Agents.Chat do
   use Clementine.Agent,
     key: "chat",
+    turn: true,
     model: :claude_sonnet,
     instructions: "You are a helpful assistant. Be brief."
 
@@ -104,9 +111,33 @@ defmodule MyApp.Agents.Chat do
 end
 ```
 
-One turn is one run with the conversation as its subject, so a second
-turn while one is in flight is refused with `:active_run_exists`. The
-host's `run_finished/2` stores each turn (below).
+A turn is a run on a thread: its subject is the thread, and the host's
+`run_finished/2` appends what it said (below). A turn agent without
+`history/1` fails the build; any other agent is a task, and may define
+one too.
+
+## Subject, actor, and the lane
+
+A run carries up to two references, stored as text and resolved by the
+host at every claim: its subject, what it is about
+(`subject: {"ticket", id}`), and its actor, whose authority it acts with
+(`actor: {"user", id}`). Either refusal cancels the run as unstartable,
+so a run acting for an account suspended while it waited for approval
+never resumes.
+
+Which decides the run's lane, the key under which active runs (queued,
+running, or waiting) are exclusive, held by one unique index:
+
+- a turn's lane is its thread, whichever agent it belongs to: at most
+  one active turn per thread, so a second agent's turn on a busy thread
+  is refused too;
+- a task's lane is its agent and subject: tasks of different agents on
+  one subject, and a turn and a task, run side by side;
+- a run with no subject has no lane and blocks nothing.
+
+Busy means refused: `start/3` returns `{:error, :active_run_exists}`. A
+thread that should queue messages instead gets a loop (the next
+version).
 
 ## Running agents
 
@@ -114,26 +145,39 @@ host's `run_finished/2` stores each turn (below).
 
 <!-- guide-sample: parse-only -->
 ```elixir
-{:ok, run} = Clementine.Runs.start(MyApp.Agents.Triage, prompt, subject: {"ticket", ticket.id})
+{:ok, run} =
+  Clementine.Runs.start(MyApp.Agents.Triage, prompt,
+    subject: {"ticket", ticket.id},
+    actor: {"user", user.id}
+  )
 
 Clementine.Runs.get(run.id)
 #=> %Clementine.Runs.AgentRun{status: "completed", result: %{"output" => "..."}}
 
 :ok = Clementine.Runs.resume(run.id, {:approved, %{by: user.id}})
 {:ok, :finished} = Clementine.Runs.cancel(run.id)
+
+Clementine.Runs.active?(MyApp.Agents.Triage, {"conversation", id})  # a screen in flight?
+Clementine.Runs.active({"conversation", id})                        # the turn in flight, or nil
+Clementine.Runs.latest({"conversation", id}, turn: true)            # the thread's newest turn
+Clementine.Runs.list(actor: {"user", id}, limit: 50)                # an account's runs
 ```
 
-- `start/3` inserts the run and its Oban job in one transaction. Each
-  agent has at most one active run (queued, running, or waiting) per
-  subject: a second start of the same agent returns
-  `{:error, :active_run_exists}`, and another agent may start on the same
-  subject. A subject with a `nil` id never blocks another.
+- `start/3` inserts the run and its Oban job in one transaction, and
+  copies the agent's `turn` to the row. A start in a busy lane returns
+  `{:error, :active_run_exists}`; a turn without a subject id,
+  `{:error, :subject_required}`.
 - `get/1` returns the row. Read it freely; only the runtime writes it.
+  `AgentRun.active?/1` and `terminal?/1` read its status.
+- `active?/2`, `active/1`, `latest/2`, and `list/1` read runs by subject,
+  agent, turn, and actor, newest first, rollouts unless told
+  `kind: :loop`.
 - `resume/2` takes a waiting run's decision, `{:approved, meta}` or
   `{:denied, meta}`. A tool declared `approval: :required` parks its run
   in `waiting` before it executes (see [Approvals](approvals.md)). The
   resume and the run's new job commit in one transaction, so a sweep can
-  never find the resumed run without a job.
+  never find the resumed run without a job, and the claim that follows
+  resolves the subject and actor again.
 - `cancel/1` finishes a queued or waiting run at once and flags a running
   one. The flag goes on to the process running it, on whichever node, so
   the model call in flight is aborted and the run ends `cancelled`
@@ -144,7 +188,7 @@ Clementine.Runs.get(run.id)
 
 ## The host module
 
-Six questions belong to the app, and one optional module answers them.
+Seven questions belong to the app, and one optional module answers them.
 Every callback is optional:
 
 ```elixir
@@ -210,6 +254,19 @@ defmodule MyApp.Agents.Host do
 
   def resolve_subject(_type, _id), do: {:ok, nil}
 
+  # How an actor resolves, at every claim, the one after a resume
+  # included. A refusal cancels the run as unstartable.
+  @impl true
+  def resolve_actor("user", id) do
+    case MyApp.Accounts.get_user(id) do
+      %{suspended_at: nil} = user -> {:ok, user}
+      nil -> {:error, :user_not_found}
+      _suspended -> {:error, :user_suspended}
+    end
+  end
+
+  def resolve_actor(_type, _id), do: {:ok, nil}
+
   defp broadcast(run, message) do
     Phoenix.PubSub.broadcast(MyApp.PubSub, "#{run.subject_type}:#{run.subject_id}", message)
   end
@@ -220,7 +277,11 @@ A run reaches the host in order: its claim, its events, then the change
 that stops the execution (a suspension, a requeue, or the end), every
 event before the change that follows it. Only `run_finished/2` runs
 inside a transaction; everything else comes after a commit, never for a
-write that rolled back.
+write that rolled back. A `Clementine.Result.Cancelled` carries the
+stored reason: `%{"code" => "cancelled"}` from `cancel/1`, and
+`%{"code" => "unstartable", "detail" => why}` for a run the runtime could
+not build at a claim. A `Clementine.RunView` closes on the run
+`run_committed/2` hands over (`RunView.close(view, run)`).
 
 `run_event/2` gets each `Clementine.Event` in a process of its own. The
 run does not wait for each call, but it waits once the callback falls 64
@@ -247,8 +308,10 @@ Both finish hooks see every end (`Completed`, `Failed`, `Cancelled`,
 
 Keep every callback fast, and call `resume/2` and `cancel/1` outside a
 transaction (they raise inside one, because the host would hear of their
-writes before the caller's commit). The resolved subject reaches `agent/1` as `run.subject` and every
-tool as `context.subject`.
+writes before the caller's commit). The resolved subject and actor reach
+`agent/1` and `history/1` as `run.subject` and `run.actor`, and every
+tool as `context.subject` and `context.actor`, beside `context.run_id`,
+`context.agent_key`, and `context.turn`.
 
 Coding agents working in the app get these rules from
 [`usage-rules.md`](../usage-rules.md), which the
@@ -327,7 +390,16 @@ would leave old nodes failing on the missing column.
    `get/1`, `run.agent` with `run.agent_key`, and `RunWorker` with
    `Clementine.Runs.Worker` in tests.
 6. Keep the old migration, and do not add `Clementine.Migration.up/1`:
-   the table exists. Add one that brings it to version 1:
+   the table exists. Add one that brings it to version 1, then one
+   calling `Clementine.Migration.up(from: 1, version: 2)` (the runtime
+   refuses to start against version 1, and says so). The hand-rolled
+   version 1 carries no version stamp; the upgrade stamps it. The
+   upgrade adds `turn` as `false` on every row and backfills nothing,
+   because which keys are turn agents is the app's code: when the table
+   holds rows, set `turn` for the turn agents' rows in that same
+   migration, right after the upgrade
+   (`execute "UPDATE agent_runs SET turn = true WHERE agent_key IN ('chat')"`),
+   so an active turn keeps its thread the moment the lane index exists:
 
    ```elixir
    defmodule MyApp.Repo.Migrations.MatchClementineVersion1 do
@@ -352,7 +424,7 @@ would leave old nodes failing on the missing column.
    end
    ```
 
-   A later version arrives as `Clementine.Migration.up(from: 1, version: 2)`.
+   Any later version arrives the same way, `up(from: 2, version: 3)`.
 7. Keep `RunWorker` for one deploy, reduced to a forwarder. Jobs queued
    before the switch name it, and so do jobs the old nodes requeued while
    they drained; without it they fail, and the reaper interrupts their
@@ -372,12 +444,13 @@ would leave old nodes failing on the missing column.
    AND state NOT IN ('completed', 'cancelled', 'discarded')` returns 0.
 
 An app whose run machinery grew on its own (yakky's `Yakky.Agents`)
-moves the same way once its table matches version 1. Compare it column
-by column first: version 1 names the agent column `agent_key`, stores
-`subject_id` as text, scopes the single-active index by
-`(agent_key, subject_type, subject_id)`, and inserts rows with no other
-required columns. Product columns may stay as long as they are nullable
-or have defaults. A chat turn's history moves to the agent's
-`history/1`, its token stream to `run_event/2`, broadcasts of its other
-transitions to `run_transition/2`, and broadcasts of its end to
-`run_committed/2`.
+moves the same way once its table matches version 1, and then takes
+version 2. Compare it column by column first: version 1 names the agent
+column `agent_key`, stores `subject_id` as text, scopes the single-active
+index by `(agent_key, subject_type, subject_id)`, and inserts rows with
+no other required columns. Product columns that version 2 answers (who
+the run acts for, whether it is a turn, the thread's latest turn) go;
+the rest may stay as long as they are nullable or have defaults. A chat
+turn's history moves to the agent's `history/1`, its token stream to
+`run_event/2`, broadcasts of its other transitions to
+`run_transition/2`, and broadcasts of its end to `run_committed/2`.

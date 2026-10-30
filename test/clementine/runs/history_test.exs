@@ -95,7 +95,11 @@ defmodule Clementine.Runs.HistoryTest do
   end
 
   test "history that is not a list of messages cancels the run as unstartable" do
-    {:ok, run} = Runs.start(Chat, "Hello", metadata: %{"history" => "not messages"})
+    {:ok, run} =
+      Runs.start(Chat, "Hello",
+        subject: {"ticket", "t-1"},
+        metadata: %{"history" => "not messages"}
+      )
 
     assert {:cancel, reason} = perform_job(Worker, %{"run_id" => run.id})
     assert reason =~ "Clementine.RunsCase.Chat.history/1 must return a list"

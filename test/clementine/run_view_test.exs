@@ -252,6 +252,46 @@ defmodule Clementine.RunViewTest do
                  closed
       end
     end
+
+    test "a durable run as its end committed it closes the view, with no codec in sight" do
+      view = fold([event(1, 1, :text_delta, %{content: "partial"})])
+      finished_at = ~U[2026-10-27 12:00:00.000000Z]
+
+      run = %Clementine.Runs.AgentRun{
+        id: "run_1",
+        status: "cancelled",
+        lease_epoch: 1,
+        cancel: %{
+          "reason" => %{"t" => "json", "v" => %{"code" => "cancelled"}},
+          "requested_at" => "2026-10-27T11:59:00.000000Z"
+        },
+        finished_at: finished_at
+      }
+
+      closed = RunView.close(view, run)
+
+      assert RunView.closed?(closed)
+      assert closed.status == :cancelled
+
+      assert %Facts{ref: "run_1", status: :cancelled, epoch: 1, finished_at: ^finished_at} =
+               closed.final
+
+      assert closed.text == "partial"
+      assert RunView.close(closed, %{run | status: "completed"}) == closed
+    end
+
+    test "a durable run that has not ended is the same contract violation" do
+      view = RunView.new("run_1")
+
+      for status <- ~w(queued running waiting) do
+        assert_raise ArgumentError, ~r/terminal/, fn ->
+          RunView.close(view, %Clementine.Runs.AgentRun{id: "run_1", status: status})
+        end
+      end
+
+      other = %Clementine.Runs.AgentRun{id: "run_2", status: "completed"}
+      assert RunView.close(view, other) == view
+    end
   end
 
   describe "reconnect: snapshot + cursor + close" do

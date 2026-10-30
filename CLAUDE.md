@@ -201,11 +201,14 @@ decisive, and its samples pass `test/clementine/guides_test.exs`.
   the tests run both agents end to end through the runtime on Postgres. CI's
   `installer` job runs it with a pinned `phx_new`; run it locally after
   changing a template.
-- The generated migration calls `Clementine.Migration.up(version: 1)`,
-  which builds on version 1 of the column recipe. Both are frozen
-  (asserted in `test/clementine/runs/runtime_test.exs` and
-  `test/clementine/lifecycle/ecto_migration_versions_test.exs`); a table
-  change is a new version, never an edit to an old one.
+- The generated migration calls `Clementine.Migration.up(version: 2)`;
+  version 1 builds on version 1 of the column recipe, and version 2 adds
+  the actor, the turn flag, and the lane index. Every version is frozen
+  (asserted in `test/clementine/runs/migration_test.exs` and
+  `test/clementine/lifecycle/ecto_migration_versions_test.exs`) and
+  stamps its number on the table, which the runtime checks as it starts;
+  a table change is a new version, never an edit to an old one, and
+  the installer template moves to the new version in the same commit.
 - Never place a supervision child with Igniter's `add_new_child/3`: use
   `Mix.Clementine.add_child/4`, which inserts beside its anchor or edits
   nothing (its moduledoc says why).

@@ -139,8 +139,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     defp build(config, %AgentRun{} = row) do
       with {:ok, module} <- fetch_agent(config, row.agent_key),
            {:ok, prompt} <- prompt(row),
-           {:ok, subject} <- resolve_subject(config.host, row),
-           row = %{row | subject: subject},
+           {:ok, subject} <-
+             resolve(config.host, :resolve_subject, row.subject_type, row.subject_id),
+           {:ok, actor} <- resolve(config.host, :resolve_actor, row.actor_type, row.actor_id),
+           row = %{row | subject: subject, actor: actor},
            {:ok, history} <- history(module, row) do
         agent = module.agent(row)
 
@@ -152,9 +154,13 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             context: %{
               run_id: row.id,
               agent_key: row.agent_key,
+              turn: row.turn,
               subject_type: row.subject_type,
               subject_id: row.subject_id,
-              subject: subject
+              subject: subject,
+              actor_type: row.actor_type,
+              actor_id: row.actor_id,
+              actor: actor
             },
             limits: default_limits(agent)
           )
@@ -181,16 +187,18 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     defp prompt(%AgentRun{}), do: {:error, :blank_prompt}
 
-    defp resolve_subject(host, %AgentRun{subject_type: type, subject_id: id})
-         when is_binary(type) and not is_nil(host) do
-      if function_exported?(host, :resolve_subject, 2) do
-        host.resolve_subject(type, id)
+    # The subject and the actor resolve the same way, at every claim: the
+    # one after a resume included, so a reference refused since the run
+    # parked cancels it rather than continuing it.
+    defp resolve(host, callback, type, id) when is_binary(type) and not is_nil(host) do
+      if function_exported?(host, callback, 2) do
+        apply(host, callback, [type, id])
       else
         {:ok, nil}
       end
     end
 
-    defp resolve_subject(_host, _row), do: {:ok, nil}
+    defp resolve(_host, _callback, _type, _id), do: {:ok, nil}
 
     # A run resumed from a checkpoint continues from the messages the
     # checkpoint holds, history and prompt included, so its history is

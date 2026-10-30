@@ -51,7 +51,10 @@ defmodule Clementine.RunView do
   """
 
   alias Clementine.{Event, Usage}
+  alias Clementine.Lifecycle.Ecto.Codec
   alias Clementine.Lifecycle.Facts
+
+  @run_fields Codec.resolve_fields(:id, [])
 
   @enforce_keys [:run_ref]
   defstruct run_ref: nil,
@@ -129,10 +132,22 @@ defmodule Clementine.RunView do
   ignored like another run's events, and non-terminal facts for *this*
   run are a contract violation, not a close.
 
+  On the durable runtime the facts are the run itself: pass the
+  `Clementine.Runs.AgentRun` that `c:Clementine.Host.run_committed/2`
+  hands over, as its end committed it, and the view closes on it. A run
+  that has not ended is the same contract violation.
+
   The cursor keeps its last live position; `status` and `final` carry the
   lifecycle truth.
   """
-  @spec close(t(), Facts.t()) :: t()
+  @spec close(t(), Facts.t() | struct()) :: t()
+  def close(%__MODULE__{} = view, %{__struct__: Clementine.Runs.AgentRun} = run) do
+    # The runtime's table is keyed by `id` and carries the column recipe
+    # under its default names, so the fold reads the run as facts without
+    # the host touching the codec.
+    close(view, Codec.to_facts(run, @run_fields))
+  end
+
   def close(%__MODULE__{closed?: true} = view, %Facts{}), do: view
 
   def close(%__MODULE__{run_ref: ref} = view, %Facts{ref: facts_ref})
