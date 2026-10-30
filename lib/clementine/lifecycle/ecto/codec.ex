@@ -288,16 +288,25 @@ defmodule Clementine.Lifecycle.Ecto.Codec do
     %{payload: decode_payload(payload), resumed_at: decode_datetime(resumed_at)}
   end
 
-  # Normative approval payloads get first-class shapes; everything else is
+  # Normative approval payloads, and a delegation's outcomes, get
+  # first-class shapes, inspectable as JSON; everything else is
   # an opaque term.
   defp encode_payload({:approved, meta}), do: %{"kind" => "approved", "meta" => encode_term(meta)}
   defp encode_payload({:denied, meta}), do: %{"kind" => "denied", "meta" => encode_term(meta)}
   defp encode_payload(:elapsed), do: %{"kind" => "elapsed"}
+
+  defp encode_payload({:delegated, outcomes}),
+    do: %{"kind" => "delegated", "outcomes" => encode_term(outcomes)}
+
   defp encode_payload(other), do: %{"kind" => "term", "value" => encode_term(other)}
 
   defp decode_payload(%{"kind" => "approved", "meta" => meta}), do: {:approved, decode_term(meta)}
   defp decode_payload(%{"kind" => "denied", "meta" => meta}), do: {:denied, decode_term(meta)}
   defp decode_payload(%{"kind" => "elapsed"}), do: :elapsed
+
+  defp decode_payload(%{"kind" => "delegated", "outcomes" => outcomes}),
+    do: {:delegated, decode_term(outcomes)}
+
   defp decode_payload(%{"kind" => "term", "value" => value}), do: decode_term(value)
 
   ## Usage

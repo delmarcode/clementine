@@ -10,7 +10,9 @@ defmodule Clementine.RunsCase do
   The agents: `Echo` and `Lookup` are tasks, `Approval` a task whose tool
   needs approval, and `Chat` and `Handoff` turns (two agents that may act
   on one thread). `Lookup` and `Handoff` carry the `Context` tool, which
-  reports what a tool sees of its run.
+  reports what a tool sees of its run. `Planner` is a task that asks
+  others (`delegates:`): `Echo`, `Lookup`, and `Chat`, which it may not
+  ask, being a turn agent.
 
   `@tag oban: [notifier: Oban.Notifiers.PG]` adds options to Oban's: the
   default Postgres notifier sends nothing from inside the sandbox's
@@ -36,7 +38,7 @@ defmodule Clementine.RunsCase do
 
       alias Clementine.Runs
       alias Clementine.Runs.{AgentRun, Worker}
-      alias Clementine.RunsCase.{Approval, Chat, Context, Echo, Handoff, Lookup}
+      alias Clementine.RunsCase.{Approval, Chat, Context, Echo, Handoff, Lookup, Planner}
       alias Clementine.TestRepo
 
       setup :set_mox_global
@@ -61,7 +63,8 @@ defmodule Clementine.RunsCase do
            __MODULE__.Lookup,
            __MODULE__.Approval,
            __MODULE__.Chat,
-           __MODULE__.Handoff
+           __MODULE__.Handoff,
+           __MODULE__.Planner
          ],
          host: __MODULE__.Host}
       )
@@ -420,4 +423,18 @@ defmodule Clementine.RunsCase.Handoff do
 
   @impl true
   def history(_run), do: []
+end
+
+defmodule Clementine.RunsCase.Planner do
+  @moduledoc """
+  A test agent that asks others: `Echo` and `Lookup`, which run tasks, and
+  `Chat`, a turn agent, which it may not ask. Its one tool needs approval.
+  """
+
+  use Clementine.Agent,
+    key: "test_planner",
+    model: :claude_sonnet,
+    instructions: "Plan.",
+    tools: [Clementine.RunsCase.Approval.SendNote],
+    delegates: [Clementine.RunsCase.Echo, Clementine.RunsCase.Lookup, Clementine.RunsCase.Chat]
 end

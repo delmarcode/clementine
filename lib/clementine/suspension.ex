@@ -17,8 +17,11 @@ defmodule Clementine.Suspension do
   `{:until, _}` parks are mid-rollout by definition and always carry one —
   the Ecto codec refuses to store them without it.
 
-  Reason scope: rollouts produce only `{:approval, _}` (gated tools).
-  `{:external, tag}` is for host- and loop-initiated waits; `{:until, t}`
+  Reason scope: rollouts produce `{:approval, _}` (gated tools) and
+  `{:external, {:delegation, child_ids}}` (`delegate` calls waiting on
+  their children, `Clementine.Delegation`), whose ids the runtime fills
+  in as it starts them. `{:external, tag}` is otherwise for host- and
+  loop-initiated waits; `{:until, t}`
   for scheduled waits, whose wake-up is host-scheduled resume — nothing in
   Clementine owns a timer. The reaper's `:suspension_expired` is the
   policy ceiling over all waits, distinct from any wake-up path.

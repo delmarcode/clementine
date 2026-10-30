@@ -173,6 +173,24 @@ defmodule Clementine.Agent do
   raises otherwise, and a run whose `c:agent/1` sets `skills` without it
   fails as `:invalid_skills` before anything runs.
 
+  ## Delegates
+
+  An agent may ask other agents (`Clementine.Delegation`): the model calls
+  a `delegate` tool, each call starts a run of the agent it names on the
+  parent's subject, with the parent's actor, and the parent waits, parked,
+  until every one has ended. Each call's result is its child's answer.
+
+      use Clementine.Agent,
+        key: "planner",
+        model: :claude_sonnet,
+        instructions: "Plan the work. Ask the researcher for facts.",
+        delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
+
+  `delegates:` takes agent modules the child spec lists; the model sees
+  their keys as the `agent` enum. A delegate runs tasks: a turn agent
+  is refused at the call. An `c:agent/1` may offer different delegates
+  by subject or actor, and no tool the agent offers is named `delegate`.
+
   Note: this module shadows Elixir's built-in `Agent` under a bare `alias`;
   prefer `alias Clementine.Agent, as: AgentDef` where the collision bites.
   The in-memory agent *process* lives at `Clementine.AgentServer`.
@@ -186,6 +204,7 @@ defmodule Clementine.Agent do
             deferred: [],
             output_schema: nil,
             skills: [],
+            delegates: [],
             defaults: [],
             policy: %{},
             tool_context: %{},
@@ -199,6 +218,7 @@ defmodule Clementine.Agent do
           deferred: [module()],
           output_schema: Clementine.OutputSchema.t() | nil,
           skills: [Clementine.Skill.t()],
+          delegates: [module()],
           defaults: keyword(),
           policy: map(),
           tool_context: map(),
@@ -353,6 +373,8 @@ defmodule Clementine.Agent do
     "Structured output" above). Atom keys become strings
   - `:skills` - skills the model may load (see "Skills" above): modules
     that `use Clementine.Skill`, or `Clementine.Skill` structs
+  - `:delegates` - agents the model may ask (see "Delegates" above):
+    modules that `use Clementine.Agent`
   - `:defaults` - default rollout limits (`max_iterations:`, `max_duration:`)
   - `:policy` - host-app policy/config passthrough (opaque to Clementine)
   - `:tool_context` - keys every tool of the execution sees (`working_dir:`,
@@ -369,11 +391,26 @@ defmodule Clementine.Agent do
 
     case Enum.filter(agent.deferred, &(&1 in agent.tools)) do
       [] ->
-        agent |> normalize_output_schema() |> put_skills!()
+        agent |> normalize_output_schema() |> put_skills!() |> check_delegates!()
 
       both ->
         raise ArgumentError,
               "a tool is in tools: or deferred:, not both; found in both: #{inspect(both)}"
+    end
+  end
+
+  # Delegates are agent modules, kept as given, and checked as far as a
+  # build may (Clementine.Delegation.check/2): their keys are read when a
+  # run prepares, never here, since `use` builds an agent at compile time,
+  # and two agents may name each other.
+  defp check_delegates!(%__MODULE__{delegates: []} = agent), do: agent
+
+  defp check_delegates!(%__MODULE__{} = agent) do
+    tools = agent.tools ++ agent.deferred ++ Enum.flat_map(agent.skills, & &1.tools)
+
+    case Clementine.Delegation.check(agent.delegates, tools) do
+      :ok -> agent
+      {:error, message} -> raise ArgumentError, message
     end
   end
 

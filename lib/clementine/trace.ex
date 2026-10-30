@@ -12,24 +12,28 @@ defmodule Clementine.Trace do
   as stored:
 
   - `:execution`, once per execution: when a run starts, and again when it
-    resumes after an approval.
+    resumes after an approval or a delegation.
     - `"model"` — the model's resolved id
     - `"agent_fingerprint"` — a sha256 over the model id, the
       instructions, the agent's tool schemas, and, when the agent has
-      them, which tools are deferred, the output schema, and the skills it
-      offers (each one's name, description, and tool schemas), in
-      lowercase hex. Executions with the same fingerprint ran the same
-      agent: they offered the model the same thing.
+      them, which tools are deferred, the output schema, the skills it
+      offers (each one's name, description, and tool schemas), and the
+      keys of the agents it may ask, in lowercase hex. Executions with the
+      same fingerprint ran the same agent: they offered the model the same
+      thing.
     - `"instructions"` — the system prompt the execution sent
     - `"tools"` — the names of the tools offered as the execution began,
       in order: the agent's, deferred ones included, then those of the
       skills a resumed execution had loaded before it parked, then
-      `use_skill` when the agent offers skills
+      `use_skill` when the agent offers skills, and `delegate` when it
+      offers delegates
     - `"deferred"` — the names of the tools among them the model loads
       through the provider's tool search (`deferred:` on the agent); `[]`
       when none are
     - `"skills"` — the names of the skills the agent offers; `[]` when
       none are
+    - `"delegates"` — the keys of the agents it may ask; `[]` when none
+      are
     - `"resumed"` — `true` for an execution that resumed from a checkpoint
   - `:model_call`, once per call to the model.
     - `"iteration"`, `"duration_ms"`
@@ -65,6 +69,16 @@ defmodule Clementine.Trace do
     - `"body_sha256"` — a sha256 of the body the model read, in lowercase
       hex: a body may differ by run, and this says which one it was under
       either fidelity (the body itself is the `use_skill` call's result)
+  - `:delegate`, once per child a `delegate` call started
+    (`Clementine.Delegation`), when the run resumes with the children's
+    answers, just before that call's `:tool_call` entry. A call refused
+    at once, or refused when the run parked, records none.
+    - `"iteration"`, `"tool_use_id"` (of the `delegate` call)
+    - `"agent"` — the child's agent key
+    - `"child_id"` — the child's run id: `Clementine.Runs.trace/1` of it
+      is the child's own trace
+    - `"status"` — how the child ended: `"completed"`, `"failed"`,
+      `"cancelled"`, or `"interrupted"`
 
   ## Fidelity
 
@@ -137,6 +151,7 @@ defmodule Clementine.Trace do
       "tools" => Enum.map(offered, &Clementine.Tool.to_schema(&1).name),
       "deferred" => Enum.map(Keyword.get(offer, :deferred, []), & &1.__name__()),
       "skills" => Enum.map(Keyword.get(offer, :skills, []), & &1.name),
+      "delegates" => Keyword.get(offer, :delegates, []),
       "resumed" => resumed?
     }
   end
@@ -196,6 +211,21 @@ defmodule Clementine.Trace do
   end
 
   @doc false
+  # The `:delegate` payload for the `delegate` call `tool_use_id` in
+  # `iteration`, whose child ended with `outcome`
+  # (`Clementine.Delegation.outcome/2`).
+  @spec delegate(pos_integer(), String.t(), Clementine.Delegation.child(), map()) :: map()
+  def delegate(iteration, tool_use_id, child, outcome) do
+    %{
+      "iteration" => iteration,
+      "tool_use_id" => tool_use_id,
+      "agent" => child.agent,
+      "child_id" => child.run_id,
+      "status" => outcome["status"]
+    }
+  end
+
+  @doc false
   # What an entry of `kind` stores at `fidelity`: content keys dropped
   # under :facts, and every value in the form a jsonb round trip returns,
   # so what is recorded is what a read gives back, and a write never
@@ -216,12 +246,14 @@ defmodule Clementine.Trace do
   `offer` is what else the execution offers the model: `deferred:`, the
   tools in `tools` it loads through the provider's tool search;
   `output_schema:`, the JSON schema its final answer follows (canonical
-  JSON too); and `skills:`, the skills it may load, each with its name,
-  its description, and its tools' schemas, not its body (the body is read
-  when the model loads the skill, and may differ by run). Each enters the
+  JSON too); `skills:`, the skills it may load, each with its name, its
+  description, and its tools' schemas, not its body (the body is read
+  when the model loads the skill, and may differ by run); and
+  `delegates:`, the keys of the agents it may ask. Each enters the
   fingerprint only when set, so an agent without it keeps the fingerprint
   it had; moving a tool between `tools:` and `deferred:`, changing the
-  schema, or changing a skill's description or tools changes it.
+  schema, changing a skill's description or tools, or changing whom it
+  may ask changes it.
   """
   @spec fingerprint(
           Clementine.LLM.ModelRegistry.model_ref(),
@@ -251,6 +283,8 @@ defmodule Clementine.Trace do
       {:output_schema, schema}, acc -> Map.put(acc, "output_schema", schema)
       {:skills, []}, acc -> acc
       {:skills, skills}, acc -> Map.put(acc, "skills", Enum.map(skills, &skill_fingerprint/1))
+      {:delegates, []}, acc -> acc
+      {:delegates, keys}, acc -> Map.put(acc, "delegates", keys)
     end)
   end
 

@@ -445,8 +445,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     `c:Clementine.Host.authorize_resume/2` decides who may resume; its
     refusal comes back as is. Returns `{:error, :not_found}` and
     `{:error, :not_waiting}` for a run that does not exist or is not
-    waiting, and `{:error, :loop_run}` for a loop, which waits for its
-    inbox rather than a decision. The claim that follows resolves the
+    waiting, `{:error, :loop_run}` for a loop, which waits for its inbox
+    rather than a decision, and `{:error, :delegating}` for a run waiting
+    on the agents it asked (`Clementine.Delegation`), which resumes when
+    they end. The claim that follows resolves the
     run's subject and actor again, so a run whose actor was refused
     meanwhile is cancelled rather than continued.
 
@@ -460,7 +462,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     resume when resume's own transaction commits.
     """
     @spec resume(Ecto.UUID.t(), Clementine.Host.decision()) ::
-            :ok | {:error, :not_found | :not_waiting | :loop_run | term()}
+            :ok | {:error, :not_found | :not_waiting | :loop_run | :delegating | term()}
     def resume(run_id, {verdict, meta} = decision)
         when verdict in [:approved, :denied] and is_map(meta) do
       %Config{repo: repo} = config = Config.fetch!()
@@ -504,10 +506,18 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     defp refuse_loop(%AgentRun{kind: "loop"}), do: {:error, :loop_run}
     defp refuse_loop(%AgentRun{}), do: :ok
 
+    # A run waiting on its delegates resumes when they end, never by a
+    # decision.
     defp waiting_token(row) do
       case Codec.to_facts(row, @fields) do
-        %Facts{status: :waiting, suspension: %Suspension{token: token}} -> {:ok, token}
-        %Facts{} -> {:error, :not_waiting}
+        %Facts{status: :waiting, suspension: %Suspension{reason: {:external, {:delegation, _}}}} ->
+          {:error, :delegating}
+
+        %Facts{status: :waiting, suspension: %Suspension{token: token}} ->
+          {:ok, token}
+
+        %Facts{} ->
+          {:error, :not_waiting}
       end
     end
 
