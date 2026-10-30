@@ -11,6 +11,17 @@ defmodule Clementine.LLM.Anthropic.Tools do
     "name" => "tool_search_tool_regex"
   }
 
+  # The models released before tool search: Claude 3.x and earlier, and
+  # Opus 4, Opus 4.1, and Sonnet 4 (Anthropic's tool search model
+  # compatibility table, read 2026-10-29). The set is closed, so every
+  # model not in it, including any released later, has tool search.
+  def searchable?(model_id) when is_binary(model_id) do
+    not Regex.match?(
+      ~r/^claude-(instant|2|3)|^claude-(opus|sonnet)-4(-[01])?(-\d{8})?$/,
+      model_id
+    )
+  end
+
   def encode(tool) when is_atom(tool) do
     schema = Tool.to_schema(tool)
 

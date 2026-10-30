@@ -250,6 +250,47 @@ defmodule Clementine.LLM.AnthropicTest do
                )
     end
 
+    test "a model released before tool search gets its deferred tools as ordinary tools", %{
+      bypass: bypass
+    } do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        assert request["model"] == "claude-opus-4-1"
+        assert [%{"name" => "echo"} = echo, %{"name" => "add"} = add] = request["tools"]
+        refute Map.has_key?(echo, "defer_loading")
+        refute Map.has_key?(add, "defer_loading")
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("ok"))
+      end)
+
+      model = {:anthropic, "claude-opus-4-1"}
+      messages = [UserMessage.new("Hi")]
+
+      assert {:ok, %Response{}} =
+               Anthropic.call(model, "system", messages, [Echo, Add], deferred: [Add])
+    end
+
+    test "tool search is for every model but those released before it" do
+      for id <-
+            ~w(claude-opus-4-0 claude-opus-4-1 claude-opus-4-20250514 claude-opus-4-1-20250805
+               claude-sonnet-4-0 claude-sonnet-4-20250514 claude-3-7-sonnet-20250219
+               claude-3-5-haiku-20241022 claude-3-opus-20240229 claude-2.1 claude-instant-1.2) do
+        refute Anthropic.Tools.searchable?(id), id
+      end
+
+      for id <-
+            ~w(claude-opus-4-5-20251101 claude-sonnet-4-5-20250929 claude-haiku-4-5
+               claude-haiku-4-5-20251001 claude-opus-4-6 claude-sonnet-4-6 claude-opus-4-7
+               claude-opus-4-8 claude-sonnet-5 claude-sonnet-5-5 claude-opus-5 claude-opus-5-5
+               claude-haiku-5-5 claude-fable-5 claude-fable-5-1 claude-mythos-5-1) do
+        assert Anthropic.Tools.searchable?(id), id
+      end
+    end
+
     test "stream/5 collects a tool search turn in the order the API sent it", %{bypass: bypass} do
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         conn

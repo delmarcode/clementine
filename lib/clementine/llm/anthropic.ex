@@ -33,7 +33,9 @@ defmodule Clementine.LLM.Anthropic do
   Tools named in the `:deferred` request option (a subset of `tools`)
   go with `defer_loading: true`, beside the API's tool search tool
   (`tool_search_tool_regex_20251119`): Claude sees only the tools that
-  are not deferred until a search loads the ones it needs. The search's
+  are not deferred until a search loads the ones it needs. Models older
+  than Claude Opus 4.5, Sonnet 4.5, and Haiku 4.5 have no tool search, so
+  their deferred tools go as ordinary tools. The search's
   `server_tool_use` and `tool_search_tool_result` blocks come back as
   `Clementine.LLM.Message.Content.ServerToolUse` and `ServerToolResult`
   and must be replayed with the turn, which history does. The search runs
@@ -281,12 +283,18 @@ defmodule Clementine.LLM.Anthropic do
 
     body =
       if tools != nil and tools != [] do
-        Map.put(body, "tools", Tools.encode_all(tools, Keyword.get(opts, :deferred, [])))
+        Map.put(body, "tools", Tools.encode_all(tools, deferred(model_id, opts)))
       else
         body
       end
 
     body
+  end
+
+  # A model without tool search gets its deferred tools as ordinary tools,
+  # as every other provider does, rather than a request the API refuses.
+  defp deferred(model_id, opts) do
+    if Tools.searchable?(model_id), do: Keyword.get(opts, :deferred, []), else: []
   end
 
   defp maybe_put_reasoning(body, nil), do: body
