@@ -56,7 +56,9 @@ defmodule Clementine.Skill do
     (`Clementine.Trace`).
 
   A skill's tools are ordinary `Clementine.Tool` modules: `approval:`,
-  `retry:`, and the tool context apply unchanged. A gated one parks the
+  `retry:`, and the tool context apply unchanged. They load in full when
+  the skill loads, never through the provider's tool search, so none may
+  also be in the agent's `deferred:`. A gated one parks the
   run, and the checkpoint records which skills were loaded, so the resume
   offers the same tools. The agent must still offer those skills when
   the run resumes: a checkpoint naming a skill it no longer offers fails

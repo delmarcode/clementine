@@ -183,8 +183,10 @@ description: &1.description, body: &1.body, tools: ...))`.
   resume offers the loaded skills' tools again. Keep offering a skill
   while runs that loaded it may be parked: a resume whose agent dropped
   it fails as `:incompatible_checkpoint`.
-- Every tool the agent may offer, its own and each skill's, has a name
-  of its own, and none is named `use_skill`; the build fails otherwise,
+- Every tool the agent may offer, its own (`tools:` and `deferred:`) and
+  each skill's, has a name of its own, and none is named `use_skill`. A
+  skill's tools load in full when it loads, so none is also `deferred:`.
+  The build fails otherwise,
   and a run whose `agent/1` sets `skills` past `Agent.new/1` fails as
   `:invalid_skills` before anything runs. Two skills may share a tool
   module.

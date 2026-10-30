@@ -166,8 +166,10 @@ defmodule Clementine.Agent do
   skill's name and description; loading one returns its body and adds its
   tools. A run that parks resumes with the skills it had loaded, so an
   `c:agent/1` must offer them again at the resume's claim, as it must its
-  tools. Every tool the model can be offered, the agent's own and each
-  skill's, has a name of its own, and none is named `use_skill`: `new/1`
+  tools. Every tool the model can be offered, the agent's own (`tools:`
+  and `deferred:`) and each skill's, has a name of its own, and none is
+  named `use_skill`. A skill's tools load in full when the skill loads,
+  never through tool search, so none of them may also be deferred. `new/1`
   raises otherwise, and a run whose `c:agent/1` sets `skills` without it
   fails as `:invalid_skills` before anything runs.
 
