@@ -159,15 +159,12 @@ defmodule Clementine.LLM do
   end
 
   @doc """
-  Extracts text content from a response.
+  Extracts text content from a response. Text that another block separates
+  (a tool search, a thinking block) is set apart by a blank line; see
+  `Clementine.LLM.Message.Content.join_text/1`.
   """
   @spec get_text(Clementine.LLM.Response.t()) :: String.t()
-  def get_text(response) do
-    response.content
-    |> Enum.filter(&match?(%Content.Text{}, &1))
-    |> Enum.map(& &1.text)
-    |> Enum.join("")
-  end
+  def get_text(response), do: Content.join_text(response.content)
 
   # Get the configured LLM client (allows for mocking in tests)
   defp get_client do

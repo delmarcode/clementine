@@ -175,6 +175,22 @@ defmodule Clementine.LLM.Message do
       %ServerToolResult{tool_use_id: tool_use_id, block_type: block_type, content: content}
     end
 
+    @doc """
+    The text of `blocks`, as one string. Adjacent text blocks run together;
+    text that another block separates (a tool search, a thinking block)
+    is set apart by a blank line, so the text before a search and the text
+    after it do not run into one sentence.
+    """
+    @spec join_text([t()]) :: String.t()
+    def join_text(blocks) when is_list(blocks) do
+      blocks
+      |> Enum.chunk_by(&match?(%Text{}, &1))
+      |> Enum.filter(&match?([%Text{} | _], &1))
+      |> Enum.map(fn run -> Enum.map_join(run, "", & &1.text) end)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join("\n\n")
+    end
+
     @doc "Checks whether a struct is a known message content variant."
     def valid?(%Text{}), do: true
     def valid?(%ToolUse{}), do: true
@@ -489,13 +505,8 @@ defmodule Clementine.LLM.Message do
       %__MODULE__{content: [Content.text(text)]}
     end
 
-    @doc "Extracts text content from the message"
-    def get_text(%__MODULE__{content: content}) do
-      content
-      |> Enum.filter(&match?(%Content.Text{}, &1))
-      |> Enum.map(& &1.text)
-      |> Enum.join("")
-    end
+    @doc "Extracts text content from the message (see `Content.join_text/1`)"
+    def get_text(%__MODULE__{content: content}), do: Content.join_text(content)
 
     @doc "Extracts tool use blocks from the message"
     def get_tool_uses(%__MODULE__{content: content}) do

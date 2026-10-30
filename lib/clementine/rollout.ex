@@ -103,11 +103,16 @@ defmodule Clementine.Rollout do
   defp to_config(%__MODULE__{} = rollout) do
     %Clementine.Agent{} = agent = rollout.agent
 
+    # A tool in both lists goes once, up front: Agent.new/1 refuses the
+    # overlap, but an agent/1 may build or update the struct directly, and
+    # a tool sent twice is a request the provider refuses.
+    deferred = agent.deferred |> Enum.reject(&(&1 in agent.tools)) |> Enum.uniq()
+
     [
       model: agent.model,
       system: agent.instructions,
-      tools: agent.tools ++ agent.deferred,
-      deferred: agent.deferred,
+      tools: agent.tools ++ deferred,
+      deferred: deferred,
       context: rollout.context,
       messages: rollout.messages,
       max_iterations: Keyword.get(limits(rollout), :max_iterations, @default_max_iterations),
@@ -141,7 +146,8 @@ defmodule Clementine.Rollout do
       iteration: 0,
       usage: %Clementine.Usage{},
       fence_raised?: false,
-      fidelity: :content
+      fidelity: :content,
+      paused?: false
     ]
   end
 
@@ -697,16 +703,18 @@ defmodule Clementine.Rollout do
 
   # A turn the provider paused mid-way through its own tools (a long tool
   # search) goes back as it stands, and the provider resumes it: one more
-  # gather, bounded by the iteration cap like any other.
+  # gather, bounded by the iteration cap like any other. The continuation
+  # joins the paused turn's message, so history holds the turn as one
+  # assistant message and the output is the whole turn's text.
   defp act(%Execution{} = exec, response) do
-    exec = %{exec | messages: exec.messages ++ [AssistantMessage.new(response.content)]}
+    exec = %{exec | messages: append_turn(exec, response.content), paused?: false}
 
     cond do
       LLM.tool_use?(response) ->
         act_on_tools(exec, LLM.get_tool_uses(response))
 
       LLM.paused?(response) ->
-        boundary(exec)
+        boundary(%{exec | paused?: true})
 
       true ->
         conclude(
@@ -715,11 +723,20 @@ defmodule Clementine.Rollout do
            Clementine.Result.completed(
              input_message: exec.input_message,
              messages: Enum.drop(exec.messages, exec.prefix_len),
-             output: LLM.get_text(response),
+             output: exec.messages |> List.last() |> AssistantMessage.get_text(),
              usage: exec.usage
            )}
         )
     end
+  end
+
+  defp append_turn(%Execution{paused?: true, messages: messages}, content) do
+    %AssistantMessage{} = paused = List.last(messages)
+    List.replace_at(messages, -1, %{paused | content: paused.content ++ content})
+  end
+
+  defp append_turn(%Execution{messages: messages}, content) do
+    messages ++ [AssistantMessage.new(content)]
   end
 
   # A signal that arrived during the gather is already in the mailbox:

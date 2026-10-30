@@ -66,6 +66,53 @@ defmodule Clementine.DeferredToolsTest do
 
       assert {:ok, %Result.Completed{}} = Rollout.execute(rollout(tools: [Echo]))
     end
+
+    test "a tool an agent/1 put in both lists goes once, up front" do
+      # agent/1 may update the struct directly, past new/1's check.
+      agent = %{
+        Clementine.Agent.new(model: :claude_sonnet, tools: [Echo, Add])
+        | deferred: [Add, GatedDeploy, GatedDeploy]
+      }
+
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, tools, opts ->
+        assert tools == [Echo, Add, GatedDeploy]
+        assert opts[:deferred] == [GatedDeploy]
+        text_events("Done.")
+      end)
+
+      assert {:ok, %Result.Completed{}} = Rollout.execute(Rollout.new(agent: agent, input: "go"))
+    end
+  end
+
+  describe "an answer around a search" do
+    test "keeps the text before the search and the text after it apart" do
+      expect_turn([
+        {:content_block_start, 0, :text},
+        {:text_delta, "I'll search for a tool."},
+        {:content_block_stop, 0},
+        {:content_block_start, 1, :server_tool_use},
+        {:server_tool_use_start, "srvtoolu_1", "tool_search_tool_regex"},
+        {:server_tool_input_delta, "srvtoolu_1", ~s({"pattern":"forecast"})},
+        {:content_block_stop, 1},
+        {:content_block_start, 2, :server_tool_result},
+        {:server_tool_result,
+         %{
+           "type" => "tool_search_tool_result",
+           "tool_use_id" => "srvtoolu_1",
+           "content" => %{"type" => "tool_search_tool_search_result", "tool_references" => []}
+         }},
+        {:content_block_stop, 2},
+        {:content_block_start, 3, :text},
+        {:text_delta, "Found nothing; answering from memory."},
+        {:content_block_stop, 3},
+        {:message_delta, %{"stop_reason" => "end_turn"}, %{"output_tokens" => 9}}
+      ])
+
+      assert {:ok, %Result.Completed{} = result} =
+               Rollout.execute(rollout(tools: [Echo], deferred: [GatedDeploy]))
+
+      assert result.output == "I'll search for a tool.\n\nFound nothing; answering from memory."
+    end
   end
 
   describe "a deferred tool the model finds" do
@@ -155,12 +202,15 @@ defmodule Clementine.DeferredToolsTest do
   end
 
   describe "a turn the provider paused" do
-    test "goes back as it stands, and the provider's next answer finishes it" do
+    test "goes back as it stands, and the provider's next answer finishes it as one turn" do
       paused = [
-        {:content_block_start, 0, :server_tool_use},
+        {:content_block_start, 0, :text},
+        {:text_delta, "Let me look."},
+        {:content_block_stop, 0},
+        {:content_block_start, 1, :server_tool_use},
         {:server_tool_use_start, "srvtoolu_1", "tool_search_tool_regex"},
         {:server_tool_input_delta, "srvtoolu_1", ~s({"pattern":"deploy"})},
-        {:content_block_stop, 0},
+        {:content_block_stop, 1},
         {:message_delta, %{"stop_reason" => "pause_turn"},
          %{"input_tokens" => 5, "output_tokens" => 2}}
       ]
@@ -169,16 +219,30 @@ defmodule Clementine.DeferredToolsTest do
 
       expect(Clementine.LLM.MockClient, :stream, fn _model, _system, messages, _tools, _opts ->
         # No "continue" message: the paused turn ends the history.
-        assert [%UserMessage{}, %AssistantMessage{content: [%Content.ServerToolUse{}]}] =
-                 messages
+        assert [
+                 %UserMessage{},
+                 %AssistantMessage{content: [%Content.Text{}, %Content.ServerToolUse{}]}
+               ] = messages
 
         text_events("Nothing to deploy.")
       end)
 
-      assert {:ok, %Result.Completed{output: "Nothing to deploy."} = result} =
+      assert {:ok, %Result.Completed{} = result} =
                Rollout.execute(rollout(tools: [Echo], deferred: [GatedDeploy]))
 
-      assert [%AssistantMessage{}, %AssistantMessage{}] = result.messages
+      # The continuation joins the paused message: one turn, one message,
+      # and the output is the whole turn's text.
+      assert [
+               %AssistantMessage{
+                 content: [
+                   %Content.Text{text: "Let me look."},
+                   %Content.ServerToolUse{id: "srvtoolu_1"},
+                   %Content.Text{text: "Nothing to deploy."}
+                 ]
+               }
+             ] = result.messages
+
+      assert result.output == "Let me look.\n\nNothing to deploy."
     end
 
     test "counts against the iteration cap" do
