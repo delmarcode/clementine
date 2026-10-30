@@ -251,7 +251,8 @@ agent's delegates are left out.
 - **The reaper** leaves a waiting parent alone, and a child it interrupts
   (its node died, or it was never claimed) resumes the parent like any
   end. A parent still waiting on children that have all ended (an end
-  that never reached it) is resumed by the next sweep. `max_wait:` on
+  that never reached it) is resumed by a sweep once its park and its
+  last child's end are a sweep interval old. `max_wait:` on
   the policy bounds a parent's wait as it bounds an approval's, and its
   end cancels the children.
 - **Purge** follows `parent_id`, so `purge/1` of the subject takes the

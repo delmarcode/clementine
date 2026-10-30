@@ -186,7 +186,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         facts = Codec.to_facts(row, @fields)
 
         case judge(facts, jobs[row.oban_job_id], now, policy) do
-          :healthy -> reconcile_delegation(facts, acc)
+          :healthy -> reconcile_delegation(facts, now, policy, acc)
           verdict -> apply_verdict(verdict, repo, facts, acc)
         end
       end)
@@ -194,23 +194,41 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     # A run waiting on its children is healthy, but if they have all
     # ended and it still waits, their end never reached it: resume it.
+    # Only once its park and its last child's end are a sweep interval
+    # old, so the paths that resume it at once (the last child's end, the
+    # worker once the execution that parked is over) have had their turn,
+    # and a resume never lands before that execution's after_execution/2.
     # The cheap read first; the resume re-checks under the run's lock.
     defp reconcile_delegation(
            %Facts{
              status: :waiting,
              ref: run_id,
+             queued_at: parked_at,
              suspension: %Suspension{reason: {:external, {:delegation, ids}}}
            },
+           now,
+           policy,
            acc
          ) do
-      if Delegations.all_ended?(ids) and Delegations.reconcile(run_id) == :resumed,
-        do: %{acc | resumed: acc.resumed + 1},
-        else: acc
+      with {:ended, last_end} <- Delegations.ended(ids),
+           true <- settled?([parked_at, last_end], now, policy.sweep_interval),
+           :resumed <- Delegations.reconcile(run_id) do
+        %{acc | resumed: acc.resumed + 1}
+      else
+        _not_yet -> acc
+      end
     rescue
       e -> log_sweep_error(run_id, Exception.message(e), acc)
     end
 
-    defp reconcile_delegation(_facts, acc), do: acc
+    defp reconcile_delegation(_facts, _now, _policy, acc), do: acc
+
+    defp settled?(stamps, now, interval) do
+      case stamps |> Enum.reject(&is_nil/1) |> Enum.max(DateTime, fn -> nil end) do
+        nil -> true
+        latest -> DateTime.diff(now, latest, :millisecond) >= interval
+      end
+    end
 
     # The storage clock, the same source that stamped the facts. A
     # node-local DateTime.utc_now/0 would bring back the two-clock problem

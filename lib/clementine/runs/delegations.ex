@@ -37,6 +37,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     import Ecto.Query, only: [from: 2]
 
+    require Logger
+
     alias Clementine.{Checkpoint, Delegation, Emissions, Pending, Suspension, ToolResult}
     alias Clementine.Lifecycle.Ecto, as: EctoLifecycle
     alias Clementine.Lifecycle.Ecto.Codec
@@ -318,13 +320,28 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     @doc false
-    # Whether every child in `ids` has ended: the reaper's cheap read
-    # before it takes a parent's lock.
-    @spec all_ended?([Ecto.UUID.t()]) :: boolean()
-    def all_ended?(ids) do
+    # When the children in `ids` had all ended: `{:ended, at}`, `at` the
+    # latest of their finished_at (`nil` with no children), or `:live`
+    # while one runs. The reaper's cheap read before it takes a parent's
+    # lock.
+    @spec ended([Ecto.UUID.t()]) :: {:ended, DateTime.t() | nil} | :live
+    def ended([]), do: {:ended, nil}
+
+    def ended(ids) do
       %Config{repo: repo} = Config.fetch!()
 
-      not repo.exists?(from(r in AgentRun, where: r.id in ^ids and r.status in @active_statuses))
+      rows =
+        repo.all(from(r in AgentRun, where: r.id in ^ids, select: {r.status, r.finished_at}))
+
+      if length(rows) == length(ids) and Enum.all?(rows, &(elem(&1, 0) not in @active_statuses)) do
+        {:ended,
+         rows
+         |> Enum.map(&elem(&1, 1))
+         |> Enum.reject(&is_nil/1)
+         |> Enum.max(DateTime, fn -> nil end)}
+      else
+        :live
+      end
     end
 
     defp resume_when_all_ended(parent_id, ids, token) do
@@ -433,11 +450,22 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       locked = MapSet.new(List.flatten(levels))
       found = MapSet.new(List.flatten(live_levels(repo, [run_id], [])))
 
-      if MapSet.subset?(found, locked) or attempts == 1 do
-        repo.query!("RELEASE SAVEPOINT clementine_descendants")
-      else
-        repo.query!("ROLLBACK TO SAVEPOINT clementine_descendants")
-        lock_live_descendants(repo, run_id, attempts - 1)
+      cond do
+        MapSet.subset?(found, locked) ->
+          repo.query!("RELEASE SAVEPOINT clementine_descendants")
+
+        attempts == 1 ->
+          Logger.warning(
+            "run #{run_id}: its live descendants kept changing while they were locked " <>
+              "(#{@lock_attempts} walks); going on with the #{MapSet.size(locked)} it holds, " <>
+              "and #{MapSet.size(MapSet.difference(found, locked))} found since unlocked"
+          )
+
+          repo.query!("RELEASE SAVEPOINT clementine_descendants")
+
+        true ->
+          repo.query!("ROLLBACK TO SAVEPOINT clementine_descendants")
+          lock_live_descendants(repo, run_id, attempts - 1)
       end
     end
 

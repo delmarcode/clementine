@@ -75,7 +75,8 @@ defmodule Clementine.Delegation do
   with that call settled as cancelled. A child the reaper interrupts, or
   one never claimed, ends like any run, and its end resumes the parent
   the same way. The reaper also resumes a waiting parent whose children
-  have all ended when no end reached it. A parent ended while it waits
+  have all ended when no end reached it, once its park and its last
+  child's end are a sweep interval old. A parent ended while it waits
   (the reaper's `max_wait:` ceiling) cancels its live children with it.
   `Clementine.Runs.purge/1` follows `parent_id`, so a subject's purge
   takes the children too.

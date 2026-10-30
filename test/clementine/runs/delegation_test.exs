@@ -602,24 +602,9 @@ defmodule Clementine.Runs.DelegationTest do
       {:ok, lease} = Protocol.claim(Lifecycle, parent.id, executor: "test")
       assert {:ok, :flagged} = Runs.cancel(parent.id)
 
-      call = %Clementine.LLM.Message.Content.ToolUse{
-        id: "tu_1",
-        name: "delegate",
-        input: %{"agent" => "test_echo", "prompt" => "Say it."}
-      }
+      assert {:cancelled, %{status: :cancelled}} =
+               Protocol.suspend(lease, delegation_request("tu_1", "test_echo"))
 
-      request = %Clementine.Suspension.Request{
-        reason: {:external, {:delegation, []}},
-        pending: %Pending.Delegation{
-          children: %{"tu_1" => %{agent: "test_echo", prompt: "Say it.", run_id: nil}}
-        },
-        messages: [
-          Clementine.LLM.Message.UserMessage.new("Plan"),
-          %Clementine.LLM.Message.AssistantMessage{content: [call]}
-        ]
-      }
-
-      assert {:cancelled, %{status: :cancelled}} = Protocol.suspend(lease, request)
       assert children(parent.id) == []
     end
 
@@ -708,20 +693,23 @@ defmodule Clementine.Runs.DelegationTest do
       assert content =~ "claim_timeout"
     end
 
-    test "resumes a waiting parent whose children ended without its hearing" do
+    test "resumes a waiting parent whose children ended without its hearing, once the " <>
+           "last end is a sweep interval old" do
       parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
       [echo] = children(parent_id)
 
       # The child's end written by code that dropped it for a rollout parent.
       {1, _} =
         TestRepo.update_all(from(r in AgentRun, where: r.id == ^echo.id),
-          set: [
-            status: "completed",
-            result: %{"output" => "Said."},
-            finished_at: DateTime.utc_now()
-          ]
+          set: [status: "completed", result: %{"output" => "Said."}, finished_at: db_now!()]
         )
 
+      # Too fresh: the paths that resume at once get their turn first.
+      assert %{resumed: 0} = Reaper.sweep()
+      assert %AgentRun{status: "waiting"} = Runs.get(parent_id)
+
+      age!(parent_id, :queued_at, 2)
+      age!(echo.id, :finished_at, 2)
       assert %{resumed: 1, interrupted: 0} = Reaper.sweep()
 
       assert %{status: :queued, resume: %{payload: {:delegated, %{"tu_1" => outcome}}}} =
@@ -729,6 +717,27 @@ defmodule Clementine.Runs.DelegationTest do
 
       assert outcome["content"] == "Said."
       assert %{resumed: 0} = Reaper.sweep()
+    end
+
+    test "waits a sweep interval before resuming a park that started no child, so the " <>
+           "worker's resume after after_execution/2 comes first" do
+      {:ok, _busy} = Runs.start(Echo, "Already busy", subject: {"ticket", "t-grace"})
+      {:ok, parent} = Runs.start(Planner, "Plan", subject: {"ticket", "t-grace"})
+
+      # The park, by the runner, without the worker that would resume it
+      # once the execution is over.
+      {:ok, lease} = Protocol.claim(Lifecycle, parent.id, executor: "test")
+      assert {:ok, _token} = Protocol.suspend(lease, delegation_request("tu_1", "test_echo"))
+
+      assert %{status: :waiting, suspension: %{reason: {:external, {:delegation, []}}}} =
+               facts(parent.id)
+
+      assert %{resumed: 0} = Reaper.sweep()
+      assert %AgentRun{status: "waiting"} = Runs.get(parent.id)
+
+      age!(parent.id, :queued_at, 2)
+      assert %{resumed: 1} = Reaper.sweep()
+      assert %{status: :queued, resume: %{payload: {:delegated, %{}}}} = facts(parent.id)
     end
 
     test "leaves the waiting parent alone" do
@@ -769,6 +778,36 @@ defmodule Clementine.Runs.DelegationTest do
       assert_received {:read, [{"tu_1", "Said.", false}]}
       assert %AgentRun{status: "completed", lease_epoch: 3} = Runs.get(parent_id)
     end
+  end
+
+  # The suspension body the engine parks on for one delegate call.
+  defp delegation_request(tool_use_id, agent) do
+    call = %Clementine.LLM.Message.Content.ToolUse{
+      id: tool_use_id,
+      name: "delegate",
+      input: %{"agent" => agent, "prompt" => "Say it."}
+    }
+
+    %Clementine.Suspension.Request{
+      reason: {:external, {:delegation, []}},
+      pending: %Pending.Delegation{
+        children: %{tool_use_id => %{agent: agent, prompt: "Say it.", run_id: nil}}
+      },
+      messages: [
+        Clementine.LLM.Message.UserMessage.new("Plan"),
+        %Clementine.LLM.Message.AssistantMessage{content: [call]}
+      ]
+    }
+  end
+
+  # Moves one of a run's timestamps `minutes` into the past.
+  defp age!(run_id, column, minutes) do
+    then = DateTime.add(db_now!(), -minutes, :minute)
+
+    {1, _} =
+      TestRepo.update_all(from(r in AgentRun, where: r.id == ^run_id), set: [{column, then}])
+
+    :ok
   end
 
   # A claimed run whose node died: running, its heartbeat two hours old,
