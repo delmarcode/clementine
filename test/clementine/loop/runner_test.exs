@@ -4,7 +4,6 @@ defmodule Clementine.Loop.RunnerTest do
   alias Clementine.{Error, InterruptReason, Result}
   alias Clementine.Lifecycle.{Facts, Protocol}
   alias Clementine.Loop.{Codec, Envelope, Input, Runner}
-  alias Clementine.Loop.Protocol, as: LoopProtocol
   alias Clementine.Test.MemoryLoopHost, as: Host
   alias Clementine.Test.ScriptedLoop
 
@@ -168,15 +167,14 @@ defmodule Clementine.Loop.RunnerTest do
     scope = Keyword.get(opts, :scope, "loop:#{System.unique_integer([:positive])}")
 
     {:ok, %Facts{ref: ref}} =
-      LoopProtocol.create(
-        Host,
+      Host.create(
         %{
           module: module,
           scope: scope,
           args: Keyword.get(opts, :args, %{}),
           policy: Keyword.get(opts, :policy, %{})
         },
-        ctx: store
+        store
       )
 
     ref
@@ -218,9 +216,9 @@ defmodule Clementine.Loop.RunnerTest do
       spec = %{module: ScriptedLoop, scope: "conversation:42", args: %{}, policy: %{}}
 
       {:ok, %Facts{ref: ref, kind: :loop, status: :queued}} =
-        LoopProtocol.create(Host, spec, ctx: store)
+        Host.create(spec, store)
 
-      {:ok, :already_exists, %Facts{ref: ^ref}} = LoopProtocol.create(Host, spec, ctx: store)
+      {:ok, :already_exists, %Facts{ref: ^ref}} = Host.create(spec, store)
 
       # No envelope exists until the first step commits init's fold.
       {:ok, %{envelope: nil}} = Host.load(ref, store)
@@ -560,7 +558,7 @@ defmodule Clementine.Loop.RunnerTest do
       # The operator says stop; a straggler message is already queued
       # behind the cancel — it must never reach handle/2.
       append!(store, ref, %{"id" => "straggler"})
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :operator_stop, ctx: store)
+      assert {:ok, :flagged} = Host.cancel(ref, :operator_stop, store)
 
       # The flag woke the parked loop: queued, job enqueued, flag durable.
       facts = Host.facts!(store, ref)
@@ -602,7 +600,7 @@ defmodule Clementine.Loop.RunnerTest do
       [child_ref] = Map.values(envelope!(store, ref).children)
       {:ok, child_lease} = Protocol.claim(Host, child_ref, executor: "child-worker", ctx: store)
 
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :stop, ctx: store)
+      assert {:ok, :flagged} = Host.cancel(ref, :stop, store)
 
       # The cascade flags the running child cooperatively and parks
       # awaiting its completion; the set cancel flag must NOT downgrade a
@@ -667,7 +665,7 @@ defmodule Clementine.Loop.RunnerTest do
 
       # The cancel arrives mid-cascade; the flag wakes the loop but the
       # halt stays the pending result — first cause wins.
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :too_late, ctx: store)
+      assert {:ok, :flagged} = Host.cancel(ref, :too_late, store)
       assert {:parked, _} = step!(store, ref)
 
       {:ok, _} = Protocol.finish(child_lease, Result.cancelled({:loop_cascade, ref}))
@@ -760,23 +758,23 @@ defmodule Clementine.Loop.RunnerTest do
     end
   end
 
-  describe "the send verb (Loop.Protocol.send/4)" do
+  describe "the send verb (append of a message)" do
     test "sugar over append: the payload arrives as {:message, payload}, the caller's key dedups, the wake rides the unit",
          %{store: store} do
       ref = create!(store, ScriptedLoop)
       assert {:parked, _} = step!(store, ref)
 
       assert {:ok, :appended} =
-               LoopProtocol.send(Host, ref, %{"id" => "hi"}, dedup_key: "wh:1", ctx: store)
+               Host.append(ref, Input.message(%{"id" => "hi"}), "wh:1", store)
 
       assert Host.facts!(store, ref).status == :queued
 
       assert {:ok, :duplicate} =
-               LoopProtocol.send(Host, ref, %{"id" => "hi"}, dedup_key: "wh:1", ctx: store)
+               Host.append(ref, Input.message(%{"id" => "hi"}), "wh:1", store)
 
       # No key, no dedup — the default for callers without an idempotency
       # source of their own.
-      assert {:ok, :appended} = LoopProtocol.send(Host, ref, %{"id" => "hi"}, ctx: store)
+      assert {:ok, :appended} = Host.append(ref, Input.message(%{"id" => "hi"}), nil, store)
 
       assert {:parked, _} = step!(store, ref)
       assert state!(store, ref)["log"] == ["init", "message:hi", "message:hi"]
@@ -792,14 +790,14 @@ defmodule Clementine.Loop.RunnerTest do
       # The sender is TOLD — retained evidence it can react to (L10), and
       # a transport's retry is a duplicate of that evidence.
       assert {:ok, :dead_lettered} =
-               LoopProtocol.send(Host, ref, %{"id" => "late"}, dedup_key: "l:1", ctx: store)
+               Host.append(ref, Input.message(%{"id" => "late"}), "l:1", store)
 
       assert {:ok, :duplicate} =
-               LoopProtocol.send(Host, ref, %{"id" => "late"}, dedup_key: "l:1", ctx: store)
+               Host.append(ref, Input.message(%{"id" => "late"}), "l:1", store)
 
       rollout_ref = Host.seed(store, kind: :rollout)
-      assert {:error, :rollout_run} = LoopProtocol.send(Host, rollout_ref, %{}, ctx: store)
-      assert {:error, :not_found} = LoopProtocol.send(Host, 424_242, %{}, ctx: store)
+      assert {:error, :rollout_run} = Host.append(rollout_ref, Input.message(%{}), nil, store)
+      assert {:error, :not_found} = Host.append(424_242, Input.message(%{}), nil, store)
     end
   end
 
@@ -826,7 +824,7 @@ defmodule Clementine.Loop.RunnerTest do
       append!(store, ref, %{"id" => "b"})
       append!(store, ref, %{"id" => "c"})
 
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :never_mind, ctx: store)
+      assert {:ok, :flagged} = Host.cancel(ref, :never_mind, store)
       assert {:finished, %Facts{status: :cancelled}} = step!(store, ref)
 
       # handle/2 never ran — no envelope state, three sweeps, evidence retained.
@@ -839,16 +837,16 @@ defmodule Clementine.Loop.RunnerTest do
     test "cancel is idempotent and first-cause-wins; terminal and rollout-kind refs are refused",
          %{store: store} do
       ref = create!(store, ScriptedLoop)
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :first, ctx: store)
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :second, ctx: store)
+      assert {:ok, :flagged} = Host.cancel(ref, :first, store)
+      assert {:ok, :flagged} = Host.cancel(ref, :second, store)
       assert Host.facts!(store, ref).cancel.reason == :first
 
       assert {:finished, _} = step!(store, ref)
-      assert {:error, :already_terminal} = LoopProtocol.cancel(Host, ref, :again, ctx: store)
+      assert {:error, :already_terminal} = Host.cancel(ref, :again, store)
 
       rollout_ref = Host.seed(store, kind: :rollout)
-      assert {:error, :rollout_run} = LoopProtocol.cancel(Host, rollout_ref, :nope, ctx: store)
-      assert {:error, :not_found} = LoopProtocol.cancel(Host, 424_242, :ghost, ctx: store)
+      assert {:error, :rollout_run} = Host.cancel(rollout_ref, :nope, store)
+      assert {:error, :not_found} = Host.cancel(424_242, :ghost, store)
     end
 
     test "a cascade absorbs completions parked behind a backlog longer than the batch window",
@@ -862,7 +860,7 @@ defmodule Clementine.Loop.RunnerTest do
       # child's completion will land.
       for i <- 1..4, do: append!(store, ref, %{"id" => "backlog-#{i}"})
 
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :stop, ctx: store)
+      assert {:ok, :flagged} = Host.cancel(ref, :stop, store)
 
       # Cascade step: the queued child terminalizes in-unit, its
       # completion appending BEHIND the backlog; the re-check sees it.
@@ -909,7 +907,7 @@ defmodule Clementine.Loop.RunnerTest do
       # the healing deploy, a re-cancel wakes the loop and the cascade
       # finishes under the first cause.
       Host.rewrite_module!(store, ref, "Clementine.Test.ScriptedLoop")
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :again, ctx: store)
+      assert {:ok, :flagged} = Host.cancel(ref, :again, store)
       assert {:finished, %Facts{status: :cancelled}} = step!(store, ref)
 
       assert {_, %Result.Cancelled{reason: :mid_park}} =
@@ -929,7 +927,7 @@ defmodule Clementine.Loop.RunnerTest do
       assert {:parked, %Facts{suspension: %{reason: {:external, {:incompatible_state, _}}}}} =
                step!(store, ref)
 
-      assert {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :give_up, ctx: store)
+      assert {:ok, :flagged} = Host.cancel(ref, :give_up, store)
       assert {:finished, %Facts{status: :cancelled}} = step!(store, ref)
 
       assert store |> Host.inbox!(ref) |> Enum.map(& &1.dead_reason) == [:terminal_sweep]
@@ -1054,7 +1052,7 @@ defmodule Clementine.Loop.RunnerTest do
 
       assert {:parked, _} = step!(store, ref)
 
-      {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :operator_stop, ctx: store)
+      {:ok, :flagged} = Host.cancel(ref, :operator_stop, store)
 
       # The cancel cargo terminalizes the queued child in-unit and its
       # completion glue appends inside the same unit, so the entry park
@@ -1094,7 +1092,7 @@ defmodule Clementine.Loop.RunnerTest do
       ref = create!(store, ScriptedLoop)
       assert {:parked, _} = step!(store, ref)
 
-      {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :operator_stop, ctx: store)
+      {:ok, :flagged} = Host.cancel(ref, :operator_stop, store)
       assert {:finished, facts} = step!(store, ref)
       assert facts.status == :cancelled
 

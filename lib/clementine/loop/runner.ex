@@ -1,99 +1,102 @@
 defmodule Clementine.Loop.Runner do
-  @moduledoc """
-  The step runner (LOOP_RFC §The Step): claim → load → bump → drain →
-  `apply_step`, one claim-cycle per call. The host's step worker maps the
-  closed outcome union exactly as its run worker maps
-  `Clementine.Runner.execute/2`:
-
-  - `{:parked, facts}` — the step committed a park; the loop waits for
-    the inbox (or, for an `:incompatible_state`/`:incompatible_spec`
-    park, for a compatible deploy).
-  - `{:continued, facts}` — a step committed and the next step's job is
-    already enqueued (a continue, or a park the host downgraded inside
-    its own commit). No worker action needed.
-  - `{:finished, facts}` — the loop reached its terminal: a halt with no
-    children in flight, or a cascade that drained its last completion.
-  - `{:discard, reason}` — nothing was written and nothing may be: a
-    lost claim race (`{:not_claimable, status}`), a lost lease, a
-    vanished row (`:not_found`), a rollout-kind ref (`:rollout_run`), or
-    a terminal that already exists (`:already_terminal`).
-  - `{:error, term}` — the step failed. When the failure was an in-step
-    exception the run was already requeued and re-enqueued (see below);
-    when the commit itself exhausted its transient-error retries the run
-    stays `running` and the reaper requeues it (amendment A3a). Either
-    way the worker acks — the machinery, not the job queue, owns the
-    retry.
-
-  ## Two-tier failure, the loop analog
-
-  The rollout runner rescues in-process exceptions into terminal
-  `finish(failed)` — right for a rollout, where the attempt is the unit
-  and the caller judges the `Result`. A loop deliberately overrides that
-  doctrine: a loop is a standing entity, and terminalizing it over one
-  poison input would let any malformed webhook kill a mailbox that
-  fifty healthy inputs are queued behind. So an in-step raise walks the
-  attempts path instead: the drain-time bump already committed (before
-  `handle/2` ran, so even VM-death poison is counted), the runner
-  requeues the run and re-enqueues its step job, and the next step
-  drains batch-1 until the head either succeeds or dead-letters at the
-  threshold with a synthesized `{:input_failed}` — the mailbox never
-  jams, innocents never dead-letter, and the loop outlives the poison
-  (matrix rows L1, L7). Process death writes nothing here either: the
-  reaper requeues loop-kind runs unconditionally — no epoch cap, no
-  retry opt-in — because a loop's epoch counts its lifetime claims and
-  capping it would kill loops for having lived (A3a, row L16).
-
-  ## Cascade mode
-
-  The cancel flag reads at claim time, ahead of every queued input by
-  design (`Clementine.Loop.Protocol.cancel/4` sets it and wakes). A set
-  flag — or a pending halt already parked in the envelope — sends the
-  drain into cascade mode: the machinery `request_cancel`s live children
-  as commit cargo, absorbs completions without invoking `handle/2`,
-  parks between them, and finishes last with the pending result (the
-  halt's, or `Result.cancelled/1`) plus the terminal sweep. Because the
-  cascade never touches `load/1`/`dump/1`, an `:incompatible_state` loop
-  is still cancellable (rows L2, L8, L9).
-
-  ## Steps are short by construction
-
-  No heartbeat process runs during a step: the claim stamps liveness,
-  the work is one drain and one commit, and the real work lives in
-  child rollout-runs with their own leases and heartbeats. A step
-  runner that dies is requeued off the stale claim stamp (A3a); one
-  that live-wedges trips the deadline belt — the execution deadline is
-  minted at claim from `loop_policy` (see below).
-
-  ## `loop_policy`
-
-  The persisted policy map is the runner's to interpret (string keys;
-  all RFC non-final knobs, LOOP_RFC §Non-Final):
-
-  - `"deadline_ms"` — the step execution deadline minted at claim
-    (default #{5 * 60 * 1000}; explicit `nil` disables the belt).
-  - `"batch_cap"` — max inputs folded per step (default
-    `Clementine.Loop.Step.default_batch_cap/0`).
-  - `"dead_letter_after"` — head attempts at which poison dead-letters
-    (default `Clementine.Loop.Step.default_dead_letter_after/0`).
-
-  ## Observation
-
-  Notifications and telemetry are post-commit only. The host's
-  `apply_step` fires its own transition notifications after its unit
-  commits; the runner emits `[:clementine, :loop, :step]` after a
-  committed step — plus `[:clementine, :loop, :spawned]` per child the
-  commit created, `[:clementine, :loop, :cascade]` when the commit
-  entered cascade mode, and `[:clementine, :loop, :upgraded]` when it
-  carried a `handle_upgrade/2` state upgrade — and
-  `[:clementine, :loop, :step_failed]` after the requeue that resolves
-  an in-step failure (shapes in `Clementine.Telemetry`). Nothing
-  observable precedes the commit it describes.
-
-  A resumed loop (a host driving the park's `ResumeToken` through
-  `Lifecycle.Protocol.resume/4`) is just a wake: the runner takes its
-  inputs from the inbox, so the lease's resume payload is deliberately
-  ignored.
-  """
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   The step runner (LOOP_RFC §The Step): claim → load → bump → drain →
+  #   `apply_step`, one claim-cycle per call. The host's step worker maps the
+  #   closed outcome union exactly as its run worker maps
+  #   `Clementine.Runner.execute/2`:
+  #
+  #   - `{:parked, facts}` — the step committed a park; the loop waits for
+  #     the inbox (or, for an `:incompatible_state`/`:incompatible_spec`
+  #     park, for a compatible deploy).
+  #   - `{:continued, facts}` — a step committed and the next step's job is
+  #     already enqueued (a continue, or a park the host downgraded inside
+  #     its own commit). No worker action needed.
+  #   - `{:finished, facts}` — the loop reached its terminal: a halt with no
+  #     children in flight, or a cascade that drained its last completion.
+  #   - `{:discard, reason}` — nothing was written and nothing may be: a
+  #     lost claim race (`{:not_claimable, status}`), a lost lease, a
+  #     vanished row (`:not_found`), a rollout-kind ref (`:rollout_run`), or
+  #     a terminal that already exists (`:already_terminal`).
+  #   - `{:error, term}` — the step failed. When the failure was an in-step
+  #     exception the run was already requeued and re-enqueued (see below);
+  #     when the commit itself exhausted its transient-error retries the run
+  #     stays `running` and the reaper requeues it (amendment A3a). Either
+  #     way the worker acks — the machinery, not the job queue, owns the
+  #     retry.
+  #
+  #   ## Two-tier failure, the loop analog
+  #
+  #   The rollout runner rescues in-process exceptions into terminal
+  #   `finish(failed)` — right for a rollout, where the attempt is the unit
+  #   and the caller judges the `Result`. A loop deliberately overrides that
+  #   doctrine: a loop is a standing entity, and terminalizing it over one
+  #   poison input would let any malformed webhook kill a mailbox that
+  #   fifty healthy inputs are queued behind. So an in-step raise walks the
+  #   attempts path instead: the drain-time bump already committed (before
+  #   `handle/2` ran, so even VM-death poison is counted), the runner
+  #   requeues the run and re-enqueues its step job, and the next step
+  #   drains batch-1 until the head either succeeds or dead-letters at the
+  #   threshold with a synthesized `{:input_failed}` — the mailbox never
+  #   jams, innocents never dead-letter, and the loop outlives the poison
+  #   (matrix rows L1, L7). Process death writes nothing here either: the
+  #   reaper requeues loop-kind runs unconditionally — no epoch cap, no
+  #   retry opt-in — because a loop's epoch counts its lifetime claims and
+  #   capping it would kill loops for having lived (A3a, row L16).
+  #
+  #   ## Cascade mode
+  #
+  #   The cancel flag reads at claim time, ahead of every queued input by
+  #   design (`Clementine.Runs.cancel/1` sets it and wakes). A set
+  #   flag — or a pending halt already parked in the envelope — sends the
+  #   drain into cascade mode: the machinery `request_cancel`s live children
+  #   as commit cargo, absorbs completions without invoking `handle/2`,
+  #   parks between them, and finishes last with the pending result (the
+  #   halt's, or `Result.cancelled/1`) plus the terminal sweep. Because the
+  #   cascade never touches `load/1`/`dump/1`, an `:incompatible_state` loop
+  #   is still cancellable (rows L2, L8, L9).
+  #
+  #   ## Steps are short by construction
+  #
+  #   No heartbeat process runs during a step: the claim stamps liveness,
+  #   the work is one drain and one commit, and the real work lives in
+  #   child rollout-runs with their own leases and heartbeats. A step
+  #   runner that dies is requeued off the stale claim stamp (A3a); one
+  #   that live-wedges trips the deadline belt — the execution deadline is
+  #   minted at claim from `loop_policy` (see below).
+  #
+  #   ## `loop_policy`
+  #
+  #   The persisted policy map is the runner's to interpret (string keys;
+  #   all RFC non-final knobs, LOOP_RFC §Non-Final):
+  #
+  #   - `"deadline_ms"` — the step execution deadline minted at claim
+  #     (default #{5 * 60 * 1000}; explicit `nil` disables the belt).
+  #   - `"batch_cap"` — max inputs folded per step (default
+  #     `Clementine.Loop.Step.default_batch_cap/0`).
+  #   - `"dead_letter_after"` — head attempts at which poison dead-letters
+  #     (default `Clementine.Loop.Step.default_dead_letter_after/0`).
+  #
+  #   ## Observation
+  #
+  #   Notifications and telemetry are post-commit only. The host's
+  #   `apply_step` fires its own transition notifications after its unit
+  #   commits; the runner emits `[:clementine, :loop, :step]` after a
+  #   committed step — plus `[:clementine, :loop, :spawned]` per child the
+  #   commit created, `[:clementine, :loop, :cascade]` when the commit
+  #   entered cascade mode, and `[:clementine, :loop, :upgraded]` when it
+  #   carried a `handle_upgrade/2` state upgrade — and
+  #   `[:clementine, :loop, :step_failed]` after the requeue that resolves
+  #   an in-step failure (shapes in `Clementine.Telemetry`). Nothing
+  #   observable precedes the commit it describes.
+  #
+  #   A resumed loop (a host driving the park's `ResumeToken` through
+  #   `Lifecycle.Protocol.resume/4`) is just a wake: the runner takes its
+  #   inputs from the inbox, so the lease's resume payload is deliberately
+  #   ignored.
 
   require Logger
 
@@ -118,10 +121,12 @@ defmodule Clementine.Loop.Runner do
 
   ## Options
 
-  - `:host` (required) — the `Clementine.Loop.Host` module
+  - `:host` (required) — the module that implements the step runner's
+    seam: `load/2`, `pending/4`, `bump_attempts/2`, `apply_step/2`, and
+    `enqueue_step/2` (`Clementine.Runs.Loops` in the durable runtime,
+    `Clementine.Loop.Local` on the script path)
   - `:lifecycle` (required) — the `Clementine.Lifecycle` module the
-    loop's run row lives in (for the Ecto pairing, the same module the
-    host was configured with)
+    loop's run row lives in
   - `:executor_id` (required) — human/telemetry identity for this step
   - `:ctx` — opaque host context, threaded to both seams
   """
@@ -557,16 +562,23 @@ defmodule Clementine.Loop.Runner do
 
   defp emit_upgraded(_lease, _commit, _stored), do: :ok
 
-  # The committed step that began a cascade — it cancels live children as
-  # cargo (a halt with children in flight, or the flag's first drain), or
-  # it is a cascade-mode commit against an envelope not yet holding the
-  # pending halt (the no-children short-circuit, which finishes at once).
-  # A replay of a crashed entry re-detects, but only one commit ever
-  # lands, so the event fires exactly once per entry.
-  defp cascade_entry?(%StepCommit{cancel_children: [_ | _]}, _stored), do: true
-
+  # The committed step that began a cascade — a halt with children in
+  # flight (the commit parks the pending halt and cancels them as cargo),
+  # or a cascade-mode commit against an envelope not yet holding the
+  # pending halt (the flag's first drain, or the no-children short-circuit,
+  # which finishes at once). A `{:cancel, tag}` action also cancels a
+  # child as cargo, in normal mode with no pending halt, and is not an
+  # entry. A replay of a crashed entry re-detects, but only one commit
+  # ever lands, so the event fires exactly once per entry.
   defp cascade_entry?(%StepCommit{meta: %{mode: :cascade}}, stored),
     do: stored == nil or not Envelope.cascading?(stored)
+
+  defp cascade_entry?(%StepCommit{cancel_children: [_ | _]} = commit, _stored) do
+    case StepCommit.envelope(commit) do
+      %Envelope{pending_halt: halt} -> halt != nil
+      nil -> false
+    end
+  end
 
   defp cascade_entry?(%StepCommit{}, _stored), do: false
 end

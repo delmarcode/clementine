@@ -296,7 +296,8 @@ defmodule Clementine.Loop.StepPropertyTest do
 
   defp action do
     one_of([
-      tuple({constant(:run), tag(), constant(%{"n" => 1})}),
+      tuple({constant(:run), child_tag(), constant(%{"n" => 1})}),
+      tuple({constant(:cancel), child_tag()}),
       tuple({constant(:timer), tag(), integer(1..1_000)}),
       tuple({constant(:cancel_timer), tag()}),
       tuple({constant(:send), integer(1..3), constant(%{"m" => 1})})
@@ -309,8 +310,13 @@ defmodule Clementine.Loop.StepPropertyTest do
     one_of([
       integer(0..4),
       member_of(@vocab),
-      tuple({member_of([:reply, :retry]), integer(0..2)})
+      child_tag()
     ])
+  end
+
+  # A child's tag has two parts: a vocabulary atom and an id.
+  defp child_tag do
+    tuple({member_of([:reply, :retry]), integer(0..2)})
   end
 
   defp usage do

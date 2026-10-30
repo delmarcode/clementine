@@ -39,12 +39,15 @@ defmodule Clementine.Result do
     `reason` is the cancel reason as it was stored on the run. On the
     durable runtime (`Clementine.Runs`) it is a map with a `"code"` and,
     when there is more to say, a `"detail"`: `%{"code" => "cancelled"}`
-    from `Clementine.Runs.cancel/1`, and
+    from `Clementine.Runs.cancel/1`,
     `%{"code" => "unstartable", "detail" => why}` when the run could not
     be built at a claim (an agent, subject, actor, or history that no
-    longer resolves). Hosts read it from the result; nothing else decodes
-    it. On a lifecycle of the app's own it is whatever the app passed to
-    `Clementine.Lifecycle.Protocol.request_cancel/4`.
+    longer resolves), and for a loop's child,
+    `%{"code" => "loop_cancel", "loop_id" => id}` when its loop's
+    `{:cancel, tag}` action stopped it or
+    `%{"code" => "loop_cascade", "loop_id" => id}` when its loop's own end
+    did. Hosts read it from the result; nothing else decodes it. Outside
+    the runtime it is whatever the caller passed as the cancel reason.
     """
     defstruct reason: nil, usage: %Clementine.Usage{}
 

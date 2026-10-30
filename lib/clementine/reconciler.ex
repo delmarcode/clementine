@@ -81,7 +81,7 @@ defmodule Clementine.Reconciler do
   at judgment time — three of the four loop verdicts commit nothing
   through the lifecycle, so the judgment is the one seam every firing
   crosses. The Oban cross-check's loop verdicts record through the same
-  seam (`Clementine.Lifecycle.Ecto.Oban.judge_job/2`). Nonzero
+  seam. Nonzero
   `:reconcile_children`/`:wake_pending` rates on a transactional
   substrate (Postgres) are the alarm condition: the sweep is healing
   strands that atomic delivery glue should make impossible.
@@ -143,8 +143,8 @@ defmodule Clementine.Reconciler do
       These two replace the backstop the `max_wait` exemption removes.
     * terminal — `:healthy`; nothing left to judge.
 
-  For Oban hosts, `Clementine.Lifecycle.Ecto.Oban.judge_job/2` is the
-  companion executor cross-check, scoped the same way.
+  The runtime's Oban cross-check is the companion executor check, scoped
+  the same way.
   """
 
   alias Clementine.InterruptReason

@@ -333,6 +333,69 @@ defmodule Clementine.Loop.StepTest do
       end
     end
 
+    test "a child's tag has two parts: any other shape raises toward the poison path" do
+      for tag <- [:poll, {:reply, 1, :extra}] do
+        batch = [msg(1, %{"actions" => [{:run, tag, %{}}]})]
+
+        assert_raise ArgumentError, ~r/two parts/, fn ->
+          Step.drain(ScriptedLoop, nil, Step.plan(nil, batch), @opts)
+        end
+      end
+    end
+
+    test "{:cancel, tag} names the live child as cancel cargo and keeps the tag live until its completion" do
+      tag = {:reply, 1}
+      envelope = scripted_envelope(children: %{key(tag) => 900})
+      batch = [msg(1, %{"id" => "stop", "actions" => [{:cancel, tag}]})]
+
+      commit = drain!(ScriptedLoop, envelope, Step.plan(envelope, batch))
+
+      assert commit.cancel_children == [key(tag)]
+      assert commit.op == :park
+      assert commit.set.envelope.children == %{key(tag) => 900}
+      assert commit.set.envelope.pending_halt == nil
+      assert log(commit) == ["message:stop"]
+    end
+
+    test "a cancel followed by its child's completion in one batch retires the cancel, so a successor under the re-armed tag is never cancelled" do
+      tag = {:reply, 1}
+      envelope = scripted_envelope(children: %{key(tag) => 900})
+
+      batch = [
+        msg(1, %{"id" => "stop", "actions" => [{:cancel, tag}]}),
+        completed(2, tag),
+        msg(3, %{"id" => "again", "actions" => [{:run, tag, %{}}]})
+      ]
+
+      commit = drain!(ScriptedLoop, envelope, Step.plan(envelope, batch))
+
+      assert commit.cancel_children == []
+      assert [%{tag_key: spawned}] = commit.children
+      assert spawned == key(tag)
+      assert commit.set.envelope.children == %{key(tag) => nil}
+      assert log(commit) == ["message:stop", "completed:{:reply, 1}", "message:again"]
+    end
+
+    test "{:cancel, tag} with no live child under the tag is a benign no-op" do
+      envelope = scripted_envelope()
+      batch = [msg(1, %{"id" => "stop", "actions" => [{:cancel, {:reply, 1}}]})]
+
+      commit = drain!(ScriptedLoop, envelope, Step.plan(envelope, batch))
+
+      assert commit.cancel_children == []
+      assert log(commit) == ["message:stop"]
+    end
+
+    test "{:cancel, tag} for a child spawned in the same step raises toward the poison path" do
+      tag = {:reply, 1}
+      envelope = scripted_envelope()
+      batch = [msg(1, %{"actions" => [{:run, tag, %{}}, {:cancel, tag}]})]
+
+      assert_raise ArgumentError, ~r/spawned in this same step/, fn ->
+        Step.drain(ScriptedLoop, envelope, Step.plan(envelope, batch), @opts)
+      end
+    end
+
     test "arming a tag that is already a pending timer raises toward the poison path" do
       envelope = scripted_envelope(timers: %{key(:poll) => %{}})
       batch = [msg(1, %{"actions" => [{:timer, :poll, 100}]})]

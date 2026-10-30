@@ -15,18 +15,29 @@ defmodule Clementine.Loop do
   (matrix row L18).
 
       defmodule MyApp.ThreadAgent do
-        use Clementine.Loop, state_version: 1, vocabulary: [:reply, :retry]
+        use Clementine.Loop, key: "thread", state_version: 1, vocabulary: [:reply, :retry]
 
-        def init(%{"agent_id" => id}), do: {:ok, %{"agent_id" => id, "cursor" => 0}, []}
+        def init(%{"agent" => agent}), do: {:ok, %{"agent" => agent, "cursor" => 0}, []}
 
-        def handle({:message, %{"email_id" => id}}, state) do
-          {:ok, state, [{:run, {:reply, id}, %{"email_id" => id}}]}
+        def handle({:message, %{"email_id" => id, "prompt" => prompt}}, state) do
+          {:ok, state, [{:run, {:reply, id}, %{"agent" => state["agent"], "prompt" => prompt}}]}
         end
         ...
       end
 
+  In the durable runtime (`Clementine.Runs`) a loop is a run of its own:
+  the controller module is listed in the child spec's `agents:` beside
+  the agents, `Clementine.Runs.start_loop/3` inserts its row, and
+  `Clementine.Runs.send/3` feeds it. Its children are runs the step
+  starts, each under a two-part tag, and the runtime builds them at
+  their claim from the `"agent"` key the action names.
+
   ## Options
 
+  - `:key` — the string the loop's run rows store in `agent_key`, in the
+    same namespace as `Clementine.Agent` keys. Required for a controller
+    listed in `agents:`; a loop that only ever runs through `run_local/3`
+    may leave it out. Keep it stable once loops exist.
   - `:state_version` — positive integer (default `1`), recorded in every
     envelope the loop commits. A stored version behind the declared one
     upgrades through the `handle_upgrade/2` chain when the module exports
@@ -34,30 +45,71 @@ defmodule Clementine.Loop do
     direction — the step fails as `:incompatible_state`: parked visibly,
     never a crash, distinct from input dead-letters (inputs are innocent
     of deploys, and of broken upgrades).
-  - `:vocabulary` — the atom whitelist for `Clementine.Loop.Codec`
+  - `:vocabulary` — the atom whitelist for durable tags and payloads
     (default `[]`). Tags and payloads may use exactly these atoms.
 
   `dump/1`/`load/1` default to identity — state is a JSON-safe map unless
   the loop provides its own doors.
+
+  ## Inputs and actions
+
+      input  :: {:message, payload}
+              | {:completed, tag, Clementine.Result.t()}
+              | {:elapsed, tag}
+              | {:input_failed, input_ref, Clementine.Error.t()}
+
+      action :: {:run, tag, child}                 # start a child run under the tag
+              | {:cancel, tag}                     # cancel the live child under the tag
+              | {:timer, tag, DateTime.t() | ms}   # a durable timer; fires as {:elapsed, tag}
+              | {:cancel_timer, tag}
+              | {:send, loop_id, payload}          # another loop's inbox
+
+  A child's `tag` is `{kind, id}`: a vocabulary atom and a string or
+  integer id. One live child per tag; the tag re-arms once the child is
+  terminal. `child` is a JSON map: `"agent"` (an agent key from the child
+  spec), `"prompt"`, and optionally `"subject"` and `"actor"` as
+  `[type, id]` (both default to the loop's own) and `"metadata"`.
+  `{:cancel, tag}` flags the live child under the tag, and its
+  `Clementine.Result.Cancelled` completion arrives like any other; a tag
+  with no live child is a no-op. The lane holds inside a loop: a step
+  that would start a second active turn on one thread fails. Cancels run
+  before spawns in a step's commit, so a child that was never claimed
+  ends inside the step and frees its lane, and `{:cancel, tag}` with the
+  successor's `{:run, ...}` in one step interrupts it; a running child
+  only takes the flag, and its successor starts on its `Cancelled`
+  completion.
   """
 
-  # The doctor is inspect/2-3 by RFC name (§Operations); Kernel's
-  # auto-imported inspect/2 yields the arity.
-  import Kernel, except: [inspect: 2]
-
-  alias Clementine.Loop.Input
   alias Clementine.Result
 
   @type state :: term()
+
+  @typedoc "A child's tag: a vocabulary atom and a string or integer id."
+  @type tag :: {atom(), String.t() | integer()}
+
+  @typedoc "What a step hands `handle/2`: a message, a child's end, a timer's fire, or a poisoned input."
+  @type input ::
+          {:message, payload :: term()}
+          | {:completed, tag(), Result.t()}
+          | {:elapsed, tag :: term()}
+          | {:input_failed, input_ref :: term(), Clementine.Error.t()}
+
   @type action ::
-          {:run, tag :: term(), child_args :: map()}
+          {:run, tag(), child :: map()}
+          | {:cancel, tag()}
           | {:timer, tag :: term(), DateTime.t() | non_neg_integer()}
           | {:cancel_timer, tag :: term()}
-          | {:send, loop_ref :: term(), payload :: term()}
+          | {:send, loop_id :: term(), payload :: term()}
+
+  @doc """
+  The key the loop's run rows store in `agent_key`, when `use
+  Clementine.Loop, key: "..."` gave one.
+  """
+  @callback key() :: String.t()
 
   @callback init(args :: map()) :: {:ok, state(), [action()]} | {:halt, Result.t()}
 
-  @callback handle(Input.callback_form(), state()) ::
+  @callback handle(input(), state()) ::
               {:ok, state(), [action()]} | {:halt, Result.t(), state()}
 
   @callback dump(state()) :: map()
@@ -75,11 +127,16 @@ defmodule Clementine.Loop do
   """
   @callback handle_upgrade(from_version :: pos_integer(), state :: map()) :: {:ok, map()}
 
-  @optional_callbacks dump: 1, load: 1, handle_upgrade: 2
+  @optional_callbacks key: 0, dump: 1, load: 1, handle_upgrade: 2
 
   defmacro __using__(opts) do
+    key = Keyword.get(opts, :key)
     state_version = Keyword.get(opts, :state_version, 1)
     vocabulary = Keyword.get(opts, :vocabulary, [])
+
+    unless is_nil(key) or (is_binary(key) and key != "") do
+      raise ArgumentError, "key must be a non-empty string, got: #{inspect(key)}"
+    end
 
     unless is_integer(state_version) and state_version >= 1 do
       raise ArgumentError,
@@ -96,6 +153,11 @@ defmodule Clementine.Loop do
       @doc false
       def __loop__(:state_version), do: unquote(state_version)
       def __loop__(:vocabulary), do: unquote(vocabulary)
+
+      if unquote(key) do
+        @impl Clementine.Loop
+        def key, do: unquote(key)
+      end
 
       @impl Clementine.Loop
       def dump(state), do: state
@@ -133,10 +195,11 @@ defmodule Clementine.Loop do
 
   - `:messages` — payloads appended in order as `{:message, payload}`
     inputs before the first step: the input script (default `[]`).
-  - `:build_child` — `fn tag, child_args -> {:ok, %Clementine.Rollout{}}
-    end`, the host boundary where JSON-safe args become rollouts
-    (`Clementine.Loop.Host.build_child/4`'s local stand-in). Required if
-    the loop emits `{:run, ...}`; `{:error, term}` from it raises.
+  - `:build_child` — `fn tag, child -> {:ok, %Clementine.Rollout{}} end`,
+    the script's stand-in for the runtime, which builds a child's agent
+    from the `"agent"` key its action names at the child's claim.
+    Required if the loop emits `{:run, ...}`; `{:error, term}` from it
+    raises.
   - `:policy` — the `loop_policy` map the step runner interprets (batch
     cap, dead-letter threshold; default `%{}`).
   - `:max_steps` — step budget guarding never-halting loops, a watcher
@@ -160,47 +223,6 @@ defmodule Clementine.Loop do
     Clementine.Loop.Local.run(module, args, opts)
   end
 
-  @doc """
-  The doctor (LOOP_RFC §Operations): one read of everything a frozen
-  loop's diagnosis needs — lifecycle facts, the persisted spec with its
-  version compatibility, the decoded envelope, live children with
-  statuses, the timer schedule, pending inputs with ages, retained dead
-  letters, and the diagnosed strands. Returns a
-  `Clementine.Loop.Report`; `Clementine.Loop.Report.render/1` prints it.
-
-      {:ok, report} =
-        Clementine.Loop.inspect(MyApp.LoopHost, loop_ref, lifecycle: MyApp.ClementineLifecycle)
-
-      report.strands
-      #=> [%{class: :parked_with_pending, detail: %{pending: 3, oldest_age_ms: 42_000}}]
-
-  Diagnosis-only: every read goes through the host seam (`load/2`,
-  `pending/4`, the optional `dead_letters/3`) and the lifecycle's
-  `fetch/2`; nothing is written and no lease is taken, so inspecting a
-  live loop is always safe.
-
-  ## Options
-
-  - `:lifecycle` — the `Clementine.Lifecycle` module the loop's children
-    live in (the same pairing `Clementine.Loop.Runner.step/2` takes).
-    Without it children report `status: :unknown` and stranded
-    completions are not detectable.
-  - `:limit` — max pending inputs and dead letters fetched (default
-    `50`); the strand diagnosis is bounded by the same windows.
-  - `:stale_after` — milliseconds a `queued` loop may wait before it is
-    diagnosed `:stale_queued` (default `:timer.minutes(5)`, the reaper
-    policy's `wake_pending_after` vocabulary).
-  - `:ctx` — the opaque host context (default `nil`).
-
-  Errors pass through from the host's `load/2`:
-  `{:error, :not_found | :rollout_run | term}`.
-  """
-  @spec inspect(module(), term(), keyword()) ::
-          {:ok, Clementine.Loop.Report.t()} | {:error, term()}
-  def inspect(host, loop_ref, opts \\ []) do
-    Clementine.Loop.Report.gather(host, loop_ref, opts)
-  end
-
   @doc "True when the module was compiled with `use Clementine.Loop`."
   @spec loop?(module()) :: boolean()
   def loop?(module) when is_atom(module) do
@@ -208,15 +230,14 @@ defmodule Clementine.Loop do
   end
 
   @doc """
-  Resolves a persisted `loop_module` spec (module or its string form) to a
+  Resolves a persisted loop spec (a module, or its string form) to a
   loaded loop module.
 
   The clean-failure half of checkpoint doctrine's deploy honesty (LOOP_RFC
-  §The Behaviour, matrix row L2): module names persist in the spec
-  columns, and a name the current release no longer carries fails as
-  `:incompatible_spec` — an operator-visible park, never a crash. The
-  stored name is trusted host storage, same doctrine as the Ecto codec's
-  atom handling.
+  §The Behaviour, matrix row L2): a run row stores the controller's key,
+  and a key the current release's `agents:` no longer carries, or a
+  module name the script path persisted that no longer resolves, fails
+  as `:incompatible_spec` — an operator-visible park, never a crash.
   """
   @spec resolve(module() | String.t()) ::
           {:ok, module()} | {:error, {:incompatible_spec, map()}}
@@ -229,6 +250,12 @@ defmodule Clementine.Loop do
   end
 
   def resolve(name) when is_binary(name) do
-    resolve(Module.concat([name]))
+    module = Module.concat([name])
+
+    if loop?(module) do
+      {:ok, module}
+    else
+      {:error, {:incompatible_spec, %{module: name, reason: :not_a_loop}}}
+    end
   end
 end

@@ -16,6 +16,14 @@ if Code.ensure_loaded?(Ecto.Schema) do
     a guarded compare-and-swap on `(status, lease_epoch)`. Read the row
     freely; never update it by hand.
 
+    `kind` says what the run is: `"rollout"` for a run of an agent, or
+    `"loop"` for a loop (`Clementine.Runs.start_loop/3`), whose
+    `agent_key` is its controller's key, `input` its args, `loop_policy`
+    its policy, and `envelope` and `state_version` the state the
+    controller last committed. A run a loop's step started carries its
+    `parent_id` and the two halves of its tag, `tag_kind` and `tag_id`
+    (`Clementine.Runs.child/2` reads them back as `{kind, id}`).
+
     `subject` and `actor` are not stored: while the run executes they hold
     what `c:Clementine.Host.resolve_subject/2` and
     `c:Clementine.Host.resolve_actor/2` returned, and they are `nil` on a
@@ -49,6 +57,16 @@ if Code.ensure_loaded?(Ecto.Schema) do
       field(:oban_job_id, :integer)
       field(:metadata, :map, default: %{})
 
+      # A loop's row (version 3).
+      field(:loop_policy, :map)
+      field(:envelope, :map)
+      field(:state_version, :integer)
+
+      # A child's row: the loop that started it, and its tag.
+      field(:parent_id, :binary_id)
+      field(:tag_kind, :string)
+      field(:tag_id, :string)
+
       # Clementine's column recipe.
       field(:kind, :string, default: "rollout")
       field(:status, :string, default: "queued")
@@ -79,11 +97,14 @@ if Code.ensure_loaded?(Ecto.Schema) do
     def terminal?(%__MODULE__{status: status}), do: status in @terminal
 
     @doc false
-    # A queued run. The unique_constraint names the lane index, so a second
-    # active run in one lane is a changeset error, not an exception.
+    # A queued run. The unique_constraints name the lane index and the
+    # one-live-child-per-tag index, so a second active run in one lane,
+    # or a second live child under one tag, is a changeset error, not an
+    # exception.
     def queued_changeset(attrs) do
       %__MODULE__{}
       |> cast(attrs, [
+        :kind,
         :agent_key,
         :subject_type,
         :subject_id,
@@ -91,7 +112,12 @@ if Code.ensure_loaded?(Ecto.Schema) do
         :actor_id,
         :turn,
         :input,
-        :metadata
+        :metadata,
+        :loop_policy,
+        :state_version,
+        :parent_id,
+        :tag_kind,
+        :tag_id
       ])
       |> validate_required([:agent_key])
       |> validate_turn_has_subject()
@@ -114,6 +140,7 @@ if Code.ensure_loaded?(Ecto.Schema) do
         message: "an actor id needs a type"
       )
       |> unique_constraint([:agent_key, :subject_type, :subject_id], name: :agent_runs_lane_index)
+      |> unique_constraint([:parent_id, :tag_kind, :tag_id], name: :agent_runs_child_tag_index)
     end
 
     # The table's checks, mirrored: a row that would slip out of its lane

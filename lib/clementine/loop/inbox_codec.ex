@@ -1,28 +1,31 @@
-defmodule Clementine.Loop.Ecto.Codec do
-  @moduledoc """
-  The value-level mapping between `Clementine.Loop.Input` and the inbox
-  recipe's `kind`/`payload` columns — public so hand-written hosts reuse
-  the codecs instead of re-deriving them, exactly like
-  `Clementine.Lifecycle.Ecto.Codec`.
-
-  Tags and message payloads cross through the canonical loop codec
-  (`Clementine.Loop.Codec`) under the loop module's declared vocabulary;
-  tags are stored in their `tag_key` string form (the same bytes the
-  child dedup index and envelope maps hold), so the child-terminal
-  projection glue — which has the child row's `tag_key`, never the term —
-  writes the identical representation. Open struct positions (a
-  completion's `Clementine.Result`, poison evidence's ref) ride the
-  lifecycle codec's tagged json/ETF convention for trusted storage.
-
-  Encoding raises `ArgumentError` on values outside the durable
-  vocabulary — an appender's contract violation surfaces at the append,
-  loud and immediate. Decoding never raises: `decode_input/3` returns
-  `{:error, %Clementine.Error{}}` for a payload the current code cannot
-  read (a shrunk vocabulary, a foreign sender's atoms, version drift), and
-  the seam surfaces it as `StoredInput.decode_error` — poison for that
-  row, walked through the head-blame path, never a failed fetch (matrix
-  row L7).
-  """
+defmodule Clementine.Loop.InboxCodec do
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   The value-level mapping between `Clementine.Loop.Input` and the inbox
+  #   recipe's `kind`/`payload` columns — public so hand-written hosts reuse
+  #   the codecs instead of re-deriving them, exactly like
+  #   `Clementine.Lifecycle.Ecto.Codec`.
+  #
+  #   Tags and message payloads cross through the canonical loop codec
+  #   (`Clementine.Loop.Codec`) under the loop module's declared vocabulary;
+  #   tags are stored in their `tag_key` string form (the same bytes the
+  #   child dedup index and envelope maps hold), so the child-terminal
+  #   projection glue — which has the child row's `tag_key`, never the term —
+  #   writes the identical representation. Open struct positions (a
+  #   completion's `Clementine.Result`, poison evidence's ref) ride the
+  #   lifecycle codec's tagged json/ETF convention for trusted storage.
+  #
+  #   Encoding raises `ArgumentError` on values outside the durable
+  #   vocabulary — an appender's contract violation surfaces at the append,
+  #   loud and immediate. Decoding never raises: `decode_input/3` returns
+  #   `{:error, %Clementine.Error{}}` for a payload the current code cannot
+  #   read (a shrunk vocabulary, a foreign sender's atoms, version drift), and
+  #   the seam surfaces it as `StoredInput.decode_error` — poison for that
+  #   row, walked through the head-blame path, never a failed fetch (matrix
+  #   row L7).
 
   alias Clementine.{Error, Result}
   alias Clementine.Lifecycle.Ecto.Codec, as: LifecycleCodec

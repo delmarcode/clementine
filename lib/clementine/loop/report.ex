@@ -1,7 +1,7 @@
 defmodule Clementine.Loop.Report do
   @moduledoc """
   The doctor's finding for one loop (LOOP_RFC §Operations), built by
-  `Clementine.Loop.inspect/3`: lifecycle facts, the persisted spec with
+  `Clementine.Runs.inspect/1`: lifecycle facts, the persisted spec with
   its version compatibility, the decoded envelope, live children with
   statuses, the timer schedule, pending inputs with ages, retained dead
   letters, and the diagnosed **strands** — so frozen-loop diagnosis is
@@ -16,7 +16,7 @@ defmodule Clementine.Loop.Report do
   reaper's verdicts heal them; a persistent strand is the glue bug the
   firing-rate telemetry pages on):
 
-  - `:incompatible_spec` — the persisted `loop_module` does not resolve
+  - `:incompatible_spec` — the persisted controller key does not resolve
     to a loop on this release (matrix row L2); deploy compatible code or
     cancel the loop.
   - `:incompatible_state` — the stored envelope (or its `state_version`)
@@ -53,7 +53,7 @@ defmodule Clementine.Loop.Report do
   alias Clementine.Lifecycle.Facts
   alias Clementine.Loop
   alias Clementine.Loop.{Codec, Envelope, StoredInput}
-  alias Clementine.Loop.Ecto.Codec, as: InboxCodec
+  alias Clementine.Loop.InboxCodec
 
   defstruct facts: nil,
             module: nil,
@@ -92,7 +92,7 @@ defmodule Clementine.Loop.Report do
           args: map(),
           policy: map(),
           state_version: %{stored: pos_integer() | nil, declared: pos_integer() | nil},
-          envelope: Envelope.t() | nil | {:error, {:incompatible_state, map()}},
+          envelope: struct() | nil | {:error, {:incompatible_state, map()}},
           children: [child()],
           timers: [timer()],
           pending: [StoredInput.t()],
@@ -334,7 +334,7 @@ defmodule Clementine.Loop.Report do
   @doc """
   The report as an operator-readable block — `IO.puts/1` it:
 
-      {:ok, report} = Clementine.Loop.inspect(MyApp.LoopHost, loop_ref, lifecycle: MyApp.Lifecycle)
+      {:ok, report} = Clementine.Runs.inspect(loop_id)
       report |> Clementine.Loop.Report.render() |> IO.puts()
   """
   @spec render(t()) :: String.t()

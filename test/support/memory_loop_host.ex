@@ -1,19 +1,23 @@
 defmodule Clementine.Test.MemoryLoopHost do
   @moduledoc """
-  An in-memory `Clementine.Lifecycle` + `Clementine.Loop.Host` pairing
-  with real atomicity, for step-runner tests: every unit the contract
-  says commits together executes as one `Agent.get_and_update`, so the
-  park re-check, in-unit appends, cascade child cancels, and the
-  terminal sweep are honestly transactional — and every guarded write is
-  an exact `(status, epoch)` CAS, exactly like `MemoryLifecycle`.
+  An in-memory `Clementine.Lifecycle` plus the step runner's seam
+  (`load/2`, `pending/4`, `bump_attempts/2`, `apply_step/2`,
+  `enqueue_step/2`) and the inbox verbs (`create/2`, `append/4`,
+  `cancel/3`, `dead_letters/3`), with real atomicity, for step-runner
+  tests: every unit the contract says commits together executes as one
+  `Agent.get_and_update`, so the park re-check, in-unit appends, cascade
+  child cancels, and the terminal sweep are honestly transactional — and
+  every guarded write is an exact `(status, epoch)` CAS, exactly like
+  `MemoryLifecycle`.
 
-  The store also plays the host glue the Ecto adapter documents: a
-  terminal transition of a loop child (any writer — cascade cargo, a
-  reaper interrupt, a direct cancel) appends `{:completed, tag, result}`
-  to its parent's inbox under the canonical dedup key and wakes a parked
-  parent, inside the same update — delivery exactly-once at source
-  (matrix row L12). Jobs are ledger rows (`jobs/1`), never executed;
-  tests drive steps by calling `Clementine.Loop.Runner.step/2`.
+  The store also plays the glue `Clementine.Runs.Loops` wires on
+  Postgres: a terminal transition of a loop child (any writer — cascade
+  cargo, a reaper interrupt, a direct cancel) appends
+  `{:completed, tag, result}` to its parent's inbox under the canonical
+  dedup key and wakes a parked parent, inside the same update — delivery
+  exactly-once at source (matrix row L12). Jobs are ledger rows
+  (`jobs/1`), never executed; tests drive steps by calling
+  `Clementine.Loop.Runner.step/2`.
 
   Fault injection (`inject_fault/3`) makes `apply_step` raise or return
   errors N times, for the crash-before-commit and transient-retry
@@ -22,7 +26,6 @@ defmodule Clementine.Test.MemoryLoopHost do
   """
 
   @behaviour Clementine.Lifecycle
-  @behaviour Clementine.Loop.Host
 
   alias Clementine.Lifecycle.{Facts, Transition}
   alias Clementine.Loop.{Envelope, Input, StepCommit, StoredInput}
@@ -171,9 +174,9 @@ defmodule Clementine.Test.MemoryLoopHost do
     end
   end
 
-  ## Clementine.Loop.Host
+  ## The step runner's seam (load, pending, bump_attempts, apply_step, enqueue_step)
+  ## and the inbox verbs (create, append, cancel, dead_letters)
 
-  @impl Clementine.Loop.Host
   def load(loop_ref, store) do
     Agent.get(store, fn state ->
       with {:ok, %Facts{} = facts} <- Map.fetch(state.runs, loop_ref),
@@ -195,7 +198,6 @@ defmodule Clementine.Test.MemoryLoopHost do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def cancel(loop_ref, reason, store) do
     now = DateTime.utc_now()
 
@@ -225,7 +227,6 @@ defmodule Clementine.Test.MemoryLoopHost do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def append(loop_ref, %Input{} = input, dedup_key, store) do
     now = DateTime.utc_now()
 
@@ -261,7 +262,6 @@ defmodule Clementine.Test.MemoryLoopHost do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def pending(loop_ref, limit, scope, store) when scope in [:any, :completions] do
     Agent.get(store, fn state ->
       state.inbox
@@ -274,7 +274,6 @@ defmodule Clementine.Test.MemoryLoopHost do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def dead_letters(loop_ref, limit, store) when is_integer(limit) and limit > 0 do
     Agent.get(store, fn state ->
       state.inbox
@@ -298,7 +297,6 @@ defmodule Clementine.Test.MemoryLoopHost do
     }
   end
 
-  @impl Clementine.Loop.Host
   def bump_attempts(refs, store) do
     Agent.update(store, fn state ->
       Enum.reduce(refs, state, fn ref, state ->
@@ -307,18 +305,10 @@ defmodule Clementine.Test.MemoryLoopHost do
     end)
   end
 
-  @impl Clementine.Loop.Host
-  def build_child(_facts, _tag, child_args, _store) do
-    agent = Clementine.Agent.new(model: :claude_sonnet, instructions: "test child")
-    {:ok, Clementine.Rollout.new(agent: agent, input: Map.get(child_args, "input", "go"))}
-  end
-
-  @impl Clementine.Loop.Host
   def enqueue_step(loop_ref, store) do
     Agent.update(store, &push_job(&1, loop_ref, "step"))
   end
 
-  @impl Clementine.Loop.Host
   def create(spec, store) do
     now = DateTime.utc_now()
 
@@ -348,7 +338,6 @@ defmodule Clementine.Test.MemoryLoopHost do
     end)
   end
 
-  @impl Clementine.Loop.Host
   def apply_step(%StepCommit{} = commit, store) do
     now = DateTime.utc_now()
 

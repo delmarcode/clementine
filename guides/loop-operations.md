@@ -4,7 +4,7 @@ A fleet of durable loops runs itself: parked loops are single rows,
 crashed steps replay, strands self-heal. Operating one is therefore two
 jobs — **watch the rates that page** (this is telemetry's half) and
 **diagnose the one loop that froze** (the doctor's half). This guide
-wires both for the host built in [Durable Loops](durable-loops.md).
+wires both for the loops built in [Durable Loops](durable-loops.md).
 
 ## The signals
 
@@ -23,9 +23,9 @@ Arrival-side context rides `[:clementine, :loop, :input]` (per-append,
 tagged `kind` and `outcome` — a `:duplicate` surge is a webhook retry
 storm) and `[:clementine, :loop, :spawned]` (children created per
 commit). Emission honesty is part of the contract: the step runner emits
-only after the host's atomic unit commits, and the storage adapter
-defers inbox events to the transaction that created them — no event ever
-describes a write that rolled back.
+only after the atomic unit commits, and the runtime defers inbox events
+to the transaction that created them — no event ever describes a write
+that rolled back.
 
 ## Wiring the metrics and the poller
 
@@ -50,7 +50,7 @@ defmodule MyApp.Telemetry do
        measurements: [
          # One GROUP BY over pending inbox rows; emits one
          # [:clementine, :loop, :inbox] event per loop with mail waiting.
-         {Clementine.Loop.Ecto, :emit_inbox_depths, [MyApp.LoopHost]}
+         {Clementine.Runs, :emit_inbox_depths, []}
        ],
        period: :timer.seconds(30)},
       {TelemetryMetricsPrometheus, metrics: metrics()}
@@ -89,28 +89,25 @@ and gauge polls at `:debug`.
 
 ## The doctor
 
-`Clementine.Loop.inspect/3` is frozen-loop diagnosis as one call: it
-reads the host seam (never writes, takes no lease) and returns a
-`Clementine.Loop.Report` — lifecycle facts, the persisted spec and its
+`Clementine.Runs.inspect/1` is frozen-loop diagnosis as one call: it
+reads the loop's row and inbox (never writes, takes no lease) and
+returns a `Clementine.Loop.Report` — lifecycle facts, the persisted spec and its
 version compatibility, the decoded envelope, live children joined to
 their run statuses, the timer schedule, pending inputs with ages,
 retained dead letters, and the diagnosed **strands**:
 
 <!-- guide-sample: parse-only -->
 ```elixir
-{:ok, report} =
-  Clementine.Loop.inspect(MyApp.LoopHost, loop_ref,
-    lifecycle: MyApp.ClementineLifecycle
-  )
+{:ok, report} = Clementine.Runs.inspect(loop_id)
 
 report |> Clementine.Loop.Report.render() |> IO.puts()
 ```
 
 ```text
-loop 42 — waiting, epoch 17
-  spec: MyApp.ThreadAgent state_version 1 (declared 1)
+loop "9b1c…" — waiting, epoch 17
+  spec: MyApp.ThreadLoop state_version 1 (declared 1)
   children (1 live):
-    {:reply, 508} -> run 91 [completed]
+    {:turn, 508} -> run "e4f0…" [completed]
   timers (1):
     {:retry, 497, :overloaded} %{"schedule_id" => 3311}
   pending (2):
@@ -119,12 +116,12 @@ loop 42 — waiting, epoch 17
   dead letters (1):
     #171 elapsed :stale_elapsed
   strands (2):
-    ! stranded_completion %{child_ref: 91, child_status: :completed, tag_key: "[\"t\",[[\"a\",\"reply\"],508]]"}
+    ! stranded_completion %{child_ref: "e4f0…", child_status: :completed, tag_key: "[\"t\",[[\"a\",\"turn\"],508]]"}
     ! parked_with_pending %{oldest_age_ms: 421000, pending: 2}
 ```
 
-That report reads: child 91 finished but its completion never reached
-the inbox, and the loop parked over pending mail — both strands the
+That report reads: the turn child finished but its completion never
+reached the inbox, and the loop parked over pending mail — both strands the
 reaper's next sweep will heal (`:reconcile_children`, `:wake_pending`),
 and both worth a glue investigation because on Postgres they should be
 unreachable.
@@ -141,11 +138,9 @@ Every strand class maps to a failure-matrix row and a healing mechanism
 | `:stranded_completion` | L13 | the reaper's `:reconcile_children` verdict |
 | `:stale_queued` | L15 | the reaper's `:reenqueue` verdict |
 
-Options that shape the report: `:lifecycle` (resolve child statuses —
-without it children read `:unknown` and stranded completions cannot be
-detected), `:limit` (pending/dead-letter window, default 50; diagnosis
-is bounded by it), `:stale_after` (the `:stale_queued` threshold,
-default five minutes).
+The report reads up to 50 pending inputs and dead letters; diagnosis is
+bounded by that window, and a `queued` loop older than five minutes
+reads as `:stale_queued`.
 
 ## Dead letters
 
@@ -159,23 +154,23 @@ or re-arm), `:terminal_sweep` (rows a finishing loop could never
 consume), `:terminal` (appends that arrived after the finish; the
 *sender* also got `{:ok, :dead_lettered}` and knew at the call).
 
-Read them through the host (`MyApp.LoopHost.dead_letters(loop_ref, 50, nil)`
-— the doctor includes them) and own their retention: they are rows in
-your inbox table, so TTL, archival, and the GDPR answer are ordinary
-data policy — `DELETE FROM agent_loop_inbox WHERE dead_at < ...` on your
-schedule. If a dead letter deserves another chance (the poison was a
-since-fixed handler bug), append a fresh input with a fresh dedup key —
-dead rows are evidence, not a retry queue.
+Read them through the doctor (`Clementine.Runs.inspect/1` includes the
+newest 50) and own their retention: they are rows in `agent_run_inbox`,
+so TTL, archival, and the GDPR answer are ordinary data policy —
+`DELETE FROM agent_run_inbox WHERE dead_at < ...` on your schedule. If a
+dead letter deserves another chance (the poison was a since-fixed
+handler bug), append a fresh input with a fresh dedup key — dead rows
+are evidence, not a retry queue.
 
 ## Fleet scale and billing
 
 - A parked loop is one `waiting` row: no process, no heartbeat, no
   scheduler entry. "Hibernation" is what `waiting` already is; dormant
   loops cost storage, not compute.
-- Keep the rollout reaper's sweep scoped `kind = 'rollout'` and the loop
-  sweep on its own slower cadence over `kind = 'loop'` rows only — the
-  two-sweep topology from the [walkthrough](durable-loops.md). Judgment
-  forks on `Facts.kind` either way; scoping is the cost story.
+- The reaper sweeps rollouts every minute and loops every five, each
+  over its own kind alone: a parked loop is permanently `waiting` by
+  design, and judging dormant loops on every minutely sweep would be
+  wasted work. Both cadences are the runtime's; nothing to wire.
 - Billing queries exclude loop rows or count double: the machinery
   aggregates children's usage into the parent loop's row as completions
   fold. Sum `WHERE kind = 'rollout'` for spend; read the loop row for

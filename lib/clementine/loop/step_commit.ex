@@ -1,43 +1,51 @@
 defmodule Clementine.Loop.StepCommit do
-  @moduledoc """
-  Everything one step caused, as one value (LOOP_RFC §The Loop Host
-  Contract): the guarded transition (exact `(status, epoch)` expectation
-  and the partial facts to set, envelope included), the consumed input
-  refs, dead-letter marks, synthesized appends, the dispatch cargo, and
-  the terminal-sweep flag.
-
-  The host's `apply_step/2` executes the *entire* value in one atomic
-  unit — CAS transition, envelope, consumption, marks, appends, child rows
-  and their jobs, sends, timer jobs, cancellations, terminal sweep — or
-  none of it (`{:error, :stale}` when the guard misses). Dispatch is
-  cargo, not a phase: nothing durable precedes this commit, which is what
-  makes a loop always replayable (Governing Invariants 3–4).
-
-  `set` follows `Clementine.Lifecycle.Transition` semantics exactly:
-  absent key = leave untouched, present `nil` = write NULL, timestamps
-  symbolic (`:now`), resolved against the storage clock. Two loop-only
-  keys ride alongside the facts: `:envelope` (an `Envelope` struct the
-  host encodes via `Envelope.encode/1`) and `:state_version`. A
-  threshold poison commit omits both (and `:usage`) — it changes no app
-  state, so the stored values ride along untouched.
-
-  When `op` is `:park`, the host re-verifies *inside the same unit* that
-  no unconsumed inputs in `park_recheck` scope exist, downgrading the park
-  to a continue when they do (Governing Invariant 5b). The scope is `:any`
-  for ordinary parks; a cascade park re-checks `:completions` only —
-  non-completion inputs legitimately sit unconsumed until the terminal
-  sweep, and an `:any` re-check would downgrade forever. The `:any`
-  re-check also covers the cancel flag: a flag that landed mid-step is a
-  wake the claim never saw, and parking over it would strand the
-  cancellation (`Clementine.Loop.Host` states the full interleaving). A
-  cascade park deliberately ignores the flag — the cascade is its handler.
-
-  Dead-letter reasons are closed and observable (Governing Invariant 11):
-  `:poison` (head attempts exhausted), `:unknown_tag` (completion for no
-  live child), `:stale_elapsed` (fire racing a cancel or retire),
-  `:terminal_sweep` (host-applied to every row remaining at a finish), and
-  `:terminal` (host-applied to post-terminal appends).
-  """
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   Everything one step caused, as one value (LOOP_RFC §The Loop Host
+  #   Contract): the guarded transition (exact `(status, epoch)` expectation
+  #   and the partial facts to set, envelope included), the consumed input
+  #   refs, dead-letter marks, synthesized appends, the dispatch cargo, and
+  #   the terminal-sweep flag. `cancel_children` names the live children this
+  #   commit cancels, by tag key: the ones `{:cancel, tag}` actions asked
+  #   for, or every live child when a halt or a cancel flag enters the
+  #   cascade.
+  #
+  #   The host's `apply_step/2` executes the *entire* value in one atomic
+  #   unit — CAS transition, envelope, consumption, marks, appends, child rows
+  #   and their jobs, sends, timer jobs, cancellations, terminal sweep — or
+  #   none of it (`{:error, :stale}` when the guard misses). Dispatch is
+  #   cargo, not a phase: nothing durable precedes this commit, which is what
+  #   makes a loop always replayable (Governing Invariants 3–4).
+  #
+  #   `set` follows `Clementine.Lifecycle.Transition` semantics exactly:
+  #   absent key = leave untouched, present `nil` = write NULL, timestamps
+  #   symbolic (`:now`), resolved against the storage clock. Two loop-only
+  #   keys ride alongside the facts: `:envelope` (an `Envelope` struct the
+  #   host encodes via `Envelope.encode/1`) and `:state_version`. A
+  #   threshold poison commit omits both (and `:usage`) — it changes no app
+  #   state, so the stored values ride along untouched.
+  #
+  #   When `op` is `:park`, the host re-verifies *inside the same unit* that
+  #   no unconsumed inputs in `park_recheck` scope exist, downgrading the park
+  #   to a continue when they do (Governing Invariant 5b). The scope is `:any`
+  #   for ordinary parks; a cascade park re-checks `:completions` only —
+  #   non-completion inputs legitimately sit unconsumed until the terminal
+  #   sweep, and an `:any` re-check would downgrade forever. The `:any`
+  #   re-check also covers the cancel flag: a flag that landed mid-step is a
+  #   wake the claim never saw, and parking over it would strand the
+  #   cancellation: flag-first, the row the CAS returns carries the flag and
+  #   the park downgrades; park-first, the flag's write sees `waiting` and
+  #   wakes the loop itself. A cascade park deliberately ignores the flag —
+  #   the cascade is its handler.
+  #
+  #   Dead-letter reasons are closed and observable (Governing Invariant 11):
+  #   `:poison` (head attempts exhausted), `:unknown_tag` (completion for no
+  #   live child), `:stale_elapsed` (fire racing a cancel or retire),
+  #   `:terminal_sweep` (host-applied to every row remaining at a finish), and
+  #   `:terminal` (host-applied to post-terminal appends).
 
   alias Clementine.Loop.{Envelope, Input}
   alias Clementine.Result

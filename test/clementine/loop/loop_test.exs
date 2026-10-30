@@ -23,6 +23,32 @@ defmodule Clementine.LoopTest do
       assert DoorLoop.load(%{"items" => ["b", "x"]}) == set
     end
 
+    test "key: defines key/0; without it the loop has no key" do
+      defmodule Keyed do
+        use Clementine.Loop, key: "keyed"
+
+        def init(_args), do: {:ok, %{}, []}
+        def handle(_input, state), do: {:ok, state, []}
+      end
+
+      assert Keyed.key() == "keyed"
+      refute function_exported?(ScriptedLoop, :key, 0)
+    end
+
+    test "an empty or non-string key refuses to compile" do
+      for bad <- ["", :keyed] do
+        assert_raise ArgumentError, ~r/key must be a non-empty string/, fn ->
+          Code.eval_quoted(
+            quote do
+              defmodule BadKey do
+                use Clementine.Loop, key: unquote(bad)
+              end
+            end
+          )
+        end
+      end
+    end
+
     test "a non-positive state_version refuses to compile" do
       assert_raise ArgumentError, ~r/state_version/, fn ->
         defmodule BadVersion do

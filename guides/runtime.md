@@ -9,7 +9,7 @@ reaches every host as a dependency bump.
 The host keeps three things:
 
 - a child after Oban in its supervision tree;
-- one migration calling `Clementine.Migration.up(version: 2)`;
+- one migration calling `Clementine.Migration.up(version: 3)`;
 - `use Clementine.Agent` modules.
 
 `mix clementine.install` writes them (plus the config and a test case),
@@ -51,16 +51,16 @@ the subject, the actor, the turn flag, and the lane index:
 defmodule MyApp.Repo.Migrations.AddClementine do
   use Ecto.Migration
 
-  def up, do: Clementine.Migration.up(version: 2)
-  def down, do: Clementine.Migration.down(version: 2)
+  def up, do: Clementine.Migration.up(version: 3)
+  def down, do: Clementine.Migration.down(version: 3)
 end
 ```
 
 Each version's DDL is frozen in `Clementine.Migration`, and each stamps
 its number on the table. The runtime checks the stamp as it starts and
 refuses to start against a table behind the code's version, naming the
-migration to write: a host on version 1 adds one calling
-`Clementine.Migration.up(from: 1, version: 2)`.
+migration to write: a host on version 2 adds one calling
+`Clementine.Migration.up(from: 2, version: 3)`.
 
 An agent is a module with a stable key, the string its run rows store:
 
@@ -136,8 +136,8 @@ running, or waiting) are exclusive, held by one unique index:
 - a run with no subject has no lane and blocks nothing.
 
 Busy means refused: `start/3` returns `{:error, :active_run_exists}`. A
-thread that should queue messages instead gets a loop (the next
-version).
+thread that should queue messages instead gets a loop, which holds the
+lane and starts one turn at a time: see [Durable Loops](durable-loops.md).
 
 ## Running agents
 
@@ -388,7 +388,7 @@ would leave old nodes failing on the missing column.
 5. Replace `MyApp.Agents.Runs.start("key", prompt)` with
    `Clementine.Runs.start(MyApp.Agents.Key, prompt)`, `get_run/1` with
    `get/1`, `run.agent` with `run.agent_key`, and `RunWorker` with
-   `Clementine.Runs.Worker` in tests.
+   `Runs.Worker` in tests.
 6. Keep the old migration, and do not add `Clementine.Migration.up/1`:
    the table exists. Add one that brings it to version 1, then one
    calling `Clementine.Migration.up(from: 1, version: 2)` (the runtime

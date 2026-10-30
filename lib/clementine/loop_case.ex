@@ -1,417 +1,331 @@
-defmodule Clementine.LoopCase do
-  @moduledoc """
-  The generated conformance battery for `Clementine.Loop.Host`
-  implementations (LOOP_RFC §The Loop Host Contract) — the loop layer's
-  analog of `Clementine.LifecycleCase`.
+if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
+  defmodule Clementine.LoopCase do
+    @moduledoc false
+    # The loop battery against the durable runtime: `Clementine.Runs`,
+    # `Clementine.Runs.Loops`, and the two workers, on a real Postgres,
+    # as `mix test` runs it:
+    #
+    #     defmodule Clementine.Runs.LoopConformanceTest do
+    #       use Clementine.LoopCase, repo: Clementine.TestRepo, moduletag: :postgres
+    #     end
+    #
+    # It starts Oban in `:manual` testing mode and `{Clementine, ...}` with
+    # the conformance controller and agents (`Clementine.LoopCase.
+    # ConformanceLoop`, `Task`, `Turn`) and host, on a shared SQL sandbox,
+    # and scripts the model on the configured `:llm_client`, a Mox mock.
+    # The library's own suite runs it; an app proves its loops at its own
+    # altitude, in its own tests.
+    #
+    # The battery's first two tests are the two the loop RFC's cold read
+    # said must lead: the park-vs-append interleaving (matrix row L4) and
+    # the crash-replay early-completion (row L5). Then creation, appends,
+    # the wrong-state calls, the step commit (L1, L11), poison isolation
+    # (L7), children through the start path (L12), the `{:cancel, tag}`
+    # action, cancels and halts (L8, L9), timers (L6), the loop sweep's
+    # five verdicts (L13, L15, L16, L4's backstop, the deadline belt),
+    # the step-job enqueues, and the lane matrix with children. Mid-step
+    # interleavings (crash windows, zombie commits, the park race) are
+    # manufactured with the pure step core (`Clementine.Loop.Step`),
+    # exactly the states a step occupies between its claim and its commit.
+    #
+    # Options: `:repo` (required), the repo `agent_runs` lives in;
+    # `:moduletag`, an atom or list of atoms applied to the generated
+    # tests. Racing-writer tests carry `racing_writers: true`.
 
-  The loop host's correctness burden is the two atomicity sentences:
-  *`apply_step/2` executes the entire StepCommit in one atomic unit,
-  re-verifying a park's pending-emptiness (and, for `:any` scope, the
-  cancel flag) inside that unit*, and *`append/4` commits the input row,
-  the wake, and the step-job enqueue in one atomic unit.* This battery
-  exists to verify those sentences and the machinery that leans on them —
-  driven through `Clementine.Loop.Runner.step/2`, `Clementine.Loop.Protocol`,
-  and the host callbacks exactly as production drives them, with mid-step
-  interleavings (crash windows, zombie commits, the park race)
-  manufactured by the pure step core. A host that hand-writes its seam and
-  misses either sentence fails this suite on day one:
+    defmacro __using__(opts) do
+      repo = Keyword.fetch!(opts, :repo)
+      moduletags = opts |> Keyword.get(:moduletag) |> List.wrap()
 
-      defmodule Meli.LoopHostConformanceTest do
-        use Clementine.LoopCase,
-          host: Meli.LoopHost,
-          lifecycle: Meli.ClementineLifecycle,
-          create_loop: &Meli.Factory.create_loop/1,
-          step_jobs: &Meli.Factory.step_job_count/1,
-          nonexistent_ref: -1,
-          moduletag: :postgres
+      quote do
+        use ExUnit.Case, async: false
+        use Oban.Testing, repo: unquote(repo)
 
-        # See "Racing writers and Ecto.Adapters.SQL.Sandbox" below.
+        import Mox
+
+        unquote_splicing(
+          for tag <- moduletags do
+            quote do: @moduletag(unquote(tag))
+          end
+        )
+
+        alias Clementine.LoopCase.Battery
+
+        setup :set_mox_global
+        setup :verify_on_exit!
+
         setup do
-          pid = Ecto.Adapters.SQL.Sandbox.start_owner!(Meli.Repo, shared: true)
+          pid = Ecto.Adapters.SQL.Sandbox.start_owner!(unquote(repo), shared: true)
           on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
+
+          start_supervised!({Oban, repo: unquote(repo), testing: :manual})
+
+          start_supervised!(
+            {Clementine,
+             repo: unquote(repo),
+             agents: [
+               Clementine.LoopCase.ConformanceLoop,
+               Clementine.LoopCase.Task,
+               Clementine.LoopCase.Turn
+             ],
+             host: Clementine.LoopCase.Host}
+          )
+
+          Process.register(self(), :clementine_loop_case)
           :ok
         end
-      end
 
-  The battery's first two tests are the two the loop RFC's cold read said
-  must lead: the park-vs-append interleaving (matrix row L4) and the
-  crash-replay early-completion (matrix row L5).
+        describe "loop conformance: the two lead interleavings" do
+          test "matrix row L4: the park-vs-append interleaving — an append landing between drain and park never strands" do
+            Battery.park_vs_append_interleaving()
+          end
 
-  ## Options
-
-    * `:host` (required) — the `Clementine.Loop.Host` implementation under
-      test.
-    * `:lifecycle` (required) — the paired `Clementine.Lifecycle` module
-      the host's run rows live in (for `use Clementine.Loop.Ecto` hosts,
-      the module the adapter was configured with). The battery claims,
-      requeues, and interrupts through it exactly as the step runner and
-      reaper do.
-    * `:create_loop` (required) — an arity-1 function receiving a keyword
-      list and returning the *loop reference* of a freshly created
-      `queued` loop. See the contract below.
-    * `:ctx` (optional, default `nil`) — the host context threaded through
-      every seam call. A literal term, or a zero-arity function evaluated
-      per test.
-    * `:step_jobs` (optional) — an arity-1 function receiving a loop
-      reference and returning how many step jobs the host has recorded
-      for it (for the Ecto pairing, a count over the job table; a
-      monotonic ledger is fine — the battery asserts deltas). Enables the
-      enqueue-observation battery: the step-job half of the atomic units
-      (create's first job, append's wake, the park downgrade, cancel's
-      wake) is host storage the seam cannot read, so without this hook
-      those enqueues go unobserved — a host that forgets them still
-      passes, stranding loops until the reaper's `:reenqueue` verdict
-      heals each one at claim-timeout latency.
-    * `:timer_schedules` (optional) — an arity-1 function receiving a
-      loop reference and returning how many live timer schedules the
-      host's scheduler holds for it (for the Ecto pairing, a count over
-      the timer job rows). Enables matrix row L6's crash-window test:
-      the schedule half of the atomic unit is host storage the seam
-      cannot read, so without this hook a host that schedules outside
-      the unit — draft v1's wedged watcher — still passes.
-    * `:nonexistent_ref` (optional) — a reference guaranteed to match no
-      run (for integer keys, `-1`). Enables the `:not_found` tests; not
-      generated when omitted.
-    * `:moduletag` (optional) — an atom or list of atoms applied as
-      `@moduletag` to the generated tests. Tags must ride this option: a
-      `@moduletag` written after `use` does not reach tests that were
-      already generated, while `setup` blocks after `use` apply normally.
-    * `:async` (optional, default `false`) — forwarded to
-      `use ExUnit.Case`.
-
-  ## The `create_loop` contract
-
-  `create_loop.(attrs)` creates one loop and returns its reference —
-  typically a thin wrapper over `Clementine.Loop.Protocol.create/3` that
-  supplies the host's scope format and any product columns its table
-  demands. The battery passes these keys:
-
-    * `:module`, `:args`, `:policy` — the loop spec, passed through
-      verbatim. The module is always `Clementine.LoopCase.ConformanceLoop`
-      (shipped in the library, so the persisted name resolves in any host
-      application); `args` and `policy` are JSON-safe maps.
-    * `:scope_token` (optional) — when present, compose the scope
-      deterministically from it: two calls sharing a token must target the
-      same scope, so the second exercises create's insert-or-get. Absent,
-      mint a fresh scope per call — repeated calls must never collide.
-    * `:completion_glue` (optional) — when `:dropped`, the returned loop's
-      *children* must terminalize WITHOUT the completion-append glue (the
-      host's projection skips `append_completion` for them), simulating
-      the lost-delivery substrate the reaper's `:reconcile_children`
-      verdict heals (matrix row L13). The conventional wiring: mark the
-      loop row, propagate the mark to child rows in `child_attrs`, and
-      check it in the projection — fiddly exactly once, in the host's
-      factory and lifecycle.
-
-  ## Racing writers and `Ecto.Adapters.SQL.Sandbox`
-
-  Carried over from `Clementine.LifecycleCase`, which documents the full
-  argument: the concurrency battery runs genuinely racing writers, which
-  the SQL sandbox cannot host in its default `:manual` checkout. Shared
-  ownership is the per-module setup that works (with `async: false`, the
-  default):
-
-      setup do
-        pid = Ecto.Adapters.SQL.Sandbox.start_owner!(MyApp.Repo, shared: true)
-        on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
-        :ok
-      end
-
-  A dedicated non-sandbox repo pointed at the test database is the
-  alternative (rely on per-loop row isolation, which `create_loop`'s
-  fresh-scope rule provides). The racing tests are tagged
-  `racing_writers: true`; a host whose environment cannot run them
-  excludes the tag rather than skipping the suite.
-
-  ## What the battery covers
-
-  Matrix rows L1, L3–L11, L13, and L15 as named tests, plus the
-  wrong-state calls every operation must refuse:
-
-    * The park-vs-append interleaving — an append landing between drain
-      and park never strands: the park re-check downgrades to continue in
-      its own commit (L4), and the same re-check covers a cancel flag the
-      claim never saw.
-    * The crash-replay early-completion — a fast child's completion
-      drained alongside its replayed spawn is delivered exactly once by
-      in-fold dedup, and the spawn's cargo retires (L5).
-    * Crash-before-commit replay: nothing durable but the attempts bump
-      precedes the commit; the replay produces one child, one send, one
-      delivery (L1). Zombie commits are fenced on both guard halves and
-      write nothing (L11).
-    * Loop-to-loop send dedup (L1/L11's send half): the causal key is
-      replay-stable — a re-dispatched send (crash replay, a zombie's
-      leaked dispatch, a cross-substrate transport's redelivery carrying
-      the traveled key) lands `:duplicate` at the target while its row
-      lives, and a genuine re-send (new causal input) mints a fresh key
-      and delivers. The send verb answers exactly like `append/4` on
-      terminal, rollout-kind, and unknown targets.
-    * Append semantics: FIFO commit-visibility order, codec round-trips,
-      per-loop `dedup_key` uniqueness over live and dead rows,
-      `:dead_lettered` for post-terminal appends (L10), the atomic wake
-      under racing appenders (L3), and appends racing steps never
-      stranding a parked loop with pending inputs.
-    * Wrong-state calls: rollout-kind refusals for every loop verb (a
-      parked rollout's suspension survives a miswired wake), `:not_found`
-      variants, cancel on terminal loops, idempotent first-cause-wins
-      flags, and the step runner's discard union.
-    * Poison isolation: head blame, batch-1 degrade, dead-letter at the
-      threshold with synthesized `{:input_failed}` evidence, innocents
-      never dead-lettered (L7) — and the drain-time attempts bump
-      committing outside both units, so VM-death poison is counted.
-    * Cascade orders: children reach terminals before the loop, queued
-      children direct-terminalize as cargo, running children get the
-      cooperative flag without spinning the cascade park, halts hold
-      their result against later cancels, the `:completions` window reads
-      past a longer-than-cap backlog, and the terminal sweep leaves
-      nothing consumable — retained as dead letters, never deleted
-      (L8, L9).
-    * Timers on the scheduler seam: a fire — the scheduler's `append`
-      under the machinery dedup key — delivers `{:elapsed, tag}` exactly
-      once per schedule, retries collapsing to `:duplicate`, and the
-      fired tag re-arms immediately (live-key lifetime); a fire racing
-      its cancel is consumed as a dead letter, never `handle/2`'s and
-      never silently dropped; a fire against a terminal loop answers
-      `:dead_lettered`; and, with `:timer_schedules`, the crash-window
-      case — a schedule is cargo and cannot outlive its never-committed
-      envelope entry (L6).
-    * The loop-kind reaper verdicts: `:reenqueue` re-inserts a lost step
-      job and never terminalizes (L15), `:reconcile_children` synthesizes
-      a lost completion under the canonical dedup key — healing the strand
-      once and collapsing to `:duplicate` against a real delivery (L13) —
-      and `:wake_pending` wakes a park stranded over pending inputs, the
-      backstop for substrates that cannot honor sentence 1's re-check
-      (L4's degraded half).
-    * With `:step_jobs`, the enqueue half of the atomic units: create's
-      first step job, the append wake's job (exactly one under a pending
-      wake), the park downgrade's, and cancel's.
-  """
-
-  defmacro __using__(opts) do
-    host = Keyword.fetch!(opts, :host)
-    lifecycle = Keyword.fetch!(opts, :lifecycle)
-    create_loop = Keyword.fetch!(opts, :create_loop)
-    step_jobs = Keyword.get(opts, :step_jobs)
-    timer_schedules = Keyword.get(opts, :timer_schedules)
-    nonexistent_ref = Keyword.fetch(opts, :nonexistent_ref)
-    ctx = Keyword.get(opts, :ctx)
-    async = Keyword.get(opts, :async, false)
-    moduletags = opts |> Keyword.get(:moduletag) |> List.wrap()
-
-    [
-      prelude(host, lifecycle, create_loop, ctx, async, moduletags),
-      battery(),
-      step_jobs_battery(step_jobs),
-      timer_schedules_battery(timer_schedules),
-      not_found_battery(nonexistent_ref)
-    ]
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp prelude(host, lifecycle, create_loop, ctx, async, moduletags) do
-    quote do
-      use ExUnit.Case, async: unquote(async)
-
-      unquote_splicing(
-        for tag <- moduletags do
-          quote do: @moduletag(unquote(tag))
-        end
-      )
-
-      alias Clementine.LoopCase.Battery
-
-      @doc false
-      def __loop_conformance__ do
-        %{
-          host: unquote(host),
-          lifecycle: unquote(lifecycle),
-          create_loop: unquote(create_loop),
-          ctx: Clementine.LoopCase.resolve_ctx(unquote(ctx))
-        }
-      end
-    end
-  end
-
-  defp battery do
-    quote do
-      describe "loop conformance: the two lead interleavings" do
-        test "matrix row L4: the park-vs-append interleaving — an append landing between drain and park never strands" do
-          Battery.park_vs_append_interleaving(__loop_conformance__())
+          test "matrix row L5: the crash-replay early-completion — the replayed step delivers the fast child's completion exactly once" do
+            Battery.crash_replay_early_completion()
+          end
         end
 
-        test "matrix row L5: the crash-replay early-completion — the replayed step delivers the fast child's completion exactly once" do
-          Battery.crash_replay_early_completion(__loop_conformance__())
-        end
-      end
+        describe "loop conformance: start_loop" do
+          test "a loop is a run: kind loop, the controller's key, the args as input; init runs in the first step, exactly once" do
+            Battery.start_loop_is_a_run()
+          end
 
-      describe "loop conformance: create" do
-        test "create is insert-or-get on the scope key; init runs in the first step, exactly once" do
-          Battery.create_insert_or_get(__loop_conformance__())
-        end
-      end
+          test "start_loop is insert-or-get on the lane: the same controller and subject returns the standing loop" do
+            Battery.start_loop_insert_or_get()
+          end
 
-      describe "loop conformance: append" do
-        test "appends round-trip the codec in FIFO commit-visibility order; the wake rides the unit" do
-          Battery.append_round_trip(__loop_conformance__())
+          test "start_loop refuses an agent, an unlisted module, and a loop without a subject" do
+            Battery.start_loop_refusals()
+          end
         end
 
-        test "duplicate appends by dedup_key return :duplicate and change nothing; keys are per-loop" do
-          Battery.dedup_key_duplicates(__loop_conformance__())
+        describe "loop conformance: send and append" do
+          test "appends round-trip the codec in FIFO commit-visibility order; the wake rides the unit" do
+            Battery.append_round_trip()
+          end
+
+          test "duplicate sends by dedup_key return :duplicate and change nothing; keys are per-loop" do
+            Battery.dedup_key_duplicates()
+          end
+
+          test "matrix row L10: a send racing or trailing the finish returns :dead_lettered — the sender observes the outcome" do
+            Battery.append_to_terminal_observability()
+          end
+
+          test "inside the caller's transaction the input and the step job commit with it" do
+            Battery.send_inside_a_transaction()
+          end
+
+          @tag racing_writers: true
+          test "matrix row L3: sends race each other and the wake — one step drains all, none lost, none doubled" do
+            Battery.concurrent_appends()
+          end
+
+          @tag racing_writers: true
+          test "matrix rows L3/L4 (load): sends racing steps never strand a parked loop with pending inputs" do
+            Battery.appends_racing_steps_never_strand()
+          end
         end
 
-        test "matrix row L10: an append racing or trailing the finish returns :dead_lettered — the sender observes the outcome" do
-          Battery.append_to_terminal_observability(__loop_conformance__())
+        describe "loop conformance: wrong-state calls" do
+          test "every loop verb refuses a run that is not a loop; a parked rollout's suspension survives a miswired wake" do
+            Battery.kind_guards()
+          end
+
+          test "cancel is idempotent and first-cause-wins; terminal loops answer :already_terminal" do
+            Battery.cancel_wrong_states()
+          end
+
+          test "the step runner discards lost claim races and terminal loops without writing" do
+            Battery.step_discards_wrong_states()
+          end
+
+          test "send, inspect, cancel, child, and the step report an unknown loop" do
+            Battery.not_found()
+          end
+
+          test "resume refuses a loop, which waits for its inbox rather than a decision" do
+            Battery.resume_refuses_a_loop()
+          end
         end
 
-        @tag racing_writers: true
-        test "matrix row L3: appends race each other and the wake — one step drains all, none lost, none doubled" do
-          Battery.concurrent_appends(__loop_conformance__())
+        describe "loop conformance: the step commit" do
+          test "matrix row L1: a step crashing before its commit replays identically — the bump counted, no duplicate children or sends" do
+            Battery.crash_replay_no_duplicates()
+          end
+
+          test "matrix row L11: a zombie step's commit is fenced :stale on both guard halves and writes nothing" do
+            Battery.zombie_step_fenced()
+          end
+
+          test "matrix rows L1/L11 (send half): a re-dispatched send — crash replay or zombie — lands :duplicate at the target" do
+            Battery.send_redispatch_dedup()
+          end
+
+          test "a cancel flag landing between drain and park downgrades the park in its own commit — never stranded" do
+            Battery.cancel_flag_racing_park()
+          end
+
+          test "the step worker maps the runner's outcomes: parked, continued, and finished ack; a discard cancels the job" do
+            Battery.step_worker_outcomes()
+          end
         end
 
-        @tag racing_writers: true
-        test "matrix rows L3/L4 (load): appends racing steps never strand a parked loop with pending inputs" do
-          Battery.appends_racing_steps_never_strand(__loop_conformance__())
-        end
-      end
+        describe "loop conformance: poison isolation" do
+          # The poison path logs each failed step at error level by design.
+          @tag capture_log: true
+          test "matrix row L7: head blame, batch-1 degrade, dead-letter at the threshold, the controller informed, innocents untouched" do
+            Battery.poison_isolation()
+          end
 
-      describe "loop conformance: wrong-state calls" do
-        test "every loop verb refuses rollout-kind refs; a parked rollout's suspension survives a miswired wake" do
-          Battery.kind_guards(__loop_conformance__())
-        end
-
-        test "cancel is idempotent and first-cause-wins; terminal loops answer :already_terminal" do
-          Battery.cancel_wrong_states(__loop_conformance__())
+          test "matrix row L7 (VM death): the drain-time attempts bump commits outside both units and survives the crash" do
+            Battery.vm_death_attempts_counted()
+          end
         end
 
-        test "the step runner discards lost claim races and terminal loops without writing" do
-          Battery.step_discards_wrong_states(__loop_conformance__())
-        end
-      end
+        describe "loop conformance: children through the start path" do
+          test "a step commit inserts the child with its parent, tag, turn, subject, actor, and Oban job in one transaction" do
+            Battery.child_inserted_through_the_start_path()
+          end
 
-      describe "loop conformance: the step commit" do
-        test "matrix row L1: a step crashing before its commit replays identically — the bump counted, no duplicate children or sends" do
-          Battery.crash_replay_no_duplicates(__loop_conformance__())
-        end
+          test "the child builds at its claim like any run: history/1 sees run.subject resolved, both resolvers run, tools see parent_id and tag" do
+            Battery.child_builds_at_claim()
+          end
 
-        test "matrix row L11: a zombie step's commit is fenced :stale on both guard halves and writes nothing" do
-          Battery.zombie_step_fenced(__loop_conformance__())
-        end
+          test "matrix row L12: the child's terminal appends {:completed, tag, result} to the parent's inbox and the parent wakes" do
+            Battery.child_completion_wakes_parent()
+          end
 
-        test "matrix rows L1/L11 (send half): a re-dispatched send — crash replay or zombie — lands :duplicate at the target" do
-          Battery.send_redispatch_dedup(__loop_conformance__())
-        end
+          test "a child the runtime cannot build is cancelled as unstartable, and its loop hears the Cancelled completion" do
+            Battery.unstartable_child_completes_cancelled()
+          end
 
-        test "a cancel flag landing between drain and park downgrades the park in its own commit — never stranded" do
-          Battery.cancel_flag_racing_park(__loop_conformance__())
-        end
-      end
+          test "a child's events fold like any run's, and its end closes the view" do
+            Battery.child_events_fold()
+          end
 
-      describe "loop conformance: poison isolation" do
-        # The poison path logs each failed step at error level by design;
-        # captured so a host's suite output stays clean.
-        @tag capture_log: true
-        test "matrix row L7: head blame, batch-1 degrade, dead-letter at the threshold, the decision layer informed, innocents untouched" do
-          Battery.poison_isolation(__loop_conformance__())
-        end
+          test "the loop's children are list(parent:) and turns/1; child/2 is the live child under a tag, re-armed once it ends" do
+            Battery.children_queries()
+          end
 
-        test "matrix row L7 (VM death): the drain-time attempts bump commits outside both units and survives the crash" do
-          Battery.vm_death_attempts_counted(__loop_conformance__())
-        end
-      end
+          test "a child description the runtime refuses fails the step naming the tag, requeues the loop, and inserts nothing" do
+            Battery.child_spec_refused()
+          end
 
-      describe "loop conformance: cascade and halt" do
-        test "matrix row L8: loop cancelled with children in flight — children terminal first, loop last, sweep leaves nothing" do
-          Battery.cascade_orders_queued_child(__loop_conformance__())
+          test "a send to a missing run or a rollout fails the step; the target's inbox stays untouched" do
+            Battery.send_target_refused()
+          end
         end
 
-        test "matrix row L8 (running child): the cascade flags cooperatively and its park never spins on the cancel flag" do
-          Battery.cascade_running_child_cooperative(__loop_conformance__())
+        describe "loop conformance: {:cancel, tag}" do
+          test "{:cancel, tag} flags the running child, the cancel relay pushes it, and its Cancelled completion arrives" do
+            Battery.cancel_action_stops_running_child()
+          end
+
+          test "a cancel and its child's completion in one drain: the cancel retires, and a successor under the re-armed tag lives" do
+            Battery.cancel_retired_by_completion_in_one_batch()
+          end
+
+          test "{:cancel, tag} ends a queued child at once; a tag with no live child is a no-op" do
+            Battery.cancel_action_queued_child_and_no_op()
+          end
         end
 
-        test "matrix row L9: halt with children in flight and inputs behind the halt — the halt's result wins, leftovers dead-letter" do
-          Battery.halt_with_children_in_flight(__loop_conformance__())
+        describe "loop conformance: cancel/1" do
+          test "matrix row L8: cancel/1 on a loop flags, wakes, cascades to its children, dead-letters leftovers, and finishes the loop last" do
+            Battery.cascade_orders_queued_child()
+          end
+
+          test "matrix row L8 (running child): the cascade flags cooperatively and its park never spins on the cancel flag" do
+            Battery.cascade_running_child_cooperative()
+          end
+
+          test "cancel/1 on a child behaves as on any rollout; the loop hears the completion and goes on" do
+            Battery.cancel_child_like_a_rollout()
+          end
+
+          test "matrix row L9: halt with children in flight and inputs behind the halt — the halt's result wins, leftovers dead-letter" do
+            Battery.halt_with_children_in_flight()
+          end
+
+          test "matrix row L9 (same step): a halt in the step that spawned a child cascades to the child it just inserted" do
+            Battery.halt_in_the_spawning_step()
+          end
+
+          test "the cascade's :completions window reads past a backlog longer than the batch cap — never a livelock" do
+            Battery.cascade_completion_behind_long_backlog()
+          end
+
+          test "cancelling a loop that never stepped short-circuits its queued inputs into the sweep" do
+            Battery.cancel_never_stepped_short_circuits()
+          end
         end
 
-        test "the cascade's :completions window reads past a backlog longer than the batch cap — never a livelock" do
-          Battery.cascade_completion_behind_long_backlog(__loop_conformance__())
+        describe "loop conformance: timers" do
+          test "matrix row L6: a timer schedules a job in the step's commit; its fire delivers {:elapsed, tag} once per schedule and the tag re-arms" do
+            Battery.timer_fire_delivers_and_rearms()
+          end
+
+          test "matrix row L6: a fire racing its cancel is consumed as a dead letter — never seen by handle/2, never silently dropped" do
+            Battery.timer_fire_racing_cancel_dead_letters()
+          end
+
+          test "matrix row L6 (terminal): a fire against a terminal loop answers :dead_lettered — distinguishable noise" do
+            Battery.timer_fire_against_terminal()
+          end
+
+          test "matrix row L6 (crash window): a schedule is cargo — it cannot outlive its never-committed envelope entry" do
+            Battery.timer_schedule_is_cargo()
+          end
         end
 
-        test "cancelling a loop that never stepped short-circuits its queued inputs into the sweep" do
-          Battery.cancel_never_stepped_short_circuits(__loop_conformance__())
-        end
-      end
+        describe "loop conformance: the loop sweep's verdicts" do
+          test "matrix row L16: a crashed step requeues with its job, whatever its epoch" do
+            Battery.sweep_requeues_crashed_step()
+          end
 
-      describe "loop conformance: timers (the scheduler seam)" do
-        test "matrix row L6: a fire delivers {:elapsed, tag} exactly once per schedule; the fired tag re-arms immediately" do
-          Battery.timer_fire_delivers_and_rearms(__loop_conformance__())
-        end
+          test "matrix row L15: a lost step job never kills the loop — :reenqueue re-inserts it" do
+            Battery.sweep_reenqueues_lost_job()
+          end
 
-        test "matrix row L6: a fire racing its cancel is consumed as a dead letter — never seen by handle/2, never silently dropped" do
-          Battery.timer_fire_racing_cancel_dead_letters(__loop_conformance__())
-        end
+          test "matrix row L13: a lost completion self-heals — :reconcile_children synthesizes the append under the canonical dedup key, and collapses to :duplicate against a real delivery" do
+            Battery.sweep_reconciles_children()
+          end
 
-        test "matrix row L6 (terminal): a fire against a terminal loop answers :dead_lettered — distinguishable noise" do
-          Battery.timer_fire_against_terminal(__loop_conformance__())
-        end
-      end
+          test "matrix row L4 (backstop): the :wake_pending verdict wakes a park stranded over pending inputs" do
+            Battery.sweep_wakes_pending()
+          end
 
-      describe "loop conformance: reaper verdicts" do
-        test "matrix row L15: a lost step enqueue never kills the loop — :reenqueue re-inserts the job standalone" do
-          Battery.reenqueue_verdict(__loop_conformance__())
+          test "a live-wedged step past its deadline is the one verdict that ends a loop" do
+            Battery.sweep_interrupts_wedged_step()
+          end
         end
 
-        test "matrix row L13: a lost completion self-heals — :reconcile_children synthesizes the append under the canonical dedup key" do
-          Battery.reconcile_children_heals_lost_glue(__loop_conformance__())
+        describe "loop conformance: step-job enqueues" do
+          test "start_loop, the send wake, the park downgrade, and cancel each enqueue the step job inside their units" do
+            Battery.step_job_enqueues()
+          end
         end
 
-        test "matrix row L13 (race): the synthesized completion collapses to :duplicate against a real delivery" do
-          Battery.reconcile_collapses_on_real_delivery(__loop_conformance__())
-        end
+        describe "loop conformance: the lane matrix" do
+          test "a turn child and a direct turn on one thread collide: the direct start is refused, and as a step commit the step fails and the poison path records it" do
+            Battery.lane_turn_child_vs_direct_turn()
+          end
 
-        test "matrix row L4 (backstop): the :wake_pending verdict wakes a park stranded over pending inputs" do
-          Battery.wake_pending_backstop(__loop_conformance__())
-        end
-      end
-    end
-  end
+          test "a turn child and a task child on one subject both run" do
+            Battery.lane_turn_child_vs_task_child()
+          end
 
-  @doc false
-  # The :ctx option is a literal term or a zero-arity function evaluated
-  # per test; the generated `__loop_conformance__/0` resolves it here.
-  def resolve_ctx(fun) when is_function(fun, 0), do: fun.()
-  def resolve_ctx(term), do: term
+          test "two loops of one controller on one subject are one loop; a loop and its own turn never collide" do
+            Battery.lane_loop_vs_loop_and_own_turn()
+          end
 
-  defp step_jobs_battery(nil), do: nil
+          test "two children of one task agent on one subject collide: the second is refused" do
+            Battery.lane_two_task_children()
+          end
 
-  defp step_jobs_battery(step_jobs) do
-    quote do
-      describe "loop conformance: step-job enqueues" do
-        test "create, the append wake, the park downgrade, and cancel each enqueue the step job inside their units" do
-          Battery.step_job_enqueues(__loop_conformance__(), unquote(step_jobs))
-        end
-      end
-    end
-  end
-
-  defp timer_schedules_battery(nil), do: nil
-
-  defp timer_schedules_battery(timer_schedules) do
-    quote do
-      describe "loop conformance: timer schedules" do
-        test "matrix row L6 (crash window): a schedule is cargo — it cannot outlive its never-committed envelope entry" do
-          Battery.timer_schedule_is_cargo(__loop_conformance__(), unquote(timer_schedules))
-        end
-      end
-    end
-  end
-
-  defp not_found_battery(:error), do: nil
-
-  defp not_found_battery({:ok, missing_ref}) do
-    quote do
-      describe "loop conformance: unknown references" do
-        test "append, send, load, cancel, and the step runner report :not_found" do
-          Battery.not_found(__loop_conformance__(), unquote(missing_ref))
+          test "interrupt is two steps: cancel, then spawn on the cancelled child's completion; cancel-and-spawn in one step fails" do
+            Battery.lane_interrupt_two_phase()
+          end
         end
       end
     end

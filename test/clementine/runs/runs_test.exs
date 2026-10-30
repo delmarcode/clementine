@@ -150,9 +150,11 @@ defmodule Clementine.RunsTest do
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
       refute Runs.active?(Echo, {"ticket", 1})
 
-      assert_raise ArgumentError, ~r/String is not an agent the child spec lists/, fn ->
-        Runs.active?(String, {"ticket", 1})
-      end
+      assert_raise ArgumentError,
+                   ~r/String is not an agent or loop controller the child spec/,
+                   fn ->
+                     Runs.active?(String, {"ticket", 1})
+                   end
     end
 
     test "active/1 is the thread's active turn, of whichever agent" do

@@ -2,9 +2,7 @@ defmodule Clementine.Loop.ReportTest do
   use ExUnit.Case, async: true
 
   alias Clementine.Lifecycle.Facts
-  alias Clementine.Loop
-  alias Clementine.Loop.{Codec, Input, Report, Runner, StoredInput}
-  alias Clementine.Loop.Protocol, as: LoopProtocol
+  alias Clementine.Loop.{Codec, Envelope, Input, Report, Runner, StoredInput}
   alias Clementine.Result
   alias Clementine.Test.MemoryLoopHost, as: Host
   alias Clementine.Test.ScriptedLoop
@@ -17,11 +15,7 @@ defmodule Clementine.Loop.ReportTest do
     scope = Keyword.get(opts, :scope, "loop:#{System.unique_integer([:positive])}")
 
     {:ok, %Facts{ref: ref}} =
-      LoopProtocol.create(
-        Host,
-        %{module: module, scope: scope, args: %{}, policy: %{}},
-        ctx: store
-      )
+      Host.create(%{module: module, scope: scope, args: %{}, policy: %{}}, store)
 
     ref
   end
@@ -32,9 +26,16 @@ defmodule Clementine.Loop.ReportTest do
 
   defp inspect!(store, ref, opts \\ []) do
     {:ok, %Report{} = report} =
-      Loop.inspect(Host, ref, Keyword.merge([lifecycle: Host, ctx: store], opts))
+      Report.gather(Host, ref, Keyword.merge([lifecycle: Host, ctx: store], opts))
 
     report
+  end
+
+  # The live child's ref under a tag, as the committed envelope records it.
+  defp child_ref!(store, ref, tag) do
+    {:ok, %{envelope: data}} = Host.load(ref, store)
+    {:ok, %Envelope{children: children}} = Envelope.decode(data)
+    Map.fetch!(children, Codec.key(tag, vocabulary: ScriptedLoop.__loop__(:vocabulary)))
   end
 
   # Strand shapes need states the honest verbs make unreachable (that
@@ -118,7 +119,7 @@ defmodule Clementine.Loop.ReportTest do
 
       {:ok, :appended} = Host.append(ref, Input.message(%{"id" => "a"}), nil, store)
       {:ok, :appended} = Host.append(ref, Input.message(%{"id" => "b"}), nil, store)
-      {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :tester, ctx: store)
+      {:ok, :flagged} = Host.cancel(ref, :tester, store)
 
       assert {:finished, %Facts{status: :cancelled}} = step!(store, ref)
 
@@ -132,10 +133,10 @@ defmodule Clementine.Loop.ReportTest do
     end
 
     test "errors pass through from load", %{store: store} do
-      assert {:error, :not_found} = Loop.inspect(Host, 999_999, ctx: store)
+      assert {:error, :not_found} = Report.gather(Host, 999_999, ctx: store)
 
       rollout = Host.seed(store, kind: :rollout)
-      assert {:error, :rollout_run} = Loop.inspect(Host, rollout, ctx: store)
+      assert {:error, :rollout_run} = Report.gather(Host, rollout, ctx: store)
     end
   end
 
@@ -219,12 +220,12 @@ defmodule Clementine.Loop.ReportTest do
         )
 
       assert {:parked, _} = step!(store, ref)
-      {:ok, child} = LoopProtocol.child_ref(Host, ref, {:reply, 1}, ctx: store)
+      child = child_ref!(store, ref, {:reply, 1})
 
       # A running child only gets the cooperative flag, so the cascade
       # parks waiting for its completion.
       {:ok, _lease} = Clementine.Lifecycle.Protocol.claim(Host, child, executor: "w", ctx: store)
-      {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :tester, ctx: store)
+      {:ok, :flagged} = Host.cancel(ref, :tester, store)
       assert {:parked, _} = step!(store, ref)
 
       forge_row!(store, ref, Input.message(%{"id" => "backlog"}))
@@ -252,7 +253,7 @@ defmodule Clementine.Loop.ReportTest do
         )
 
       assert {:parked, _} = step!(store, ref)
-      {:ok, child} = LoopProtocol.child_ref(Host, ref, {:reply, 1}, ctx: store)
+      child = child_ref!(store, ref, {:reply, 1})
 
       # Terminalize the child row directly — the lost-glue simulation: no
       # projection ran, so no completion was appended.
@@ -290,10 +291,10 @@ defmodule Clementine.Loop.ReportTest do
         )
 
       assert {:parked, _} = step!(store, ref)
-      {:ok, child} = LoopProtocol.child_ref(Host, ref, {:reply, 1}, ctx: store)
+      child = child_ref!(store, ref, {:reply, 1})
 
       {:ok, _lease} = Clementine.Lifecycle.Protocol.claim(Host, child, executor: "w", ctx: store)
-      {:ok, :flagged} = LoopProtocol.cancel(Host, ref, :tester, ctx: store)
+      {:ok, :flagged} = Host.cancel(ref, :tester, store)
       assert {:parked, _} = step!(store, ref)
 
       # The child reached its terminal and its completion WAS delivered —
@@ -334,7 +335,7 @@ defmodule Clementine.Loop.ReportTest do
         )
 
       assert {:parked, _} = step!(store, ref)
-      {:ok, child} = LoopProtocol.child_ref(Host, ref, {:reply, 1}, ctx: store)
+      child = child_ref!(store, ref, {:reply, 1})
 
       Agent.update(store, fn state ->
         update_in(state.runs[child], &%{&1 | status: :completed})

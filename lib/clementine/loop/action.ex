@@ -1,24 +1,30 @@
 defmodule Clementine.Loop.Action do
-  @moduledoc """
-  What a step emits (LOOP_RFC §Vocabulary), normalized from the tuple
-  forms `init/1` and `handle/2` return:
-
-      {:run, tag, child_args}      spawn a child rollout-run
-      {:timer, tag, at_or_ms}      schedule a durable timer
-      {:cancel_timer, tag}         retire a pending timer
-      {:send, loop_ref, payload}   append to another loop's inbox
-
-  Actions are durable cargo, so they carry data, never structs with module
-  references: `child_args` must be a plain JSON map (rollouts are built at
-  the child boundary via `build_child/4`), payloads must be codec-encodable
-  terms, and timers fire at an absolute `DateTime` or after a relative
-  millisecond delay — the relative form stays symbolic (`{:now_plus, ms}`)
-  so the host resolves it against the storage clock, never this node's.
-
-  A malformed action is an app-contract violation and raises: the step
-  fails deterministically and the causing input walks the poison path,
-  informed and observable, instead of half-committed cargo.
-  """
+  @moduledoc false
+  # The pure loop core, hidden from the docs: apps reach loops through
+  # Clementine.Loop and Clementine.Runs. The text below is kept for the
+  # library's own readers.
+  #
+  #   What a step emits (LOOP_RFC §Vocabulary), normalized from the tuple
+  #   forms `init/1` and `handle/2` return:
+  #
+  #       {:run, tag, child}           start a child run under a two-part tag
+  #       {:cancel, tag}               cancel the live child under the tag
+  #       {:timer, tag, at_or_ms}      schedule a durable timer
+  #       {:cancel_timer, tag}         retire a pending timer
+  #       {:send, loop_id, payload}    append to another loop's inbox
+  #
+  #   Actions are durable cargo, so they carry data, never structs with module
+  #   references: `child` must be a plain JSON map (the runtime builds the
+  #   child's agent at its claim, from the `"agent"` key it names), payloads
+  #   must be codec-encodable terms, and timers fire at an absolute `DateTime`
+  #   or after a relative millisecond delay — the relative form stays symbolic
+  #   (`{:now_plus, ms}`) so the host resolves it against the storage clock,
+  #   never this node's. A child's tag is `{kind, id}` (`Clementine.Loop.Codec.split_tag/1`),
+  #   because the child's row stores the two halves.
+  #
+  #   A malformed action is an app-contract violation and raises: the step
+  #   fails deterministically and the causing input walks the poison path,
+  #   informed and observable, instead of half-committed cargo.
 
   alias Clementine.Loop.Codec
 
@@ -34,7 +40,7 @@ defmodule Clementine.Loop.Action do
   @type fire :: {:at, DateTime.t()} | {:now_plus, non_neg_integer()}
 
   @type t :: %__MODULE__{
-          kind: :run | :timer | :cancel_timer | :send,
+          kind: :run | :cancel | :timer | :cancel_timer | :send,
           tag: term(),
           tag_key: String.t() | nil,
           child_args: map() | nil,
@@ -49,12 +55,21 @@ defmodule Clementine.Loop.Action do
   """
   @spec normalize(term(), keyword()) :: t()
   def normalize({:run, tag, child_args}, opts) do
+    # A child's row stores the tag's two halves; refuse any other shape
+    # here, before the step commits anything.
+    _ = Codec.split_tag(tag)
+
     %__MODULE__{
       kind: :run,
       tag: tag,
       tag_key: Codec.key(tag, opts),
-      child_args: Codec.validate_json_map!(child_args, "child_args for #{inspect(tag)}")
+      child_args: Codec.validate_json_map!(child_args, "child for #{inspect(tag)}")
     }
+  end
+
+  def normalize({:cancel, tag}, opts) do
+    _ = Codec.split_tag(tag)
+    %__MODULE__{kind: :cancel, tag: tag, tag_key: Codec.key(tag, opts)}
   end
 
   def normalize({:timer, tag, %DateTime{} = at}, opts) do
@@ -78,7 +93,8 @@ defmodule Clementine.Loop.Action do
 
   def normalize(other, _opts) do
     raise ArgumentError,
-          "action outside the closed set {:run, tag, args} | {:timer, tag, at_or_ms} | " <>
-            "{:cancel_timer, tag} | {:send, loop_ref, payload}: #{inspect(other)}"
+          "action outside the closed set {:run, tag, child} | {:cancel, tag} | " <>
+            "{:timer, tag, at_or_ms} | {:cancel_timer, tag} | {:send, loop_id, payload}: " <>
+            inspect(other)
   end
 end

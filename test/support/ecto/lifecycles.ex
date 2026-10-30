@@ -33,15 +33,6 @@ defmodule Clementine.Test.Ecto.Lifecycle do
   what observers were told. A row labeled `"boom"` makes the projection
   raise — the atomicity probe — and `raise`/`raise:<variant>` labels carry
   the `LifecycleCase` probe convention.
-
-  The loop glue is wired the way a real host wires it (LOOP_RFC amendment
-  A5): the projection appends a loop child's completion inside the
-  terminal transaction — before the probes, so a probe raise proves the
-  append rolls back with the terminal — and `after_transition/3` is
-  wake-only. Both no-op for rows that are not loop children. A row
-  carrying `Clementine.Test.Ecto.LoopHost.drop_glue_label/0` skips the
-  append — the `Clementine.LoopCase` lost-glue probe (the row L13 strand
-  a conforming substrate cannot otherwise produce).
   """
 
   use Clementine.Lifecycle.Ecto,
@@ -50,10 +41,6 @@ defmodule Clementine.Test.Ecto.Lifecycle do
 
   @impl Clementine.Lifecycle.Ecto
   def project(result, row, ctx) do
-    unless row.label == Clementine.Test.Ecto.LoopHost.drop_glue_label() do
-      Clementine.Loop.Ecto.append_completion(Clementine.Test.Ecto.LoopHost, result, row, ctx)
-    end
-
     if row.label == "boom", do: raise("projection boom")
     Clementine.Test.Ecto.ProjectionProbe.check!(row.label, result)
     if is_pid(ctx), do: send(ctx, {:projected, result, row})
@@ -62,7 +49,6 @@ defmodule Clementine.Test.Ecto.Lifecycle do
 
   @impl Clementine.Lifecycle.Ecto
   def after_transition(facts, transition, ctx) do
-    Clementine.Loop.Ecto.wake_parent(Clementine.Test.Ecto.LoopHost, transition, ctx)
     if is_pid(ctx), do: send(ctx, {:transition, facts, transition})
     if transition.meta[:raise_in_hook], do: raise("hook boom")
     :ok
@@ -196,35 +182,5 @@ defmodule Clementine.Test.Ecto.HandWrittenLifecycle do
   defp db_now do
     %{rows: [[%DateTime{} = now]]} = Repo.query!("SELECT now()")
     now
-  end
-end
-
-defmodule Clementine.Test.Ecto.UuidLifecycle do
-  @moduledoc """
-  `Clementine.Test.Ecto.Lifecycle`'s uuid-keyed twin, paired with
-  `Clementine.Test.Ecto.UuidLoopHost` — the loop glue wired identically,
-  against the table whose refs are UUID strings.
-  """
-
-  use Clementine.Lifecycle.Ecto,
-    repo: Clementine.TestRepo,
-    schema: Clementine.Test.Ecto.UuidRun
-
-  @impl Clementine.Lifecycle.Ecto
-  def project(result, row, ctx) do
-    unless row.label == Clementine.Test.Ecto.LoopHost.drop_glue_label() do
-      Clementine.Loop.Ecto.append_completion(Clementine.Test.Ecto.UuidLoopHost, result, row, ctx)
-    end
-
-    Clementine.Test.Ecto.ProjectionProbe.check!(row.label, result)
-    if is_pid(ctx), do: send(ctx, {:projected, result, row})
-    :ok
-  end
-
-  @impl Clementine.Lifecycle.Ecto
-  def after_transition(facts, transition, ctx) do
-    Clementine.Loop.Ecto.wake_parent(Clementine.Test.Ecto.UuidLoopHost, transition, ctx)
-    if is_pid(ctx), do: send(ctx, {:transition, facts, transition})
-    :ok
   end
 end
