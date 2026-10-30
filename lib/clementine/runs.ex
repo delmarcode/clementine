@@ -21,9 +21,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       * `use Clementine.Agent` modules, listed in `agents:`.
 
     The optional `host:` module implements `Clementine.Host`: who may
-    resume a run, what commits with a run's end and what hears of it
-    after, what hears of its events and its other transitions, and how a
-    subject and an actor resolve. An agent that converses supplies its
+    resume a run, which calls to a `{:policy, term}` tool run, what
+    commits with a run's end and what hears of it after, what hears of
+    its events and its other transitions, and how a subject and an actor
+    resolve. An agent that converses supplies its
     history with `c:Clementine.Agent.history/1`. Nothing else is
     configurable. Coding agents: the rules are in
     [`usage-rules.md`](usage-rules.md).

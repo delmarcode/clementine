@@ -19,16 +19,23 @@ defmodule Clementine.Pending do
     batch that already executed — nothing is discarded at suspension, and
     nothing unsafe re-executes on resume. ToolResult `metadata` is advisory
     and not preserved across the checkpoint boundary.
+
+    `policy` is `:require_approval` when the host's tool policy
+    (`c:Clementine.Host.authorize_tool/3`) asked for the decision, and
+    `nil` when the tool's own declaration did. It feeds the trace entry
+    the call gets when the decision settles it; the resume never asks the
+    policy about this call again.
     """
 
     @enforce_keys [:tool_use_id, :tool_name]
-    defstruct tool_use_id: nil, tool_name: nil, args: %{}, completed_results: %{}
+    defstruct tool_use_id: nil, tool_name: nil, args: %{}, completed_results: %{}, policy: nil
 
     @type t :: %__MODULE__{
             tool_use_id: String.t(),
             tool_name: String.t(),
             args: map(),
-            completed_results: %{optional(String.t()) => Clementine.ToolResult.t()}
+            completed_results: %{optional(String.t()) => Clementine.ToolResult.t()},
+            policy: :require_approval | nil
           }
   end
 
@@ -70,6 +77,7 @@ defmodule Clementine.Pending do
       "args" => pending.args,
       "completed_results" => encode_results(pending.completed_results)
     }
+    |> put_policy(pending.policy)
   end
 
   def to_map(%Delegation{} = pending) do
@@ -94,7 +102,8 @@ defmodule Clementine.Pending do
       tool_use_id: Map.fetch!(data, "tool_use_id"),
       tool_name: Map.fetch!(data, "tool_name"),
       args: Map.get(data, "args", %{}),
-      completed_results: decode_results(data)
+      completed_results: decode_results(data),
+      policy: decode_policy(Map.get(data, "policy"))
     }
   end
 
@@ -117,6 +126,18 @@ defmodule Clementine.Pending do
 
   def from_map(other) do
     raise ArgumentError, "unknown pending shape: #{inspect(other)}"
+  end
+
+  # Only an approval the tool policy asked for names it, so every other
+  # pending approval encodes exactly as before the policy existed.
+  defp put_policy(map, nil), do: map
+  defp put_policy(map, :require_approval), do: Map.put(map, "policy", "require_approval")
+
+  defp decode_policy(nil), do: nil
+  defp decode_policy("require_approval"), do: :require_approval
+
+  defp decode_policy(other) do
+    raise ArgumentError, "unknown pending approval policy: #{inspect(other)}"
   end
 
   defp encode_results(results) do

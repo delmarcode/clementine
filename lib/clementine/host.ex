@@ -1,12 +1,13 @@
 defmodule Clementine.Host do
   @moduledoc """
   The host's say in the durable runtime: one optional module, named in the
-  child spec, with up to seven callbacks. Every callback is optional;
+  child spec, with up to eight callbacks. Every callback is optional;
   leave out the ones the app has no opinion on.
 
   | Callback | Runs | Use it for |
   | --- | --- | --- |
   | `c:authorize_resume/2` | in `Clementine.Runs.resume/2`, on the locked run | who may approve or deny a waiting run |
+  | `c:authorize_tool/3` | before each call to a tool declared `approval: {:policy, term}` | whether this call runs, waits for approval, or is refused |
   | `c:resolve_subject/2` | at every claim | turning the stored `{type, id}` into what the agent works on |
   | `c:resolve_actor/2` | at every claim | turning the stored `{type, id}` into whose authority the run acts with, or refusing it |
   | `c:run_event/2` | while a run executes, in a process of its own | streaming tokens and tool activity to a UI |
@@ -51,6 +52,15 @@ defmodule Clementine.Host do
         end
 
         def authorize_resume(_run, _decision), do: {:error, :forbidden}
+
+        @impl true
+        def authorize_tool(run, %Clementine.ApprovalRequest{args: args}, :refund) do
+          cond do
+            not MyApp.Accounts.may_refund?(run.actor) -> {:deny, "You may not issue refunds."}
+            args["amount_cents"] > 50_00 -> :require_approval
+            true -> :allow
+          end
+        end
 
         @impl true
         def run_event(run, %Event{type: :text_delta, payload: %{content: text}}) do
@@ -137,6 +147,45 @@ defmodule Clementine.Host do
   app that leaves it out must check before calling `resume/2`.
   """
   @callback authorize_resume(AgentRun.t(), decision()) :: :ok | {:error, term()}
+
+  @typedoc "The tool policy's answer for one call, as `c:authorize_tool/3` gives it."
+  @type tool_verdict :: :allow | :require_approval | {:deny, reason :: String.t()}
+
+  @doc """
+  The tool policy: whether one call to a tool declared
+  `approval: {:policy, term}` runs. The engine asks it before the call's
+  batch runs anything, with the run as `c:Clementine.Agent.agent/1` saw it
+  (`run.subject` and `run.actor` resolved), the call as a
+  `Clementine.ApprovalRequest` (its tool's name and exactly the arguments
+  that would run), and the tool's `term`. It answers:
+
+    * `:allow` — the call runs with its batch.
+    * `:require_approval` — the call waits for a decision, as if its tool
+      said `approval: :required`: the run parks, and
+      `Clementine.Runs.resume/2` settles it.
+    * `{:deny, reason}` — the call runs nothing and settles as an error
+      result whose text is `reason`, a string the model reads and can
+      answer.
+
+  It fails closed. A raise, an exit, a throw, or any other answer denies
+  the call, logs why, and gives the model only "Denied: the tool's policy
+  check failed.". The trace's `:tool_call` entry records the verdict
+  beside the approval (`Clementine.Trace`).
+
+  It runs in the run's process at every call, so keep it fast and free of
+  writes. It covers every tool the run offers: the agent's own, deferred
+  ones, and those a loaded skill brought. A run a `delegate` call started
+  is asked about with its own run, which carries the parent's subject and
+  actor. Engine tools (`use_skill`, `delegate`) carry no approval: which
+  skills and delegates a run is offered is `agent/1`'s decision. A call
+  that was still waiting when its batch parked is asked about again when
+  the run resumes; a call a decision settled is not.
+
+  Without this callback a `{:policy, term}` tool gates every call like
+  `:required`.
+  """
+  @callback authorize_tool(AgentRun.t(), Clementine.ApprovalRequest.t(), term :: term()) ::
+              tool_verdict()
 
   @doc """
   Database writes that must commit with a run's end: completed, failed,
@@ -245,6 +294,7 @@ defmodule Clementine.Host do
               {:ok, term()} | {:error, term()}
 
   @optional_callbacks authorize_resume: 2,
+                      authorize_tool: 3,
                       run_event: 2,
                       run_transition: 2,
                       run_finished: 2,

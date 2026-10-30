@@ -718,7 +718,7 @@ defmodule Clementine.RolloutExecuteTest do
       refute_received {:mark, :fence}
     end
 
-    test "a {:policy, _} declaration gates exactly like :required" do
+    test "without authorize_tool:, a {:policy, _} declaration gates exactly like :required" do
       expect_stream(tool_events("tu_1", "policy_gated", %{}))
 
       assert {:suspend, %Suspension.Request{pending: pending}} =

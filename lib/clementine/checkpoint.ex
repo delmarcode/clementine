@@ -30,7 +30,10 @@ defmodule Clementine.Checkpoint do
   inside the envelope, so a later shape joins version 2 without a new
   version (and makes `encode/1` write version 2): a shape this code does
   not know fails the decode as incompatible, as an unknown version does.
-  A pending delegation (`Clementine.Pending.Delegation`) joined that way.
+  A pending delegation (`Clementine.Pending.Delegation`) joined that way,
+  and so did a pending approval the host's tool policy asked for (its
+  `policy`), which version-1 code would resume without knowing why it
+  waited.
 
   Checkpoint-on-suspend (this epic) and checkpoint-every-iteration (the
   future tool-call ledger) are the same mechanism at different cadences;
@@ -80,10 +83,15 @@ defmodule Clementine.Checkpoint do
   @spec version_for(t()) :: pos_integer()
   def version_for(%__MODULE__{} = checkpoint), do: max(checkpoint.version, needs(checkpoint))
 
-  # The version the content needs: loaded skills and a pending delegation
-  # arrived with version 2.
+  # The version the content needs: loaded skills, a pending delegation,
+  # and a pending approval the tool policy asked for arrived with version
+  # 2.
   defp needs(%__MODULE__{skills: [_ | _]}), do: 2
   defp needs(%__MODULE__{pending: %Pending.Delegation{}}), do: 2
+
+  defp needs(%__MODULE__{pending: %Pending.ToolApproval{policy: policy}}) when policy != nil,
+    do: 2
+
   defp needs(%__MODULE__{}), do: 1
 
   @doc "The versions this code reads: the current one, and those before it."

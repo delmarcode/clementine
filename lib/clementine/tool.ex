@@ -49,13 +49,15 @@ defmodule Clementine.Tool do
     non-`:safe` tool, and a cooperative cancel kills `:safe` tools
     immediately while unsafe ones run out their own timeout.
   - `:approval` - `:never | :required | {:policy, term()}` (default
-    `:never`). Anything but `:never` pauses the run for a human decision
-    before the tool executes: the rollout suspends with a durable
-    checkpoint — ungated batch siblings execute first and ride in it —
-    and resumes on `{:approved, meta}` (the call runs) or
-    `{:denied, meta}` (the model sees an error tool result carrying
-    `meta[:message]`). `{:policy, term}` is a reserved shape and gates
-    exactly like `:required` until policy resolution lands.
+    `:never`). `:required` pauses the run for a human decision before
+    each call executes: the rollout suspends with a durable checkpoint —
+    ungated batch siblings execute first and ride in it — and resumes on
+    `{:approved, meta}` (the call runs) or `{:denied, meta}` (the model
+    sees an error tool result carrying `meta[:message]`).
+    `{:policy, term}` asks the host's tool policy about each call
+    (`c:Clementine.Host.authorize_tool/3`, which receives `term`): it
+    runs the call, pauses it like `:required`, or refuses it with an
+    error the model reads. Without a policy it gates like `:required`.
   """
 
   @type context :: %{

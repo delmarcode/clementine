@@ -57,6 +57,19 @@ defmodule Clementine.Trace do
     - `"approval"` — `nil`, or `%{"verdict" => "approved" | "denied",
       "by" => ...}` for a call that waited on a decision, with `by` from
       the decision's meta
+    - `"policy"` — `nil`, or the tool policy's verdict on a call to a
+      tool declared `approval: {:policy, term}`
+      (`c:Clementine.Host.authorize_tool/3`): `%{"verdict" => "allow" |
+      "require_approval" | "deny", "reason" => ..., "failed" => ...}`.
+      `"reason"` is the text a deny gave the model, `nil` otherwise, and
+      `"failed"` is `true` when the policy raised or gave an answer it may
+      not and the call was denied for it. A `"require_approval"` call
+      also carries the `"approval"` that settled it. `nil` when no policy
+      was asked: a tool without `{:policy, _}`, or a run without one,
+      where `{:policy, _}` gates like `:required`.
+
+    A call the policy denied ran nothing: its entry has the deny's text
+    as `"result"`, `"is_error"` `true`, and `"duration_ms"` 0.
 
     A `use_skill` call is a tool call like any other: its result is the
     skill's body, or the error the model saw. The engine settles it before
@@ -179,7 +192,10 @@ defmodule Clementine.Trace do
   end
 
   @doc false
-  # The `:tool_call` payload. `approval` is nil or `{verdict, meta}`.
+  # The `:tool_call` payload. `approval` is nil or `{verdict, meta}`, and
+  # `policy` nil or the tool policy's verdict: `:allow`,
+  # `:require_approval`, `{:deny, reason}`, or `{:failed, reason}` for a
+  # call denied because the policy failed.
   @spec tool_call(map()) :: map()
   def tool_call(%{} = call) do
     %{
@@ -191,7 +207,8 @@ defmodule Clementine.Trace do
       "is_error" => call.is_error,
       "killed" => Map.get(call, :killed, false),
       "duration_ms" => call.duration_ms,
-      "approval" => approval(call[:approval])
+      "approval" => approval(call[:approval]),
+      "policy" => policy(call[:policy])
     }
   end
 
@@ -345,6 +362,15 @@ defmodule Clementine.Trace do
   defp approval({verdict, meta}) when verdict in [:approved, :denied] do
     %{"verdict" => Atom.to_string(verdict), "by" => by(meta)}
   end
+
+  defp policy(nil), do: nil
+  defp policy(:allow), do: %{"verdict" => "allow", "reason" => nil, "failed" => false}
+
+  defp policy(:require_approval),
+    do: %{"verdict" => "require_approval", "reason" => nil, "failed" => false}
+
+  defp policy({:deny, reason}), do: %{"verdict" => "deny", "reason" => reason, "failed" => false}
+  defp policy({:failed, reason}), do: %{"verdict" => "deny", "reason" => reason, "failed" => true}
 
   defp by(%{by: by}), do: by
   defp by(%{"by" => by}), do: by
