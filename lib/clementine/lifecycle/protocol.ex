@@ -154,25 +154,21 @@ defmodule Clementine.Lifecycle.Protocol do
   @doc """
   Writes trace entries the execution recorded since its last write: the
   iteration-boundary flush. A guarded write like the heartbeat, which it
-  also is (`heartbeat_at` moves, and a `usage:` sample rides along), so a
-  superseded executor writes no entries: `:stale` maps to `:lost_lease`
-  and is definitive, and any other error is transient, the entries
-  staying with the execution for its next write or its end.
+  also is (`heartbeat_at` moves), so a superseded executor writes no
+  entries: `:stale` maps to `:lost_lease` and is definitive, and any other
+  error is transient, the entries staying with the execution for its next
+  write or its end. It carries no usage sample: the heartbeat is the one
+  writer of usage while the run executes, so a sample taken earlier can
+  never land after a later one.
   """
-  @spec record_trace(Lease.t(), [Clementine.Trace.Entry.t()], keyword()) ::
+  @spec record_trace(Lease.t(), [Clementine.Trace.Entry.t()]) ::
           :ok | {:error, :lost_lease} | {:error, term()}
-  def record_trace(%Lease{} = lease, entries, opts \\ []) when is_list(entries) do
-    set =
-      case Keyword.fetch(opts, :usage) do
-        {:ok, %Usage{} = usage} -> %{heartbeat_at: :now, usage: usage}
-        :error -> %{heartbeat_at: :now}
-      end
-
+  def record_trace(%Lease{} = lease, entries) when is_list(entries) do
     transition = %Transition{
       op: :record_trace,
       run_ref: lease.run_ref,
       expect: running_expect(lease),
-      set: set,
+      set: %{heartbeat_at: :now},
       trace: entries
     }
 

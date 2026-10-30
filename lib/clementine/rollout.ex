@@ -805,20 +805,33 @@ defmodule Clementine.Rollout do
     tool_calls = Enum.map(calls, fn t -> %{id: t.id, name: t.name, input: t.input} end)
     context = Map.put(exec.context, :_clementine_iteration, exec.iteration)
 
-    with {:continue, %Execution{} = exec} <- raise_fence(exec, calls),
-         {:ok, results} <-
-           ToolRunner.run_batch(exec.tools, tool_calls, context, batch_opts(exec)) do
+    with {:continue, %Execution{} = exec} <- raise_fence(exec, calls) do
       uses = Map.new(calls, &{&1.id, &1})
 
-      settled =
-        Enum.reduce(results, completed, fn {id, result, duration_ms}, completed ->
-          emit_tool_result(exec, {id, result})
-          completed = settle_result({id, result}, completed)
-          record_tool_call(exec, Map.fetch!(uses, id), completed[id], duration_ms, approval)
-          completed
-        end)
+      case ToolRunner.run_batch(exec.tools, tool_calls, context, batch_opts(exec)) do
+        {:ok, results} ->
+          settled =
+            Enum.reduce(results, completed, fn {id, result, duration_ms}, completed ->
+              emit_tool_result(exec, {id, result})
+              completed = settle_result({id, result}, completed)
+              record_tool_call(exec, Map.fetch!(uses, id), completed[id], duration_ms, approval)
+              completed
+            end)
 
-      {:ok, exec, settled}
+          {:ok, exec, settled}
+
+        # The model never sees these, but they ran: the trace keeps them.
+        {:cancelled, reason, settled} ->
+          Enum.each(settled, fn {id, result, duration_ms} ->
+            %{^id => tool_result} = settle_result({id, result}, %{})
+            record_tool_call(exec, Map.fetch!(uses, id), tool_result, duration_ms, approval)
+          end)
+
+          {:cancelled, reason}
+
+        unwound ->
+          unwound
+      end
     end
   end
 

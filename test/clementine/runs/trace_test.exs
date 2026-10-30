@@ -152,8 +152,7 @@ defmodule Clementine.Runs.TraceTest do
     {:ok, old} = Protocol.claim(Lifecycle, run.id, executor: "old")
     entry = %Entry{run_id: run.id, epoch: old.epoch, seq: 1, kind: :execution, payload: %{}}
 
-    assert :ok = Protocol.record_trace(old, [entry], usage: %Usage{input_tokens: 3})
-    assert %AgentRun{usage: %{"input_tokens" => 3}} = Runs.get(run.id)
+    assert :ok = Protocol.record_trace(old, [entry])
     assert trace_rows(run.id) == 1
 
     {:ok, facts} = Lifecycle.fetch(run.id, nil)

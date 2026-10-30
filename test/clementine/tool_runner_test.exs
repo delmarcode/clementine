@@ -399,11 +399,14 @@ defmodule Clementine.ToolRunnerTest do
 
       started = System.monotonic_time(:millisecond)
 
-      assert {:cancelled, :mid_batch_stop} =
+      assert {:cancelled, :mid_batch_stop, settled} =
                ToolRunner.run_batch(@batch_tools, calls, %{push_to: self(), notify: self()})
 
-      # The unsafe tool ran to completion — its effect settled coherently.
+      # The unsafe tool ran to completion — its effect settled coherently,
+      # and its result comes back for the record; the killed one has none.
       assert_received {:unsafe_done, 80}
+      assert [{"call_2", {:ok, %ToolResult{}}, ran_ms}] = settled
+      assert ran_ms >= 80
       # The safe tool sleeps forever; returning at all proves the kill.
       assert System.monotonic_time(:millisecond) - started < 2_000
     end
@@ -413,7 +416,7 @@ defmodule Clementine.ToolRunnerTest do
 
       started = System.monotonic_time(:millisecond)
 
-      assert {:cancelled, :mid_batch_stop} =
+      assert {:cancelled, :mid_batch_stop, []} =
                ToolRunner.run_batch(@batch_tools, calls, %{push_to: self()})
 
       assert System.monotonic_time(:millisecond) - started < 2_000
@@ -425,7 +428,8 @@ defmodule Clementine.ToolRunnerTest do
 
       calls = [%{id: "call_1", name: "echo", input: %{"message" => "hi"}}]
 
-      assert {:cancelled, :first} = ToolRunner.run_batch(@batch_tools, calls, %{})
+      assert {:cancelled, :first, [{"call_1", {:ok, %ToolResult{content: "Echo: hi"}}, _ms}]} =
+               ToolRunner.run_batch(@batch_tools, calls, %{})
     end
 
     test "a drain kills the whole batch immediately, safe and unsafe alike" do

@@ -107,7 +107,7 @@ defmodule Clementine.Runner do
     rollout_execute = Keyword.get(opts, :rollout_execute, &Rollout.execute/2)
     stamper = Events.stamper(sink, lease)
     heartbeat = start_heartbeat(lease, stamper, Keyword.get(opts, :heartbeat, []))
-    recorder = start_recorder(lease, stamper)
+    recorder = start_recorder(lease)
     subscribe_cancel(lease)
 
     try do
@@ -137,11 +137,9 @@ defmodule Clementine.Runner do
   end
 
   # The trace buffer for this execution, written through the protocol's
-  # fenced trace write, with the usage so far riding along as on a beat.
-  defp start_recorder(lease, stamper) do
-    Recorder.new(lease.run_ref, lease.epoch, fn entries ->
-      Protocol.record_trace(lease, entries, usage: Stamper.usage(stamper))
-    end)
+  # fenced trace write.
+  defp start_recorder(lease) do
+    Recorder.new(lease.run_ref, lease.epoch, &Protocol.record_trace(lease, &1))
   end
 
   defp start_heartbeat(_lease, _stamper, false), do: nil

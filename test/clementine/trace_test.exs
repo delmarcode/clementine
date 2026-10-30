@@ -14,7 +14,7 @@ defmodule Clementine.TraceTest do
   alias Clementine.{Result, Rollout, Run, Runner, Trace}
   alias Clementine.Lifecycle.{Facts, Protocol}
   alias Clementine.Test.{FlakyLifecycle, MemoryLifecycle}
-  alias Clementine.Test.Tools.{GatedDeploy, SafeEcho}
+  alias Clementine.Test.Tools.{GatedDeploy, SafeEcho, SafePush, UnsafeSlow}
   alias Clementine.Trace.Entry
 
   setup :verify_on_exit!
@@ -262,6 +262,41 @@ defmodule Clementine.TraceTest do
              } = call
     end
 
+    test "a cancel mid-batch keeps the tool calls that ran, and none that were killed",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      # The safe tool pushes the cancel and is killed; the unsafe one runs
+      # out its time, as the kill policy says, and its effect happened.
+      expect_stream([
+        {:tool_use_start, "tu_1", "safe_push"},
+        {:content_block_stop, 0},
+        {:tool_use_start, "tu_2", "unsafe_slow"},
+        {:input_json_delta, "tu_2", Jason.encode!(%{"delay_ms" => 50})},
+        {:content_block_stop, 1},
+        {:message_delta, %{"stop_reason" => "tool_use"},
+         %{"input_tokens" => 5, "output_tokens" => 2}}
+      ])
+
+      run =
+        build_run(ref, [tools: [SafePush, UnsafeSlow]],
+          context: %{push_to: self(), notify: self()}
+        )
+
+      assert {:finished, %Facts{status: :cancelled}} = execute(run, store)
+      assert_received {:unsafe_done, 50}
+
+      assert [_execution, _call, %Entry{kind: :tool_call, payload: ran}] =
+               MemoryLifecycle.trace(store, ref)
+
+      assert %{
+               "tool_use_id" => "tu_2",
+               "name" => "unsafe_slow",
+               "result" => "effect done after 50ms",
+               "is_error" => false
+             } = ran
+    end
+
     test "a drained run writes its trace before it is requeued", %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
 
@@ -466,10 +501,7 @@ defmodule Clementine.TraceTest do
       {:ok, old} = Protocol.claim(MemoryLifecycle, ref, executor: "old", ctx: store)
       entry = %Entry{run_id: ref, epoch: 1, seq: 1, kind: :execution, payload: %{}}
 
-      assert :ok = Protocol.record_trace(old, [entry], usage: %Clementine.Usage{input_tokens: 3})
-
-      assert %Facts{usage: %Clementine.Usage{input_tokens: 3}} =
-               MemoryLifecycle.facts!(store, ref)
+      assert :ok = Protocol.record_trace(old, [entry])
 
       {:ok, _} =
         Protocol.requeue(

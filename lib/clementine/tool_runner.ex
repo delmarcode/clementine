@@ -101,8 +101,11 @@ defmodule Clementine.ToolRunner do
     is free, so is losing them); non-`:safe` tools run out their own
     timeout, because killing an effectful tool mid-flight creates
     unknowable external state. When the batch settles, returns
-    `{:cancelled, reason}` — settled results are abandoned, the run is
-    terminal-bound and the terminal result is truth.
+    `{:cancelled, reason, settled}`: the run is terminal-bound and the
+    model never sees the results, but `settled` keeps every call that
+    reached a result (finished before the cancel, ran out its time after
+    it, or timed out), as `{id, result, duration_ms}` in call order, so
+    the run's trace records what ran. A killed call has none.
   - `{:clementine, :lease_lost, _}` / `{:clementine, :drain}` — a
     superseded or draining executor must unwind *now*: every task is
     killed and `:lost_lease` / `:drained` returns immediately.
@@ -115,7 +118,7 @@ defmodule Clementine.ToolRunner do
   """
   @spec run_batch([module()], [map()], map(), keyword()) ::
           {:ok, [{String.t(), term(), non_neg_integer()}]}
-          | {:cancelled, reason :: term()}
+          | {:cancelled, reason :: term(), [{String.t(), term(), non_neg_integer()}]}
           | :lost_lease
           | :drained
   def run_batch(tools, tool_calls, context, opts \\ []) do
@@ -152,7 +155,7 @@ defmodule Clementine.ToolRunner do
   defp await_batch(%{awaiting: awaiting} = state) when map_size(awaiting) == 0 do
     case state.cancelled do
       nil -> {:ok, Enum.map(state.entries, fn e -> {e.call.id, e.result, e.duration_ms} end)}
-      reason -> {:cancelled, reason}
+      reason -> {:cancelled, reason, settled(state.entries)}
     end
   end
 
@@ -188,6 +191,10 @@ defmodule Clementine.ToolRunner do
   end
 
   defp entry(state, ref), do: Enum.at(state.entries, Map.fetch!(state.awaiting, ref))
+
+  defp settled(entries) do
+    for %{result: result} = e <- entries, result != nil, do: {e.call.id, result, e.duration_ms}
+  end
 
   defp settle(state, ref, result) do
     {index, awaiting} = Map.pop!(state.awaiting, ref)

@@ -29,7 +29,8 @@ defmodule Clementine.Trace do
       the stream reported, so far as it got
     - `"content"` — the assistant's blocks, as
       `Clementine.LLM.Message.Content.to_map/1` maps them
-  - `:tool_call`, once per tool call settled.
+  - `:tool_call`, once per tool call settled, a call that ran on after a
+    cancel included (the model never sees its result; the trace keeps it).
     - `"iteration"`, `"tool_use_id"`, `"name"`, `"args"` (the arguments
       the tool ran with), `"is_error"`, `"duration_ms"`
     - `"result"` — the text the model saw
