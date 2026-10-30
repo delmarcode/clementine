@@ -118,6 +118,9 @@ defmodule Clementine.MigrationTest do
   ]
 
   @trace_indexes [
+    {"agent_run_trace_entry_index",
+     "CREATE UNIQUE INDEX agent_run_trace_entry_index ON public.agent_run_trace USING btree " <>
+       "(run_id, epoch, seq)"},
     {"agent_run_trace_pkey",
      "CREATE UNIQUE INDEX agent_run_trace_pkey ON public.agent_run_trace USING btree (id)"},
     {"agent_run_trace_run_index",

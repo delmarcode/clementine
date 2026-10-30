@@ -221,9 +221,11 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   model the same thing group together.
 - A `:model_call` entry records each call to the model, a call cut off
   by a cancel included, with the usage it had reported. A `:tool_call`
-  entry records each tool call settled, with the arguments it ran with,
+  entry records each tool call started, with the arguments it ran with
   and the decision it waited on (`"approval" => %{"verdict" => "approved",
-  "by" => ...}`).
+  "by" => ...}`). A call a cancel or a drain cut off is there too: with
+  its result if it had one, and `"killed" => true` if it was killed
+  before it answered, so what it did is unknown.
 - The runner writes new entries at every iteration boundary, fenced on
   the epoch like the heartbeat, and the rest with the run's end or park,
   in the same transaction: `run_finished/2` already sees the whole trace.

@@ -102,17 +102,22 @@ defmodule Clementine.ToolRunner do
     timeout, because killing an effectful tool mid-flight creates
     unknowable external state. When the batch settles, returns
     `{:cancelled, reason, settled}`: the run is terminal-bound and the
-    model never sees the results, but `settled` keeps every call that
-    reached a result (finished before the cancel, ran out its time after
-    it, or timed out), as `{id, result, duration_ms}` in call order, so
-    the run's trace records what ran. A killed call has none.
+    model never sees the results, but `settled` accounts for every call,
+    in call order, so the run's trace records what ran: `{id, result,
+    duration_ms}` for a call that reached a result (before the cancel,
+    after it, or a timeout), and `{id, :killed, duration_ms}` for one
+    killed before it answered, whose effect is unknown.
   - `{:clementine, :lease_lost, _}` / `{:clementine, :drain}` — a
     superseded or draining executor must unwind *now*: every task still
     running is killed and `:lost_lease` / `{:drained, settled}` returns
     immediately. A drained run is still its executor's to end, so
-    `settled` keeps the calls that reached a result before the drain, as
-    for a cancel; a superseded executor writes nothing, so a lost lease
-    keeps none.
+    `settled` accounts for every call as for a cancel; a superseded
+    executor writes nothing, so a lost lease keeps none.
+
+  A call that answers in the instant its kill lands (a timeout, a cancel,
+  or a drain processed while its reply already waits in the mailbox)
+  settles with that reply: it ran, and its result is the truth, never
+  "timed out" or killed.
 
   With no signal, returns `{:ok, results}`: `execute/4`'s `{id, result}`
   pairs, in call order, each with the milliseconds from its spawn to its
@@ -122,9 +127,9 @@ defmodule Clementine.ToolRunner do
   """
   @spec run_batch([module()], [map()], map(), keyword()) ::
           {:ok, [{String.t(), term(), non_neg_integer()}]}
-          | {:cancelled, reason :: term(), [{String.t(), term(), non_neg_integer()}]}
+          | {:cancelled, reason :: term(), [{String.t(), term() | :killed, non_neg_integer()}]}
           | :lost_lease
-          | {:drained, [{String.t(), term(), non_neg_integer()}]}
+          | {:drained, [{String.t(), term() | :killed, non_neg_integer()}]}
   def run_batch(tools, tool_calls, context, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     task_supervisor = Keyword.get(opts, :task_supervisor, Clementine.TaskSupervisor)
@@ -174,9 +179,11 @@ defmodule Clementine.ToolRunner do
         state |> settle(ref, exit_result(call, state.context, reason)) |> await_batch()
 
       {__MODULE__, :timeout, ref} when is_map_key(awaiting, ref) ->
-        %{call: call, task: task} = entry(state, ref)
-        Task.shutdown(task, :brutal_kill)
-        state |> settle(ref, timeout_result(call, state.context, state.timeout)) |> await_batch()
+        %{call: call} = entry(state, ref)
+
+        state
+        |> shut_down(ref, fn -> timeout_result(call, state.context, state.timeout) end)
+        |> await_batch()
 
       {:clementine, :lease_lost, _lease} ->
         kill_awaiting(state, fn _entry -> true end)
@@ -200,6 +207,19 @@ defmodule Clementine.ToolRunner do
     for %{result: result} = e <- entries, result != nil, do: {e.call.id, result, e.duration_ms}
   end
 
+  # Kills one awaited call and settles it with what the kill found: the
+  # reply it had already sent, the exit it had already died of, or, when
+  # it was still running, `killed.()`.
+  defp shut_down(state, ref, killed) do
+    %{call: call, task: task} = entry(state, ref)
+
+    case Task.shutdown(task, :brutal_kill) do
+      {:ok, reply} -> settle(state, ref, reply)
+      {:exit, reason} -> settle(state, ref, exit_result(call, state.context, reason))
+      nil -> settle(state, ref, killed.())
+    end
+  end
+
   defp settle(state, ref, result) do
     {index, awaiting} = Map.pop!(state.awaiting, ref)
     drop_timer(Enum.at(state.entries, index))
@@ -217,18 +237,9 @@ defmodule Clementine.ToolRunner do
   end
 
   defp kill_awaiting(state, kill?) do
-    {killed, awaiting} =
-      Enum.split_with(state.awaiting, fn {_ref, index} ->
-        kill?.(Enum.at(state.entries, index))
-      end)
-
-    Enum.each(killed, fn {_ref, index} ->
-      %{task: task} = e = Enum.at(state.entries, index)
-      Task.shutdown(task, :brutal_kill)
-      drop_timer(e)
-    end)
-
-    %{state | awaiting: Map.new(awaiting)}
+    state.awaiting
+    |> Enum.filter(fn {_ref, index} -> kill?.(Enum.at(state.entries, index)) end)
+    |> Enum.reduce(state, fn {ref, _index}, state -> shut_down(state, ref, fn -> :killed end) end)
   end
 
   # A settled or killed entry's timer must not fire later as an unmatchable

@@ -440,6 +440,26 @@ defmodule Clementine.Lifecycle.EctoAdapterTest do
       assert_received {:transition, _facts, _transition}
     end
 
+    test "the trace write is a fenced beat that observers never hear, for a lifecycle that keeps no trace" do
+      run = insert_run!()
+      lease = claim!(run)
+      assert_received {:transition, _facts, %Transition{op: :claim}}
+      before = fetch!(run.id).heartbeat_at
+
+      entry = %Clementine.Trace.Entry{epoch: lease.epoch, seq: 1, kind: :execution, payload: %{}}
+
+      # Nothing stores the entries here, so the write is the heartbeat's
+      # single guarded UPDATE, and no hook hears of it.
+      assert :ok = Protocol.record_trace(lease, [entry])
+      assert DateTime.compare(fetch!(run.id).heartbeat_at, before) in [:gt, :eq]
+      refute_received {:transition, _facts, %Transition{op: :record_trace}}
+
+      # Still fenced: a superseded lease writes nothing.
+      {:ok, _} = Protocol.requeue(Lifecycle, fetch!(run.id), :lease_expired, self())
+      _successor = claim!(run)
+      assert {:error, :lost_lease} = Protocol.record_trace(lease, [entry])
+    end
+
     test "a stale apply fires no hook" do
       run = insert_run!()
 

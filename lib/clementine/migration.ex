@@ -42,9 +42,12 @@ if Code.ensure_loaded?(Ecto.Migration) do
           payload      jsonb, not null
           inserted_at  timestamptz, not null, default now()
           index agent_run_trace_run_index on (run_id, id)
+          unique index agent_run_trace_entry_index on (run_id, epoch, seq)
 
     The cascade erases a run's trace with the run, so `Clementine.Runs.purge/1`
-    takes it. `up(from: 3, version: 4)` creates the table and touches no
+    takes it. The unique index makes an entry's identity the database's:
+    a write retried after a commit its client never heard of inserts
+    nothing twice. `up(from: 3, version: 4)` creates the table and touches no
     row of `agent_runs`.
 
     ## Version 3
@@ -404,6 +407,9 @@ if Code.ensure_loaded?(Ecto.Migration) do
       end
 
       create(index(@trace, [:run_id, :id], name: :agent_run_trace_run_index))
+
+      create(unique_index(@trace, [:run_id, :epoch, :seq], name: :agent_run_trace_entry_index))
+
       stamp(4)
     end
 

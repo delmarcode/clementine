@@ -49,14 +49,17 @@ if Code.ensure_loaded?(Ecto.Query) do
     #     `heartbeat_at` — plus the small `usage` sample when the heartbeat
     #     piggybacks one. It never rewrites the large jsonb columns
     #     (`suspension`, `error`), keeping the steady-state write HOT-update
-    #     friendly.
+    #     friendly. `:record_trace`, the iteration-boundary trace write, is a
+    #     transaction (the guarded `UPDATE` plus `record_trace/3`'s rows) only
+    #     when it carries entries and the module stores them; otherwise it is
+    #     the same single `UPDATE` as a heartbeat.
     #
     #     `after_transition/3` fires post-commit, outside the transaction, for
-    #     every applied transition — it is the universal observation point where
-    #     transition notifications fan out (and where a terminal notification
-    #     closes `Clementine.RunView` folds). Failures are logged, never raised,
-    #     and never affect the committed transition. Hosts that find per-heartbeat
-    #     notifications noisy filter on `transition.op`.
+    #     every applied transition but `:record_trace` — it is the universal
+    #     observation point where transition notifications fan out (and where a
+    #     terminal notification closes `Clementine.RunView` folds). Failures are
+    #     logged, never raised, and never affect the committed transition. Hosts
+    #     that find per-heartbeat notifications noisy filter on `transition.op`.
     #
     #     ## The cancel push channel
     #
@@ -175,7 +178,9 @@ if Code.ensure_loaded?(Ecto.Query) do
 
     @doc """
     Post-commit notification hook, invoked outside the transaction for
-    every applied transition with the committed facts. This is where
+    every applied transition with the committed facts, except the
+    `:record_trace` write at each iteration boundary, which changes no
+    fact an observer acts on. This is where
     transition notifications broadcast (resume, reap, and direct cancel
     reach observers only through here — no executor was alive to announce
     them) and where terminal notifications close RunView folds. Failures
@@ -298,8 +303,27 @@ if Code.ensure_loaded?(Ecto.Query) do
 
     @doc false
     def apply_transition(module, %Transition{op: :heartbeat} = transition, ctx) do
-      # A single guarded UPDATE is already atomic; no transaction, no
-      # projection, only small columns.
+      guarded_beat(module, transition, ctx)
+    end
+
+    # The boundary trace write is a transaction only when it has rows to
+    # store; for a lifecycle that keeps no trace it is a liveness write,
+    # exactly as cheap as a heartbeat.
+    def apply_transition(module, %Transition{op: :record_trace} = transition, ctx) do
+      if transition.trace != [] and function_exported?(module, :record_trace, 3) do
+        apply_in_transaction(module, transition, ctx)
+      else
+        guarded_beat(module, transition, ctx)
+      end
+    end
+
+    def apply_transition(module, %Transition{} = transition, ctx) do
+      apply_in_transaction(module, transition, ctx)
+    end
+
+    # A single guarded UPDATE is already atomic; no transaction, no
+    # projection, only small columns.
+    defp guarded_beat(module, transition, ctx) do
       %{fields: fields} = config = module.__clementine_config__()
 
       case cas_update(config, transition, nil) do
@@ -313,7 +337,7 @@ if Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    def apply_transition(module, %Transition{} = transition, ctx) do
+    defp apply_in_transaction(module, %Transition{} = transition, ctx) do
       %{repo: repo, fields: fields} = config = module.__clementine_config__()
 
       # Projection hooks run inside this transaction and may emit through
@@ -491,6 +515,11 @@ if Code.ensure_loaded?(Ecto.Query) do
       defp pubsub_subscribe(_pubsub, _topic), do: {:error, :phoenix_pubsub_unavailable}
       defp pubsub_broadcast(_pubsub, _topic, _message), do: :ok
     end
+
+    # The trace write tells observers nothing: it changes no fact a host
+    # acts on (its heartbeat_at aside), and it lands at every iteration
+    # boundary, so after_transition/3 never hears of it.
+    defp notify(_module, %Facts{} = facts, %Transition{op: :record_trace}, _ctx), do: {:ok, facts}
 
     # Post-commit, best-effort: a failed notification must never fail (or
     # retry) a committed transition.

@@ -19,6 +19,60 @@ defmodule Clementine.ToolRunnerTest do
 
   @tools [Echo, Add, Crash, Slow, Fail, TrackedSlow, InspectObject, InspectDeclaredObject]
 
+  defmodule Answer do
+    @moduledoc false
+    # A call that answers in the instant a signal lands: it suspends the
+    # batch's caller, sends it the signal (or sleeps past its timeout),
+    # and answers; the caller resumes once the call has exited, with the
+    # signal ahead of the reply in its mailbox.
+    def as_signal_lands(args, %{runner: runner}) do
+      :erlang.suspend_process(runner)
+
+      case args.signal do
+        "drain" -> send(runner, {:clementine, :drain})
+        "cancel" -> send(runner, {:clementine, :cancel, :late})
+        "none" -> :ok
+      end
+
+      if ms = args[:sleep_ms], do: Process.sleep(ms)
+      call = self()
+
+      spawn(fn ->
+        ref = Process.monitor(call)
+
+        receive do
+          {:DOWN, ^ref, :process, _pid, _reason} -> :erlang.resume_process(runner)
+        end
+      end)
+
+      {:ok, "answered"}
+    end
+  end
+
+  defmodule SafeAnswer do
+    @moduledoc false
+    use Clementine.Tool,
+      name: "safe_answer",
+      description: "Answers as a signal lands",
+      retry: :safe,
+      parameters: [signal: [type: :string, required: true], sleep_ms: [type: :integer]]
+
+    @impl true
+    def run(args, context), do: Answer.as_signal_lands(args, context)
+  end
+
+  defmodule UnsafeAnswer do
+    @moduledoc false
+    use Clementine.Tool,
+      name: "unsafe_answer",
+      description: "Answers as a signal lands, with an effect",
+      retry: :unsafe,
+      parameters: [signal: [type: :string, required: true], sleep_ms: [type: :integer]]
+
+    @impl true
+    def run(args, context), do: Answer.as_signal_lands(args, context)
+  end
+
   setup do
     # The TaskSupervisor is started by the application
     :ok
@@ -403,9 +457,10 @@ defmodule Clementine.ToolRunnerTest do
                ToolRunner.run_batch(@batch_tools, calls, %{push_to: self(), notify: self()})
 
       # The unsafe tool ran to completion — its effect settled coherently,
-      # and its result comes back for the record; the killed one has none.
+      # and its result comes back for the record; the killed one is
+      # accounted for as killed.
       assert_received {:unsafe_done, 80}
-      assert [{"call_2", {:ok, %ToolResult{}}, ran_ms}] = settled
+      assert [{"call_1", :killed, _killed_ms}, {"call_2", {:ok, %ToolResult{}}, ran_ms}] = settled
       assert ran_ms >= 80
       # The safe tool sleeps forever; returning at all proves the kill.
       assert System.monotonic_time(:millisecond) - started < 2_000
@@ -416,7 +471,7 @@ defmodule Clementine.ToolRunnerTest do
 
       started = System.monotonic_time(:millisecond)
 
-      assert {:cancelled, :mid_batch_stop, []} =
+      assert {:cancelled, :mid_batch_stop, [{"call_1", :killed, _ms}]} =
                ToolRunner.run_batch(@batch_tools, calls, %{push_to: self()})
 
       assert System.monotonic_time(:millisecond) - started < 2_000
@@ -448,13 +503,40 @@ defmodule Clementine.ToolRunnerTest do
 
       started = System.monotonic_time(:millisecond)
 
-      # The call that finished before the drain comes back for the record;
-      # the killed ones have no result.
-      assert {:drained, [{"call_3", {:ok, %ToolResult{content: "Echo: done first"}}, _ms}]} =
-               ToolRunner.run_batch(@batch_tools, calls, %{})
+      # The call that finished before the drain comes back for the record,
+      # and the killed ones as killed.
+      assert {:drained,
+              [
+                {"call_1", :killed, _},
+                {"call_2", :killed, _},
+                {"call_3", {:ok, %ToolResult{content: "Echo: done first"}}, _}
+              ]} = ToolRunner.run_batch(@batch_tools, calls, %{})
 
       assert System.monotonic_time(:millisecond) - started < 2_000
       refute_received {:unsafe_done, _}
+    end
+
+    test "a call that answers as a drain lands settles with its answer" do
+      calls = [%{id: "call_1", name: "unsafe_answer", input: %{"signal" => "drain"}}]
+
+      assert {:drained, [{"call_1", {:ok, %ToolResult{content: "answered"}}, _ms}]} =
+               ToolRunner.run_batch([UnsafeAnswer], calls, %{runner: self()})
+    end
+
+    test "a safe call that answers as a cancel lands settles with its answer" do
+      calls = [%{id: "call_1", name: "safe_answer", input: %{"signal" => "cancel"}}]
+
+      assert {:cancelled, :late, [{"call_1", {:ok, %ToolResult{content: "answered"}}, _ms}]} =
+               ToolRunner.run_batch([SafeAnswer], calls, %{runner: self()})
+    end
+
+    test "a call that answers as its timeout fires settles with its answer, not a timeout" do
+      calls = [
+        %{id: "call_1", name: "safe_answer", input: %{"signal" => "none", "sleep_ms" => 150}}
+      ]
+
+      assert {:ok, [{"call_1", {:ok, %ToolResult{content: "answered"}}, _ms}]} =
+               ToolRunner.run_batch([SafeAnswer], calls, %{runner: self()}, timeout: 50)
     end
 
     test "a lost lease kills the whole batch immediately" do

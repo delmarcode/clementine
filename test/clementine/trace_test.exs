@@ -302,18 +302,29 @@ defmodule Clementine.TraceTest do
       assert {:finished, %Facts{status: :cancelled}} = execute(run, store)
       assert_received {:unsafe_done, 50}
 
-      assert [_execution, _call, %Entry{kind: :tool_call, payload: ran}] =
+      assert [_execution, _call, %Entry{kind: :tool_call, payload: killed}, %Entry{payload: ran}] =
                MemoryLifecycle.trace(store, ref)
+
+      # The killed call started: it is on the record, its result unknown.
+      assert %{
+               "tool_use_id" => "tu_1",
+               "name" => "safe_push",
+               "result" => nil,
+               "is_error" => true,
+               "killed" => true
+             } = killed
 
       assert %{
                "tool_use_id" => "tu_2",
                "name" => "unsafe_slow",
                "result" => "effect done after 50ms",
-               "is_error" => false
+               "is_error" => false,
+               "killed" => false
              } = ran
     end
 
-    test "a drain mid-batch keeps the tool calls that finished", %{store: store, ref: ref} do
+    test "a drain mid-batch keeps every call: the one that finished, and the one it killed",
+         %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
       runner = self()
 
@@ -343,10 +354,20 @@ defmodule Clementine.TraceTest do
       # interrupted, with the call that finished on the record.
       assert {:finished, %Facts{status: :interrupted}} = execute(run, store)
 
-      assert [_execution, _call, %Entry{kind: :tool_call, payload: kept}] =
+      assert [_execution, _call, %Entry{kind: :tool_call, payload: kept}, %Entry{payload: cut}] =
                MemoryLifecycle.trace(store, ref)
 
-      assert %{"tool_use_id" => "tu_1", "result" => "Echo: read"} = kept
+      assert %{"tool_use_id" => "tu_1", "result" => "Echo: read", "killed" => false} = kept
+
+      # The effectful call was issued and killed mid-flight: what it did is
+      # unknown, and the record says so, under either fidelity.
+      assert %{
+               "tool_use_id" => "tu_2",
+               "args" => %{"delay_ms" => 5_000},
+               "result" => nil,
+               "is_error" => true,
+               "killed" => true
+             } = cut
     end
 
     test "a drained run's trace commits with its requeue", %{store: store, ref: ref} do

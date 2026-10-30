@@ -29,11 +29,15 @@ defmodule Clementine.Trace do
       the stream reported, so far as it got
     - `"content"` — the assistant's blocks, as
       `Clementine.LLM.Message.Content.to_map/1` maps them
-  - `:tool_call`, once per tool call settled, a call that ran on after a
-    cancel included (the model never sees its result; the trace keeps it).
+  - `:tool_call`, once per tool call started, a call a cancel or a drain
+    cut off included (the model never sees its result; the trace keeps it).
     - `"iteration"`, `"tool_use_id"`, `"name"`, `"args"` (the arguments
       the tool ran with), `"is_error"`, `"duration_ms"`
-    - `"result"` — the text the model saw
+    - `"result"` — the text the model saw, or would have; `nil` for a
+      killed call
+    - `"killed"` — `true` for a call killed before it answered (a drain,
+      or a cancel stopping a `retry: :safe` tool): it started, and what it
+      did is unknown
     - `"approval"` — `nil`, or `%{"verdict" => "approved" | "denied",
       "by" => ...}` for a call that waited on a decision, with `by` from
       the decision's meta
@@ -136,6 +140,7 @@ defmodule Clementine.Trace do
       "args" => call.args,
       "result" => call.result,
       "is_error" => call.is_error,
+      "killed" => Map.get(call, :killed, false),
       "duration_ms" => call.duration_ms,
       "approval" => approval(call[:approval])
     }

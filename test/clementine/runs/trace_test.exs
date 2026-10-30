@@ -164,6 +164,22 @@ defmodule Clementine.Runs.TraceTest do
     assert trace_rows(run.id) == 1
   end
 
+  test "entries a write carries again, after a commit its client never heard of, insert once" do
+    {:ok, run} = Runs.start(Echo, "Hello")
+    {:ok, lease} = Protocol.claim(Lifecycle, run.id, executor: "test")
+    first = %Entry{run_id: run.id, epoch: lease.epoch, seq: 1, kind: :execution, payload: %{}}
+    second = %Entry{first | seq: 2, kind: :model_call, payload: %{"iteration" => 1}}
+
+    # The boundary write committed, but its caller saw an error, so the
+    # entries stayed pending and the end carries them again.
+    assert :ok = Protocol.record_trace(lease, [first])
+
+    assert {:ok, _} =
+             Protocol.finish(lease, Result.cancelled(%{"code" => "x"}), trace: [first, second])
+
+    assert [{1, 1, :execution}, {1, 2, :model_call}] = kinds(Runs.trace(run.id))
+  end
+
   test "a cancelled run keeps the usage its stream reported, on the row and in the trace" do
     {:ok, run} = Runs.start(Echo, "Tell me a long story")
     id = run.id

@@ -835,10 +835,17 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # A cancel or a drain cut the batch short: every call is still on the
+  # record, the ones killed before they answered marked so, since what
+  # they did is unknown.
   defp record_abandoned(exec, uses, settled, approval) do
-    Enum.each(settled, fn {id, result, duration_ms} ->
-      %{^id => tool_result} = settle_result({id, result}, %{})
-      record_tool_call(exec, Map.fetch!(uses, id), tool_result, duration_ms, approval)
+    Enum.each(settled, fn
+      {id, :killed, duration_ms} ->
+        record_tool_call(exec, Map.fetch!(uses, id), :killed, duration_ms, approval)
+
+      {id, result, duration_ms} ->
+        %{^id => tool_result} = settle_result({id, result}, %{})
+        record_tool_call(exec, Map.fetch!(uses, id), tool_result, duration_ms, approval)
     end)
   end
 
@@ -854,7 +861,13 @@ defmodule Clementine.Rollout do
     })
   end
 
-  defp record_tool_call(exec, tool_use, %Clementine.ToolResult{} = result, duration_ms, approval) do
+  defp record_tool_call(exec, tool_use, result, duration_ms, approval) do
+    {content, is_error, killed} =
+      case result do
+        %Clementine.ToolResult{content: content, is_error: is_error} -> {content, is_error, false}
+        :killed -> {nil, true, true}
+      end
+
     record(
       exec,
       :tool_call,
@@ -863,8 +876,9 @@ defmodule Clementine.Rollout do
         tool_use_id: tool_use.id,
         name: tool_use.name,
         args: tool_use.input,
-        result: result.content,
-        is_error: result.is_error,
+        result: content,
+        is_error: is_error,
+        killed: killed,
         duration_ms: duration_ms,
         approval: approval
       })
