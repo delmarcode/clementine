@@ -215,7 +215,7 @@ defmodule Clementine.Lifecycle.Ecto.CodecTest do
       end
     end
 
-    test "round-trips a delegation's outcomes as inspectable JSON" do
+    test "round-trips a delegation's outcomes as a term, the shape earlier code reads" do
       outcomes = %{
         "tu_1" => %{"status" => "completed", "content" => "Done.", "is_error" => false},
         "tu_2" => %{"status" => "failed", "content" => "It broke.", "is_error" => true}
@@ -224,8 +224,7 @@ defmodule Clementine.Lifecycle.Ecto.CodecTest do
       value = %{payload: {:delegated, outcomes}, resumed_at: ~U[2026-07-05 12:00:00Z]}
       assert_exact(:resume, value)
 
-      assert %{"payload" => %{"kind" => "delegated", "outcomes" => %{"t" => "json"}}} =
-               jsonb_round_trip(Codec.encode_resume(value))
+      assert %{"payload" => %{"kind" => "term"}} = jsonb_round_trip(Codec.encode_resume(value))
     end
 
     test "round-trips :elapsed and opaque payloads" do

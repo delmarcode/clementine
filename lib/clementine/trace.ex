@@ -18,7 +18,8 @@ defmodule Clementine.Trace do
       instructions, the agent's tool schemas, and, when the agent has
       them, which tools are deferred, the output schema, the skills it
       offers (each one's name, description, and tool schemas), and the
-      keys of the agents it may ask, in lowercase hex. Executions with the
+      agents it may ask (their keys, and descriptions where they have
+      them), in lowercase hex. Executions with the
       same fingerprint ran the same agent: they offered the model the same
       thing.
     - `"instructions"` — the system prompt the execution sent
@@ -151,7 +152,7 @@ defmodule Clementine.Trace do
       "tools" => Enum.map(offered, &Clementine.Tool.to_schema(&1).name),
       "deferred" => Enum.map(Keyword.get(offer, :deferred, []), & &1.__name__()),
       "skills" => Enum.map(Keyword.get(offer, :skills, []), & &1.name),
-      "delegates" => Keyword.get(offer, :delegates, []),
+      "delegates" => Enum.map(Keyword.get(offer, :delegates, []), &delegate_key/1),
       "resumed" => resumed?
     }
   end
@@ -249,7 +250,9 @@ defmodule Clementine.Trace do
   JSON too); `skills:`, the skills it may load, each with its name, its
   description, and its tools' schemas, not its body (the body is read
   when the model loads the skill, and may differ by run); and
-  `delegates:`, the keys of the agents it may ask. Each enters the
+  `delegates:`, the agents it may ask, each by key, or as a
+  `{key, description}` pair whose description enters beside the key
+  when there is one. Each enters the
   fingerprint only when set, so an agent without it keeps the fingerprint
   it had; moving a tool between `tools:` and `deferred:`, changing the
   schema, changing a skill's description or tools, or changing whom it
@@ -277,16 +280,41 @@ defmodule Clementine.Trace do
 
   defp offered(offer) do
     Enum.reduce(offer, %{}, fn
-      {:deferred, []}, acc -> acc
-      {:deferred, tools}, acc -> Map.put(acc, "deferred", Enum.map(tools, & &1.__name__()))
-      {:output_schema, nil}, acc -> acc
-      {:output_schema, schema}, acc -> Map.put(acc, "output_schema", schema)
-      {:skills, []}, acc -> acc
-      {:skills, skills}, acc -> Map.put(acc, "skills", Enum.map(skills, &skill_fingerprint/1))
-      {:delegates, []}, acc -> acc
-      {:delegates, keys}, acc -> Map.put(acc, "delegates", keys)
+      {:deferred, []}, acc ->
+        acc
+
+      {:deferred, tools}, acc ->
+        Map.put(acc, "deferred", Enum.map(tools, & &1.__name__()))
+
+      {:output_schema, nil}, acc ->
+        acc
+
+      {:output_schema, schema}, acc ->
+        Map.put(acc, "output_schema", schema)
+
+      {:skills, []}, acc ->
+        acc
+
+      {:skills, skills}, acc ->
+        Map.put(acc, "skills", Enum.map(skills, &skill_fingerprint/1))
+
+      {:delegates, []}, acc ->
+        acc
+
+      {:delegates, entries}, acc ->
+        Map.put(acc, "delegates", Enum.map(entries, &delegate_print/1))
     end)
   end
+
+  # A delegate enters as its key, or `{key, description}`; a description
+  # enters the fingerprint beside its key, so an agent whose delegates
+  # have none keeps the fingerprint it had.
+  defp delegate_key({key, _description}), do: key
+  defp delegate_key(key) when is_binary(key), do: key
+
+  defp delegate_print({key, nil}), do: key
+  defp delegate_print({key, description}), do: %{"key" => key, "description" => description}
+  defp delegate_print(key) when is_binary(key), do: key
 
   defp skill_fingerprint(%Clementine.Skill{} = skill) do
     %{

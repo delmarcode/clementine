@@ -428,7 +428,8 @@ end
 defmodule Clementine.RunsCase.Planner do
   @moduledoc """
   A test agent that asks others: `Echo` and `Lookup`, which run tasks, and
-  `Chat`, a turn agent, which it may not ask. Its one tool needs approval.
+  `Chat`, a turn agent, which it may not ask. Its one tool needs approval,
+  and its `after_execution/2` reports the run's status as it lets go.
   """
 
   use Clementine.Agent,
@@ -437,4 +438,12 @@ defmodule Clementine.RunsCase.Planner do
     instructions: "Plan.",
     tools: [Clementine.RunsCase.Approval.SendNote],
     delegates: [Clementine.RunsCase.Echo, Clementine.RunsCase.Lookup, Clementine.RunsCase.Chat]
+
+  # Reports the run's status as the execution lets go of it.
+  @impl true
+  def after_execution(run, _context) do
+    if pid = Process.whereis(:clementine_runs_test) do
+      send(pid, {:after_execution, run.id, Clementine.Runs.get(run.id).status})
+    end
+  end
 end

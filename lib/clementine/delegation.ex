@@ -40,7 +40,7 @@ defmodule Clementine.Delegation do
   holds an approval-gated call waits for the decision first: the batch
   parks for each gated call, then once for its children.
 
-  ## Lanes
+  ## Lanes and cycles
 
   A child is a task on the parent's subject, so it needs a lane of its
   own there:
@@ -52,17 +52,33 @@ defmodule Clementine.Delegation do
     sibling in the same batch, or a run the app started) is refused when
     the batch parks.
 
-  Either refusal is an error tool result the model reads, never a crash.
-  When no child of a batch could start, the parent resumes at once.
+  An agent among those whose requests led to the park (the parent, its
+  parent, and so on up) is refused there too, subject or not, so agents
+  cannot ask each other in a circle and a chain of asks is as deep as
+  there are agents at most.
+
+  Each refusal is an error tool result the model reads, never a crash.
+  When no child of a batch could start, the parent resumes once its
+  execution is over.
 
   ## Cancel, reaper, purge
 
-  Cancelling a parent that waits on its children cancels the live ones
-  in the same transaction. Cancelling one child resumes the parent once
-  its siblings have ended, with that call settled as cancelled. A child
-  the reaper interrupts, or one never claimed, ends like any run, and
-  its end resumes the parent the same way. `Clementine.Runs.purge/1`
-  follows `parent_id`, so a subject's purge takes the children too.
+  Cancelling a parent that waits on its children flags it, as a running
+  run is flagged, and cancels its live children in the same transaction:
+  a queued child ends at once, a running one gets its own flag. The last
+  child's end resumes the parent, whose next execution honors the flag
+  before anything else: it ends `cancelled` after its children, so a
+  cascade (a thread's loop, its turn, the turn's children) finishes from
+  the bottom up, and the subject purges once the top has ended.
+
+  Cancelling one child resumes the parent once its siblings have ended,
+  with that call settled as cancelled. A child the reaper interrupts, or
+  one never claimed, ends like any run, and its end resumes the parent
+  the same way. The reaper also resumes a waiting parent whose children
+  have all ended when no end reached it. A parent ended while it waits
+  (the reaper's `max_wait:` ceiling) cancels its live children with it.
+  `Clementine.Runs.purge/1` follows `parent_id`, so a subject's purge
+  takes the children too.
 
   ## The trace
 
@@ -71,10 +87,21 @@ defmodule Clementine.Delegation do
   just before the call's `:tool_call` entry (`Clementine.Trace`). The
   child's own trace is `Clementine.Runs.trace(child_id)`.
 
-  Delegation needs the durable runtime (`Clementine.Runs`): a run on
-  another lifecycle parks on its first `delegate` call, as on any
-  `{:external, _}` wait, with the children described in its pending
-  delegation and none started.
+  ## Where it runs
+
+  Only `Clementine.Runs` starts children, so only its runs are offered
+  `delegate` (the runner's `delegation: true`). On `Clementine.run/3`,
+  `Clementine.stream/3`, `Clementine.AgentServer`, and a local loop's
+  children, an agent's `delegates:` are not offered: the model sees no
+  `delegate` tool, and the trace's execution entry lists none.
+
+  ## Deploying it
+
+  Code from before delegation drops a child's end when its parent is a
+  rollout, and cannot read a delegation's checkpoint. Ship the version
+  of Clementine that has it one deploy before any agent offers
+  `delegates:`. A parent whose child's end was dropped anyway is resumed
+  by the reaper's next sweep, once all its children have ended.
   """
 
   alias Clementine.{EngineTool, Result}
@@ -148,10 +175,18 @@ defmodule Clementine.Delegation do
 
   @doc false
   # The `delegate` engine tool for an agent offering `delegates`: `agent`
-  # is an enum of their keys.
+  # is an enum of their keys, and the description lists each with its
+  # own description, when it has one.
   @spec tool([module(), ...]) :: EngineTool.t()
   def tool([_ | _] = delegates) do
-    keys = keys(delegates)
+    entries = entries(delegates)
+    keys = Enum.map(entries, &elem(&1, 0))
+
+    listing =
+      Enum.map_join(entries, "\n", fn
+        {key, nil} -> "- #{key}"
+        {key, description} -> "- #{key}: #{description}"
+      end)
 
     %EngineTool{
       kind: :delegate,
@@ -161,7 +196,7 @@ defmodule Clementine.Delegation do
           "run of that agent with your prompt as its whole brief: it sees nothing of this " <>
           "conversation, so say everything it needs. Calls you make together run side by " <>
           "side, and their answers come back as these calls' results once every one has " <>
-          "ended.\n\nAgents: " <> Enum.join(keys, ", "),
+          "ended.\n\nAgents:\n" <> listing,
       parameters: [
         agent: [
           type: :string,
@@ -176,6 +211,19 @@ defmodule Clementine.Delegation do
         ]
       ]
     }
+  end
+
+  @doc false
+  # Each delegate's key and description (`nil` without one), in order:
+  # what the tool lists, and what the agent fingerprint covers.
+  @spec entries([module()]) :: [{String.t(), String.t() | nil}]
+  def entries(delegates) do
+    delegates
+    |> keys()
+    |> Enum.zip(delegates)
+    |> Enum.map(fn {key, module} ->
+      {key, if(function_exported?(module, :description, 0), do: module.description())}
+    end)
   end
 
   @doc false

@@ -25,7 +25,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     alias Clementine.Lifecycle.{Facts, Protocol}
     alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
-    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, DrainNotifier, Lifecycle}
+    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, Delegations, DrainNotifier}
+    alias Clementine.Runs.Lifecycle
 
     # The wall-clock budget of one execution, minted fresh at every claim,
     # unless the agent sets `defaults: [max_duration: ...]`.
@@ -60,6 +61,14 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
         {:finished, _facts} ->
           # Any terminal; the projection committed with it.
+          :ok
+
+        {:suspended, %Clementine.ResumeToken{reason_type: :external}} ->
+          # Parked on the agents it asked. Its children's ends resume it;
+          # a park whose children have all ended already (none started)
+          # resumes now, once this execution is over, so its next one is
+          # claimed after after_execution/2 has run.
+          _ = Delegations.reconcile(run_id)
           :ok
 
         {:suspended, _token} ->
@@ -131,6 +140,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       try do
         Clementine.Runner.execute(run,
           lifecycle: Lifecycle,
+          delegation: true,
           executor_id: executor_id,
           events: if(courier, do: Courier, else: Clementine.Events.Null),
           ctx: %{run: row, courier: courier}

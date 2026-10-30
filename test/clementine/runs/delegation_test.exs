@@ -37,6 +37,46 @@ defmodule Clementine.Runs.DelegationTest do
       }
   end
 
+  defmodule Concierge do
+    @moduledoc false
+    use Clementine.Agent,
+      key: "test_concierge",
+      turn: true,
+      model: :claude_sonnet,
+      instructions: "Help travellers.",
+      delegates: [Clementine.RunsCase.Echo]
+
+    @impl true
+    def history(_run), do: []
+  end
+
+  defmodule Ping do
+    @moduledoc false
+    use Clementine.Agent,
+      key: "test_ping",
+      model: :claude_sonnet,
+      instructions: "Serve.",
+      delegates: [Clementine.Runs.DelegationTest.Pong]
+  end
+
+  defmodule Pong do
+    @moduledoc false
+    use Clementine.Agent,
+      key: "test_pong",
+      model: :claude_sonnet,
+      instructions: "Return.",
+      delegates: [Clementine.Runs.DelegationTest.Ping]
+  end
+
+  defmodule Narcissus do
+    @moduledoc false
+    use Clementine.Agent,
+      key: "test_narcissus",
+      model: :claude_sonnet,
+      instructions: "Ask yourself.",
+      delegates: [Clementine.Runs.DelegationTest.Narcissus]
+  end
+
   defmodule Head do
     @moduledoc false
     use Clementine.Agent,
@@ -332,9 +372,14 @@ defmodule Clementine.Runs.DelegationTest do
       assert %AgentRun{status: "queued"} = Runs.get(busy.id)
     end
 
-    test "a batch whose every child is refused at the park resumes the parent at once" do
+    test "a batch whose every child is refused at the park resumes the parent once its " <>
+           "execution is over" do
       {:ok, _busy} = Runs.start(Echo, "Already busy", subject: {"ticket", "t-5"})
       parent_id = park!([ask("tu_1", "test_echo", "Say it.")], subject: {"ticket", "t-5"})
+
+      # after_execution/2 ran with the run still parked: nothing could
+      # claim its next execution before it let go.
+      assert_received {:after_execution, ^parent_id, "waiting"}
 
       assert children(parent_id) == []
 
@@ -347,6 +392,108 @@ defmodule Clementine.Runs.DelegationTest do
       assert_received {:read, [{"tu_1", refusal, true}]}
       assert refusal =~ "already at work on this subject"
       assert %AgentRun{status: "completed"} = Runs.get(parent_id)
+    end
+  end
+
+  describe "cycles" do
+    @describetag runtime: false
+
+    setup do
+      start_supervised!(
+        {Clementine,
+         repo: TestRepo, agents: [Ping, Pong, Narcissus], host: Clementine.RunsCase.Host}
+      )
+
+      :ok
+    end
+
+    test "an agent may not ask itself, subject or not" do
+      {:ok, parent} = Runs.start(Narcissus, "Look inward")
+      expect_turn(calls([ask("tu_1", "test_narcissus", "Again.")]))
+      assert :ok = perform!(parent)
+
+      assert children(parent.id) == []
+      assert %{status: :queued} = facts(parent.id)
+
+      expect_reply("Alone, then.")
+      assert :ok = perform!(parent.id)
+      assert_received {:read, [{"tu_1", refusal, true}]}
+      assert refusal =~ ~s(Cannot ask "test_narcissus": it is among the agents)
+    end
+
+    test "nor an agent whose request led here: two agents cannot ask each other in a circle" do
+      {:ok, ping} = Runs.start(Ping, "Serve")
+      expect_turn(calls([ask("tu_1", "test_pong", "Return it.")]))
+      assert :ok = perform!(ping)
+      [pong] = children(ping.id)
+
+      # Pong asks Ping back: Ping is above it, so nothing starts.
+      expect_turn(calls([ask("tu_2", "test_ping", "Serve again.")]))
+      assert :ok = perform!(pong)
+      assert children(pong.id) == []
+
+      expect_reply("Out.")
+      assert :ok = perform!(pong.id)
+      assert_received {:read, [{"tu_2", refusal, true}]}
+      assert refusal =~ ~s(Cannot ask "test_ping": it is among the agents)
+    end
+  end
+
+  describe "a thread's erasure" do
+    @describetag runtime: false
+
+    setup do
+      start_supervised!(
+        {Clementine,
+         repo: TestRepo,
+         agents: [Concierge, Echo, Clementine.Thread],
+         host: Clementine.RunsCase.Host}
+      )
+
+      :ok
+    end
+
+    test "cancelling the loop ends the turn after its delegates, and the loop after the " <>
+           "turn, so the thread purges from the loop's end" do
+      subject = {"conversation", "erase-me"}
+
+      {:ok, loop} =
+        Runs.start_loop(Clementine.Thread, %{"agent" => "test_concierge"}, subject: subject)
+
+      assert {:ok, :appended} = Runs.send(loop.id, %{"prompt" => "Plan my trip", "id" => "m1"})
+      assert :ok = perform_job(Clementine.Runs.StepWorker, %{"run_id" => loop.id})
+      assert {:ok, turn} = Runs.child(loop.id, {:turn, "m1"})
+
+      # The turn asks a delegate, which starts running.
+      expect_turn(calls([ask("tu_1", "test_echo", "Find flights.")]))
+      assert :ok = perform!(turn)
+      [echo] = children(turn.id)
+      {:ok, lease} = Protocol.claim(Lifecycle, echo.id, executor: "test")
+
+      # The user deletes the conversation: cancel the loop. Its step
+      # cancels the turn, which flags its running delegate and waits.
+      assert {:ok, :flagged} = Runs.cancel(loop.id)
+      assert :ok = perform_job(Clementine.Runs.StepWorker, %{"run_id" => loop.id})
+
+      assert %{status: :waiting, cancel: %{}} = facts(turn.id)
+      assert %{status: :running, cancel: %{}} = facts(echo.id)
+      assert %AgentRun{status: status} = Runs.get(loop.id)
+      assert status in ["waiting", "queued"]
+      assert {:error, :active} = Runs.purge(subject)
+
+      # Bottom up: the delegate ends, the turn resumes and ends cancelled,
+      # and the loop's next step finishes it.
+      {:ok, _} = Protocol.finish(lease, Result.cancelled(%{"code" => "parent_cancelled"}))
+      assert :ok = perform!(turn.id)
+      assert %AgentRun{status: "cancelled"} = Runs.get(turn.id)
+      assert :ok = perform_job(Clementine.Runs.StepWorker, %{"run_id" => loop.id})
+
+      loop_id = loop.id
+
+      assert_received {:run_committed, %AgentRun{id: ^loop_id, status: "cancelled"}, _result,
+                       false}
+
+      assert {:ok, 3} = Runs.purge(subject)
     end
   end
 
@@ -385,26 +532,125 @@ defmodule Clementine.Runs.DelegationTest do
       assert %AgentRun{status: "waiting"} = Runs.get(parent_id)
     end
 
-    test "cancelled, cancels its live children in the same transaction: a queued one ends, " <>
-           "a running one is flagged, and its end resumes nothing" do
+    test "cancelled, is flagged and cancels its live children in the same transaction; it " <>
+           "ends after the last of them, so its subject purges from its end" do
       parent_id =
-        park!([ask("tu_1", "test_echo", "Say it."), ask("tu_2", "test_lookup", "Look.")])
+        park!(
+          [ask("tu_1", "test_echo", "Say it."), ask("tu_2", "test_lookup", "Look.")],
+          subject: {"ticket", "erase-me"}
+        )
 
       [echo, lookup] = children(parent_id)
       {:ok, lease} = Protocol.claim(Lifecycle, lookup.id, executor: "test")
 
-      assert {:ok, :finished} = Runs.cancel(parent_id)
-      assert %AgentRun{status: "cancelled"} = Runs.get(parent_id)
+      assert {:ok, :flagged} = Runs.cancel(parent_id)
 
-      reason = %{"code" => "parent_ended", "parent_id" => parent_id}
+      reason = %{"code" => "parent_cancelled", "parent_id" => parent_id}
+      assert %{status: :waiting, cancel: %{reason: %{"code" => "cancelled"}}} = facts(parent_id)
       assert %{status: :cancelled, cancel: %{reason: ^reason}} = facts(echo.id)
       assert %{status: :running, cancel: %{reason: ^reason}} = facts(lookup.id)
 
-      # The flagged child writing its end keeps it, and the parent stays ended.
-      job = Runs.get(parent_id).oban_job_id
-      {:ok, _} = Protocol.finish(lease, Result.completed(output: "late"))
-      assert %AgentRun{status: "completed"} = Runs.get(lookup.id)
-      assert %AgentRun{status: "cancelled", oban_job_id: ^job} = Runs.get(parent_id)
+      # A child still runs: nothing on the subject may be erased yet.
+      assert {:error, :active} = Runs.purge({"ticket", "erase-me"})
+      refute_received {:run_committed, %AgentRun{id: ^parent_id}, _result, _in_transaction?}
+
+      # The running child honors its flag, and its end resumes the parent,
+      # whose next execution honors its own before anything else.
+      {:ok, _} = Protocol.finish(lease, Result.cancelled(reason))
+      assert %{status: :queued, resume: %{payload: {:delegated, _}}} = facts(parent_id)
+      assert :ok = perform!(parent_id)
+
+      assert_received {:run_committed, %AgentRun{id: ^parent_id, status: "cancelled"},
+                       %Result.Cancelled{reason: %{"code" => "cancelled"}}, false}
+
+      # The recipe: purge once the run that was cancelled has ended.
+      assert {:ok, 3} = Runs.purge({"ticket", "erase-me"})
+    end
+
+    test "cancelled with only queued children, ends with them" do
+      parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
+      [echo] = children(parent_id)
+
+      assert {:ok, :flagged} = Runs.cancel(parent_id)
+      assert %AgentRun{status: "cancelled"} = Runs.get(echo.id)
+      assert %{status: :queued, cancel: %{}} = facts(parent_id)
+
+      assert :ok = perform!(parent_id)
+      assert %AgentRun{status: "cancelled"} = Runs.get(parent_id)
+    end
+
+    test "flagged before it parks starts no child, and ends cancelled" do
+      {:ok, parent} = Runs.start(Planner, "Plan")
+
+      Mox.expect(Clementine.LLM.MockClient, :stream, fn _model,
+                                                        _system,
+                                                        _messages,
+                                                        _tools,
+                                                        _opts ->
+        assert {:ok, :flagged} = Runs.cancel(parent.id)
+        calls([ask("tu_1", "test_echo", "Say it.")])
+      end)
+
+      assert :ok = perform!(parent)
+      assert %AgentRun{status: "cancelled"} = Runs.get(parent.id)
+      assert children(parent.id) == []
+    end
+
+    test "flagged after its batch was checked but before the park, starts no child: the " <>
+           "park resolves as a cancel" do
+      {:ok, parent} = Runs.start(Planner, "Plan")
+      {:ok, lease} = Protocol.claim(Lifecycle, parent.id, executor: "test")
+      assert {:ok, :flagged} = Runs.cancel(parent.id)
+
+      call = %Clementine.LLM.Message.Content.ToolUse{
+        id: "tu_1",
+        name: "delegate",
+        input: %{"agent" => "test_echo", "prompt" => "Say it."}
+      }
+
+      request = %Clementine.Suspension.Request{
+        reason: {:external, {:delegation, []}},
+        pending: %Pending.Delegation{
+          children: %{"tu_1" => %{agent: "test_echo", prompt: "Say it.", run_id: nil}}
+        },
+        messages: [
+          Clementine.LLM.Message.UserMessage.new("Plan"),
+          %Clementine.LLM.Message.AssistantMessage{content: [call]}
+        ]
+      }
+
+      assert {:cancelled, %{status: :cancelled}} = Protocol.suspend(lease, request)
+      assert children(parent.id) == []
+    end
+
+    test "that moved on as its write waited answers stale, and leaves an enclosing unit usable" do
+      parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
+      %{epoch: epoch} = facts(parent_id)
+      [echo] = children(parent_id)
+
+      # The last child ends, and the parent resumes, between a canceller's
+      # read (waiting) and its write.
+      expect_turn(text_events("Said."))
+      assert :ok = perform!(echo)
+      assert %AgentRun{status: "queued"} = Runs.get(parent_id)
+
+      flag = %Clementine.Lifecycle.Transition{
+        op: :cancel_request,
+        run_ref: parent_id,
+        expect: %{status: :waiting, epoch: epoch},
+        set: %{cancel: %{reason: %{"code" => "cancelled"}, requested_at: :now}}
+      }
+
+      # As a loop's step cancelling its turn would: inside its own unit,
+      # which goes on after the stale answer.
+      assert {:ok, :went_on} =
+               TestRepo.transaction(fn ->
+                 assert {:error, :stale} = Lifecycle.apply(flag, nil)
+                 assert %AgentRun{status: "queued"} = TestRepo.get(AgentRun, parent_id)
+                 :went_on
+               end)
+
+      assert {:ok, :finished} = Runs.cancel(parent_id)
     end
 
     test "resumes with a cancelled result for a child cancelled on its own" do
@@ -460,6 +706,29 @@ defmodule Clementine.Runs.DelegationTest do
       assert :ok = perform!(parent_id)
       assert_received {:read, [{"tu_1", content, true}]}
       assert content =~ "claim_timeout"
+    end
+
+    test "resumes a waiting parent whose children ended without its hearing" do
+      parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
+      [echo] = children(parent_id)
+
+      # The child's end written by code that dropped it for a rollout parent.
+      {1, _} =
+        TestRepo.update_all(from(r in AgentRun, where: r.id == ^echo.id),
+          set: [
+            status: "completed",
+            result: %{"output" => "Said."},
+            finished_at: DateTime.utc_now()
+          ]
+        )
+
+      assert %{resumed: 1, interrupted: 0} = Reaper.sweep()
+
+      assert %{status: :queued, resume: %{payload: {:delegated, %{"tu_1" => outcome}}}} =
+               facts(parent_id)
+
+      assert outcome["content"] == "Said."
+      assert %{resumed: 0} = Reaper.sweep()
     end
 
     test "leaves the waiting parent alone" do

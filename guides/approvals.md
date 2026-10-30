@@ -228,7 +228,7 @@ Two product consequences worth deciding up front:
 A run also parks on its `delegate` calls (`Clementine.Delegation`):
 `waiting`, with the reason `{:external, {:delegation, child_ids}}`, until
 the agents it asked have ended. That park takes no decision
-(`Clementine.Runs.resume/2` returns `{:error, :delegating}`), but
-`max_wait:` and cancel apply to it as above, and its end cancels the
-children. A batch holding both a gated call and a `delegate` call waits
+(`Clementine.Runs.resume/2` returns `{:error, :delegating}`). `max_wait:`
+applies to it as above, and its end cancels the children; a cancel
+flags it, cancels the children, and it ends after them. A batch holding both a gated call and a `delegate` call waits
 for the decision first, then for the children.

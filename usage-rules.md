@@ -210,11 +210,12 @@ use Clementine.Agent,
 ```
 
 - The model sees a `delegate` tool taking `agent` (an enum of the
-  delegates' keys) and `prompt`. Each call starts a run of that agent,
-  a child with the parent's subject and actor, `parent_id` the parent's,
+  delegates' keys, each listed with its `description:`) and `prompt`.
+  Give every delegate `use Clementine.Agent, ..., description: "..."`,
+  a sentence on when to ask it. Each call starts a run of that agent, a
+  child with the parent's subject and actor, `parent_id` the parent's,
   tag `{:delegate, tool_use_id}`, and metadata
-  `%{"delegated_by" => parent_key}`. The child sees only the prompt, so
-  say in the instructions what each delegate is for.
+  `%{"delegated_by" => parent_key}`. The child sees only the prompt.
 - The parent parks `waiting` and resumes on a new job when the last
   child ends; each call's result is its child's output (text as is,
   anything else JSON-encoded) or, for a child that failed, was cancelled,
@@ -224,13 +225,23 @@ use Clementine.Agent,
 - A delegate runs tasks: a turn agent is refused at the call. A child
   needs its lane on the subject, so a delegate with an active task there
   (or a second call to one agent in a batch) is refused when the parent
-  parks. A parent with no subject has no lanes to refuse.
+  parks. An agent already above the parent in its chain of asks (the
+  parent included) is refused too, subject or not: no cycles.
 - List the delegates in the child spec's `agents:` too. `agent/1` may
   offer different ones by subject or actor; no tool is named `delegate`.
-- `cancel/1` of a waiting parent cancels its live children with it.
-  Cancelling one child settles its call as cancelled. A child the reaper
-  interrupts resumes the parent too. `resume/2` refuses a waiting
-  parent with `{:error, :delegating}`.
+  Only `Clementine.Runs` offers `delegate`: `Clementine.run/3`,
+  `stream/3`, and `AgentServer` leave the agent's delegates out.
+- `cancel/1` of a waiting parent returns `{:ok, :flagged}`: it cancels
+  the live children, and the parent ends `cancelled` after the last of
+  them, so purging the subject from the parent's `run_committed/2` (or
+  the thread loop's) finds nothing active. Cancelling one child settles
+  its call as cancelled. A child the reaper interrupts resumes the
+  parent, and the reaper resumes a parent whose children all ended
+  without its hearing. `resume/2` refuses a waiting parent with
+  `{:error, :delegating}`.
+- Deploy Clementine's delegation support one deploy before any agent
+  offers `delegates:`: older nodes drop a child's end for a rollout
+  parent and cannot read its checkpoint.
 - Fan-out a product controls (start N, decide on each answer, keep
   answering the user meanwhile) is a loop's job, not `delegate`:
   `delegate` blocks the run that asks until every child ends.

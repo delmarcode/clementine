@@ -5,7 +5,19 @@ defmodule Clementine.DelegationTest do
 
   defmodule Researcher do
     @moduledoc false
-    use Clementine.Agent, key: "researcher", model: :claude_sonnet, instructions: "Research."
+    use Clementine.Agent,
+      key: "researcher",
+      description: "Looks things up.",
+      model: :claude_sonnet,
+      instructions: "Research."
+  end
+
+  defmodule AlsoNamed do
+    @moduledoc false
+    use Clementine.Agent, key: "also"
+
+    @impl true
+    def agent(_run), do: Clementine.Agent.new(model: :claude_sonnet)
   end
 
   defmodule AlsoResearcher do
@@ -20,8 +32,26 @@ defmodule Clementine.DelegationTest do
       assert EngineTool.parks?(tool)
       refute EngineTool.parks?(Clementine.Skill.use_skill_tool([skill()]))
 
-      assert tool.description =~ "Agents: researcher"
+      assert tool.description =~ "Agents:\n- researcher: Looks things up."
       assert tool.parameters[:agent][:enum] == ["researcher"]
+    end
+
+    test "lists each delegate's description beside its key, and a key alone without one" do
+      assert Delegation.entries([Researcher, AlsoNamed]) == [
+               {"researcher", "Looks things up."},
+               {"also", nil}
+             ]
+
+      assert Delegation.tool([Researcher, AlsoNamed]).description =~
+               "- researcher: Looks things up.\n- also"
+    end
+
+    test "an agent's description is checked when it is built" do
+      assert_raise ArgumentError, ~r/description: as a non-empty string/, fn ->
+        defmodule Blank do
+          use Clementine.Agent, key: "blank", description: "", model: :claude_sonnet
+        end
+      end
     end
 
     test "refuses a module that is not an agent, and two agents sharing a key" do

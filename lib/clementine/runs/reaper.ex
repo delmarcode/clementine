@@ -7,7 +7,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # The rollout sweep, every sweep_interval: a dying node writes nothing
     # on purpose; its runs' heartbeats stop, and every tick here
     # interrupts (or, by policy, requeues) the runs that are no longer
-    # alive, a loop's children included. The loop sweep, every
+    # alive, a loop's children included, and resumes a run waiting on
+    # children that have all ended when no child's end reached it (a
+    # node on code from before delegation dropped it). The loop sweep, every
     # loop_sweep_interval over loop rows alone: a loop is a standing
     # entity, so no verdict but the deadline belt ends one. A crashed step
     # requeues, a lost step job is re-inserted, a child's lost completion
@@ -29,7 +31,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     alias Clementine.Lifecycle.Ecto.Oban, as: JobCheck
     alias Clementine.Lifecycle.{Facts, Protocol}
     alias Clementine.Reconciler
-    alias Clementine.Runs.{AgentRun, Config, Lifecycle, Loops, Worker}
+    alias Clementine.Runs.{AgentRun, Config, Delegations, Lifecycle, Loops, Worker}
+    alias Clementine.Suspension
 
     @fields Codec.resolve_fields(:id, [])
     @active_statuses ~w(queued running waiting)
@@ -63,11 +66,14 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     defp report(policy) do
       case sweep(policy) do
-        %{interrupted: 0, requeued: 0} ->
+        %{interrupted: 0, requeued: 0, resumed: 0} ->
           :ok
 
-        %{interrupted: interrupted, requeued: requeued} ->
-          Logger.info("Agent run sweep interrupted #{interrupted} and requeued #{requeued} runs")
+        %{interrupted: interrupted, requeued: requeued, resumed: resumed} ->
+          Logger.info(
+            "Agent run sweep interrupted #{interrupted}, requeued #{requeued}, and resumed " <>
+              "#{resumed} runs"
+          )
       end
     rescue
       e -> Logger.error("Agent run sweep failed: " <> Exception.message(e))
@@ -167,7 +173,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # cannot convict.
     @spec sweep(Reconciler.Policy.t()) :: %{
             interrupted: non_neg_integer(),
-            requeued: non_neg_integer()
+            requeued: non_neg_integer(),
+            resumed: non_neg_integer()
           }
     def sweep(policy \\ Reconciler.Policy.new()) do
       %Config{repo: repo, oban: oban} = Config.fetch!()
@@ -175,14 +182,35 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       rows = active_runs(repo, "rollout")
       jobs = oban_jobs_by_id(repo, oban, rows)
 
-      Enum.reduce(rows, %{interrupted: 0, requeued: 0}, fn row, acc ->
+      Enum.reduce(rows, %{interrupted: 0, requeued: 0, resumed: 0}, fn row, acc ->
         facts = Codec.to_facts(row, @fields)
 
-        facts
-        |> judge(jobs[row.oban_job_id], now, policy)
-        |> apply_verdict(repo, facts, acc)
+        case judge(facts, jobs[row.oban_job_id], now, policy) do
+          :healthy -> reconcile_delegation(facts, acc)
+          verdict -> apply_verdict(verdict, repo, facts, acc)
+        end
       end)
     end
+
+    # A run waiting on its children is healthy, but if they have all
+    # ended and it still waits, their end never reached it: resume it.
+    # The cheap read first; the resume re-checks under the run's lock.
+    defp reconcile_delegation(
+           %Facts{
+             status: :waiting,
+             ref: run_id,
+             suspension: %Suspension{reason: {:external, {:delegation, ids}}}
+           },
+           acc
+         ) do
+      if Delegations.all_ended?(ids) and Delegations.reconcile(run_id) == :resumed,
+        do: %{acc | resumed: acc.resumed + 1},
+        else: acc
+    rescue
+      e -> log_sweep_error(run_id, Exception.message(e), acc)
+    end
+
+    defp reconcile_delegation(_facts, acc), do: acc
 
     # The storage clock, the same source that stamped the facts. A
     # node-local DateTime.utc_now/0 would bring back the two-clock problem

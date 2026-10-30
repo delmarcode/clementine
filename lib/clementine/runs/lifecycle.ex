@@ -9,9 +9,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # hands the result to the host's run_finished/2. Every other committed
     # change reaches the host's run_transition/2, after its commit, and a
     # committed cancel flag goes on to the run's runner (CancelRelay).
-    # Two writes carry delegation's cargo (Clementine.Runs.Delegations): a
-    # park on `delegate` calls starts the children, and the end of a run
-    # that waits cancels its live ones.
+    # Writes that carry delegation's cargo go through
+    # Clementine.Runs.Delegations: a park on `delegate` calls starts the
+    # children, and a cancel flag or an end on a run that waits cancels
+    # its live ones.
 
     @behaviour Clementine.Lifecycle
     @behaviour Clementine.Lifecycle.Ecto
@@ -55,9 +56,14 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       flush_events(transition, ctx)
 
       cond do
-        Delegations.park?(transition) -> Delegations.park(transition, ctx)
-        Delegations.ends_wait?(transition) -> Delegations.end_wait(transition, ctx)
-        true -> EctoLifecycle.apply_transition(__MODULE__, transition, ctx)
+        Delegations.park?(transition) ->
+          Delegations.park(transition, ctx)
+
+        Delegations.flags_wait?(transition) or Delegations.ends_wait?(transition) ->
+          Delegations.write_wait(transition, ctx)
+
+        true ->
+          EctoLifecycle.apply_transition(__MODULE__, transition, ctx)
       end
     end
 

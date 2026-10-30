@@ -29,7 +29,11 @@ defmodule Clementine.DelegationExecutionTest do
 
   defmodule Researcher do
     @moduledoc false
-    use Clementine.Agent, key: "researcher", model: :claude_sonnet, instructions: "Research."
+    use Clementine.Agent,
+      key: "researcher",
+      description: "Finds and cites facts.",
+      model: :claude_sonnet,
+      instructions: "Research."
   end
 
   defmodule Writer do
@@ -84,7 +88,10 @@ defmodule Clementine.DelegationExecutionTest do
       lifecycle: MemoryLifecycle,
       ctx: store,
       executor_id: "test:delegation",
-      heartbeat: false
+      heartbeat: false,
+      # The runtime that starts the children says so; this lifecycle
+      # stands in for it.
+      delegation: true
     )
   end
 
@@ -143,18 +150,32 @@ defmodule Clementine.DelegationExecutionTest do
     do: %{"status" => "completed", "content" => content, "is_error" => false}
 
   describe "the delegate tool" do
-    test "is offered beside the agent's tools, its agent an enum of the delegates' keys" do
+    test "is offered beside the agent's tools, its agent an enum of the delegates' keys, " <>
+           "each listed with its description" do
       expect_gather(text_events("Nothing to ask."))
 
       assert {:ok, %Result.Completed{}} =
-               Rollout.execute(Rollout.new(agent: agent(), input: "go"))
+               Rollout.execute(Rollout.new(agent: agent(), input: "go"), delegation: true)
 
       assert_received {:gather, @instructions, tools, _messages}
       assert Enum.map(tools, &Tool.to_schema(&1).name) == ["echo", "gated_deploy", "delegate"]
 
-      %{input_schema: schema} = Tool.to_schema(List.last(tools))
+      %{input_schema: schema, description: description} = Tool.to_schema(List.last(tools))
       assert schema["properties"]["agent"]["enum"] == ["researcher", "writer", "chatter"]
       assert schema["required"] |> Enum.sort() == ["agent", "prompt"]
+
+      assert description =~
+               "Agents:\n- researcher: Finds and cites facts.\n- writer\n- chatter"
+    end
+
+    test "is not offered off a runtime that starts children: the run goes on without it" do
+      expect_gather(text_events("On my own, then."))
+
+      assert {:ok, %Result.Completed{output: "On my own, then."}} =
+               Clementine.run(agent(), "go")
+
+      assert_received {:gather, _, tools, _}
+      assert Enum.map(tools, &Tool.to_schema(&1).name) == ["echo", "gated_deploy"]
     end
 
     test "is not offered by an agent with no delegates" do
@@ -511,11 +532,20 @@ defmodule Clementine.DelegationExecutionTest do
       assert %Clementine.Agent{} = agent(tools: [Shadow], delegates: [])
     end
 
-    test "fingerprints the delegates by key, and records them on the execution entry",
+    test "fingerprints the delegates by key and description, and records their keys on the " <>
+           "execution entry",
          %{store: store, ref: ref} do
       base = Trace.fingerprint(:claude_sonnet, "x", [Echo])
       assert Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: []) == base
-      refute Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: ["researcher"]) == base
+      keyed = Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: ["writer"])
+      refute keyed == base
+
+      # A delegate with no description fingerprints by its key alone; one
+      # with a description, by both.
+      assert Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: [{"writer", nil}]) == keyed
+
+      refute Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: [{"writer", "Writes."}]) ==
+               keyed
 
       MemoryLifecycle.seed_queued(store, ref)
       expect_gather(text_events("Hi."))

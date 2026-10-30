@@ -213,7 +213,12 @@ end
 ```
 
 The model sees a `delegate` tool taking `agent`, an enum of the
-delegates' keys, and `prompt`, the child's whole brief.
+delegates' keys, and `prompt`, the child's whole brief. The tool lists
+each delegate with its `description:`, so give each one a sentence on
+when to ask it (`use Clementine.Agent, key: "researcher", description:
+"Finds and cites facts.", ...`). Only `Clementine.Runs` offers
+`delegate`; on `Clementine.run/3`, `stream/3`, and `AgentServer` the
+agent's delegates are left out.
 
 - **The call.** Each call starts a run of that agent: a child whose
   `parent_id` is the parent's, tagged `{:delegate, tool_use_id}`, with the
@@ -229,26 +234,39 @@ delegates' keys, and `prompt`, the child's whole brief.
   failed, was cancelled, or was interrupted settles as an error the model
   reads. A parent resumed and then drained before any effect requeues
   and resumes again with the same answers.
-- **Lanes.** A child is a task on the parent's subject. A turn agent is
-  never a delegate: the call is refused at once. A delegate with an
-  active task on the subject, the parent itself or a sibling of the same
-  batch included, is refused when the parent parks. Either refusal is an
-  error result the model reads; if no child of a batch could start, the
-  parent resumes at once.
-- **Cancel.** `cancel/1` of a waiting parent cancels its live children in
-  the same transaction: a queued child ends, a running one gets its flag.
-  `cancel/1` of one child settles that call as cancelled once its
-  siblings have ended.
+- **Lanes and cycles.** A child is a task on the parent's subject. A
+  turn agent is never a delegate: the call is refused at once. A
+  delegate with an active task on the subject, the parent itself or a
+  sibling of the same batch included, is refused when the parent parks,
+  and so is an agent above the parent in its chain of asks, subject or
+  not. Each refusal is an error result the model reads; if no child of
+  a batch could start, the parent resumes once its execution is over.
+- **Cancel.** `cancel/1` of a waiting parent flags it (`{:ok, :flagged}`)
+  and cancels its live children in the same transaction: a queued child
+  ends, a running one gets its flag. The parent ends `cancelled` after
+  the last of them, so a thread's erasure works as for any thread:
+  cancel the loop, and purge from its `run_committed/2`, which runs once
+  the turn and the turn's delegates have all ended. `cancel/1` of one
+  child settles that call as cancelled once its siblings have ended.
 - **The reaper** leaves a waiting parent alone, and a child it interrupts
   (its node died, or it was never claimed) resumes the parent like any
-  end. `max_wait:` on the policy bounds a parent's wait as it bounds an
-  approval's, and its end cancels the children.
+  end. A parent still waiting on children that have all ended (an end
+  that never reached it) is resumed by the next sweep. `max_wait:` on
+  the policy bounds a parent's wait as it bounds an approval's, and its
+  end cancels the children.
 - **Purge** follows `parent_id`, so `purge/1` of the subject takes the
   children and their traces.
 
 `delegate` blocks the run that asks until every child ends. Fan-out
 that a product drives (start several, decide on each answer, keep
 answering the user meanwhile) belongs in a loop.
+
+**Deploying it.** Ship this version of Clementine one deploy before any
+agent offers `delegates:`. Nodes on older code drop a child's end when
+its parent is a rollout, and cannot read a delegation's checkpoint: a
+child they ran during a rolling deploy would leave its parent waiting
+until a new node's reaper resumes it, and a parent they claimed would
+fail as `:incompatible_checkpoint`.
 
 ## The trace
 

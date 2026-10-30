@@ -187,9 +187,21 @@ defmodule Clementine.Agent do
         delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
 
   `delegates:` takes agent modules the child spec lists; the model sees
-  their keys as the `agent` enum. A delegate runs tasks: a turn agent
-  is refused at the call. An `c:agent/1` may offer different delegates
-  by subject or actor, and no tool the agent offers is named `delegate`.
+  their keys as the `agent` enum, each with its `description:` when it
+  has one, so give a delegate one that says when to ask it:
+
+      use Clementine.Agent,
+        key: "researcher",
+        description: "Finds and cites facts. Ask it for anything you would look up.",
+        model: :claude_sonnet,
+        instructions: "..."
+
+  `description:` goes to `use` in either form, beside `key:`, with the
+  agent's fields or with an `c:agent/1` of your own. A delegate runs
+  tasks: a turn agent is refused at the call. An `c:agent/1` may offer
+  different delegates by subject or actor, and no tool the agent offers
+  is named `delegate`. Only `Clementine.Runs` starts a delegate's run, so
+  only there is `delegate` offered.
 
   Note: this module shadows Elixir's built-in `Agent` under a bare `alias`;
   prefer `alias Clementine.Agent, as: AgentDef` where the collision bites.
@@ -236,6 +248,14 @@ defmodule Clementine.Agent do
   `Clementine.Runs.start/3` copies it to the row's `turn` column.
   """
   @callback turn() :: boolean()
+
+  @doc """
+  What the agent does, in a sentence (`description:` on `use`), or `nil`.
+  A delegating agent's model reads it beside the agent's key in its
+  `delegate` tool (`Clementine.Delegation`), so it says when to ask this
+  agent; the agent's own model never sees it.
+  """
+  @callback description() :: String.t() | nil
 
   @doc """
   The agent for one execution of `run`: model, instructions, tools, and
@@ -295,7 +315,7 @@ defmodule Clementine.Agent do
   """
   @callback after_execution(run :: Clementine.Runs.AgentRun.t(), context :: map()) :: any()
 
-  @optional_callbacks history: 1, after_execution: 2
+  @optional_callbacks history: 1, after_execution: 2, description: 0
 
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do
@@ -304,6 +324,7 @@ defmodule Clementine.Agent do
 
       {key, fields} = Keyword.pop(opts, :key)
       {turn, fields} = Keyword.pop(fields, :turn, false)
+      {description, fields} = Keyword.pop(fields, :description)
 
       unless is_binary(key) and key != "" do
         raise ArgumentError,
@@ -315,14 +336,24 @@ defmodule Clementine.Agent do
               "use Clementine.Agent takes turn: true or false, got: #{inspect(turn)}"
       end
 
+      unless is_nil(description) or (is_binary(description) and description != "") do
+        raise ArgumentError,
+              "use Clementine.Agent takes description: as a non-empty string, got: " <>
+                inspect(description)
+      end
+
       @clementine_agent_key key
       @clementine_agent_turn turn
+      @clementine_agent_description description
 
       @impl Clementine.Agent
       def key, do: @clementine_agent_key
 
       @impl Clementine.Agent
       def turn, do: @clementine_agent_turn
+
+      @impl Clementine.Agent
+      def description, do: @clementine_agent_description
 
       # A turn reads its thread as history, so a turn agent writes
       # history/1 itself (__before_compile__ checks); a task defaults to

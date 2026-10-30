@@ -185,6 +185,7 @@ defmodule Clementine.Rollout do
       paused?: false,
       skills: [],
       delegates: [],
+      delegation?: false,
       engine_tools: [],
       loaded_skills: []
     ]
@@ -240,6 +241,9 @@ defmodule Clementine.Rollout do
     `retry` metadata is not `:safe` (`:unknown` is `:unsafe`). Batches of
     only `:safe` tools leave the fence down: nothing external can happen,
     so the run stays requeue-eligible.
+  - `:delegation` - `true` when the lifecycle starts the children of a
+    delegation park (`Clementine.Runs`); without it the agent's
+    `delegates:` are not offered.
   - `:deadline` - the execution deadline minted at claim, checked at
     iteration boundaries and applied as a cap on the provider stream's
     receive timeout and on per-tool timeouts.
@@ -279,6 +283,7 @@ defmodule Clementine.Rollout do
       output_schema: Keyword.get(config, :output_schema),
       skills: Keyword.get(config, :skills, []),
       delegates: Keyword.get(config, :delegates, []),
+      delegation?: Keyword.get(opts, :delegation, false),
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       emit: Keyword.get(opts, :emit),
@@ -393,8 +398,12 @@ defmodule Clementine.Rollout do
   # delegate's key, and an agent/1 may set the field directly: every run
   # checks them here (agent modules, their keys distinct, no tool it
   # offers named delegate), and one that fails runs nothing. A run with
-  # delegates is offered delegate.
+  # delegates is offered delegate, when its runner's lifecycle starts the
+  # children (`delegation: true`); elsewhere it is offered none.
   defp prepare_delegates(%Execution{delegates: []} = exec), do: {:ok, exec}
+
+  defp prepare_delegates(%Execution{delegation?: false} = exec),
+    do: {:ok, %{exec | delegates: []}}
 
   defp prepare_delegates(%Execution{} = exec) do
     offered = exec.tools ++ Enum.flat_map(exec.skills, & &1.tools)
@@ -1523,14 +1532,14 @@ defmodule Clementine.Rollout do
         deferred: exec.deferred,
         output_schema: exec.output_schema,
         skills: exec.skills,
-        delegates: delegate_keys(exec),
+        delegates: delegate_entries(exec),
         offered: offered_tools(exec)
       )
     )
   end
 
-  defp delegate_keys(%Execution{delegates: []}), do: []
-  defp delegate_keys(%Execution{delegates: delegates}), do: Delegation.keys(delegates)
+  defp delegate_entries(%Execution{delegates: []}), do: []
+  defp delegate_entries(%Execution{delegates: delegates}), do: Delegation.entries(delegates)
 
   defp record(%Execution{recorder: nil}, _kind, _payload), do: :ok
 

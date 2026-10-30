@@ -3,27 +3,37 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @moduledoc false
     # The rollout half of parent and child (Clementine.Delegation): a run
     # whose `delegate` calls start children, waits on them, and resumes
-    # when the last one ends. Three writes, each one transaction, each
-    # reached through Clementine.Runs.Lifecycle:
+    # when the last one ends. Each write is one transaction, reached
+    # through Clementine.Runs.Lifecycle:
     #
     #   * the park: the parent's suspend, which starts its children in the
     #     same transaction, so they exist exactly when it waits on them. A
-    #     child whose lane is taken is refused there, its call settled as
-    #     an error in the checkpoint; with no child started, the parent
-    #     resumes at once in the same unit;
+    #     child whose lane is taken, or whose agent already asked on the
+    #     way here, is refused there, its call settled as an error in the
+    #     checkpoint. A parent flagged for cancel starts none;
     #   * a child's end: inside the child's terminal transaction
     #     (Loops.append_completion/2 dispatches here on the parent's
     #     kind), under the parent's row lock, the last child to end
     #     resumes the parent with every child's outcome and its new job;
-    #   * the parent's end while it waits (a cancel, the reaper's wait
-    #     ceiling): its live children are cancelled in the same
-    #     transaction, a running one by its flag.
+    #   * the parent's cancel while it waits: a flag, like a running
+    #     run's, and its live children cancelled in the same transaction.
+    #     The last child's end resumes it, and its next execution honors
+    #     the flag, so it ends after them and a cascade finishes bottom up;
+    #   * the parent's end while it waits (the reaper's wait ceiling, a
+    #     cancel of a park that started no child): its live children are
+    #     cancelled in the same transaction.
+    #
+    # reconcile/1 resumes a parent whose children have all ended and that
+    # still waits: after a park that started none (the worker calls it
+    # once the execution is over), and for an end a child's terminal
+    # write dropped (the reaper calls it; code from before delegation
+    # drops a rollout parent's completion).
     #
     # Lock order is child before parent everywhere: a child's terminal
-    # write holds its own row and then locks its parent's, so the
-    # parent's end locks its live descendants, deepest first, before its
-    # own compare-and-swap. Two children ending at once serialize on the
-    # parent's row, so exactly one of them sees every child ended.
+    # write holds its own row and then locks its parent's, so a write to a
+    # waiting parent locks its live descendants, deepest first, before its
+    # own row. Two children ending at once serialize on the parent's row,
+    # so exactly one of them sees every child ended.
 
     import Ecto.Query, only: [from: 2]
 
@@ -38,6 +48,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @fields Codec.resolve_fields(:id, [])
     @active_statuses Enum.map(Facts.active_statuses(), &Atom.to_string/1)
     @tag_kind "delegate"
+
+    # How far up a parent's ancestry is read, and how many times its
+    # descendants are found again while they are being locked: bounds on
+    # data that should never come near them.
+    @max_ancestry 100
+    @lock_attempts 5
 
     ## The park
 
@@ -58,40 +74,41 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     def park?(%Transition{}), do: false
 
     @doc false
-    # The park and the children, one transaction: each child is checked
-    # and inserted through Runs.insert_queued/2, then the parent's
-    # suspension records the ids and any refusal, then its
-    # compare-and-swap. A lane taken between the check and the insert
-    # (a racing start) fails the unit, and the protocol's retry finds it
-    # taken and refuses it.
+    # The park and the children, one transaction: the parent's row is
+    # locked and read afresh, each child is checked and inserted through
+    # Runs.insert_queued/2, then the parent's suspension records the ids
+    # and any refusal, then its compare-and-swap. A lane taken between the
+    # check and the insert (a racing start) fails the unit, and the
+    # protocol's retry finds it taken and refuses it. Nothing here resumes
+    # the parent: a park that started no child waits until the worker has
+    # finished with the execution (reconcile/1).
     @spec park(Transition.t(), term()) :: {:ok, Facts.t()} | {:error, term()}
     def park(%Transition{} = transition, ctx) do
       %Config{repo: repo} = config = Config.fetch!()
 
       Emissions.after_commit(fn ->
         repo.transaction(fn ->
-          parent = parent_row(repo, transition.run_ref, ctx)
-          {transition, started} = start_children(config, parent, transition)
+          parent =
+            repo.one(from(r in AgentRun, where: r.id == ^transition.run_ref, lock: "FOR UPDATE"))
+
+          transition = start_children(config, parent, transition)
 
           case EctoLifecycle.apply_transition(Lifecycle, transition, ctx) do
-            {:ok, %Facts{} = facts} ->
-              if started == [], do: resume!(facts.ref, facts.suspension.token, %{})
-              facts
-
-            {:error, reason} ->
-              repo.rollback(reason)
+            {:ok, %Facts{} = facts} -> facts
+            {:error, reason} -> repo.rollback(reason)
           end
         end)
       end)
     end
 
-    defp parent_row(_repo, _ref, %{run: %AgentRun{} = run}), do: run
-    defp parent_row(repo, ref, _ctx), do: repo.get!(AgentRun, ref)
-
     # In the batch's order, so of two calls to one agent the first starts.
+    defp start_children(_config, nil, transition), do: transition
+
     defp start_children(config, %AgentRun{} = parent, %Transition{} = transition) do
       %Suspension{checkpoint: %Checkpoint{pending: pending} = checkpoint} =
         suspension = transition.set.suspension
+
+      ancestry = ancestry(config.repo, parent)
 
       {children, refusals, started} =
         checkpoint.messages
@@ -100,7 +117,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
                                                                 {children, refusals, started} ->
           child = Map.fetch!(pending.children, id)
 
-          case start_child(config, parent, id, child) do
+          case start_child(config, parent, ancestry, id, child) do
             {:ok, run_id} ->
               {Map.put(children, id, %{child | run_id: run_id}), refusals, [run_id | started]}
 
@@ -118,7 +135,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           checkpoint: %{checkpoint | pending: pending}
       }
 
-      {put_in(transition.set.suspension, suspension), started}
+      put_in(transition.set.suspension, suspension)
     end
 
     defp call_order(messages, %Pending.Delegation{children: children}) do
@@ -135,10 +152,34 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       ordered ++ Enum.sort(Map.keys(children) -- ordered)
     end
 
+    # The agents whose requests led to this park: the parent's and its
+    # ancestors', up the parent_id chain.
+    defp ancestry(repo, %AgentRun{agent_key: key, parent_id: parent_id}) do
+      parent_id
+      |> Stream.unfold(fn
+        nil ->
+          nil
+
+        id ->
+          case repo.one(
+                 from(r in AgentRun, where: r.id == ^id, select: {r.agent_key, r.parent_id})
+               ) do
+            nil -> nil
+            {key, up} -> {key, up}
+          end
+      end)
+      |> Enum.take(@max_ancestry)
+      |> MapSet.new()
+      |> MapSet.put(key)
+    end
+
     # A child is a task of its agent on the parent's subject, with the
-    # parent's actor: start/3's checks, then its lane, then the insert.
-    defp start_child(%Config{} = config, %AgentRun{} = parent, tool_use_id, child) do
-      with {:ok, module} <- child_agent(config, child.agent),
+    # parent's actor: no cancel pending on the parent, an agent that has
+    # not asked on the way here, start/3's checks, its lane, the insert.
+    defp start_child(%Config{} = config, %AgentRun{} = parent, ancestry, tool_use_id, child) do
+      with :ok <- not_cancelling(parent),
+           :ok <- not_an_ancestor(ancestry, child.agent),
+           {:ok, module} <- child_agent(config, child.agent),
            {:ok, attrs} <- child_attrs(config, parent, module, child),
            :ok <- lane_free(config, attrs, child.agent) do
         attrs =
@@ -148,6 +189,23 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           {:ok, %AgentRun{id: id}} -> {:ok, id}
           {:error, reason} -> config.repo.rollback({:delegate_insert, tool_use_id, reason})
         end
+      end
+    end
+
+    # A cancel that reached the parent before its park: nothing starts
+    # for a run that is going away, and the park resolves as a cancel.
+    defp not_cancelling(%AgentRun{cancel: nil}), do: :ok
+    defp not_cancelling(%AgentRun{}), do: {:refused, "Not asked: this run is being cancelled."}
+
+    # An agent asked again below itself could ask again forever; refusing
+    # one already in the ancestry bounds a chain by the agents there are.
+    defp not_an_ancestor(ancestry, key) do
+      if MapSet.member?(ancestry, key) do
+        {:refused,
+         "Cannot ask #{inspect(key)}: it is among the agents whose requests led here, so " <>
+           "asking it would go in a circle."}
+      else
+        :ok
       end
     end
 
@@ -207,14 +265,14 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    ## A child's end
+    ## A child's end, and the reconcile
 
     @doc false
     # Inside `child`'s terminal transaction, with `parent` (a rollout)
     # locked: when the parent waits on it and every child it waits on has
     # ended, the parent resumes with their outcomes, and its job commits
     # with the child's end. A parent that no longer waits on the child
-    # (cancelled, or resumed by an earlier end) hears nothing.
+    # (ended, or resumed by an earlier end) hears nothing.
     @spec child_ended(AgentRun.t(), AgentRun.t()) :: :ok
     def child_ended(%AgentRun{} = parent, %AgentRun{} = child) do
       case Codec.to_facts(parent, @fields) do
@@ -222,7 +280,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           status: :waiting,
           suspension: %Suspension{reason: {:external, {:delegation, ids}}, token: token}
         } ->
-          if child.id in ids, do: resume_when_all_ended(parent, ids, token)
+          if child.id in ids, do: resume_when_all_ended(parent.id, ids, token)
           :ok
 
         %Facts{} ->
@@ -230,7 +288,46 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp resume_when_all_ended(%AgentRun{} = parent, ids, token) do
+    @doc false
+    # Resumes the rollout `parent_id` if it waits on children that have
+    # all ended (none, for a park that started none), under its row lock,
+    # so a racing child's end and this one resume it once between them.
+    # The worker calls it once an execution that parked has finished; the
+    # reaper, for a parent whose children's ends never reached it.
+    @spec reconcile(Ecto.UUID.t()) :: :resumed | :waiting | :not_waiting
+    def reconcile(parent_id) do
+      %Config{repo: repo} = Config.fetch!()
+
+      {:ok, outcome} =
+        Emissions.after_commit(fn ->
+          repo.transaction(fn ->
+            with %AgentRun{kind: "rollout"} = parent <-
+                   repo.one(from(r in AgentRun, where: r.id == ^parent_id, lock: "FOR UPDATE")),
+                 %Facts{
+                   status: :waiting,
+                   suspension: %Suspension{reason: {:external, {:delegation, ids}}, token: token}
+                 } <- Codec.to_facts(parent, @fields) do
+              if resume_when_all_ended(parent.id, ids, token), do: :resumed, else: :waiting
+            else
+              _other -> :not_waiting
+            end
+          end)
+        end)
+
+      outcome
+    end
+
+    @doc false
+    # Whether every child in `ids` has ended: the reaper's cheap read
+    # before it takes a parent's lock.
+    @spec all_ended?([Ecto.UUID.t()]) :: boolean()
+    def all_ended?(ids) do
+      %Config{repo: repo} = Config.fetch!()
+
+      not repo.exists?(from(r in AgentRun, where: r.id in ^ids and r.status in @active_statuses))
+    end
+
+    defp resume_when_all_ended(parent_id, ids, token) do
       %Config{repo: repo} = Config.fetch!()
       children = repo.all(from(r in AgentRun, where: r.id in ^ids))
 
@@ -240,21 +337,29 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             {child.tag_id, Delegation.outcome(child.agent_key, Lifecycle.terminal_result(child))}
           end)
 
-        resume!(parent.id, token, outcomes)
+        {:ok, _facts} = Protocol.resume(Lifecycle, token, {:delegated, outcomes})
+        :ok = Worker.re_enqueue!(parent_id)
+        true
+      else
+        false
       end
     end
 
-    # The resume and the parent's new job, in the unit at hand.
-    defp resume!(parent_id, token, outcomes) do
-      {:ok, _facts} = Protocol.resume(Lifecycle, token, {:delegated, outcomes})
-      :ok = Worker.re_enqueue!(parent_id)
-    end
-
-    ## The parent's end while it waits
+    ## Writes to a parent that waits
 
     @doc false
-    # A terminal write of a run that waits: the one end that can find
-    # live children.
+    # The cancel flag on a run waiting on its children (request_cancel/4
+    # gives it one rather than ending it).
+    @spec flags_wait?(Transition.t()) :: boolean()
+    def flags_wait?(
+          %Transition{op: :cancel_request, result: nil, expect: %{status: :waiting}} = t
+        ),
+        do: not is_map_key(t.set, :status)
+
+    def flags_wait?(%Transition{}), do: false
+
+    @doc false
+    # A terminal write of a run that waits.
     @spec ends_wait?(Transition.t()) :: boolean()
     def ends_wait?(%Transition{result: result, expect: %{status: :waiting}}) when result != nil,
       do: true
@@ -262,28 +367,41 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     def ends_wait?(%Transition{}), do: false
 
     @doc false
-    # The end and the cascade, one transaction: the live descendants are
-    # locked deepest first, then the run's own compare-and-swap, then each
-    # live child is cancelled (a waiting one cascades the same way).
-    @spec end_wait(Transition.t(), term()) :: {:ok, Facts.t()} | {:error, term()}
-    def end_wait(%Transition{run_ref: run_id} = transition, ctx) do
+    # The flag, or the end, and the cascade, one transaction: the live
+    # descendants locked deepest first, then the run's own row, compared
+    # with what the write expects, then the write, then each live child
+    # cancelled (a waiting one cascades the same way). A run that moved
+    # meanwhile (its last child's end resumed it) is `{:error, :stale}`,
+    # returned as a value with nothing written, so a cancel inside an
+    # enclosing unit (a loop's step) fetches again and goes on.
+    @spec write_wait(Transition.t(), term()) :: {:ok, Facts.t()} | {:error, term()}
+    def write_wait(%Transition{run_ref: run_id} = transition, ctx) do
       %Config{repo: repo} = Config.fetch!()
+      code = if transition.result, do: "parent_ended", else: "parent_cancelled"
 
       Emissions.after_commit(fn ->
         repo.transaction(fn ->
           rollout? = rollout?(repo, run_id)
           if rollout?, do: lock_live_descendants(repo, run_id)
 
-          case EctoLifecycle.apply_transition(Lifecycle, transition, ctx) do
-            {:ok, %Facts{} = facts} ->
-              if rollout?, do: cancel_live_children(repo, run_id)
-              facts
+          if expected?(repo, transition) do
+            case EctoLifecycle.apply_transition(Lifecycle, transition, ctx) do
+              {:ok, %Facts{} = facts} ->
+                if rollout?, do: cancel_live_children(repo, run_id, code)
+                facts
 
-            {:error, reason} ->
-              repo.rollback(reason)
+              {:error, reason} ->
+                repo.rollback(reason)
+            end
+          else
+            :stale
           end
         end)
       end)
+      |> case do
+        {:ok, :stale} -> {:error, :stale}
+        other -> other
+      end
     end
 
     # A loop's children are its controller's; only a rollout's are its
@@ -292,12 +410,39 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       repo.one(from(r in AgentRun, where: r.id == ^run_id, select: r.kind)) == "rollout"
     end
 
-    defp lock_live_descendants(repo, run_id) do
-      repo
-      |> live_levels([run_id], [])
-      |> Enum.each(fn ids ->
-        repo.all(from(r in AgentRun, where: r.id in ^ids, lock: "FOR UPDATE", select: r.id))
-      end)
+    defp expected?(repo, %Transition{run_ref: run_id, expect: expect}) do
+      case repo.one(from(r in AgentRun, where: r.id == ^run_id, lock: "FOR UPDATE")) do
+        nil ->
+          false
+
+        row ->
+          %Facts{status: status, epoch: epoch} = Codec.to_facts(row, @fields)
+          status == expect.status and epoch == expect.epoch
+      end
+    end
+
+    # Deepest first, so this write takes rows in the order a child's end
+    # does. A descendant found only after the others were locked (a
+    # child's park committed in between) would be taken after its parent,
+    # the other way round: the locks go back to a savepoint, and the walk
+    # starts again with it. A locked run cannot park, so the walk settles.
+    defp lock_live_descendants(repo, run_id, attempts \\ @lock_attempts) do
+      repo.query!("SAVEPOINT clementine_descendants")
+      levels = live_levels(repo, [run_id], [])
+      Enum.each(levels, &lock_rows(repo, &1))
+      locked = MapSet.new(List.flatten(levels))
+      found = MapSet.new(List.flatten(live_levels(repo, [run_id], [])))
+
+      if MapSet.subset?(found, locked) or attempts == 1 do
+        repo.query!("RELEASE SAVEPOINT clementine_descendants")
+      else
+        repo.query!("ROLLBACK TO SAVEPOINT clementine_descendants")
+        lock_live_descendants(repo, run_id, attempts - 1)
+      end
+    end
+
+    defp lock_rows(repo, ids) do
+      repo.all(from(r in AgentRun, where: r.id in ^ids, lock: "FOR UPDATE", select: r.id))
     end
 
     # The live descendants by level, deepest first.
@@ -313,8 +458,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp cancel_live_children(repo, run_id) do
-      reason = %{"code" => "parent_ended", "parent_id" => run_id}
+    defp cancel_live_children(repo, run_id, code) do
+      reason = %{"code" => code, "parent_id" => run_id}
 
       repo.all(
         from(r in AgentRun,

@@ -549,11 +549,15 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     cancels like any run; its loop hears the `Cancelled` completion and
     decides.
 
-    A run waiting on the agents it asked (`Clementine.Delegation`) takes
-    its live children with it, in the same transaction: a queued child
-    finishes `cancelled`, a running one is flagged, each with the reason
-    `%{"code" => "parent_ended", "parent_id" => run_id}`. A child cancelled
-    on its own settles its parent's call as cancelled.
+    A run waiting on the agents it asked (`Clementine.Delegation`) is
+    flagged (`{:ok, :flagged}`), and its live children are cancelled in
+    the same transaction with the reason
+    `%{"code" => "parent_cancelled", "parent_id" => run_id}`: a queued one
+    finishes at once, a running one is flagged. The last child's end
+    resumes the run, which ends `cancelled` before it does anything else,
+    so it ends after its children, and its `run_committed/2` finds none
+    of them active. A child cancelled on its own settles its parent's
+    call as cancelled.
 
     Who may cancel which run is the app's decision: check it before
     calling. A cancel of a run that has ended returns
