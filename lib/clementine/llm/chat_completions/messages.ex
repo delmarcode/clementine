@@ -24,9 +24,12 @@ defmodule Clementine.LLM.ChatCompletions.Messages do
   end
 
   def decode_message(message) when is_map(message) do
+    # A refusal comes as `refusal` in place of `content`: it is the
+    # turn's text.
     text_blocks =
-      case Map.get(message, "content") do
-        text when is_binary(text) and text != "" -> [Content.text(text)]
+      case message do
+        %{"content" => text} when is_binary(text) and text != "" -> [Content.text(text)]
+        %{"refusal" => text} when is_binary(text) and text != "" -> [Content.text(text)]
         _ -> []
       end
 

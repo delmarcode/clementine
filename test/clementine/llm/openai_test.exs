@@ -292,6 +292,48 @@ defmodule Clementine.LLM.OpenAITest do
     assert {:ok, %Response{}} = OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [])
   end
 
+  test "call/5 reads a refusal and a cut-off response by their stop reasons", %{bypass: bypass} do
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      response =
+        case Jason.decode!(body)["input"] do
+          [%{"content" => "Refuse"}] ->
+            %{
+              "status" => "completed",
+              "output" => [
+                %{
+                  "type" => "message",
+                  "content" => [%{"type" => "refusal", "refusal" => "I can't help with that."}]
+                }
+              ]
+            }
+
+          _cut_off ->
+            %{
+              "status" => "incomplete",
+              "incomplete_details" => %{"reason" => "max_output_tokens"},
+              "output" => [
+                %{"type" => "message", "content" => [%{"type" => "output_text", "text" => "{"}]}
+              ]
+            }
+        end
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, Jason.encode!(Map.put(response, "usage", %{})))
+    end)
+
+    assert {:ok, %Response{} = refused} =
+             OpenAI.call(:gpt_test, "system", [UserMessage.new("Refuse")], [])
+
+    assert [%Content.Text{text: "I can't help with that."}] = refused.content
+    assert refused.stop_reason == "refusal"
+
+    assert {:ok, %Response{stop_reason: "max_tokens"}} =
+             OpenAI.call(:gpt_test, "system", [UserMessage.new("Cut off")], [])
+  end
+
   test "call/5 parses tool calls", %{bypass: bypass} do
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       response = %{

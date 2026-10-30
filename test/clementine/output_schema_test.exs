@@ -72,6 +72,40 @@ defmodule Clementine.OutputSchemaTest do
     end
   end
 
+  describe "a schema's keywords" do
+    test "a malformed keyword fails the build, naming where it is" do
+      for {schema, message} <- [
+            {%{"type" => "object", "properties" => ["verdict"]},
+             ~s("/properties" must be an object of schemas)},
+            {%{"type" => "object", "required" => "verdict"},
+             ~s("/required" must be a list of property names)},
+            {%{"type" => "object", "required" => [:verdict, 1]},
+             ~s("/required" must be a list of property names)},
+            {%{"type" => "object", "properties" => %{"a" => %{"type" => %{}}}},
+             ~s("/properties/a/type" must be a type name)},
+            {%{"type" => "object", "properties" => %{"a" => %{"items" => 3}}},
+             ~s("/properties/a/items" must be a schema)},
+            {%{"type" => "object", "anyOf" => []}, ~s("/anyOf" must be a non-empty list)},
+            {%{"type" => "object", "allOf" => [%{"enum" => "x"}]},
+             ~s("/allOf/0/enum" must be a list of values)},
+            {%{"type" => "object", "$defs" => %{"a/b" => %{"$ref" => 1}}},
+             ~s("/$defs/a~1b/$ref" must be a string)},
+            {%{"type" => "object", "additionalProperties" => "no"},
+             ~s("/additionalProperties" must be a schema)}
+          ] do
+        assert_raise ArgumentError, ~r/#{Regex.escape(message)}/, fn ->
+          Clementine.Agent.new(model: :claude_sonnet, output_schema: schema)
+        end
+      end
+    end
+
+    test "normalizing a normalized schema returns it unchanged" do
+      once = OutputSchema.normalize!(%{type: :object, properties: %{a: %{type: :string}}})
+      assert OutputSchema.normalize!(once) == once
+      assert {:ok, ^once} = OutputSchema.normalize(once)
+    end
+  end
+
   describe "the run" do
     test "uses its tools freely, then completes with the decoded answer" do
       expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, tools, opts ->
@@ -187,6 +221,67 @@ defmodule Clementine.OutputSchemaTest do
                result.messages
     end
 
+    test "an agent/1 that sets the schema on the struct gets it normalized and checked" do
+      agent = %{
+        Clementine.Agent.new(model: :claude_sonnet)
+        | output_schema: %{type: :object, required: [:a], additionalProperties: false}
+      }
+
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, opts ->
+        assert opts[:output_schema] == %{
+                 "type" => "object",
+                 "required" => ["a"],
+                 "additionalProperties" => false
+               }
+
+        text_events(~s({"b": 1}))
+      end)
+
+      assert {:error, %Clementine.Error{code: :invalid_output, message: message}} =
+               Rollout.execute(Rollout.new(agent: agent, input: "go"))
+
+      assert message =~ ~s(/: missing required property "a")
+      assert message =~ ~s(/: unexpected property "b")
+    end
+
+    test "a schema on the struct that is not one fails the run before the model is called" do
+      for schema <- [%{"type" => "string"}, %{"type" => "object", "properties" => []}, "verdict"] do
+        agent = %{Clementine.Agent.new(model: :claude_sonnet) | output_schema: schema}
+
+        assert {:error, %Clementine.Error{kind: :rollout, code: :invalid_output_schema} = error} =
+                 Rollout.execute(Rollout.new(agent: agent, input: "go"))
+
+        assert error.message =~ "output_schema:"
+        refute error.retryable?
+      end
+    end
+
+    test "an OpenAI refusal fails the run as a refusal, with its text in raw" do
+      sse =
+        Enum.map_join(
+          [
+            {"response.refusal.delta", %{"delta" => "I can't grade that."}},
+            {"response.completed",
+             %{"response" => %{"status" => "completed", "output" => [], "usage" => %{}}}}
+          ],
+          fn {type, data} ->
+            "event: #{type}\ndata: #{Jason.encode!(Map.put(data, "type", type))}\n\n"
+          end
+        )
+
+      {events, _state} =
+        Clementine.LLM.OpenAIStreamParser.parse(Clementine.LLM.OpenAIStreamParser.new(), sse)
+
+      expect_turn(events)
+
+      assert {:error, %Clementine.Error{code: :invalid_output} = error} =
+               Rollout.execute(rollout(tools: [], output_schema: @verdict))
+
+      assert error.message =~ "(the model refused)"
+      assert error.raw["output"] == "I can't grade that."
+      assert error.raw["stop_reason"] == "refusal"
+    end
+
     test "fails as a Result.Failed through the runner" do
       expect_turn(text_events("I would rather not."))
 
@@ -217,6 +312,23 @@ defmodule Clementine.OutputSchemaTest do
 
       assert message =~ "the answer is empty"
       assert message =~ "(the model refused)"
+    end
+  end
+
+  describe "decode/3 and a fenced answer" do
+    test "one markdown fence around the whole answer is taken off" do
+      schema = %{"type" => "object", "required" => ["verdict"]}
+
+      assert {:ok, %{"verdict" => "pass"}} =
+               OutputSchema.decode(schema, "```json\n{\"verdict\": \"pass\"}\n```\n")
+
+      assert {:ok, %{"verdict" => "pass"}} =
+               OutputSchema.decode(schema, "```\n{\"verdict\": \"pass\"}```")
+
+      assert {:error, %Clementine.Error{message: message}} =
+               OutputSchema.decode(schema, "Here it is:\n```json\n{\"verdict\": \"pass\"}\n```")
+
+      assert message =~ "the answer is not JSON"
     end
   end
 

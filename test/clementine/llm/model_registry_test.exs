@@ -171,6 +171,33 @@ defmodule Clementine.LLM.ModelRegistryTest do
            } = ModelRegistry.resolve!(:qwen_finetune)
   end
 
+  test "resolve!/1 reads structured_output, :native unless a chat completions entry says otherwise" do
+    Application.put_env(:clementine, :models,
+      local: [provider: :openai_compatible, id: "qwen3", structured_output: :instructions],
+      routed: [provider: :openrouter, id: "deepseek/deepseek-v3.2"]
+    )
+
+    assert %{structured_output: :instructions} = ModelRegistry.resolve!(:local)
+    assert %{structured_output: :native} = ModelRegistry.resolve!(:routed)
+    assert %{structured_output: :native} = ModelRegistry.resolve!({:vertex, "zai/glm-4.7-maas"})
+  end
+
+  test "validate_config!/0 refuses structured_output: :instructions outside chat completions" do
+    Application.put_env(:clementine, :models,
+      broken: [provider: :anthropic, id: "claude-sonnet-5", structured_output: :instructions]
+    )
+
+    assert_raise ArgumentError, ~r/structured_output: :instructions is only supported/, fn ->
+      ModelRegistry.validate_config!()
+    end
+
+    Application.put_env(:clementine, :models,
+      broken: [provider: :openrouter, id: "x/y", structured_output: :prompt]
+    )
+
+    assert_raise ArgumentError, ~r/structured_output/, fn -> ModelRegistry.validate_config!() end
+  end
+
   test "resolve!/1 supports direct provider tuple references" do
     assert %{provider: :openai, id: "gpt-5", defaults: [], alias: nil} =
              ModelRegistry.resolve!({:openai, "gpt-5"})

@@ -15,7 +15,8 @@ defmodule Clementine.OutputSchema do
   turn wrote last (after any tool search or thinking, and across a
   paused turn's continuation), and checks it here as well, because a provider's constraint gives way when the model
   refuses or runs out of tokens, and an OpenAI-compatible server may not
-  constrain at all. An answer that is not JSON, or does not match, fails
+  constrain at all (nor is it asked to, for a model whose catalog entry
+  sets `structured_output: :instructions`; see `Clementine.LLM.ChatCompletions`). An answer that is not JSON, or does not match, fails
   the run with a `Clementine.Error` of code `:invalid_output`.
 
   The check covers the schema's structure: `type`, `properties`,
@@ -35,6 +36,13 @@ defmodule Clementine.OutputSchema do
   object at the root, since the answer decodes to a map. Raises
   `ArgumentError` on anything else, so a bad schema on
   `use Clementine.Agent` fails the build.
+
+  The keywords the check reads must have their JSON Schema shapes
+  wherever they appear: `type` a string or a list of strings,
+  `properties` and `$defs`/`definitions` objects of schemas, `required`
+  a list of strings, `items` and `additionalProperties` a schema,
+  `enum`, `anyOf`, and `allOf` lists, `$ref` a string. Normalizing a
+  normalized schema returns it unchanged.
   """
   @spec normalize!(term()) :: t()
   def normalize!(schema) when is_map(schema) and not is_struct(schema) do
@@ -51,7 +59,7 @@ defmodule Clementine.OutputSchema do
 
     case normalized do
       %{"type" => "object"} ->
-        normalized
+        check_shapes!(normalized, "")
 
       _other ->
         raise ArgumentError,
@@ -63,6 +71,88 @@ defmodule Clementine.OutputSchema do
   def normalize!(other) do
     raise ArgumentError, "output_schema: must be a JSON schema map, got: #{inspect(other)}"
   end
+
+  @doc """
+  `normalize!/1` for a schema that reaches the engine without
+  `Clementine.Agent.new/1` (an `c:Clementine.Agent.agent/1` that sets the
+  struct's field itself): `{:ok, schema}`, or `{:error, error}` with a
+  `Clementine.Error` of code `:invalid_output_schema` that fails the run.
+  """
+  @spec normalize(term()) :: {:ok, t()} | {:error, Clementine.Error.t()}
+  def normalize(schema) do
+    {:ok, normalize!(schema)}
+  rescue
+    error in ArgumentError ->
+      {:error,
+       %Clementine.Error{
+         kind: :rollout,
+         code: :invalid_output_schema,
+         message: Exception.message(error),
+         retryable?: false,
+         raw: schema
+       }}
+  end
+
+  # The keywords check/4 reads, at every place a schema can sit, have the
+  # shapes it assumes: a malformed one fails the build, not the end of a
+  # run whose tools already ran.
+  defp check_shapes!(schema, _path) when is_boolean(schema), do: schema
+
+  defp check_shapes!(%{} = schema, path) do
+    Enum.each(schema, fn {keyword, value} -> check_shape!(keyword, value, path) end)
+    schema
+  end
+
+  defp check_shapes!(other, path),
+    do: bad_shape!(path, "a schema (an object or a boolean)", other)
+
+  defp check_shape!("type", type, path) do
+    unless is_binary(type) or (is_list(type) and type != [] and Enum.all?(type, &is_binary/1)),
+      do: bad_shape!(at(path, "type"), "a type name or a list of type names", type)
+  end
+
+  defp check_shape!(keyword, schemas, path)
+       when keyword in ["properties", "$defs", "definitions"] do
+    if is_map(schemas),
+      do:
+        Enum.each(schemas, fn {name, sub} -> check_shapes!(sub, at(at(path, keyword), name)) end),
+      else: bad_shape!(at(path, keyword), "an object of schemas", schemas)
+  end
+
+  defp check_shape!("required", names, path) do
+    unless is_list(names) and Enum.all?(names, &is_binary/1),
+      do: bad_shape!(at(path, "required"), "a list of property names", names)
+  end
+
+  defp check_shape!(keyword, sub, path) when keyword in ["items", "additionalProperties"],
+    do: check_shapes!(sub, at(path, keyword))
+
+  defp check_shape!(keyword, schemas, path) when keyword in ["anyOf", "allOf"] do
+    if is_list(schemas) and schemas != [],
+      do:
+        schemas
+        |> Enum.with_index()
+        |> Enum.each(fn {sub, index} -> check_shapes!(sub, at(at(path, keyword), index)) end),
+      else: bad_shape!(at(path, keyword), "a non-empty list of schemas", schemas)
+  end
+
+  defp check_shape!("enum", values, path) do
+    unless is_list(values), do: bad_shape!(at(path, "enum"), "a list of values", values)
+  end
+
+  defp check_shape!("$ref", ref, path) do
+    unless is_binary(ref), do: bad_shape!(at(path, "$ref"), "a string", ref)
+  end
+
+  defp check_shape!(_keyword, _value, _path), do: :ok
+
+  defp bad_shape!(path, expected, got) do
+    raise ArgumentError,
+          "output_schema: #{inspect(if(path == "", do: "/", else: path))} must be " <>
+            "#{expected}, got: #{inspect(got)}"
+  end
+
+  defp at(path, key), do: child(path, key)
 
   @doc """
   Decodes a final answer against `schema`: `{:ok, map}`, or
@@ -106,7 +196,7 @@ defmodule Clementine.OutputSchema do
   end
 
   defp parse(text) do
-    case String.trim(text) do
+    case text |> String.trim() |> unfence() do
       "" ->
         {:error, ["the answer is empty, not JSON"]}
 
@@ -115,6 +205,17 @@ defmodule Clementine.OutputSchema do
           {:ok, value} -> {:ok, value}
           {:error, error} -> {:error, ["the answer is not JSON: #{Exception.message(error)}"]}
         end
+    end
+  end
+
+  # A model the provider does not constrain (a Chat Completions model set
+  # to `structured_output: :instructions`) may wrap its JSON in one
+  # markdown fence. A constrained answer is an object, so it never starts
+  # with one.
+  defp unfence(text) do
+    case Regex.run(~r/\A```[A-Za-z]*[ \t]*\n(.*?)\n?[ \t]*```\z/s, text) do
+      [_fenced, body] -> String.trim(body)
+      nil -> text
     end
   end
 

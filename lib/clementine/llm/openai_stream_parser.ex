@@ -1,13 +1,21 @@
 defmodule Clementine.LLM.OpenAIStreamParser do
   @moduledoc false
 
+  # Parses Responses API SSE streams into Clementine's provider event
+  # tuples. A refusal streams as `response.refusal.delta`: it becomes the
+  # turn's text, and the stop reason "refusal". A response that ends
+  # `response.incomplete` stops with "max_tokens" when it ran out of
+  # output tokens (its other reasons pass through as they are), and one
+  # that ends `response.failed` is an error, not an empty answer.
+
   defmodule State do
     @moduledoc false
     defstruct buffer: "",
               item_call_ids: %{},
               started_calls: MapSet.new(),
               calls_with_arg_deltas: MapSet.new(),
-              closed_calls: MapSet.new()
+              closed_calls: MapSet.new(),
+              refused: false
   end
 
   def new do
@@ -121,6 +129,11 @@ defmodule Clementine.LLM.OpenAIStreamParser do
     {[{:text_delta, text}], state}
   end
 
+  defp convert_event("response.refusal.delta", %{"delta" => text}, state)
+       when is_binary(text) and text != "" do
+    {[{:text_delta, text}], %{state | refused: true}}
+  end
+
   defp convert_event("response.output_item.added", %{"item" => item} = data, state) do
     output_index = Map.get(data, "output_index", 0)
     process_output_item(item, output_index, state, :added)
@@ -176,20 +189,34 @@ defmodule Clementine.LLM.OpenAIStreamParser do
   defp convert_event("response.completed", %{"response" => response}, state) do
     {fallback_tool_events, state} = ensure_completed_tool_events(response, state)
     usage = Map.get(response, "usage", %{}) || %{}
-    output = Map.get(response, "output", [])
-
-    stop_reason =
-      if Enum.any?(output, &(Map.get(&1, "type") == "function_call")) do
-        "tool_use"
-      else
-        "end_turn"
-      end
 
     events =
       fallback_tool_events ++
-        [{:message_delta, %{"stop_reason" => stop_reason}, usage}, {:message_stop}]
+        [
+          {:message_delta, %{"stop_reason" => stop_reason(response, state)}, usage},
+          {:message_stop}
+        ]
 
     {events, state}
+  end
+
+  # Cut off: what streamed is the turn, and nothing more arrives. A call
+  # still open has no complete arguments, so none is replayed.
+  defp convert_event("response.incomplete", %{"response" => response}, state) do
+    usage = Map.get(response, "usage", %{}) || %{}
+
+    {[{:message_delta, %{"stop_reason" => stop_reason(response, state)}, usage}, {:message_stop}],
+     state}
+  end
+
+  defp convert_event("response.failed", %{"response" => response}, state) do
+    error =
+      case Map.get(response, "error") do
+        %{} = error -> error
+        _ -> %{"message" => "The response failed without an error."}
+      end
+
+    {[{:error, error}], state}
   end
 
   defp convert_event("response.error", %{"error" => error}, state) do
@@ -203,6 +230,29 @@ defmodule Clementine.LLM.OpenAIStreamParser do
   defp convert_event(_event_type, _data, state) do
     {[], state}
   end
+
+  defp stop_reason(response, state) do
+    output = Map.get(response, "output") || []
+
+    cond do
+      Enum.any?(output, &match?(%{"type" => "function_call"}, &1)) -> "tool_use"
+      state.refused -> "refusal"
+      true -> incomplete_reason(response)
+    end
+  end
+
+  @doc false
+  # The stop reason a finished response's status gives (`call/5` reads it
+  # too): "max_tokens" for one cut off at max_output_tokens.
+  def incomplete_reason(%{"status" => "incomplete"} = response) do
+    case get_in(response, ["incomplete_details", "reason"]) do
+      "max_output_tokens" -> "max_tokens"
+      reason when is_binary(reason) -> reason
+      _ -> "incomplete"
+    end
+  end
+
+  def incomplete_reason(_response), do: "end_turn"
 
   defp process_output_item(%{"type" => "function_call"} = item, output_index, state, stage) do
     item_id = Map.get(item, "id")

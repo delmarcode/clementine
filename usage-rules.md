@@ -428,6 +428,11 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   every property in `required` (type an optional one
   `["string", "null"]`). The provider refuses a schema outside its
   subset, and the run fails with its error.
+- On a Chat Completions server that enforces `response_format` with a
+  grammar over the whole completion (vLLM, SGLang, Ollama, llama.cpp),
+  the model cannot call tools. Set `structured_output: :instructions` on
+  that model's catalog entry and describe the answer in the agent's
+  instructions; see `docs/MODELS.md`.
 - An answer that does not decode or match fails the run:
   `Result.Failed` with a `Clementine.Error` of code `:invalid_output`,
   whose `raw["output"]` is the text the model wrote. There is no retry

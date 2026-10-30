@@ -43,8 +43,16 @@ defmodule Clementine.LLM.ChatCompletions do
   {"name": "output", "schema": ..., "strict": true}}`). Support varies
   by server and model: one without structured outputs may refuse the
   request or ignore the field, and an answer that does not match then
-  fails the run (`Clementine.OutputSchema`), so an agent served this way
-  describes the answer's shape in its instructions as well.
+  fails the run (`Clementine.OutputSchema`). A server that enforces the
+  format over the whole completion with a grammar (vLLM, SGLang, Ollama,
+  and llama.cpp may) leaves the model no way to call a tool, so the
+  agent answers at once without its tools and nothing fails. For such a
+  model, set `structured_output: :instructions` on its catalog entry:
+  no `response_format` is sent, the agent's instructions describe the
+  answer, and the engine still checks it.
+
+  A refusal (`delta.refusal`, or `message.refusal` on `call/5`) arrives
+  as the turn's text with stop reason `"refusal"`.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -255,7 +263,7 @@ defmodule Clementine.LLM.ChatCompletions do
     body =
       body
       |> maybe_put_reasoning(resolved.provider, Keyword.get(opts, :reasoning, resolved.reasoning))
-      |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
+      |> maybe_put_output_schema(resolved.structured_output, Keyword.get(opts, :output_schema))
 
     if is_list(tools) and tools != [] do
       body
@@ -282,9 +290,10 @@ defmodule Clementine.LLM.ChatCompletions do
     Map.merge(body, Reasoning.to_provider_config!(provider, reasoning))
   end
 
-  defp maybe_put_output_schema(body, nil), do: body
+  defp maybe_put_output_schema(body, _structured_output, nil), do: body
+  defp maybe_put_output_schema(body, :instructions, _schema), do: body
 
-  defp maybe_put_output_schema(body, schema) do
+  defp maybe_put_output_schema(body, :native, schema) do
     Map.put(body, "response_format", %{
       "type" => "json_schema",
       "json_schema" => %{"name" => "output", "schema" => schema, "strict" => true}
@@ -399,9 +408,15 @@ defmodule Clementine.LLM.ChatCompletions do
     message = Map.get(choice, "message", %{})
     content = Messages.decode_message(message)
 
+    stop_reason =
+      case message do
+        %{"refusal" => refusal} when is_binary(refusal) and refusal != "" -> "refusal"
+        _ -> stop_reason(Map.get(choice, "finish_reason"), content)
+      end
+
     %Response{
       content: content,
-      stop_reason: stop_reason(Map.get(choice, "finish_reason"), content),
+      stop_reason: stop_reason,
       usage: Map.get(body, "usage", %{}) || %{}
     }
   end

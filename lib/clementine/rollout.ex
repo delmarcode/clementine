@@ -263,7 +263,7 @@ defmodule Clementine.Rollout do
       resume = Keyword.get(opts, :resume)
       record_execution(exec, resume != nil)
 
-      case restore(exec, resume, rollout) do
+      case prepare(exec, resume, rollout) do
         {:ok, %Execution{} = exec} ->
           boundary(exec)
 
@@ -282,6 +282,18 @@ defmodule Clementine.Rollout do
         emit_rollout_raise(exec, kind, reason, __STACKTRACE__)
         :erlang.raise(kind, reason, __STACKTRACE__)
     end
+  end
+
+  # Agent.new/1 normalizes an output_schema, but an agent/1 may set the
+  # struct's field directly: normalize it here too (a normalized schema
+  # comes back unchanged), and fail the run on one that is not a schema
+  # before anything executes.
+  defp prepare(%Execution{output_schema: nil} = exec, resume, rollout),
+    do: restore(exec, resume, rollout)
+
+  defp prepare(%Execution{output_schema: schema} = exec, resume, rollout) do
+    with {:ok, schema} <- Clementine.OutputSchema.normalize(schema),
+         do: restore(%{exec | output_schema: schema}, resume, rollout)
   end
 
   # Fresh start: history, then the materialized input message.
