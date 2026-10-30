@@ -456,7 +456,7 @@ defmodule Clementine.RolloutExecuteTest do
     end
 
     test "matrix row 8: a checkpoint struct from another version is incompatible" do
-      checkpoint = %Checkpoint{version: 2, rollout_id: "r1"}
+      checkpoint = %Checkpoint{version: 3, rollout_id: "r1"}
 
       assert {:error, %Error{code: :incompatible_checkpoint, retryable?: false}} =
                Rollout.execute(rollout(), resume: {checkpoint, :elapsed})

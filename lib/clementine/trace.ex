@@ -14,16 +14,22 @@ defmodule Clementine.Trace do
   - `:execution`, once per execution: when a run starts, and again when it
     resumes after an approval.
     - `"model"` — the model's resolved id
-    - `"agent_fingerprint"` — a sha256 over the instructions, the tool
-      schemas, and the model id, and over which tools are deferred and
-      the output schema when the agent has them, in lowercase hex. Executions with the same fingerprint
-      offered the model the same thing.
+    - `"agent_fingerprint"` — a sha256 over the model id, the
+      instructions, the agent's tool schemas, and, when the agent has
+      them, which tools are deferred, the output schema, and the skills it
+      offers (each one's name, description, and tool schemas), in
+      lowercase hex. Executions with the same fingerprint ran the same
+      agent: they offered the model the same thing.
     - `"instructions"` — the system prompt the execution sent
-    - `"tools"` — the names of the tools offered, in order, deferred ones
-      included
+    - `"tools"` — the names of the tools offered as the execution began,
+      in order: the agent's, deferred ones included, then those of the
+      skills a resumed execution had loaded before it parked, then
+      `use_skill` when the agent offers skills
     - `"deferred"` — the names of the tools among them the model loads
       through the provider's tool search (`deferred:` on the agent); `[]`
       when none are
+    - `"skills"` — the names of the skills the agent offers; `[]` when
+      none are
     - `"resumed"` — `true` for an execution that resumed from a checkpoint
   - `:model_call`, once per call to the model.
     - `"iteration"`, `"duration_ms"`
@@ -46,6 +52,19 @@ defmodule Clementine.Trace do
     - `"approval"` — `nil`, or `%{"verdict" => "approved" | "denied",
       "by" => ...}` for a call that waited on a decision, with `by` from
       the decision's meta
+
+    A `use_skill` call is a tool call like any other: its result is the
+    skill's body, or the error the model saw. The engine settles it before
+    the rest of its batch starts, so a cancel or a drain never kills one.
+  - `:skill_load`, once per skill loaded, just before the `use_skill`
+    call that loaded it (`Clementine.Skill`). A call that loaded nothing
+    (a name not offered, a skill already loaded) records none.
+    - `"iteration"`, `"tool_use_id"` (of the `use_skill` call)
+    - `"name"` — the skill's
+    - `"tools"` — the names of the tools it brought
+    - `"body_sha256"` — a sha256 of the body the model read, in lowercase
+      hex: a body may differ by run, and this says which one it was under
+      either fidelity (the body itself is the `use_skill` call's result)
 
   ## Fidelity
 
@@ -95,8 +114,11 @@ defmodule Clementine.Trace do
 
   @doc false
   # The `:execution` payload for an execution offering `model`,
-  # `instructions`, and `tools`. `offer` is what else it offers the model
-  # (see `fingerprint/4`).
+  # `instructions`, and `tools`, the agent's own. `offer` is what else it
+  # offers the model (see `fingerprint/4`), and `offered:`, every tool the
+  # execution begins with when that is more than `tools` (the tools of
+  # skills restored from a checkpoint, and engine tools), which only the
+  # entry's `"tools"` reads.
   @spec execution(
           Clementine.LLM.ModelRegistry.model_ref(),
           String.t() | nil,
@@ -106,12 +128,15 @@ defmodule Clementine.Trace do
         ) ::
           map()
   def execution(model, instructions, tools, resumed?, offer \\ []) do
+    {offered, offer} = Keyword.pop(offer, :offered, tools)
+
     %{
       "model" => model_id(model),
       "agent_fingerprint" => fingerprint(model, instructions, tools, offer),
       "instructions" => instructions,
-      "tools" => Enum.map(tools, & &1.__name__()),
+      "tools" => Enum.map(offered, &Clementine.Tool.to_schema(&1).name),
       "deferred" => Enum.map(Keyword.get(offer, :deferred, []), & &1.__name__()),
+      "skills" => Enum.map(Keyword.get(offer, :skills, []), & &1.name),
       "resumed" => resumed?
     }
   end
@@ -155,6 +180,22 @@ defmodule Clementine.Trace do
   end
 
   @doc false
+  # The `:skill_load` payload for `skill`, whose `body` the `use_skill`
+  # call `tool_use_id` loaded in `iteration`. The body's hash is a fact:
+  # :facts keeps it.
+  @spec skill_load(pos_integer(), String.t(), Clementine.Skill.t(), String.t()) :: map()
+  def skill_load(iteration, tool_use_id, %Clementine.Skill{} = skill, body)
+      when is_binary(body) do
+    %{
+      "iteration" => iteration,
+      "tool_use_id" => tool_use_id,
+      "name" => skill.name,
+      "tools" => Enum.map(skill.tools, & &1.__name__()),
+      "body_sha256" => :sha256 |> :crypto.hash(body) |> Base.encode16(case: :lower)
+    }
+  end
+
+  @doc false
   # What an entry of `kind` stores at `fidelity`: content keys dropped
   # under :facts, and every value in the form a jsonb round trip returns,
   # so what is recorded is what a read gives back, and a write never
@@ -173,11 +214,14 @@ defmodule Clementine.Trace do
   across deploys and VM versions while the agent is unchanged.
 
   `offer` is what else the execution offers the model: `deferred:`, the
-  tools in `tools` it loads through the provider's tool search, and
+  tools in `tools` it loads through the provider's tool search;
   `output_schema:`, the JSON schema its final answer follows (canonical
-  JSON too). Each enters the fingerprint only when set, so an agent
-  without it keeps the fingerprint it had; moving a tool between
-  `tools:` and `deferred:`, or changing the schema, changes it.
+  JSON too); and `skills:`, the skills it may load, each with its name,
+  its description, and its tools' schemas, not its body (the body is read
+  when the model loads the skill, and may differ by run). Each enters the
+  fingerprint only when set, so an agent without it keeps the fingerprint
+  it had; moving a tool between `tools:` and `deferred:`, changing the
+  schema, or changing a skill's description or tools changes it.
   """
   @spec fingerprint(
           Clementine.LLM.ModelRegistry.model_ref(),
@@ -205,7 +249,17 @@ defmodule Clementine.Trace do
       {:deferred, tools}, acc -> Map.put(acc, "deferred", Enum.map(tools, & &1.__name__()))
       {:output_schema, nil}, acc -> acc
       {:output_schema, schema}, acc -> Map.put(acc, "output_schema", schema)
+      {:skills, []}, acc -> acc
+      {:skills, skills}, acc -> Map.put(acc, "skills", Enum.map(skills, &skill_fingerprint/1))
     end)
+  end
+
+  defp skill_fingerprint(%Clementine.Skill{} = skill) do
+    %{
+      "name" => skill.name,
+      "description" => skill.description,
+      "tools" => Enum.map(skill.tools, & &1.__schema__())
+    }
   end
 
   # The provider's id for a model reference; a reference the catalog does

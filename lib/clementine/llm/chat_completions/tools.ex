@@ -3,7 +3,7 @@ defmodule Clementine.LLM.ChatCompletions.Tools do
 
   alias Clementine.Tool
 
-  def encode(tool) when is_atom(tool) do
+  def encode(tool) do
     schema = Tool.to_schema(tool)
 
     %{

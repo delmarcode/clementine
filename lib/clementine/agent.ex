@@ -146,6 +146,31 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent, key: "chat", turn: true, trace: :facts, ...
 
+  ## Skills
+
+  An agent may offer skills (`Clementine.Skill`): instructions for one
+  kind of task and the tools it needs, which the model loads when a task
+  calls for them, rather than carrying every procedure in the system
+  prompt and every tool from the start.
+
+      use Clementine.Agent,
+        key: "support",
+        model: :claude_sonnet,
+        instructions: "Help customers with their orders.",
+        tools: [MyApp.Tools.Search],
+        skills: [MyApp.Skills.Refunds, MyApp.Skills.Shipping]
+
+  `skills:` takes modules that `use Clementine.Skill` and skills built with
+  `Clementine.Skill.new/1`, so an `c:agent/1` may offer skills the app
+  keeps as rows. With any, the model sees a `use_skill` tool listing each
+  skill's name and description; loading one returns its body and adds its
+  tools. A run that parks resumes with the skills it had loaded, so an
+  `c:agent/1` must offer them again at the resume's claim, as it must its
+  tools. Every tool the model can be offered, the agent's own and each
+  skill's, has a name of its own, and none is named `use_skill`: `new/1`
+  raises otherwise, and a run whose `c:agent/1` sets `skills` without it
+  fails as `:invalid_skills` before anything runs.
+
   Note: this module shadows Elixir's built-in `Agent` under a bare `alias`;
   prefer `alias Clementine.Agent, as: AgentDef` where the collision bites.
   The in-memory agent *process* lives at `Clementine.AgentServer`.
@@ -158,6 +183,7 @@ defmodule Clementine.Agent do
             tools: [],
             deferred: [],
             output_schema: nil,
+            skills: [],
             defaults: [],
             policy: %{},
             tool_context: %{},
@@ -170,6 +196,7 @@ defmodule Clementine.Agent do
           tools: [module()],
           deferred: [module()],
           output_schema: Clementine.OutputSchema.t() | nil,
+          skills: [Clementine.Skill.t()],
           defaults: keyword(),
           policy: map(),
           tool_context: map(),
@@ -322,6 +349,8 @@ defmodule Clementine.Agent do
   - `:output_schema` - the JSON schema of the final answer, its root an
     object; with it, a completed run's `output` is the decoded map (see
     "Structured output" above). Atom keys become strings
+  - `:skills` - skills the model may load (see "Skills" above): modules
+    that `use Clementine.Skill`, or `Clementine.Skill` structs
   - `:defaults` - default rollout limits (`max_iterations:`, `max_duration:`)
   - `:policy` - host-app policy/config passthrough (opaque to Clementine)
   - `:tool_context` - keys every tool of the execution sees (`working_dir:`,
@@ -338,7 +367,7 @@ defmodule Clementine.Agent do
 
     case Enum.filter(agent.deferred, &(&1 in agent.tools)) do
       [] ->
-        normalize_output_schema(agent)
+        agent |> normalize_output_schema() |> put_skills!()
 
       both ->
         raise ArgumentError,
@@ -350,4 +379,16 @@ defmodule Clementine.Agent do
 
   defp normalize_output_schema(%__MODULE__{output_schema: schema} = agent),
     do: %{agent | output_schema: Clementine.OutputSchema.normalize!(schema)}
+
+  # Skills arrive as modules or structs and are kept as structs, checked
+  # against every tool the agent may offer (Clementine.Skill.prepare/2).
+  # The rollout checks again, since an agent/1 may set the field directly.
+  defp put_skills!(%__MODULE__{skills: []} = agent), do: agent
+
+  defp put_skills!(%__MODULE__{} = agent) do
+    case Clementine.Skill.prepare(agent.skills, agent.tools ++ agent.deferred, agent.deferred) do
+      {:ok, skills} -> %{agent | skills: skills}
+      {:error, message} -> raise ArgumentError, message
+    end
+  end
 end

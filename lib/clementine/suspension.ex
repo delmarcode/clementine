@@ -43,8 +43,9 @@ defmodule Clementine.Suspension do
   defmodule Request do
     @moduledoc """
     The suspension body as the rollout produces it: reason, pending
-    operation, and loop state — everything except the cursor and the
-    token, which require the lease the rollout never sees.
+    operation, and loop state (the skills it had loaded among it) —
+    everything except the cursor and the token, which require the lease
+    the rollout never sees.
     """
 
     @enforce_keys [:reason, :pending]
@@ -52,6 +53,7 @@ defmodule Clementine.Suspension do
               pending: nil,
               messages: [],
               iteration: 0,
+              skills: [],
               usage: %Clementine.Usage{}
 
     @type t :: %__MODULE__{
@@ -59,6 +61,7 @@ defmodule Clementine.Suspension do
             pending: Clementine.Pending.t(),
             messages: [Clementine.LLM.Message.message()],
             iteration: non_neg_integer(),
+            skills: [String.t()],
             usage: Clementine.Usage.t()
           }
   end

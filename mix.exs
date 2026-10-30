@@ -42,6 +42,8 @@ defmodule Clementine.MixProject do
         Core: [
           Clementine,
           Clementine.Agent,
+          Clementine.Skill,
+          Clementine.EngineTool,
           Clementine.AgentServer,
           Clementine.Rollout,
           Clementine.Run,

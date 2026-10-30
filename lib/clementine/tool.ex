@@ -791,8 +791,17 @@ defmodule Clementine.Tool do
   defp truncate(string, max), do: String.slice(string, 0, max - 1) <> "…"
 
   @doc """
-  Returns a tool module's provider-neutral schema.
+  Returns a tool's provider-neutral schema: a tool module's, or an engine
+  tool's (`Clementine.EngineTool`). The tools a rollout hands a provider
+  client are of both kinds; a client encodes each through this.
   """
+  @spec to_schema(module() | Clementine.EngineTool.t()) :: %{
+          name: String.t(),
+          description: String.t(),
+          input_schema: map()
+        }
+  def to_schema(%Clementine.EngineTool{} = tool), do: Clementine.EngineTool.schema(tool)
+
   def to_schema(tool_module) when is_atom(tool_module) do
     tool_module.__schema__()
   end

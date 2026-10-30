@@ -16,12 +16,12 @@ defmodule Clementine.Trace.Entry do
   stored. `Clementine.Trace` lists every kind and its keys.
   """
 
-  @kinds [:execution, :model_call, :tool_call]
+  @kinds [:execution, :model_call, :tool_call, :skill_load]
 
   @enforce_keys [:kind, :payload]
   defstruct run_id: nil, epoch: nil, seq: nil, at: nil, kind: nil, payload: %{}
 
-  @type kind :: :execution | :model_call | :tool_call
+  @type kind :: :execution | :model_call | :tool_call | :skill_load
 
   @type t :: %__MODULE__{
           run_id: term(),

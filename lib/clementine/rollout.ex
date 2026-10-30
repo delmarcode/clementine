@@ -36,13 +36,23 @@ defmodule Clementine.Rollout do
   and deciding to retry is outer-control work (see `Clementine.Verifier` for
   the judge-function shape it uses).
 
+  ## Engine Tools
+
+  Most tool calls act on the world, through `Clementine.ToolRunner`. An
+  engine tool (`Clementine.EngineTool`) acts on the execution itself, so
+  the engine settles its calls in place, first in their batch: `use_skill`
+  loads a `Clementine.Skill`, adding the skill's tools to the ones offered
+  from the next model call on. The batch's other calls then resolve
+  against the toolset it leaves. The system prompt never changes.
+
   Formerly `Clementine.Loop`; renamed so `Loop` can name the outer control
   primitive.
   """
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
   alias Clementine.LLM.Message.{Content, ToolResultMessage}
-  alias Clementine.{ApprovalRequest, LLM, Pending, Suspension, Tool, ToolInput, ToolRunner, Trace}
+  alias Clementine.{ApprovalRequest, EngineTool, LLM, Pending, Skill, Suspension, Tool}
+  alias Clementine.{ToolInput, ToolResult, ToolRunner, Trace}
   alias Clementine.Trace.Recorder
 
   @default_max_iterations 10
@@ -114,6 +124,7 @@ defmodule Clementine.Rollout do
       tools: agent.tools ++ deferred,
       deferred: deferred,
       output_schema: agent.output_schema,
+      skills: agent.skills,
       context: rollout.context,
       messages: rollout.messages,
       max_iterations: Keyword.get(limits(rollout), :max_iterations, @default_max_iterations),
@@ -127,7 +138,10 @@ defmodule Clementine.Rollout do
     # accumulated typed usage, and `prefix_len` — where history + input end
     # and generated messages begin, so `Result.Completed` can separate the
     # two. `recorder` is the runner's trace buffer (nil: no trace), and
-    # `fidelity` the agent's `trace:`.
+    # `fidelity` the agent's `trace:`. `tools` are the tool modules
+    # offered now (the agent's, then each loaded skill's), `engine_tools`
+    # the engine's own, `skills` the skills the agent offers, and
+    # `loaded_skills` the names of those loaded, in load order.
     defstruct [
       :model,
       :system,
@@ -149,7 +163,10 @@ defmodule Clementine.Rollout do
       usage: %Clementine.Usage{},
       fence_raised?: false,
       fidelity: :content,
-      paused?: false
+      paused?: false,
+      skills: [],
+      engine_tools: [],
+      loaded_skills: []
     ]
   end
 
@@ -240,6 +257,7 @@ defmodule Clementine.Rollout do
       tools: Keyword.get(config, :tools, []),
       deferred: Keyword.get(config, :deferred, []),
       output_schema: Keyword.get(config, :output_schema),
+      skills: Keyword.get(config, :skills, []),
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       emit: Keyword.get(opts, :emit),
@@ -267,7 +285,7 @@ defmodule Clementine.Rollout do
         {:resolve, %Execution{} = exec, pending, payload} ->
           resolve_pending(exec, pending, payload)
 
-        {:error, %Clementine.Error{} = error} ->
+        {:error, %Execution{} = exec, %Clementine.Error{} = error} ->
           fail(exec, error)
       end
     rescue
@@ -281,23 +299,70 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # Checks what the agent offers (its output schema, its skills),
+  # restores a resumed run's state, and records the execution entry. The
+  # entry names the toolset the execution begins with, so it follows the
+  # restore that rebuilds it; an execution that fails here records one
+  # too, with the agent's own tools.
+  defp prepare(%Execution{} = exec, resume, rollout) do
+    resumed? = resume != nil
+
+    with {:ok, %Execution{} = exec} <- normalize_output_schema(exec),
+         {:ok, %Execution{} = exec} <- prepare_skills(exec) do
+      case restore(exec, resume, rollout) do
+        {:ok, %Execution{} = restored} = ok ->
+          record_execution(restored, exec.tools, resumed?)
+          ok
+
+        {:resolve, %Execution{} = restored, _pending, _payload} = resolve ->
+          record_execution(restored, exec.tools, true)
+          resolve
+
+        {:error, %Clementine.Error{} = error} ->
+          record_execution(exec, exec.tools, resumed?)
+          {:error, exec, error}
+      end
+    else
+      {:error, %Execution{} = exec, %Clementine.Error{}} = error ->
+        record_execution(exec, exec.tools, resumed?)
+        error
+    end
+  end
+
   # Agent.new/1 normalizes an output_schema, but an agent/1 may set the
   # struct's field directly: normalize it here too (a normalized schema
   # comes back unchanged), so the execution's trace entry fingerprints the
   # schema the run uses, and fail the run on one that is not a schema
   # before anything executes.
-  defp prepare(%Execution{} = exec, resume, rollout) do
-    {exec, checked} = normalize_output_schema(exec)
-    record_execution(exec, resume != nil)
-    with :ok <- checked, do: restore(exec, resume, rollout)
-  end
-
-  defp normalize_output_schema(%Execution{output_schema: nil} = exec), do: {exec, :ok}
+  defp normalize_output_schema(%Execution{output_schema: nil} = exec), do: {:ok, exec}
 
   defp normalize_output_schema(%Execution{output_schema: schema} = exec) do
     case Clementine.OutputSchema.normalize(schema) do
-      {:ok, schema} -> {%{exec | output_schema: schema}, :ok}
-      {:error, %Clementine.Error{}} = error -> {exec, error}
+      {:ok, schema} -> {:ok, %{exec | output_schema: schema}}
+      {:error, %Clementine.Error{} = error} -> {:error, exec, error}
+    end
+  end
+
+  # Agent.new/1 checks skills, but an agent/1 may set the field directly
+  # (a raw skill module, a tool whose name another takes): every run is
+  # checked here, against the tools it offers of its own, deferred ones
+  # included, and one that fails runs nothing. A run with skills is
+  # offered use_skill.
+  defp prepare_skills(%Execution{skills: []} = exec), do: {:ok, exec}
+
+  defp prepare_skills(%Execution{} = exec) do
+    case Skill.prepare(exec.skills, exec.tools, exec.deferred) do
+      {:ok, skills} ->
+        {:ok, %{exec | skills: skills, engine_tools: [Skill.use_skill_tool(skills)]}}
+
+      {:error, message} ->
+        {:error, %{exec | skills: []},
+         %Clementine.Error{
+           kind: :rollout,
+           code: :invalid_skills,
+           message: message,
+           retryable?: false
+         }}
     end
   end
 
@@ -311,7 +376,8 @@ defmodule Clementine.Rollout do
   # operation is the act the suspension interrupted; the payload resolves
   # it before the loop may gather again.
   defp restore(%Execution{} = exec, {checkpoint, payload}, _rollout) do
-    with {:ok, %Clementine.Checkpoint{} = checkpoint} <- decode_checkpoint(checkpoint) do
+    with {:ok, %Clementine.Checkpoint{} = checkpoint} <- decode_checkpoint(checkpoint),
+         {:ok, %Execution{} = exec} <- restore_skills(exec, checkpoint) do
       exec = %{
         exec
         | messages: checkpoint.messages,
@@ -355,17 +421,40 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # The skills loaded before the park are loaded again, from the agent's
+  # current skills: the resume offers the tools the checkpointed messages
+  # were written against. A skill the agent no longer offers is a
+  # checkpoint this rollout cannot honor, as a gated tool it no longer
+  # carries is.
+  defp restore_skills(%Execution{} = exec, %Clementine.Checkpoint{skills: names} = checkpoint) do
+    Enum.reduce_while(names, {:ok, exec}, fn name, {:ok, exec} ->
+      case Enum.find(exec.skills, &(&1.name == name)) do
+        %Skill{} = skill ->
+          {:cont, {:ok, put_skill(exec, skill)}}
+
+        nil ->
+          {:halt,
+           {:error,
+            incompatible_checkpoint(
+              "the checkpoint loaded skill #{inspect(name)}, which the agent no " <>
+                "longer offers",
+              checkpoint
+            )}}
+      end
+    end)
+  end
+
   defp pending_shape(%struct{}), do: inspect(struct)
   defp pending_shape(other), do: inspect(other)
 
   defp decode_checkpoint(%Clementine.Checkpoint{version: version} = checkpoint) do
-    if version == Clementine.Checkpoint.version() do
+    if version in Clementine.Checkpoint.versions() do
       {:ok, checkpoint}
     else
       {:error,
        incompatible_checkpoint(
          "unknown checkpoint version #{inspect(version)} " <>
-           "(current: #{Clementine.Checkpoint.version()})",
+           "(this engine reads #{inspect(Clementine.Checkpoint.versions())})",
          checkpoint
        )}
     end
@@ -598,11 +687,13 @@ defmodule Clementine.Rollout do
   defp stream_response(%Execution{} = exec) do
     alias Clementine.LLM.StreamParser.Accumulator
 
+    tools = offered_tools(exec)
+
     metadata = %{
       model: exec.model,
       iteration: exec.iteration,
       message_count: length(exec.messages),
-      tool_count: length(exec.tools),
+      tool_count: length(tools),
       streaming: true
     }
 
@@ -613,7 +704,7 @@ defmodule Clementine.Rollout do
     )
 
     started = System.monotonic_time()
-    stream = LLM.stream(exec.model, exec.system, exec.messages, exec.tools, stream_opts(exec))
+    stream = LLM.stream(exec.model, exec.system, exec.messages, tools, stream_opts(exec))
 
     {acc, signal} =
       try do
@@ -786,15 +877,28 @@ defmodule Clementine.Rollout do
   defp repair_tool_uses(%Execution{} = exec, tool_uses, report?) do
     Enum.map(tool_uses, fn tool_use ->
       with %{} = input <- tool_use.input,
-           tool when not is_nil(tool) <- Tool.find_by_name(exec.tools, tool_use.name),
+           parameters when is_list(parameters) <- parameters(exec, tool_use.name),
            {repaired, [_ | _] = fields} <-
-             ToolInput.repair(input, tool.__parameters__(), tool: tool_use.name) do
+             ToolInput.repair(input, parameters, tool: tool_use.name) do
         if report?, do: report_repair(exec, tool_use, fields)
         %{tool_use | input: repaired}
       else
         _ -> tool_use
       end
     end)
+  end
+
+  defp parameters(%Execution{} = exec, name) do
+    case engine_tool(exec, name) do
+      %EngineTool{parameters: parameters} ->
+        parameters
+
+      nil ->
+        case Tool.find_by_name(exec.tools, name) do
+          nil -> nil
+          tool -> tool.__parameters__()
+        end
+    end
   end
 
   defp report_repair(%Execution{} = exec, tool_use, fields) do
@@ -806,16 +910,36 @@ defmodule Clementine.Rollout do
   end
 
   # Settles one tool batch toward its ToolResultMessage, possibly across
-  # suspensions: uncovered ungated calls execute now; then the first
-  # uncovered approval-gated call parks the run — everything settled so
-  # far rides in the checkpoint, so nothing is discarded and nothing
-  # unsafe re-executes on resume — and a fully covered batch feeds back
-  # to the model. Resume re-enters here with the decided call already
-  # settled, so a batch holding several gated calls parks once per
-  # decision.
+  # suspensions: uncovered engine calls settle first, in place, since
+  # they change the execution the rest resolve against; uncovered ungated
+  # calls execute now; then the first uncovered approval-gated call parks
+  # the run — everything settled so far rides in the checkpoint, so
+  # nothing is discarded and nothing unsafe re-executes on resume — and a
+  # fully covered batch feeds back to the model. Resume re-enters here
+  # with the decided call already settled, so a batch holding several
+  # gated calls parks once per decision.
   defp settle_batch(%Execution{} = exec, tool_uses, completed) do
     uncovered = Enum.reject(tool_uses, &Map.has_key?(completed, &1.id))
-    {gated, ungated} = Enum.split_with(uncovered, &approval_gated?(exec.tools, &1))
+    {engine, world} = Enum.split_with(uncovered, &engine_tool(exec, &1.name))
+    {exec, completed} = settle_engine_calls(exec, engine, completed)
+
+    case signals_after(engine) do
+      :continue ->
+        settle_world(exec, tool_uses, repair_after_loads(exec, engine, world), completed)
+
+      unwound ->
+        conclude(exec, unwound)
+    end
+  end
+
+  # Engine calls run host code (a skill's body): a signal that arrived
+  # meanwhile is honored before the fence write and before any tool
+  # starts, as one that arrived during the gather is.
+  defp signals_after([] = _engine_calls), do: :continue
+  defp signals_after(_engine_calls), do: check_signals()
+
+  defp settle_world(%Execution{} = exec, tool_uses, world, completed) do
+    {gated, ungated} = Enum.split_with(world, &approval_gated?(exec.tools, &1))
 
     case execute_now(exec, ungated, completed) do
       {:ok, %Execution{} = exec, completed} ->
@@ -834,6 +958,67 @@ defmodule Clementine.Rollout do
         conclude(exec, unwound)
     end
   end
+
+  # The batch was repaired as it arrived, against the tools offered then;
+  # a call to a tool a skill load in this batch just added was not, so the
+  # rest of the batch is repaired again against the toolset the loads left.
+  # A call already repaired has nothing left to repair.
+  defp repair_after_loads(_exec, [] = _engine_calls, world), do: world
+  defp repair_after_loads(exec, _engine_calls, world), do: repair_tool_uses(exec, world, true)
+
+  defp engine_tool(%Execution{engine_tools: tools}, name) do
+    Enum.find(tools, &(&1.name == name))
+  end
+
+  # Engine calls settle in batch order, each against the execution the
+  # one before left, and are traced and reported like any tool call. They
+  # touch nothing outside the execution: no fence, no gate, no runner.
+  defp settle_engine_calls(%Execution{} = exec, calls, completed) do
+    Enum.reduce(calls, {exec, completed}, fn call, {exec, completed} ->
+      started = System.monotonic_time()
+      {exec, %ToolResult{} = result} = engine_call(exec, engine_tool(exec, call.name), call)
+
+      emit_event(exec, :tool_result, %{
+        tool_use_id: call.id,
+        result: result.content,
+        is_error: result.is_error
+      })
+
+      record_tool_call(exec, call, result, to_ms(System.monotonic_time() - started), nil)
+      {exec, Map.put(completed, call.id, result)}
+    end)
+  end
+
+  defp engine_call(%Execution{} = exec, %EngineTool{kind: :use_skill}, call),
+    do: use_skill(exec, call)
+
+  # Only a first load changes the execution: the skill's tools are
+  # offered from the next model call on, and the checkpoint of a later
+  # park names it.
+  defp use_skill(%Execution{} = exec, call) do
+    case Skill.load(exec.skills, exec.loaded_skills, call.input, exec.context) do
+      {:loaded, %Skill{} = skill, body, content} ->
+        record(exec, :skill_load, Trace.skill_load(exec.iteration, call.id, skill, body))
+        {put_skill(exec, skill), %ToolResult{content: content, is_error: false}}
+
+      {:unchanged, content} ->
+        {exec, %ToolResult{content: content, is_error: false}}
+
+      {:error, content} ->
+        {exec, %ToolResult{content: content, is_error: true}}
+    end
+  end
+
+  defp put_skill(%Execution{} = exec, %Skill{} = skill) do
+    %{
+      exec
+      | tools: exec.tools ++ Enum.reject(skill.tools, &(&1 in exec.tools)),
+        loaded_skills: exec.loaded_skills ++ [skill.name]
+    }
+  end
+
+  # The tools the model is offered: the modules, then the engine's own.
+  defp offered_tools(%Execution{} = exec), do: exec.tools ++ exec.engine_tools
 
   # {:policy, _} is reserved and unresolved in this engine version, so it
   # gates exactly like :required: a tool that declares any approval
@@ -973,6 +1158,7 @@ defmodule Clementine.Rollout do
       },
       messages: exec.messages,
       iteration: exec.iteration,
+      skills: exec.loaded_skills,
       usage: exec.usage
     }
   end
@@ -1108,16 +1294,19 @@ defmodule Clementine.Rollout do
     )
   end
 
-  # What this execution offers the model, once, before anything runs.
-  defp record_execution(%Execution{recorder: nil}, _resumed?), do: :ok
+  # What this execution offers the model, once, before the model runs.
+  # `agent_tools` are the agent's own, which the fingerprint covers.
+  defp record_execution(%Execution{recorder: nil}, _agent_tools, _resumed?), do: :ok
 
-  defp record_execution(%Execution{} = exec, resumed?) do
+  defp record_execution(%Execution{} = exec, agent_tools, resumed?) do
     record(
       exec,
       :execution,
-      Trace.execution(exec.model, exec.system, exec.tools, resumed?,
+      Trace.execution(exec.model, exec.system, agent_tools, resumed?,
         deferred: exec.deferred,
-        output_schema: exec.output_schema
+        output_schema: exec.output_schema,
+        skills: exec.skills,
+        offered: offered_tools(exec)
       )
     )
   end

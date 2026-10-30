@@ -284,9 +284,14 @@ defmodule Clementine.Lifecycle.Protocol do
       iteration: request.iteration,
       messages: request.messages,
       pending: request.pending,
+      skills: request.skills,
       usage: request.usage,
       cursor: Keyword.get(opts, :cursor)
     }
+
+    # The lowest version that holds it, so code that reads only an older
+    # version can still resume a run that needs nothing newer.
+    checkpoint = %{checkpoint | version: Checkpoint.version_for(checkpoint)}
 
     suspension = %Suspension{reason: request.reason, checkpoint: checkpoint, token: token}
 

@@ -24,7 +24,7 @@ defmodule Clementine.LLM.Anthropic.Tools do
 
   def search_tool?(encoded), do: encoded == @tool_search
 
-  def encode(tool) when is_atom(tool) do
+  def encode(tool) do
     schema = Tool.to_schema(tool)
 
     %{
