@@ -14,7 +14,7 @@ defmodule Clementine.TraceTest do
   alias Clementine.{Result, Rollout, Run, Runner, Trace}
   alias Clementine.Lifecycle.{Facts, Protocol}
   alias Clementine.Test.{FlakyLifecycle, MemoryLifecycle}
-  alias Clementine.Test.Tools.{GatedDeploy, SafeEcho, SafePush, UnsafeSlow}
+  alias Clementine.Test.Tools.{Add, GatedDeploy, SafeEcho, SafePush, UnsafeSlow}
   alias Clementine.Trace.Entry
 
   setup :verify_on_exit!
@@ -661,6 +661,70 @@ defmodule Clementine.TraceTest do
       refute base == Trace.fingerprint(:claude_sonnet, "Trace you.", [SafeEcho])
       refute base == Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho, GatedDeploy])
       refute base == Trace.fingerprint({:openai, "gpt-5"}, "Trace me.", [SafeEcho])
+    end
+
+    test "moves when a tool is deferred, and not for an agent with none" do
+      both = [SafeEcho, GatedDeploy]
+      base = Trace.fingerprint(:claude_sonnet, "Trace me.", both)
+
+      assert base == Trace.fingerprint(:claude_sonnet, "Trace me.", both, deferred: [])
+      refute base == Trace.fingerprint(:claude_sonnet, "Trace me.", both, deferred: [GatedDeploy])
+    end
+  end
+
+  describe "a run with deferred tools" do
+    test "names them in its execution, and traces the search and the call it led to",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      search = [
+        {:content_block_start, 0, :server_tool_use},
+        {:server_tool_use_start, "srvtoolu_1", "tool_search_tool_regex"},
+        {:server_tool_input_delta, "srvtoolu_1", ~s({"pattern":"push"})},
+        {:content_block_stop, 0},
+        {:content_block_start, 1, :server_tool_result},
+        {:server_tool_result,
+         %{
+           "type" => "tool_search_tool_result",
+           "tool_use_id" => "srvtoolu_1",
+           "content" => %{"type" => "tool_search_tool_search_result", "tool_references" => []}
+         }},
+        {:content_block_stop, 1},
+        {:message_delta, %{"stop_reason" => "pause_turn"},
+         %{"input_tokens" => 4, "output_tokens" => 1}}
+      ]
+
+      expect_stream(search)
+      expect_stream(tool_events("tu_1", "add", %{"a" => 2, "b" => 3}))
+      expect_stream(text_events("Five."))
+
+      assert {:finished, %Facts{status: :completed}} =
+               execute(build_run(ref, tools: [SafeEcho], deferred: [Add]), store)
+
+      assert [execution, paused, called, tool_call, answered] = MemoryLifecycle.trace(store, ref)
+
+      assert %{"tools" => ["safe_echo", "add"], "deferred" => ["add"]} = execution.payload
+
+      assert execution.payload["agent_fingerprint"] ==
+               Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho, Add], deferred: [Add])
+
+      # Each call to the model is its own entry, the paused one included,
+      # and keeps the search it ran.
+      assert %{
+               "iteration" => 1,
+               "stop_reason" => "pause_turn",
+               "content" => [
+                 %{"type" => "server_tool_use", "id" => "srvtoolu_1"},
+                 %{"type" => "server_tool_result", "tool_use_id" => "srvtoolu_1"}
+               ]
+             } = paused.payload
+
+      assert %{"iteration" => 2, "stop_reason" => "tool_use"} = called.payload
+
+      assert %{"name" => "add", "tool_use_id" => "tu_1", "result" => "5", "is_error" => false} =
+               tool_call.payload
+
+      assert %{"iteration" => 3, "stop_reason" => "end_turn"} = answered.payload
     end
   end
 

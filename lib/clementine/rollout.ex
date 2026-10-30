@@ -1069,7 +1069,11 @@ defmodule Clementine.Rollout do
   defp record_execution(%Execution{recorder: nil}, _resumed?), do: :ok
 
   defp record_execution(%Execution{} = exec, resumed?) do
-    record(exec, :execution, Trace.execution(exec.model, exec.system, exec.tools, resumed?))
+    record(
+      exec,
+      :execution,
+      Trace.execution(exec.model, exec.system, exec.tools, resumed?, deferred: exec.deferred)
+    )
   end
 
   defp record(%Execution{recorder: nil}, _kind, _payload), do: :ok
