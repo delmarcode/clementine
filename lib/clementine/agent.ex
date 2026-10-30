@@ -43,6 +43,29 @@ defmodule Clementine.Agent do
   The fields given to `use` build the agent at compile time, so a typo in
   them fails the build. List the module in the child spec's `agents:`.
 
+  ## Deferred tools
+
+  An agent with more tools than a model can choose among well (tens, or
+  every tool of several MCP servers) lists the ones it rarely needs as
+  `deferred:` rather than `tools:`:
+
+      use Clementine.Agent,
+        key: "support",
+        model: :claude_sonnet,
+        instructions: "Help customers with their orders.",
+        tools: [MyApp.Tools.LookupOrder],
+        deferred: [MyApp.Tools.IssueRefund, MyApp.Tools.ChangeAddress]
+
+  The model starts out seeing only `tools:` and searches the deferred ones
+  by name and description, loading the few it needs (Anthropic's tool
+  search). A deferred tool is an ordinary `Clementine.Tool`: once found
+  it runs like any other, and `approval:`, `retry:`, and the tool context
+  apply unchanged. A provider without tool search gets deferred tools as
+  ordinary tools. A tool that leaves the list drops out of the earlier
+  searches a thread's history replays, so the thread keeps working; that
+  edits the replayed history, which restarts the prompt cache and may
+  void earlier thinking on models that verify it.
+
   ## Turns and tasks
 
   A run is a **turn** or a **task**. A turn is a run on a thread: its
@@ -103,6 +126,7 @@ defmodule Clementine.Agent do
             model: nil,
             instructions: nil,
             tools: [],
+            deferred: [],
             defaults: [],
             policy: %{},
             tool_context: %{},
@@ -113,6 +137,7 @@ defmodule Clementine.Agent do
           model: Clementine.LLM.ModelRegistry.model_ref(),
           instructions: String.t() | nil,
           tools: [module()],
+          deferred: [module()],
           defaults: keyword(),
           policy: map(),
           tool_context: map(),
@@ -259,6 +284,9 @@ defmodule Clementine.Agent do
   - `:id` - host-app identifier, kept for audit trails
   - `:instructions` - system prompt
   - `:tools` - tool modules
+  - `:deferred` - tool modules the model loads on demand through the
+    provider's tool search, rather than seeing up front (see "Deferred
+    tools" above); a tool is in `:tools` or `:deferred`, not both
   - `:defaults` - default rollout limits (`max_iterations:`, `max_duration:`)
   - `:policy` - host-app policy/config passthrough (opaque to Clementine)
   - `:tool_context` - keys every tool of the execution sees (`working_dir:`,
@@ -272,6 +300,14 @@ defmodule Clementine.Agent do
   def new(opts) when is_list(opts) do
     agent = struct!(__MODULE__, opts)
     Clementine.Trace.validate_fidelity!(agent.trace)
-    agent
+
+    case Enum.filter(agent.deferred, &(&1 in agent.tools)) do
+      [] ->
+        agent
+
+      both ->
+        raise ArgumentError,
+              "a tool is in tools: or deferred:, not both; found in both: #{inspect(both)}"
+    end
   end
 end

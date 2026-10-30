@@ -31,6 +31,10 @@ defmodule Clementine.LLM do
   - `opts` - Additional options:
     - `:max_tokens` - Override max tokens for this request
     - `:reasoning` - Override configured provider reasoning for this request
+    - `:deferred` - The tool modules in `tools` the model need not see up
+      front. A provider with tool search (Anthropic) sends them with
+      `defer_loading: true`, beside its search tool, and the model loads
+      the ones it needs; any other provider sends them as ordinary tools.
 
   ## Returns
 
@@ -138,6 +142,14 @@ defmodule Clementine.LLM do
   end
 
   @doc """
+  Checks if the provider paused a turn it was running tools of its own
+  in (Anthropic's `pause_turn`): the turn is unfinished, and sending it
+  back as it stands lets the provider resume it.
+  """
+  @spec paused?(Clementine.LLM.Response.t()) :: boolean()
+  def paused?(response), do: response.stop_reason == "pause_turn"
+
+  @doc """
   Extracts tool use requests from a response.
   """
   @spec get_tool_uses(Clementine.LLM.Response.t()) :: [Content.ToolUse.t()]
@@ -147,15 +159,12 @@ defmodule Clementine.LLM do
   end
 
   @doc """
-  Extracts text content from a response.
+  Extracts text content from a response. Text that another block separates
+  (a tool search, a thinking block) is set apart by a blank line; see
+  `Clementine.LLM.Message.Content.join_text/1`.
   """
   @spec get_text(Clementine.LLM.Response.t()) :: String.t()
-  def get_text(response) do
-    response.content
-    |> Enum.filter(&match?(%Content.Text{}, &1))
-    |> Enum.map(& &1.text)
-    |> Enum.join("")
-  end
+  def get_text(response), do: Content.join_text(response.content)
 
   # Get the configured LLM client (allows for mocking in tests)
   defp get_client do

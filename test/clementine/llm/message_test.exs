@@ -37,6 +37,34 @@ defmodule Clementine.LLM.MessageTest do
     end
   end
 
+  describe "Content.join_text/1 and the get_text functions" do
+    test "text a search separates is set apart by a blank line; adjacent text runs together" do
+      content = [
+        Content.thinking("hmm", "sig"),
+        Content.text("I'll search "),
+        Content.text("for a tool."),
+        Content.server_tool_use("srvtoolu_1", "tool_search_tool_regex", %{"pattern" => "x"}),
+        Content.server_tool_result("srvtoolu_1", "tool_search_tool_result", %{}),
+        Content.text(""),
+        Content.text("Found nothing; answering from memory."),
+        Content.tool_use("toolu_1", "echo", %{})
+      ]
+
+      expected = "I'll search for a tool.\n\nFound nothing; answering from memory."
+
+      assert Content.join_text(content) == expected
+      assert AssistantMessage.get_text(AssistantMessage.new(content)) == expected
+
+      assert Clementine.LLM.get_text(%Clementine.LLM.Response{content: content}) == expected
+    end
+
+    test "a turn with no text, or one run of it, joins as before" do
+      assert Content.join_text([]) == ""
+      assert Content.join_text([Content.tool_use("toolu_1", "echo", %{})]) == ""
+      assert Content.join_text([Content.text("a"), Content.text("b")]) == "ab"
+    end
+  end
+
   describe "ToolResultMessage.new/1" do
     test "handles {:ok, content} 2-tuple" do
       msg = ToolResultMessage.new([{"id1", {:ok, "result"}}])

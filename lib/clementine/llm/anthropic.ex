@@ -27,6 +27,23 @@ defmodule Clementine.LLM.Anthropic do
   `:reasoning` translates to the Messages API `thinking` and
   `output_config` request fields (see `Clementine.LLM.Reasoning`); a
   `:reasoning` entry in request opts overrides the configured value.
+
+  ## Deferred tools
+
+  Tools named in the `:deferred` request option (a subset of `tools`)
+  go with `defer_loading: true`, beside the API's tool search tool
+  (`tool_search_tool_regex_20251119`): Claude sees only the tools that
+  are not deferred until a search loads the ones it needs. Models older
+  than Claude Opus 4.5, Sonnet 4.5, and Haiku 4.5 have no tool search, so
+  their deferred tools go as ordinary tools. The search's
+  `server_tool_use` and `tool_search_tool_result` blocks come back as
+  `Clementine.LLM.Message.Content.ServerToolUse` and `ServerToolResult`
+  and are replayed with the turn as far as the request can honour them:
+  a reference to a tool the request no longer carries is left out, and a
+  request without the search tool leaves past searches out. The search runs
+  inside the response, so its stream emits `{:server_tool_use_start, id,
+  name}`, `{:server_tool_input_delta, id, json}`, and
+  `{:server_tool_result, block}` rather than the client tool events.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -251,10 +268,13 @@ defmodule Clementine.LLM.Anthropic do
         Keyword.get(resolved.defaults, :max_tokens, @default_max_tokens)
       )
 
+    encoded_tools =
+      if tools != nil and tools != [], do: Tools.encode_all(tools, deferred(model_id, opts))
+
     body = %{
       "model" => model_id,
       "max_tokens" => max_tokens,
-      "messages" => format_messages(messages)
+      "messages" => Messages.encode_all(messages, tool_search: loadable(encoded_tools))
     }
 
     body = maybe_put_reasoning(body, Keyword.get(opts, :reasoning, resolved.reasoning))
@@ -266,14 +286,24 @@ defmodule Clementine.LLM.Anthropic do
         body
       end
 
-    body =
-      if tools != nil and tools != [] do
-        Map.put(body, "tools", format_tools(tools))
-      else
-        body
-      end
+    if encoded_tools, do: Map.put(body, "tools", encoded_tools), else: body
+  end
 
-    body
+  # What this request's tool search can load, read off its own tools: their
+  # names when it carries the search tool, nil when it does not. History's
+  # past searches replay only that far (`Messages.encode_all/2`).
+  defp loadable(nil), do: nil
+
+  defp loadable(encoded_tools) do
+    if Enum.any?(encoded_tools, &Tools.search_tool?/1) do
+      MapSet.new(encoded_tools, & &1["name"])
+    end
+  end
+
+  # A model without tool search gets its deferred tools as ordinary tools,
+  # as every other provider does, rather than a request the API refuses.
+  defp deferred(model_id, opts) do
+    if Tools.searchable?(model_id), do: Keyword.get(opts, :deferred, []), else: []
   end
 
   defp maybe_put_reasoning(body, nil), do: body
@@ -316,14 +346,6 @@ defmodule Clementine.LLM.Anthropic do
     resolved
   end
 
-  defp format_messages(messages) do
-    Messages.encode_all(messages)
-  end
-
-  defp format_tools(tools) do
-    Tools.encode_all(tools)
-  end
-
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do
     %Response{
       content: Enum.flat_map(content, &parse_content_block/1),
@@ -348,6 +370,16 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp parse_content_block(%{"type" => "redacted_thinking"} = block) do
+    [Messages.decode_content(block)]
+  end
+
+  # A tool search the API ran for deferred tools: kept, in place, so the
+  # turn replays as produced and the tools it loaded stay loaded.
+  defp parse_content_block(%{"type" => "server_tool_use"} = block) do
+    [Messages.decode_content(block)]
+  end
+
+  defp parse_content_block(%{"type" => "tool_search_tool_result"} = block) do
     [Messages.decode_content(block)]
   end
 

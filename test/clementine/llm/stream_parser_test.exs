@@ -410,7 +410,112 @@ defmodule Clementine.LLM.StreamParserTest do
     end
   end
 
+  describe "parse/2 tool search" do
+    test "a tool search turn parses into server tool events apart from the client tool's" do
+      {events, _state} =
+        StreamParser.parse(StreamParser.new(), Clementine.Test.Fixtures.sse_tool_search_stream())
+
+      search_events =
+        Enum.filter(events, fn event ->
+          elem(event, 0) in [
+            :server_tool_use_start,
+            :server_tool_input_delta,
+            :server_tool_result,
+            :tool_use_start,
+            :input_json_delta
+          ]
+        end)
+
+      assert [
+               {:server_tool_use_start, "srvtoolu_01ABC123", "tool_search_tool_regex"},
+               {:server_tool_input_delta, "srvtoolu_01ABC123", "{\"pattern\":"},
+               {:server_tool_input_delta, "srvtoolu_01ABC123", "\"weather\"}"},
+               {:server_tool_result,
+                %{
+                  "type" => "tool_search_tool_result",
+                  "tool_use_id" => "srvtoolu_01ABC123",
+                  "content" => %{
+                    "type" => "tool_search_tool_search_result",
+                    "tool_references" => [
+                      %{"type" => "tool_reference", "tool_name" => "get_weather"}
+                    ]
+                  }
+                }},
+               {:tool_use_start, "toolu_01XYZ789", "get_weather"},
+               {:input_json_delta, "toolu_01XYZ789", ~s({"location":"San Francisco"})}
+             ] = search_events
+    end
+
+    test "the turn accumulates in the order it streamed, the search apart from the tool call" do
+      {events, _state} =
+        StreamParser.parse(StreamParser.new(), Clementine.Test.Fixtures.sse_tool_search_stream())
+
+      response = events |> Enum.reduce(Accumulator.new(), &Accumulator.process(&2, &1))
+
+      assert %Response{
+               stop_reason: "tool_use",
+               content: [
+                 %Content.Text{text: "I'll search for a tool."},
+                 %Content.ServerToolUse{
+                   id: "srvtoolu_01ABC123",
+                   name: "tool_search_tool_regex",
+                   input: %{"pattern" => "weather"}
+                 },
+                 %Content.ServerToolResult{
+                   tool_use_id: "srvtoolu_01ABC123",
+                   block_type: "tool_search_tool_result",
+                   content: %{"type" => "tool_search_tool_search_result"}
+                 },
+                 %Content.Text{text: "Found one."},
+                 %Content.ToolUse{
+                   id: "toolu_01XYZ789",
+                   name: "get_weather",
+                   input: %{"location" => "San Francisco"}
+                 }
+               ]
+             } = Accumulator.to_response(response)
+    end
+
+    test "a failed search's error result is kept as sent" do
+      events =
+        parse_one("""
+        event: content_block_start
+        data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"tool_search_tool_result_error","error_code":"invalid_tool_input","error_message":"Invalid regular expression pattern"}}}
+        """)
+
+      assert [
+               {:content_block_start, 1, :server_tool_result},
+               {:server_tool_result, %{"content" => %{"error_code" => "invalid_tool_input"}}}
+             ] = events
+    end
+  end
+
   describe "Accumulator" do
+    test "usage keeps the start's input count under the end's counts (C13)" do
+      started =
+        Accumulator.process(
+          Accumulator.new(),
+          {:message_start, %{"usage" => %{"input_tokens" => 42, "output_tokens" => 1}}}
+        )
+
+      # Cut off before the end: the start's counts are what burned.
+      assert Accumulator.to_response(started).usage == %{
+               "input_tokens" => 42,
+               "output_tokens" => 1
+             }
+
+      finished =
+        Accumulator.process(
+          started,
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{"output_tokens" => 30}}
+        )
+
+      assert Accumulator.to_response(finished).usage == %{
+               "input_tokens" => 42,
+               "output_tokens" => 30
+             }
+    end
+
     test "accumulates text deltas" do
       acc =
         Accumulator.new()
@@ -429,8 +534,7 @@ defmodule Clementine.LLM.StreamParserTest do
         |> Accumulator.process({:input_json_delta, "toolu_123", "\"test.txt\"}"})
         |> Accumulator.process({:content_block_stop, 0})
 
-      assert length(acc.tool_uses) == 1
-      [tool] = acc.tool_uses
+      assert [%Content.ToolUse{} = tool] = Accumulator.to_response(acc).content
       assert tool.id == "toolu_123"
       assert tool.name == "read_file"
       assert tool.input == %{"path" => "test.txt"}
@@ -451,9 +555,9 @@ defmodule Clementine.LLM.StreamParserTest do
       refute Accumulator.error?(acc)
 
       assert [
-               %{id: "toolu_a", name: "echo", input: %{"message" => "hi"}},
-               %{id: "toolu_b", name: "add", input: %{"a" => 1, "b" => 2}}
-             ] = acc.tool_uses
+               %Content.ToolUse{id: "toolu_a", name: "echo", input: %{"message" => "hi"}},
+               %Content.ToolUse{id: "toolu_b", name: "add", input: %{"a" => 1, "b" => 2}}
+             ] = Accumulator.to_response(acc).content
     end
 
     test "drops input deltas for unknown tool ids" do
@@ -464,7 +568,7 @@ defmodule Clementine.LLM.StreamParserTest do
         |> Accumulator.process({:input_json_delta, "toolu_a", "{}"})
         |> Accumulator.process({:content_block_stop, 0})
 
-      assert [%{id: "toolu_a", input: %{}}] = acc.tool_uses
+      assert [%Content.ToolUse{id: "toolu_a", input: %{}}] = Accumulator.to_response(acc).content
     end
 
     test "accumulates thinking blocks with their signatures" do
@@ -512,6 +616,66 @@ defmodule Clementine.LLM.StreamParserTest do
              } = response
     end
 
+    test "keeps content in streamed order: text on either side of a block stays on its side" do
+      response =
+        Accumulator.new()
+        |> Accumulator.process({:content_block_start, 0, :thinking})
+        |> Accumulator.process({:thinking_delta, "first"})
+        |> Accumulator.process({:content_block_stop, 0})
+        |> Accumulator.process({:content_block_start, 1, :text})
+        |> Accumulator.process({:text_delta, "Before."})
+        |> Accumulator.process({:content_block_stop, 1})
+        |> Accumulator.process({:content_block_start, 2, :thinking})
+        |> Accumulator.process({:thinking_delta, "second"})
+        |> Accumulator.process({:content_block_stop, 2})
+        |> Accumulator.process({:content_block_start, 3, :text})
+        |> Accumulator.process({:text_delta, "After."})
+        |> Accumulator.process({:content_block_stop, 3})
+        |> Accumulator.to_response()
+
+      assert [
+               %Content.Thinking{thinking: "first"},
+               %Content.Text{text: "Before."},
+               %Content.Thinking{thinking: "second"},
+               %Content.Text{text: "After."}
+             ] = response.content
+    end
+
+    test "text with no block events of its own still merges into one block" do
+      response =
+        Accumulator.new()
+        |> Accumulator.process({:text_delta, "Let me "})
+        |> Accumulator.process({:text_delta, "check."})
+        |> Accumulator.process({:tool_use_start, "call_1", "echo"})
+        |> Accumulator.process({:input_json_delta, "call_1", "{}"})
+        |> Accumulator.process({:content_block_stop, 0})
+        |> Accumulator.to_response()
+
+      assert [%Content.Text{text: "Let me check."}, %Content.ToolUse{id: "call_1"}] =
+               response.content
+    end
+
+    test "a server tool call never becomes a tool use, and malformed input is still an error" do
+      acc =
+        Accumulator.new()
+        |> Accumulator.process({:server_tool_use_start, "srvtoolu_1", "tool_search_tool_regex"})
+        |> Accumulator.process({:server_tool_input_delta, "srvtoolu_1", "{\"pattern\":"})
+        |> Accumulator.process({:content_block_stop, 0})
+
+      assert Accumulator.error?(acc)
+      assert %{"tool_use_id" => "srvtoolu_1", "tool_name" => "tool_search_tool_regex"} = acc.error
+
+      response =
+        Accumulator.new()
+        |> Accumulator.process({:server_tool_use_start, "srvtoolu_1", "tool_search_tool_regex"})
+        |> Accumulator.process({:server_tool_input_delta, "srvtoolu_1", ~s({"pattern":"x"})})
+        |> Accumulator.process({:content_block_stop, 0})
+        |> Accumulator.to_response()
+
+      assert [%Content.ServerToolUse{input: %{"pattern" => "x"}}] = response.content
+      refute Clementine.LLM.tool_use?(response)
+    end
+
     test "captures malformed tool input JSON instead of producing empty args" do
       acc =
         Accumulator.new()
@@ -520,7 +684,7 @@ defmodule Clementine.LLM.StreamParserTest do
         |> Accumulator.process({:content_block_stop, 0})
 
       assert Accumulator.error?(acc)
-      assert acc.tool_uses == []
+      assert acc.blocks == []
 
       assert %{
                "type" => "stream_parse_error",
@@ -541,7 +705,7 @@ defmodule Clementine.LLM.StreamParserTest do
         |> Accumulator.process({:content_block_stop, 0})
 
       assert Accumulator.error?(acc)
-      assert acc.tool_uses == []
+      assert acc.blocks == []
       assert acc.error["reason"] == "expected a JSON object, got: []"
     end
 

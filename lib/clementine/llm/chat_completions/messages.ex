@@ -57,12 +57,20 @@ defmodule Clementine.LLM.ChatCompletions.Messages do
 
           {[tool_result_message(block) | messages], text_buffer, tool_calls}
 
-        # Anthropic reasoning artifacts have no chat-completions encoding;
-        # a history carried across providers drops them rather than crashing.
+        # Anthropic reasoning artifacts and the tool searches the API ran
+        # itself have no chat-completions encoding; a history carried across
+        # providers drops them rather than crashing. The calls a search
+        # led to stay: this provider got every deferred tool up front.
         %Content.Thinking{}, acc ->
           acc
 
         %Content.RedactedThinking{}, acc ->
+          acc
+
+        %Content.ServerToolUse{}, acc ->
+          acc
+
+        %Content.ServerToolResult{}, acc ->
           acc
       end)
 

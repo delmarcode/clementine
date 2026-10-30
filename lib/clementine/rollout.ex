@@ -103,10 +103,16 @@ defmodule Clementine.Rollout do
   defp to_config(%__MODULE__{} = rollout) do
     %Clementine.Agent{} = agent = rollout.agent
 
+    # A tool in both lists goes once, up front: Agent.new/1 refuses the
+    # overlap, but an agent/1 may build or update the struct directly, and
+    # a tool sent twice is a request the provider refuses.
+    deferred = agent.deferred |> Enum.reject(&(&1 in agent.tools)) |> Enum.uniq()
+
     [
       model: agent.model,
       system: agent.instructions,
-      tools: agent.tools,
+      tools: agent.tools ++ deferred,
+      deferred: deferred,
       context: rollout.context,
       messages: rollout.messages,
       max_iterations: Keyword.get(limits(rollout), :max_iterations, @default_max_iterations),
@@ -125,6 +131,7 @@ defmodule Clementine.Rollout do
       :model,
       :system,
       :tools,
+      :deferred,
       :context,
       :max_iterations,
       :emit,
@@ -139,7 +146,8 @@ defmodule Clementine.Rollout do
       iteration: 0,
       usage: %Clementine.Usage{},
       fence_raised?: false,
-      fidelity: :content
+      fidelity: :content,
+      paused?: false
     ]
   end
 
@@ -228,6 +236,7 @@ defmodule Clementine.Rollout do
       model: Keyword.fetch!(config, :model),
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
+      deferred: Keyword.get(config, :deferred, []),
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       emit: Keyword.get(opts, :emit),
@@ -586,15 +595,15 @@ defmodule Clementine.Rollout do
     started = System.monotonic_time()
     stream = LLM.stream(exec.model, exec.system, exec.messages, exec.tools, stream_opts(exec))
 
-    {acc, signal, start_usage} =
+    {acc, signal} =
       try do
-        Enum.reduce_while(stream, {Accumulator.new(), nil, %{}}, fn
-          {:signal, message}, {acc, _signal, start_usage} ->
-            {:halt, {acc, message, start_usage}}
+        Enum.reduce_while(stream, {Accumulator.new(), nil}, fn
+          {:signal, message}, {acc, _signal} ->
+            {:halt, {acc, message}}
 
-          event, {acc, nil, start_usage} ->
+          event, {acc, nil} ->
             forward_stream_event(exec, event)
-            {:cont, {Accumulator.process(acc, event), nil, start_usage(start_usage, event)}}
+            {:cont, {Accumulator.process(acc, event), nil}}
         end)
       rescue
         e ->
@@ -607,16 +616,14 @@ defmodule Clementine.Rollout do
       end
 
     duration = System.monotonic_time() - started
-    # The provider's usage so far: the final counts where the stream got
-    # that far, over what its start reported (the input count).
-    usage = Map.merge(start_usage, acc.usage)
 
     cond do
       signal != nil ->
         # Aborted by a runner signal: no provider stop_reason exists, and
-        # the partial usage is what actually burned.
-        emit_llm_stop(metadata, duration, Clementine.Usage.new(usage), nil)
-        {:signal, signal, %{Accumulator.to_response(acc) | usage: usage}, duration}
+        # the partial usage is what actually burned: the accumulator keeps
+        # the input count the stream's start reported.
+        emit_llm_stop(metadata, duration, Clementine.Usage.new(acc.usage), nil)
+        {:signal, signal, Accumulator.to_response(acc), duration}
 
       Accumulator.error?(acc) ->
         :telemetry.execute(
@@ -625,10 +632,10 @@ defmodule Clementine.Rollout do
           Map.merge(metadata, %{kind: :error, reason: acc.error})
         )
 
-        {:error, acc.error, usage, duration}
+        {:error, acc.error, acc.usage, duration}
 
       true ->
-        response = %{Accumulator.to_response(acc) | usage: usage}
+        response = Accumulator.to_response(acc)
 
         emit_llm_stop(
           metadata,
@@ -640,13 +647,6 @@ defmodule Clementine.Rollout do
         {:ok, response, duration}
     end
   end
-
-  # A stream's start event carries the input count; the counts at its end
-  # supersede it, so it is kept apart and merged under them.
-  defp start_usage(_start_usage, {:message_start, %{"usage" => usage}}) when is_map(usage),
-    do: usage
-
-  defp start_usage(start_usage, _event), do: start_usage
 
   defp emit_llm_stop(metadata, duration, %Clementine.Usage{} = usage, stop_reason) do
     :telemetry.execute(
@@ -692,23 +692,42 @@ defmodule Clementine.Rollout do
     %{exec | usage: Clementine.Usage.add(exec.usage, delta)}
   end
 
+  # A turn the provider paused mid-way through its own tools (a long tool
+  # search) goes back as it stands, and the provider resumes it: one more
+  # gather, bounded by the iteration cap like any other. The continuation
+  # joins the paused turn's message, so history holds the turn as one
+  # assistant message and the output is the whole turn's text.
   defp act(%Execution{} = exec, response) do
-    exec = %{exec | messages: exec.messages ++ [AssistantMessage.new(response.content)]}
+    exec = %{exec | messages: append_turn(exec, response.content), paused?: false}
 
-    if LLM.tool_use?(response) do
-      act_on_tools(exec, LLM.get_tool_uses(response))
-    else
-      conclude(
-        exec,
-        {:ok,
-         Clementine.Result.completed(
-           input_message: exec.input_message,
-           messages: Enum.drop(exec.messages, exec.prefix_len),
-           output: LLM.get_text(response),
-           usage: exec.usage
-         )}
-      )
+    cond do
+      LLM.tool_use?(response) ->
+        act_on_tools(exec, LLM.get_tool_uses(response))
+
+      LLM.paused?(response) ->
+        boundary(%{exec | paused?: true})
+
+      true ->
+        conclude(
+          exec,
+          {:ok,
+           Clementine.Result.completed(
+             input_message: exec.input_message,
+             messages: Enum.drop(exec.messages, exec.prefix_len),
+             output: exec.messages |> List.last() |> AssistantMessage.get_text(),
+             usage: exec.usage
+           )}
+        )
     end
+  end
+
+  defp append_turn(%Execution{paused?: true, messages: messages}, content) do
+    %AssistantMessage{} = paused = List.last(messages)
+    List.replace_at(messages, -1, %{paused | content: paused.content ++ content})
+  end
+
+  defp append_turn(%Execution{messages: messages}, content) do
+    messages ++ [AssistantMessage.new(content)]
   end
 
   # A signal that arrived during the gather is already in the mailbox:
@@ -951,11 +970,15 @@ defmodule Clementine.Rollout do
     end)
   end
 
-  defp stream_opts(%Execution{deadline: nil}), do: []
+  defp stream_opts(%Execution{deadline: nil, deferred: deferred}), do: deferred_opts(deferred)
 
-  defp stream_opts(%Execution{deadline: deadline}) do
-    [receive_timeout: min(@provider_receive_timeout, remaining_ms(deadline))]
+  defp stream_opts(%Execution{deadline: deadline, deferred: deferred}) do
+    [receive_timeout: min(@provider_receive_timeout, remaining_ms(deadline))] ++
+      deferred_opts(deferred)
   end
+
+  defp deferred_opts([]), do: []
+  defp deferred_opts(deferred), do: [deferred: deferred]
 
   defp batch_opts(%Execution{deadline: nil}), do: []
 
@@ -1046,7 +1069,11 @@ defmodule Clementine.Rollout do
   defp record_execution(%Execution{recorder: nil}, _resumed?), do: :ok
 
   defp record_execution(%Execution{} = exec, resumed?) do
-    record(exec, :execution, Trace.execution(exec.model, exec.system, exec.tools, resumed?))
+    record(
+      exec,
+      :execution,
+      Trace.execution(exec.model, exec.system, exec.tools, resumed?, deferred: exec.deferred)
+    )
   end
 
   defp record(%Execution{recorder: nil}, _kind, _payload), do: :ok

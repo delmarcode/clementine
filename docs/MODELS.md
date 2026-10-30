@@ -104,6 +104,11 @@ claude_opus: [
 
 - `id` is the Anthropic model id (`claude-sonnet-5`, `claude-opus-4-8`, ...).
 - Endpoint override: `config :clementine, anthropic_base_url: ...`.
+- An agent's `deferred:` tools go out with `defer_loading: true` beside
+  the Messages API's tool search tool (`tool_search_tool_regex_20251119`).
+  Models older than Claude Opus 4.5, Sonnet 4.5, and Haiku 4.5 have no
+  tool search and get them as ordinary tools, as every other provider
+  does.
 
 ### `:openai` — first-party OpenAI (Responses API)
 

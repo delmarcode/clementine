@@ -453,6 +453,28 @@ defmodule Clementine.LLM.ChatCompletionsTest do
     assert encoded == [%{"role" => "assistant", "content" => "Answer."}]
   end
 
+  test "message encoding skips a tool search the Anthropic API ran, keeping the call it led to" do
+    encoded =
+      Clementine.LLM.ChatCompletions.Messages.encode_all([
+        %AssistantMessage{
+          content: [
+            Content.text("Searching."),
+            Content.server_tool_use("srvtoolu_1", "tool_search_tool_regex", %{"pattern" => "x"}),
+            Content.server_tool_result("srvtoolu_1", "tool_search_tool_result", %{}),
+            Content.tool_use("call_1", "echo", %{"message" => "hi"})
+          ]
+        }
+      ])
+
+    assert [
+             %{
+               "role" => "assistant",
+               "content" => "Searching.",
+               "tool_calls" => [%{"id" => "call_1"}]
+             }
+           ] = encoded
+  end
+
   test "call/5 rejects models configured for non chat-completions providers" do
     Application.put_env(:clementine, :models,
       claude_test: [provider: :anthropic, id: "claude-sonnet-5"]

@@ -19,9 +19,51 @@ defmodule Clementine.LLM.Anthropic.Messages do
     %{"role" => "user", "content" => Enum.map(content, &encode_content/1)}
   end
 
-  def encode_all(messages) when is_list(messages) do
-    Enum.map(messages, &encode/1)
+  # `tool_search:` says what this request's tool search can load: the
+  # names of its tools, or nil when it carries no search tool. History
+  # replays a past search only as far as the request can honour it — the
+  # API refuses a reference to a tool the request lacks, and a search
+  # block without the search tool — so a thread whose tool left the
+  # request (a deploy, an actor agent/1 offers less, a model without tool
+  # search) keeps working. That edits the replayed turn, which may cost
+  # its thinking blocks on models that check them. Without the option,
+  # history replays as stored.
+  def encode_all(messages, opts \\ []) when is_list(messages) do
+    case Keyword.fetch(opts, :tool_search) do
+      :error ->
+        Enum.map(messages, &encode/1)
+
+      {:ok, loadable} ->
+        Enum.flat_map(messages, fn
+          %AssistantMessage{content: content} = message ->
+            case Enum.flat_map(content, &replayable(&1, loadable)) do
+              [] -> []
+              content -> [encode(%{message | content: content})]
+            end
+
+          message ->
+            [encode(message)]
+        end)
+    end
   end
+
+  defp replayable(%Content.ServerToolUse{name: "tool_search_tool_" <> _}, nil), do: []
+
+  defp replayable(%Content.ServerToolResult{block_type: "tool_search_tool_result"}, nil), do: []
+
+  defp replayable(
+         %Content.ServerToolResult{
+           block_type: "tool_search_tool_result",
+           content: %{"tool_references" => references} = content
+         } = result,
+         %MapSet{} = loadable
+       )
+       when is_list(references) do
+    references = Enum.filter(references, &MapSet.member?(loadable, &1["tool_name"]))
+    [%{result | content: %{content | "tool_references" => references}}]
+  end
+
+  defp replayable(block, _loadable), do: [block]
 
   def decode_assistant(%{"role" => "assistant", "content" => content}) when is_list(content) do
     AssistantMessage.new(Enum.map(content, &decode_content/1))
@@ -53,6 +95,18 @@ defmodule Clementine.LLM.Anthropic.Messages do
     Content.redacted_thinking(data)
   end
 
+  def decode_content(%{"type" => "server_tool_use", "id" => id, "name" => name} = data) do
+    Content.server_tool_use(id, name, Map.get(data, "input", %{}))
+  end
+
+  def decode_content(%{
+        "type" => "tool_search_tool_result" = type,
+        "tool_use_id" => id,
+        "content" => content
+      }) do
+    Content.server_tool_result(id, type, content)
+  end
+
   defp encode_content(%Content.Text{text: text}) do
     %{"type" => "text", "text" => text}
   end
@@ -73,5 +127,19 @@ defmodule Clementine.LLM.Anthropic.Messages do
 
   defp encode_content(%Content.RedactedThinking{data: data}) do
     %{"type" => "redacted_thinking", "data" => data}
+  end
+
+  # Replayed as the provider sent them: the API reads a tool search's
+  # references from history to keep the tools it loaded in context.
+  defp encode_content(%Content.ServerToolUse{id: id, name: name, input: input}) do
+    %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
+  end
+
+  defp encode_content(%Content.ServerToolResult{} = result) do
+    %{
+      "type" => result.block_type,
+      "tool_use_id" => result.tool_use_id,
+      "content" => result.content
+    }
   end
 end
