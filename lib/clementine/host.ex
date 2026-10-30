@@ -62,6 +62,8 @@ defmodule Clementine.Host do
           end
         end
 
+        def authorize_tool(_run, _request, _term), do: {:deny, "No policy covers this tool."}
+
         @impl true
         def run_event(run, %Event{type: :text_delta, payload: %{content: text}}) do
           broadcast(run, {:run_text, run.id, text})
@@ -167,19 +169,38 @@ defmodule Clementine.Host do
       result whose text is `reason`, a string the model reads and can
       answer.
 
-  It fails closed. A raise, an exit, a throw, or any other answer denies
-  the call, logs why, and gives the model only "Denied: the tool's policy
-  check failed.". The trace's `:tool_call` entry records the verdict
-  beside the approval (`Clementine.Trace`).
+  An approval does not outrank the policy. When an approval resumes a
+  run, the approved call is asked about once more: `{:deny, reason}` (or
+  a failure) wins, and the call settles as that deny, never running;
+  `:allow` or `:require_approval` runs it, the approval already given. A
+  call an approver denied is not asked again.
 
-  It runs in the run's process at every call, so keep it fast and free of
-  writes. It covers every tool the run offers: the agent's own, deferred
-  ones, and those a loaded skill brought. A run a `delegate` call started
-  is asked about with its own run, which carries the parent's subject and
+  It fails closed. A raise, an exit, a throw, no answer in time, or any
+  other answer denies the call and gives the model only "Denied: the
+  tool's policy check failed.". The log says why without the run's
+  data: the exception's type and where it was raised (each frame's
+  arguments replaced by their count), or the shape of the answer, never
+  its values. End with a catch-all clause, so a tool without a rule of
+  its own is denied by your answer rather than by a `FunctionClauseError`.
+
+  It runs in a task of its own, bounded like a tool call (the tool
+  timeout or the run's remaining time, whichever is less), and a cancel
+  or a drain stops it at once. The task inherits the run's `$callers`,
+  so an Ecto sandbox allowance follows it. Keep it fast and free of
+  writes: it runs once for each call it decides, one call at a time,
+  before any of the batch's tools run. A call still waiting when its
+  batch parks for another call's decision is asked about again on each
+  resume until it settles, so a batch of N calls that each need approval
+  asks N(N+3)/2 times in all.
+
+  It covers every tool the run offers: the agent's own, deferred ones,
+  and those a loaded skill brought. A run a `delegate` call started is
+  asked about with its own run, which carries the parent's subject and
   actor. Engine tools (`use_skill`, `delegate`) carry no approval: which
-  skills and delegates a run is offered is `agent/1`'s decision. A call
-  that was still waiting when its batch parked is asked about again when
-  the run resumes; a call a decision settled is not.
+  skills and delegates a run is offered is `agent/1`'s decision. Each
+  answer is on the run's trace as it is given (a `:policy` entry), and
+  the `:tool_call` entry records the verdict the call settled under,
+  beside the approval (`Clementine.Trace`).
 
   Without this callback a `{:policy, term}` tool gates every call like
   `:required`.

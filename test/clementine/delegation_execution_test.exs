@@ -53,11 +53,12 @@ defmodule Clementine.DelegationExecutionTest do
     @moduledoc false
     use Clementine.Skill, name: "notes", description: "Take notes.", tools: []
 
-    # The body runs in the run's own process, between the engine calls of
-    # its batch: where a signal can land after the batch was acted on.
+    # The body runs between the engine calls of its batch, in a task: it
+    # delivers a signal to the run's process (`run`) after the batch was
+    # acted on.
     @impl true
-    def body(%{signal: signal}) do
-      send(self(), signal)
+    def body(%{signal: signal, run: run}) do
+      send(run, signal)
       "Keep notes short."
     end
   end
@@ -408,7 +409,8 @@ defmodule Clementine.DelegationExecutionTest do
         ])
       )
 
-      run = build_run(ref, [skills: [Notes]], context: %{signal: {:clementine, :drain}})
+      run =
+        build_run(ref, [skills: [Notes]], context: %{signal: {:clementine, :drain}, run: self()})
 
       assert {:finished, %Facts{status: :queued, suspension: nil}} = execute(run, store)
     end

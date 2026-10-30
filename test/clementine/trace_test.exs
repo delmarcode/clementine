@@ -647,8 +647,17 @@ defmodule Clementine.TraceTest do
 
   describe "entry kinds" do
     test "a stored kind reads back as its atom, and one a later version wrote stays text" do
-      assert Entry.kinds() == [:execution, :model_call, :tool_call, :skill_load, :delegate]
+      assert Entry.kinds() == [
+               :execution,
+               :model_call,
+               :tool_call,
+               :policy,
+               :skill_load,
+               :delegate
+             ]
+
       assert Entry.decode_kind("tool_call") == :tool_call
+      assert Entry.decode_kind("policy") == :policy
       assert Entry.decode_kind("skill_load") == :skill_load
       assert Entry.decode_kind("delegate") == :delegate
       assert Entry.decode_kind("handoff") == "handoff"

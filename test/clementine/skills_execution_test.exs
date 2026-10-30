@@ -165,14 +165,17 @@ defmodule Clementine.SkillsExecutionTest do
 
   defp kinds(entries), do: Enum.map(entries, &{&1.epoch, &1.seq, &1.kind})
 
-  # A skill whose body, which runs in the run's own process, delivers
-  # `signal` to it, as the runner would while the body runs.
+  # A skill whose body delivers `signal` to the run's process (this test
+  # process, which drives the runner), as the runner would while the
+  # body runs in its task.
   defp signaller(signal) do
+    run = self()
+
     Skill.new(
       name: "signaller",
       description: "Loads while a signal arrives.",
       body: fn _context ->
-        send(self(), signal)
+        send(run, signal)
         "Loaded."
       end
     )
@@ -334,6 +337,38 @@ defmodule Clementine.SkillsExecutionTest do
       assert [{"tu_1", error, true}] = tool_results(messages)
       assert error =~ ~s(The skill "flaky" could not be loaded: exit)
       refute Enum.any?(MemoryLifecycle.trace(store, ref), &(&1.kind == :skill_load))
+    end
+
+    test "whose body does not finish within the run's remaining time loads nothing, and the " <>
+           "run ends at its deadline instead of waiting on it",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_gather(tool_events([{"tu_1", "use_skill", %{"name" => "stuck"}}]))
+
+      stuck =
+        Skill.new(
+          name: "stuck",
+          description: "Reads its body from a server that never answers.",
+          body: fn _ -> Process.sleep(:infinity) end
+        )
+
+      run = build_run(ref, [skills: [stuck]], limits: [max_duration: 300])
+      assert {:finished, %Facts{status: :failed}} = execute(run, store)
+
+      assert [{_ref, %Result.Failed{error: %{code: :deadline_exceeded}}}] =
+               MemoryLifecycle.projections(store)
+
+      trace = MemoryLifecycle.trace(store, ref)
+      refute Enum.any?(trace, &(&1.kind == :skill_load))
+
+      assert %{
+               payload: %{
+                 "name" => "use_skill",
+                 "is_error" => true,
+                 "result" =>
+                   ~s(The skill "stuck" could not be loaded: its body did not finish in time.)
+               }
+             } = Enum.find(trace, &(&1.kind == :tool_call))
     end
 
     test "leaves the effect fence down: loading a skill acts on nothing outside the run" do
@@ -786,7 +821,7 @@ defmodule Clementine.SkillsExecutionTest do
     end
 
     test "by a drain that arrives while a skill's body runs requeues the run before any tool " <>
-           "starts",
+           "starts, with nothing loaded",
          %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
 
@@ -803,15 +838,11 @@ defmodule Clementine.SkillsExecutionTest do
         )
 
       # No fence went up, so the drain requeues rather than interrupts.
+      # The drain stopped the body's task: the load never settled.
       assert {:finished, %Facts{status: :queued, effects?: false}} = execute(run, store)
       refute_received {:unsafe_done, _}
 
-      assert kinds(MemoryLifecycle.trace(store, ref)) == [
-               {1, 1, :execution},
-               {1, 2, :model_call},
-               {1, 3, :skill_load},
-               {1, 4, :tool_call}
-             ]
+      assert kinds(MemoryLifecycle.trace(store, ref)) == [{1, 1, :execution}, {1, 2, :model_call}]
     end
 
     test "by a cancel that arrives while a skill's body runs stops the run before any tool " <>

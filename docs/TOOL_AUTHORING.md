@@ -124,7 +124,8 @@ The declaration has two consequences:
 (see `guides/approvals.md`). `{:policy, term}` asks the host's tool policy
 about each call (`Clementine.Host.authorize_tool/3`, given `term`), which
 runs it, parks it like `:required`, or refuses it with an error the model
-reads; a policy that raises or answers anything else refuses it. Without a
+reads; a policy that raises, times out, or answers anything else refuses
+it. Without a
 policy, `{:policy, term}` gates like `:required`. The ephemeral path
 (`Clementine.run/3`) cannot park, so it raises on a gated call.
 

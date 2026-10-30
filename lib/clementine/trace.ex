@@ -57,19 +57,30 @@ defmodule Clementine.Trace do
     - `"approval"` — `nil`, or `%{"verdict" => "approved" | "denied",
       "by" => ...}` for a call that waited on a decision, with `by` from
       the decision's meta
-    - `"policy"` — `nil`, or the tool policy's verdict on a call to a
-      tool declared `approval: {:policy, term}`
+    - `"policy"` — `nil`, or the tool policy's verdict the call settled
+      under, for a call to a tool declared `approval: {:policy, term}`
       (`c:Clementine.Host.authorize_tool/3`): `%{"verdict" => "allow" |
       "require_approval" | "deny", "reason" => ..., "failed" => ...}`.
       `"reason"` is the text a deny gave the model, `nil` otherwise, and
-      `"failed"` is `true` when the policy raised or gave an answer it may
-      not and the call was denied for it. A `"require_approval"` call
-      also carries the `"approval"` that settled it. `nil` when no policy
-      was asked: a tool without `{:policy, _}`, or a run without one,
-      where `{:policy, _}` gates like `:required`.
+      `"failed"` is `true` when the policy raised, gave an answer it may
+      not, or did not answer in time, and the call was denied for it. A
+      call that waited on a decision carries the `"approval"` beside it:
+      the verdict the policy gave when the approval resumed the run
+      (where a deny wins over the approval), or the one that parked it
+      when the decision was a denial. `nil` when no policy was asked: a
+      tool without `{:policy, _}`, or a run without one, where
+      `{:policy, _}` gates like `:required`.
 
     A call the policy denied ran nothing: its entry has the deny's text
     as `"result"`, `"is_error"` `true`, and `"duration_ms"` 0.
+  - `:policy`, once per answer the tool policy gave, when it gave it:
+    before the call settles, so a run that parks on the call, or a
+    cancel, a drain, or an expiry that ends it meanwhile, keeps the
+    answer. A call the policy is asked about again (on a resume) gets an
+    entry each time.
+    - `"iteration"`, `"tool_use_id"`, `"name"` (the tool's)
+    - `"verdict"`, `"reason"`, `"failed"` — as in the `:tool_call`
+      entry's `"policy"`
 
     A `use_skill` call is a tool call like any other: its result is the
     skill's body, or the error the model saw. The engine settles it before
@@ -208,8 +219,19 @@ defmodule Clementine.Trace do
       "killed" => Map.get(call, :killed, false),
       "duration_ms" => call.duration_ms,
       "approval" => approval(call[:approval]),
-      "policy" => policy(call[:policy])
+      "policy" => call[:policy] && verdict_map(call[:policy])
     }
+  end
+
+  @doc false
+  # The `:policy` payload: the tool policy's `verdict` (as `tool_call/1`
+  # takes it) on `call` in `iteration`.
+  @spec policy(pos_integer(), %{id: String.t(), name: String.t()}, term()) :: map()
+  def policy(iteration, call, verdict) do
+    Map.merge(
+      %{"iteration" => iteration, "tool_use_id" => call.id, "name" => call.name},
+      verdict_map(verdict)
+    )
   end
 
   @doc false
@@ -363,14 +385,16 @@ defmodule Clementine.Trace do
     %{"verdict" => Atom.to_string(verdict), "by" => by(meta)}
   end
 
-  defp policy(nil), do: nil
-  defp policy(:allow), do: %{"verdict" => "allow", "reason" => nil, "failed" => false}
+  defp verdict_map(:allow), do: %{"verdict" => "allow", "reason" => nil, "failed" => false}
 
-  defp policy(:require_approval),
+  defp verdict_map(:require_approval),
     do: %{"verdict" => "require_approval", "reason" => nil, "failed" => false}
 
-  defp policy({:deny, reason}), do: %{"verdict" => "deny", "reason" => reason, "failed" => false}
-  defp policy({:failed, reason}), do: %{"verdict" => "deny", "reason" => reason, "failed" => true}
+  defp verdict_map({:deny, reason}),
+    do: %{"verdict" => "deny", "reason" => reason, "failed" => false}
+
+  defp verdict_map({:failed, reason}),
+    do: %{"verdict" => "deny", "reason" => reason, "failed" => true}
 
   defp by(%{by: by}), do: by
   defp by(%{"by" => by}), do: by

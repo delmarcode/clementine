@@ -23,8 +23,8 @@ defmodule Clementine.Pending do
     `policy` is `:require_approval` when the host's tool policy
     (`c:Clementine.Host.authorize_tool/3`) asked for the decision, and
     `nil` when the tool's own declaration did. It feeds the trace entry
-    the call gets when the decision settles it; the resume never asks the
-    policy about this call again.
+    the call gets when the decision settles it without asking the policy
+    again: a denial, or an approval in a run with no policy.
     """
 
     @enforce_keys [:tool_use_id, :tool_name]

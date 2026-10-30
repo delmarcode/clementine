@@ -91,8 +91,9 @@ lifecycle, or a reaper into the app.
   the tools offered, the agent's fingerprint, the system prompt), each
   model call (`:model_call`: usage, timing, what it said), each tool
   call (`:tool_call`: name, arguments, result, timing, the approval it
-  waited on, and the tool policy's verdict), each skill loaded (`:skill_load`: its name, the tools
-  it brought, and a hash of the body it read), and each child a
+  waited on, and the tool policy's verdict), each answer of the tool
+  policy (`:policy`), each skill loaded (`:skill_load`: its name, the
+  tools it brought, and a hash of the body it read), and each child a
   `delegate` call started (`:delegate`: its agent, its run id, how it
   ended). It commits with the run's end, so `run_finished/2` can
   read it. Read tool names in order from it rather than storing your
@@ -177,10 +178,10 @@ description: &1.description, body: &1.body, tools: ...))`.
   description. A load returns the body and offers the skill's tools from
   the next model call on; the system prompt never changes. Write the
   description so the model knows when to load the skill from it alone.
-- `body/1` runs at load, in the run's process, with the tools' context
-  (`subject`, `actor`, `metadata`, ...). Keep it quick; a raise, an
-  exit, or a throw is an error the model reads, and the skill stays
-  unloaded.
+- `body/1` runs at load, in a task bounded like a tool call (a cancel
+  stops it), with the tools' context (`subject`, `actor`, `metadata`,
+  ...). Keep it quick; a raise, an exit, a throw, or no answer in time
+  is an error the model reads, and the skill stays unloaded.
 - `agent/1` decides which skills a run may load, with its subject and
   actor resolved: tenancy and authority go there, never in the body.
 - A skill's tools are ordinary tools: `approval:` parks the run (or asks
@@ -445,20 +446,29 @@ def authorize_tool(run, %Clementine.ApprovalRequest{args: args}, :refund) do
     true -> :allow
   end
 end
+
+def authorize_tool(_run, _request, _term), do: {:deny, "No policy covers this tool."}
 ```
 
-- It fails closed: a raise, an exit, a throw, or any other answer
-  denies the call and logs why. Without the callback, a
-  `{:policy, term}` tool gates every call like `:required`.
+- It fails closed: a raise, an exit, a throw, no answer in time, or any
+  other answer denies the call and logs why, with the exception's type
+  and frames or the answer's shape, never the run's data. End with a
+  catch-all clause. Without the callback, a `{:policy, term}` tool gates
+  every call like `:required`.
+- An approval does not outrank it: an approved call is asked once more
+  when the run resumes, and a deny wins. A call the approver denied is
+  not asked again.
 - It covers every tool the run offers, deferred ones and a loaded
   skill's included. `use_skill` and `delegate` carry no approval: offer
   skills and delegates by actor in `agent/1`. A delegated child is asked
   about with its own run, which carries the parent's subject and actor.
-- It runs in the run's process at every call: keep it fast and
-  read-only. A call still waiting when its batch parks is asked about
-  again on the resume; the call a decision settled is not.
-- The trace's `:tool_call` entry records the verdict under `"policy"`,
-  beside `"approval"`.
+- It runs in a task, bounded like a tool call, one call at a time
+  before the batch's tools: keep it fast and read-only. A call still
+  waiting when its batch parks is asked again on each resume, so N calls
+  that each need approval ask N(N+3)/2 times in all.
+- The trace keeps each answer as a `:policy` entry when it is given, and
+  the call's `:tool_call` entry records the verdict it settled under, in
+  `"policy"`, beside `"approval"`.
 
 `resolve_subject/2` turns the stored `{type, id}` into what the agent works
 on, at every claim. Agents read it as `run.subject` and tools as

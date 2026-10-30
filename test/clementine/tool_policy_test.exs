@@ -3,14 +3,16 @@ defmodule Clementine.ToolPolicyTest do
   The tool policy in the engine, through the real runner on the in-memory
   lifecycle. A tool declared `approval: {:policy, term}` asks the
   `authorize_tool:` function about each call: `:allow` runs it with its
-  batch, `:require_approval` parks it like `:required` (the resume
-  settles it without asking again), and `{:deny, reason}` settles it as
-  an error the model reads. A function that raises, exits, throws, or
-  answers anything else denies the call and logs why; without one, the
-  tool gates like `:required`. A skill's tools and deferred tools are
-  checked the same way, engine tools never are, a signal that lands
-  while the policy answers is honored before anything runs, and the
-  trace records each verdict beside the approval.
+  batch, `:require_approval` parks it like `:required`, and
+  `{:deny, reason}` settles it as an error the model reads. An approval's
+  resume asks once more, and a deny wins over the approval. A function
+  that raises, exits, throws, answers anything else, or does not answer
+  in time denies the call and logs why, without the run's data; without
+  one, the tool gates like `:required`. The function runs in a task of
+  its own: a cancel or a drain while it answers unwinds the run at once.
+  A skill's tools and deferred tools are checked the same way, engine
+  tools never are, and the trace keeps each answer as it is given and
+  the verdict each call settled under, beside the approval.
   """
 
   use ExUnit.Case, async: true
@@ -93,8 +95,15 @@ defmodule Clementine.ToolPolicyTest do
     )
   end
 
-  defp build_run(ref, agent_opts \\ []) do
-    rollout = Rollout.new(agent: agent(agent_opts), input: "go", context: %{notify: self()})
+  defp build_run(ref, agent_opts \\ [], rollout_opts \\ []) do
+    rollout =
+      Rollout.new(
+        Keyword.merge(
+          [agent: agent(agent_opts), input: "go", context: %{notify: self()}],
+          rollout_opts
+        )
+      )
+
     Run.new(ref: ref, rollout: rollout)
   end
 
@@ -181,6 +190,18 @@ defmodule Clementine.ToolPolicyTest do
     |> Map.fetch!(:payload)
   end
 
+  # The tool policy's answers, as the trace's :policy entries keep them.
+  defp answers(store, ref) do
+    for %{kind: :policy} = entry <- MemoryLifecycle.trace(store, ref),
+        do: {entry.epoch, entry.payload["tool_use_id"], entry.payload["verdict"]}
+  end
+
+  # A policy whose answer the test changes between executions.
+  defp switchable(first) do
+    {:ok, answer} = Agent.start_link(fn -> first end)
+    {answer, policy(fn request -> answer |> Agent.get(& &1) |> then(& &1.(request)) end)}
+  end
+
   defp pending!(store, ref) do
     %Facts{status: :waiting, suspension: %{reason: reason, checkpoint: checkpoint}} =
       MemoryLifecycle.facts!(store, ref)
@@ -226,8 +247,8 @@ defmodule Clementine.ToolPolicyTest do
       assert %{"policy" => nil} = tool_call(store, ref, "tu_2")
     end
 
-    test ":require_approval parks the call like :required, and the resume runs it without " <>
-           "asking again; the trace keeps the verdict beside the approval",
+    test ":require_approval parks the call like :required; the approval's resume asks once " <>
+           "more and runs it, and the trace keeps every answer and the verdict beside the approval",
          %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
       expect_gather(tool_events([refund("tu_1", "o-1", 90_000)]))
@@ -237,6 +258,9 @@ defmodule Clementine.ToolPolicyTest do
       assert {:suspended, token} = execute(run, store, policy)
       assert_received {:asked, %ApprovalRequest{tool_use_id: "tu_1"}, :refund}
       refute_received {:refunded, _}
+
+      # The answer is on the trace with the park, before any decision.
+      assert answers(store, ref) == [{1, "tu_1", "require_approval"}]
 
       assert {{:approval, %ApprovalRequest{tool_name: "refund", args: args}},
               %Checkpoint{pending: %Pending.ToolApproval{policy: :require_approval}} = checkpoint} =
@@ -258,8 +282,14 @@ defmodule Clementine.ToolPolicyTest do
       expect_gather(text_events("Refunded."))
       assert {:finished, %Facts{status: :completed}} = execute(run, store, policy)
 
+      assert_received {:asked, %ApprovalRequest{tool_use_id: "tu_1"}, :refund}
       refute_received {:asked, _, _}
       assert_received {:refunded, %{order: "o-1", cents: 90_000}}
+
+      assert answers(store, ref) == [
+               {1, "tu_1", "require_approval"},
+               {2, "tu_1", "require_approval"}
+             ]
 
       assert %{
                "policy" => %{"verdict" => "require_approval", "failed" => false},
@@ -268,8 +298,8 @@ defmodule Clementine.ToolPolicyTest do
              } = tool_call(store, ref, "tu_1")
     end
 
-    test ":require_approval then an approver's denial: the model reads the denial, and the " <>
-           "trace keeps both",
+    test ":require_approval then an approver's denial: the policy is not asked again, the " <>
+           "model reads the denial, and the trace keeps both",
          %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
       expect_gather(tool_events([refund("tu_1", "o-1", 90_000)]))
@@ -277,6 +307,7 @@ defmodule Clementine.ToolPolicyTest do
       run = build_run(ref)
       policy = policy(fn _ -> :require_approval end)
       assert {:suspended, token} = execute(run, store, policy)
+      assert_received {:asked, _, _}
 
       {:ok, _} =
         Protocol.resume(
@@ -289,6 +320,7 @@ defmodule Clementine.ToolPolicyTest do
       expect_gather(text_events("Understood."))
       assert {:finished, %Facts{status: :completed}} = execute(run, store, policy)
 
+      refute_received {:asked, _, _}
       refute_received {:refunded, _}
       assert last_results() == [{"tu_1", "Too much.", true}]
 
@@ -327,6 +359,122 @@ defmodule Clementine.ToolPolicyTest do
     end
   end
 
+  describe "an approval's resume" do
+    test "asks once more, and a deny wins: the approved call runs nothing, the model reads " <>
+           "the deny, the trace keeps both, and a sibling still waiting is denied too",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      expect_gather(tool_events([refund("tu_1", "o-1", 90_000), refund("tu_2", "o-2", 90_000)]))
+
+      run = build_run(ref)
+      {answer, policy} = switchable(fn _ -> :require_approval end)
+      assert {:suspended, token} = execute(run, store, policy)
+
+      # Two days later the actor loses refund authority, and a manager,
+      # who does not know it, approves.
+      Agent.update(answer, fn _ -> fn _ -> {:deny, "The actor lost refund authority."} end end)
+      {:ok, _} = Protocol.resume(MemoryLifecycle, token, {:approved, %{by: "manager"}}, store)
+      expect_gather(text_events("I cannot refund these."))
+
+      assert {:finished, %Facts{status: :completed, effects?: false}} =
+               execute(run, store, policy)
+
+      refute_received {:refunded, _}
+
+      assert last_results() == [
+               {"tu_1", "The actor lost refund authority.", true},
+               {"tu_2", "The actor lost refund authority.", true}
+             ]
+
+      assert %{
+               "approval" => %{"verdict" => "approved", "by" => "manager"},
+               "policy" => %{"verdict" => "deny", "reason" => "The actor lost refund authority."},
+               "result" => "The actor lost refund authority.",
+               "is_error" => true
+             } = tool_call(store, ref, "tu_1")
+
+      assert %{"approval" => nil, "policy" => %{"verdict" => "deny"}} =
+               tool_call(store, ref, "tu_2")
+
+      assert answers(store, ref) == [
+               {1, "tu_1", "require_approval"},
+               {1, "tu_2", "require_approval"},
+               {2, "tu_1", "deny"},
+               {2, "tu_2", "deny"}
+             ]
+    end
+
+    test ":allow on the second ask runs the approved call", %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_gather(tool_events([refund("tu_1", "o-1", 90_000)]))
+
+      run = build_run(ref)
+      {answer, policy} = switchable(fn _ -> :require_approval end)
+      assert {:suspended, token} = execute(run, store, policy)
+
+      Agent.update(answer, fn _ -> fn _ -> :allow end end)
+      {:ok, _} = Protocol.resume(MemoryLifecycle, token, {:approved, %{by: "u1"}}, store)
+      expect_gather(text_events("Refunded."))
+      assert {:finished, %Facts{status: :completed}} = execute(run, store, policy)
+
+      assert_received {:refunded, %{order: "o-1"}}
+
+      assert %{"approval" => %{"verdict" => "approved"}, "policy" => %{"verdict" => "allow"}} =
+               tool_call(store, ref, "tu_1")
+    end
+
+    test "a failure on the second ask denies the approved call", %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_gather(tool_events([refund("tu_1", "o-1", 90_000)]))
+
+      run = build_run(ref)
+      {answer, policy} = switchable(fn _ -> :require_approval end)
+      assert {:suspended, token} = execute(run, store, policy)
+
+      Agent.update(answer, fn _ -> fn _ -> raise "policy store down" end end)
+      {:ok, _} = Protocol.resume(MemoryLifecycle, token, {:approved, %{by: "u1"}}, store)
+      expect_gather(text_events("The check failed."))
+
+      log =
+        capture_log(fn ->
+          assert {:finished, %Facts{status: :completed}} = execute(run, store, policy)
+        end)
+
+      assert log =~ "raised RuntimeError"
+      refute_received {:refunded, _}
+
+      assert %{
+               "approval" => %{"verdict" => "approved"},
+               "policy" => %{"verdict" => "deny", "failed" => true}
+             } = tool_call(store, ref, "tu_1")
+    end
+
+    test "of a call parked with no policy asks the policy the run has now, and a deny wins",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_gather(tool_events([refund("tu_1", "o-1", 90_000)]))
+
+      run = build_run(ref)
+      assert {:suspended, token} = execute(run, store, nil)
+
+      assert {_reason, %Checkpoint{pending: %Pending.ToolApproval{policy: nil}} = checkpoint} =
+               pending!(store, ref)
+
+      assert Checkpoint.version_for(checkpoint) == 1
+
+      {:ok, _} = Protocol.resume(MemoryLifecycle, token, {:approved, %{by: "u1"}}, store)
+      expect_gather(text_events("I cannot."))
+
+      assert {:finished, %Facts{status: :completed}} =
+               execute(run, store, policy(fn _ -> {:deny, "Not any more."} end))
+
+      assert_received {:asked, %ApprovalRequest{tool_use_id: "tu_1"}, :refund}
+      refute_received {:refunded, _}
+      assert last_results() == [{"tu_1", "Not any more.", true}]
+    end
+  end
+
   describe "a policy that fails" do
     test "a raise denies the call, logs why, and tells the model only that the check failed",
          %{store: store, ref: ref} do
@@ -342,9 +490,11 @@ defmodule Clementine.ToolPolicyTest do
                    execute(build_run(ref), store, policy)
         end)
 
-      assert log =~ ~s[authorize_tool for tool "refund" (call tu_1) failed]
-      assert log =~ "** (RuntimeError) accounts service down"
+      assert log =~ ~s[authorize_tool for tool "refund" (call tu_1) raised RuntimeError]
+      assert log =~ "test/clementine/tool_policy_test.exs"
       assert log =~ "The call is denied."
+      # The message may inspect the run's data, so the log leaves it out.
+      refute log =~ "accounts service down"
 
       refute_received {:refunded, _}
       assert last_results() == [{"tu_1", @failed, true}]
@@ -355,8 +505,8 @@ defmodule Clementine.ToolPolicyTest do
 
     test "an exit or a throw denies the call too" do
       for {logged, answer} <- [
-            {"** (exit) time out", fn _ -> exit(:timeout) end},
-            {"** (throw) :nope", fn _ -> throw(:nope) end}
+            {"exited with :timeout", fn _ -> exit(:timeout) end},
+            {"threw :nope", fn _ -> throw(:nope) end}
           ] do
         store = MemoryLifecycle.start_store()
         ref = make_ref()
@@ -370,8 +520,7 @@ defmodule Clementine.ToolPolicyTest do
                      execute(build_run(ref), store, policy(answer))
           end)
 
-        assert log =~ ~s[authorize_tool for tool "refund" (call tu_1) failed]
-        assert log =~ logged
+        assert log =~ ~s[authorize_tool for tool "refund" (call tu_1) #{logged}]
         refute_received {:refunded, _}
         assert last_results() == [{"tu_1", @failed, true}]
         assert %{"policy" => %{"failed" => true}} = tool_call(store, ref, "tu_1")
@@ -379,7 +528,14 @@ defmodule Clementine.ToolPolicyTest do
     end
 
     test "an answer it may not give denies the call, whatever it looks like" do
-      for answer <- [:ok, true, nil, {:deny, :forbidden}, {:allow, "yes"}, {:error, :nope}] do
+      for {answer, shape} <- [
+            {:ok, ":ok"},
+            {true, "true"},
+            {nil, "nil"},
+            {{:deny, :forbidden}, "{:deny, :forbidden}"},
+            {{:allow, "yes"}, "{:allow, a string}"},
+            {{:error, %{reason: "nope"}}, "{:error, a map}"}
+          ] do
         store = MemoryLifecycle.start_store()
         ref = make_ref()
         MemoryLifecycle.seed_queued(store, ref)
@@ -392,10 +548,110 @@ defmodule Clementine.ToolPolicyTest do
                      execute(build_run(ref), store, policy(fn _ -> answer end))
           end)
 
-        assert log =~ "answered #{inspect(answer)}"
+        assert log =~ "answered #{shape}, which is not :allow"
         refute_received {:refunded, _}
         assert last_results() == [{"tu_1", @failed, true}]
       end
+    end
+  end
+
+  describe "a policy's log" do
+    @ssn "123-45-6789"
+
+    test "never carries the run's data: not a clause's arguments, an exception's message, an " <>
+           "answer's values, or an exit's reason" do
+      cases = [
+        # A FunctionClauseError's top frame holds the call's arguments.
+        fn %ApprovalRequest{tool_name: "not_this_tool"} -> :allow end,
+        # A MatchError's message inspects the value.
+        fn %ApprovalRequest{args: args} -> %{"order" => "o-1"} = args end,
+        fn %ApprovalRequest{args: args} -> {:deny, args} end,
+        fn %ApprovalRequest{args: args} -> exit({:shutdown, args["order"]}) end
+      ]
+
+      for answer <- cases do
+        store = MemoryLifecycle.start_store()
+        ref = make_ref()
+        MemoryLifecycle.seed_queued(store, ref)
+        expect_gather(tool_events([refund("tu_1", @ssn, 500)]))
+        expect_gather(text_events("The check failed."))
+
+        log =
+          capture_log(fn ->
+            assert {:finished, %Facts{status: :completed}} =
+                     execute(build_run(ref), store, policy(answer))
+          end)
+
+        assert log =~ "The call is denied."
+        refute log =~ @ssn
+        assert last_results() == [{"tu_1", @failed, true}]
+      end
+    end
+  end
+
+  describe "a policy that takes its time" do
+    test "is denied when it does not answer within the run's remaining time, and the run " <>
+           "ends at its deadline",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_gather(tool_events([refund("tu_1", "o-1", 500)]))
+
+      run = build_run(ref, [], limits: [max_duration: 300])
+
+      log =
+        capture_log(fn ->
+          assert {:finished, %Facts{status: :failed}} =
+                   execute(run, store, policy(fn _ -> Process.sleep(:infinity) end))
+        end)
+
+      assert log =~
+               ~r/authorize_tool for tool "refund" \(call tu_1\) did not answer within \d+ ms/
+
+      refute_received {:refunded, _}
+
+      assert [{_ref, %Clementine.Result.Failed{error: %{code: :deadline_exceeded}}}] =
+               MemoryLifecycle.projections(store)
+
+      assert %{"policy" => %{"verdict" => "deny", "failed" => true}} =
+               tool_call(store, ref, "tu_1")
+    end
+
+    test "is stopped at once by a cancel that lands while it answers: nothing runs",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_gather(tool_events([refund("tu_1", "o-1", 500)]))
+      runner = self()
+
+      hang = fn _ ->
+        send(runner, {:clementine, :cancel, :stop})
+        Process.sleep(:infinity)
+      end
+
+      assert {:finished, %Facts{status: :cancelled, effects?: false}} =
+               execute(build_run(ref), store, policy(hang))
+
+      refute_received {:refunded, _}
+      assert answers(store, ref) == []
+    end
+
+    test "runs in a task that carries the run's $callers, for an Ecto sandbox allowance",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_gather(tool_events([refund("tu_1", "o-1", 500)]))
+      expect_gather(text_events("Done."))
+      test = self()
+
+      answer = fn _ ->
+        send(test, {:callers, self(), Process.get(:"$callers")})
+        :allow
+      end
+
+      assert {:finished, %Facts{status: :completed}} =
+               execute(build_run(ref), store, policy(answer))
+
+      assert_received {:callers, task, callers}
+      assert task != test
+      assert test in callers
     end
   end
 
@@ -624,8 +880,9 @@ defmodule Clementine.ToolPolicyTest do
       assert {:suspended, second} = execute(run, store, policy)
       assert_received {:refunded, %{order: "o-2"}}
 
-      # Only the call still waiting is asked again, in the execution that
-      # settles it.
+      # The approved call is asked once more, and the call still waiting
+      # is asked again, in batch order.
+      assert_received {:asked, %ApprovalRequest{tool_use_id: "tu_3"}, :refund}
       assert_received {:asked, %ApprovalRequest{tool_use_id: "tu_4"}, :refund}
       refute_received {:asked, _, _}
 
@@ -635,8 +892,21 @@ defmodule Clementine.ToolPolicyTest do
       {:ok, _} = Protocol.resume(MemoryLifecycle, second, {:approved, %{by: "u2"}}, store)
       expect_gather(text_events("Done."))
       assert {:finished, %Facts{status: :completed}} = execute(run, store, policy)
+      assert_received {:asked, %ApprovalRequest{tool_use_id: "tu_4"}, :refund}
       refute_received {:asked, _, _}
       assert_received {:refunded, %{order: "o-3"}}
+
+      # Two calls that each needed approval: 2 * (2 + 3) / 2 = 5 asks of
+      # them, beside one each for the allowed and the denied call.
+      assert answers(store, ref) == [
+               {1, "tu_1", "allow"},
+               {1, "tu_2", "deny"},
+               {1, "tu_3", "require_approval"},
+               {1, "tu_4", "require_approval"},
+               {2, "tu_3", "require_approval"},
+               {2, "tu_4", "require_approval"},
+               {3, "tu_4", "require_approval"}
+             ]
 
       assert last_results() == [
                {"tu_1", "Order o-1 shipped.", false},
@@ -658,22 +928,29 @@ defmodule Clementine.ToolPolicyTest do
              ]
     end
 
-    test "a signal that lands while the policy answers is honored before anything runs",
+    test "a drain that lands while the policy answers is honored before anything runs, and " <>
+           "the answers already given stay on the trace",
          %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
-      expect_gather(tool_events([refund("tu_1", "o-1", 500)]))
+      expect_gather(tool_events([refund("tu_1", "o-1", 500), refund("tu_2", "o-2", 500)]))
+      runner = self()
 
-      # The policy runs in the run's own process: a drain the runner
-      # delivers meanwhile lands in its mailbox.
-      answer = fn _ ->
-        send(self(), {:clementine, :drain})
-        :allow
+      # The runner delivers the drain to the run's process while the
+      # policy answers for the second call.
+      answer = fn
+        %ApprovalRequest{tool_use_id: "tu_1"} ->
+          :allow
+
+        %ApprovalRequest{} ->
+          send(runner, {:clementine, :drain})
+          Process.sleep(:infinity)
       end
 
       assert {:finished, %Facts{status: :queued, effects?: false}} =
                execute(build_run(ref), store, policy(answer))
 
       refute_received {:refunded, _}
+      assert answers(store, ref) == [{1, "tu_1", "allow"}]
     end
   end
 

@@ -4,10 +4,12 @@ defmodule Clementine.Runs.ToolPolicyTest do
   `c:Clementine.Host.authorize_tool/3` is asked about each call to a
   `{:policy, term}` tool with the run as `agent/1` saw it (subject and
   actor resolved), and its answers run the call, park the run for
-  `Runs.resume/2`, or refuse the call; a raise denies the call and logs;
-  a run a `delegate` call started is asked about with its own run, which
-  carries the parent's subject and actor; and a host without the
-  callback gates the tool like `:required`.
+  `Runs.resume/2`, or refuse the call; the approval's resume asks again,
+  with the run as that claim resolved it, and a deny wins; a raise
+  denies the call and logs without the run's data; a run a `delegate`
+  call started is asked about with its own run, which carries the
+  parent's subject and actor; and a host without the callback gates the
+  tool like `:required`.
   """
 
   use Clementine.RunsCase
@@ -55,8 +57,9 @@ defmodule Clementine.Runs.ToolPolicyTest do
   defmodule PolicyHost do
     @moduledoc false
     # Resolves subjects and actors as the test host does, and answers for
-    # refunds: an intern may not refund, an order named "raise" breaks
-    # the policy, and a refund over 100.00 needs approval.
+    # refunds: an intern may not refund, nor a run whose metadata says its
+    # refunds were revoked; an order named "raise" or "clause" breaks the
+    # policy; and a refund over 100.00 needs approval.
     @behaviour Clementine.Host
 
     alias Clementine.RunsCase.Host
@@ -72,13 +75,17 @@ defmodule Clementine.Runs.ToolPolicyTest do
       if pid = Process.whereis(:clementine_runs_test),
         do: send(pid, {:authorize_tool, run, request, term})
 
-      case {run.actor, args} do
-        {%{user: "intern"}, _args} -> {:deny, "Interns may not refund."}
-        {_actor, %{"order" => "raise"}} -> raise "policy store down"
-        {_actor, %{"cents" => cents}} when cents > 100_00 -> :require_approval
+      case {run.actor, run.metadata, args} do
+        {%{user: "intern"}, _metadata, _args} -> {:deny, "Interns may not refund."}
+        {_actor, %{"refunds" => "revoked"}, _args} -> {:deny, "Refund authority was revoked."}
+        {_actor, _metadata, %{"order" => "raise"}} -> raise "policy store down"
+        {_actor, _metadata, %{"order" => "clause"}} -> no_rule(run)
+        {_actor, _metadata, %{"cents" => cents}} when cents > 100_00 -> :require_approval
         _other -> :allow
       end
     end
+
+    defp no_rule(%Clementine.Runs.AgentRun{status: "never"}), do: :allow
   end
 
   @moduletag runtime: false
@@ -165,13 +172,46 @@ defmodule Clementine.Runs.ToolPolicyTest do
     assert :ok = perform_job(Worker, %{"run_id" => run.id})
 
     assert %AgentRun{status: "completed"} = Runs.get(run.id)
-    refute_received {:authorize_tool, _run, _request, _term}
+    # The approval's resume asked once more, and :require_approval runs it.
+    assert_received {:authorize_tool, _run, %ApprovalRequest{tool_use_id: "tu_1"}, :refund}
 
     assert %{
              "policy" => %{"verdict" => "require_approval"},
              "approval" => %{"verdict" => "approved", "by" => "alice"},
              "result" => "Refunded 50000 on o-1."
            } = tool_call(run.id, "tu_1")
+  end
+
+  test "an authority revoked while the call waited wins over the approval: the approved " <>
+         "call runs nothing" do
+    {:ok, run} = Runs.start(Cashier, "Refund o-1", actor: {"user", "ada"})
+    expect_turn(tool_events("tu_1", "refund", refund("o-1", 900_00)))
+    assert :ok = perform_job(Worker, %{"run_id" => run.id})
+    assert %AgentRun{status: "waiting"} = Runs.get(run.id)
+
+    # Ada's refund authority is revoked, but her account stands, so
+    # resolve_actor/2 still lets the run resume. A manager approves.
+    {1, _} =
+      TestRepo.update_all(from(r in AgentRun, where: r.id == ^run.id),
+        set: [metadata: %{"refunds" => "revoked"}]
+      )
+
+    assert :ok = Runs.resume(run.id, {:approved, %{by: "manager"}})
+    expect_turn_reading("Refund authority was revoked.", text_events("I cannot."))
+    assert :ok = perform_job(Worker, %{"run_id" => run.id})
+    assert %AgentRun{status: "completed"} = Runs.get(run.id)
+
+    assert %{
+             "approval" => %{"verdict" => "approved", "by" => "manager"},
+             "policy" => %{"verdict" => "deny", "reason" => "Refund authority was revoked."},
+             "is_error" => true
+           } = tool_call(run.id, "tu_1")
+
+    assert [
+             %{epoch: 1, payload: %{"verdict" => "require_approval"}},
+             %{epoch: 2, payload: %{"verdict" => "deny"}}
+           ] =
+             run.id |> Runs.trace() |> Enum.filter(&(&1.kind == :policy))
   end
 
   test "{:deny, reason} settles the call as an error the model reads" do
@@ -198,11 +238,35 @@ defmodule Clementine.Runs.ToolPolicyTest do
         assert :ok = perform_job(Worker, %{"run_id" => run.id})
       end)
 
-    assert log =~ "policy store down"
+    assert log =~ "raised RuntimeError"
     assert %AgentRun{status: "completed"} = Runs.get(run.id)
 
     assert %{"policy" => %{"verdict" => "deny", "failed" => true}, "is_error" => true} =
              tool_call(run.id, "tu_1")
+  end
+
+  test "a host whose authorize_tool has no clause for the call denies it, and the log holds " <>
+         "none of the run's data" do
+    ssn = "123-45-6789"
+
+    {:ok, run} =
+      Runs.start(Cashier, "Refund the order of SSN #{ssn}",
+        actor: {"user", "ada"},
+        metadata: %{"ssn" => ssn}
+      )
+
+    expect_turn(tool_events("tu_1", "refund", refund("clause", 500)))
+    expect_turn_reading("the tool's policy check failed", text_events("The check failed."))
+
+    log =
+      capture_log(fn ->
+        assert :ok = perform_job(Worker, %{"run_id" => run.id})
+      end)
+
+    # The FunctionClauseError's top frame held the whole run.
+    assert log =~ "raised FunctionClauseError"
+    refute log =~ ssn
+    assert %AgentRun{status: "completed"} = Runs.get(run.id)
   end
 
   test "a run a delegate call started is asked about with its own run, which carries the " <>

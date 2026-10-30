@@ -1657,8 +1657,11 @@ engine asks an app callback (`authorize_tool`, given to
 durable runtime) about each call before its batch runs anything, with the
 call's arguments and `term`. `:allow` runs it, `:require_approval` parks
 it as `:required` would, and `{:deny, reason}` settles it as an error tool
-result. The callback fails closed: a raise or any other answer denies the
-call. Without a callback, `{:policy, term}` gates like `:required`.
+result. An approved call is asked once more when the approval resumes the
+run, and a deny wins over the approval. The callback runs in a task bounded
+like a tool call and fails closed: a raise, a timeout, or any other answer
+denies the call. Without a callback, `{:policy, term}` gates like
+`:required`.
 
 ## The Reaper
 

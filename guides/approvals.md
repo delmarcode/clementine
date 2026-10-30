@@ -90,15 +90,26 @@ the arguments that would run), and the tool's `term`:
 
 - `:allow` runs the call with its batch.
 - `:require_approval` parks the run for a decision, exactly as
-  `approval: :required` would: everything below applies, and the resume
-  settles the call without asking the policy again.
+  `approval: :required` would, and everything below applies.
 - `{:deny, reason}` runs nothing. The call settles as an error tool
   result carrying `reason`, a string the model reads and can answer, and
   the batch goes on.
 
-The policy fails closed. A raise, an exit, a throw, or any other answer
-denies the call, logs why, and tells the model only that the tool's
-policy check failed. Without `authorize_tool/3`, a `{:policy, term}`
+An approval does not outrank the policy. When an approval resumes the
+run, the approved call is asked about once more: a deny wins, and the
+call settles as that deny without running, while `:allow` or
+`:require_approval` runs it, the approval already given. An actor who
+lost the right to refund while the call waited is refused even after a
+manager approves. A call the approver denied is not asked again.
+
+The policy fails closed. A raise, an exit, a throw, no answer in time,
+or any other answer denies the call and tells the model only that the
+tool's policy check failed. The log says why without the run's data:
+the exception's type and where it was raised, with each frame's
+arguments replaced by their count, or the shape of the answer, never its
+values. End with a catch-all clause, as above, so a tool without a rule
+of its own is denied by your answer rather than by a
+`FunctionClauseError`. Without `authorize_tool/3`, a `{:policy, term}`
 tool gates every call like `:required`.
 
 It covers every tool the run offers: the agent's own, deferred ones, and
@@ -107,12 +118,20 @@ carry no approval, because which skills and agents a run may use is
 `agent/1`'s decision; a run a `delegate` call started is asked about
 with its own run, which carries the parent's subject and actor.
 
-`authorize_tool/3` runs in the run's process at every call, so keep it
-fast and read-only. A call still waiting when its batch parks for
-another call's decision is asked about again when the run resumes. The
-run's trace records each verdict in the call's `:tool_call` entry, under
-`"policy"`, beside the `"approval"` that settled a parked one
-(`Clementine.Trace`).
+`authorize_tool/3` runs in a task of its own, bounded like a tool call
+(the tool timeout or the run's remaining time, whichever is less), and a
+cancel stops it at once. Keep it fast and read-only: the engine asks
+about each call in turn, before any of the batch's tools run. A call
+still waiting when its batch parks for another call's decision is asked
+about again on each resume until it settles, and once more when its own
+approval resumes the run, so a batch of N calls that each need approval
+asks N(N+3)/2 times in all.
+
+The run's trace keeps each answer as it is given, in a `:policy` entry,
+so a run cancelled or expired while it waits still shows that the policy
+asked for approval. The call's `:tool_call` entry records the verdict it
+settled under, in `"policy"`, beside the `"approval"` that settled a
+parked one (`Clementine.Trace`).
 
 ## What happens at the gate
 

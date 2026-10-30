@@ -313,7 +313,9 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   "by" => ...}`); a call to a `{:policy, term}` tool also carries the
   tool policy's verdict (`"policy" => %{"verdict" => "allow" |
   "require_approval" | "deny", "reason" => ..., "failed" => ...}`), and a
-  call it denied ran nothing. A call a cancel or a drain cut off is there too: with
+  call it denied ran nothing. A `:policy` entry records each answer the
+  policy gave, as it gave it, so a run that ends while it waits still
+  shows the policy asked for approval. A call a cancel or a drain cut off is there too: with
   its result if it had one, and `"killed" => true` if it was killed
   before it answered, so what it did is unknown. A `:skill_load` entry
   records each skill the model loaded (`Clementine.Skill`), with the

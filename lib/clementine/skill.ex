@@ -33,14 +33,16 @@ defmodule Clementine.Skill do
 
   ## The body
 
-  `c:body/1` runs when the model loads the skill, and only then, in the
-  run's own process. It receives the context the run's tools see: on the
-  durable runtime `run_id`, `agent_key`, `subject`, `actor`, `metadata`,
-  and the rest (`c:Clementine.Agent.agent/1` documents them), so a body
-  may differ by subject or actor. Keep it quick. A body that raises or
-  returns anything but a string is an error the model sees, and the skill
-  stays unloaded, and so does one that exits (a call that timed out) or
-  throws. A skill built with `new/1` takes the body as a string,
+  `c:body/1` runs when the model loads the skill, and only then, in a
+  task of its own, bounded like a tool call: the tool timeout or the
+  run's remaining time, whichever is less. A cancel or a drain stops it
+  at once, and nothing loads. It receives the context the run's tools
+  see: on the durable runtime `run_id`, `agent_key`, `subject`, `actor`,
+  `metadata`, and the rest (`c:Clementine.Agent.agent/1` documents
+  them), so a body may differ by subject or actor. Keep it quick. A body
+  that raises or returns anything but a string is an error the model
+  sees, and the skill stays unloaded, and so does one that exits (a call
+  that timed out), throws, or does not finish in time. A skill built with `new/1` takes the body as a string,
   or as a one-argument function called the same way.
 
   ## What a load does
