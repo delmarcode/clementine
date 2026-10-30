@@ -186,7 +186,8 @@ text, or, for an agent with `output_schema:`, the decoded answer
   in `waiting` before it executes (see [Approvals](approvals.md)). The
   resume and the run's new job commit in one transaction, so a sweep can
   never find the resumed run without a job, and the claim that follows
-  resolves the subject and actor again.
+  resolves the subject and actor again. A run waiting on the agents it
+  asked takes no decision: `{:error, :delegating}`.
 - `cancel/1` finishes a queued or waiting run at once and flags a running
   one. The flag goes on to the process running it, on whichever node, so
   the model call in flight is aborted and the run ends `cancelled`
@@ -194,6 +195,60 @@ text, or, for an agent with `output_schema:`, the decoded answer
   it notifies every node through Oban's notifier, so a notifier that
   cannot listen (Postgres behind a transaction pooler) leaves the run to
   find the flag at its next step.
+
+## Asking other agents
+
+An agent that needs another agent's answer before it goes on lists the
+agents it may ask with `delegates:` (`Clementine.Delegation`):
+
+<!-- guide-sample: parse-only -->
+```elixir
+defmodule MyApp.Agents.Planner do
+  use Clementine.Agent,
+    key: "planner",
+    model: :claude_sonnet,
+    instructions: "Plan the launch. Ask the researcher for facts you lack.",
+    delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
+end
+```
+
+The model sees a `delegate` tool taking `agent`, an enum of the
+delegates' keys, and `prompt`, the child's whole brief.
+
+- **The call.** Each call starts a run of that agent: a child whose
+  `parent_id` is the parent's, tagged `{:delegate, tool_use_id}`, with the
+  parent's subject and actor and `metadata: %{"delegated_by" => "planner"}`.
+  The children of one batch start in the transaction that parks the
+  parent, so they exist exactly when it waits on them. A batch that also
+  holds an approval-gated call waits for the decision first, then parks
+  once for its children.
+- **The resume.** A child's end reaches its parent inside the child's
+  terminal transaction. The last one resumes the parent, on a new job,
+  and each `delegate` call settles with its child's output: text as is,
+  anything else (a map from `output_schema:`) JSON-encoded. A child that
+  failed, was cancelled, or was interrupted settles as an error the model
+  reads. A parent resumed and then drained before any effect requeues
+  and resumes again with the same answers.
+- **Lanes.** A child is a task on the parent's subject. A turn agent is
+  never a delegate: the call is refused at once. A delegate with an
+  active task on the subject, the parent itself or a sibling of the same
+  batch included, is refused when the parent parks. Either refusal is an
+  error result the model reads; if no child of a batch could start, the
+  parent resumes at once.
+- **Cancel.** `cancel/1` of a waiting parent cancels its live children in
+  the same transaction: a queued child ends, a running one gets its flag.
+  `cancel/1` of one child settles that call as cancelled once its
+  siblings have ended.
+- **The reaper** leaves a waiting parent alone, and a child it interrupts
+  (its node died, or it was never claimed) resumes the parent like any
+  end. `max_wait:` on the policy bounds a parent's wait as it bounds an
+  approval's, and its end cancels the children.
+- **Purge** follows `parent_id`, so `purge/1` of the subject takes the
+  children and their traces.
+
+`delegate` blocks the run that asks until every child ends. Fan-out
+that a product drives (start several, decide on each answer, keep
+answering the user meanwhile) belongs in a loop.
 
 ## The trace
 
@@ -220,14 +275,15 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 ```
 
 - An `:execution` entry opens each execution: when the run starts, and
-  again, `"resumed" => true`, when it resumes after an approval, under
-  the next epoch. `"tools"` names every tool offered, `"deferred"` the
-  ones among them the model loads through tool search, and `"skills"` the
-  skills it may load. Its `"agent_fingerprint"` is a sha256 over the
-  system prompt, the tool schemas, the model id, which tools are
-  deferred, the output schema, and the skills offered (names,
-  descriptions, and their tools' schemas), so runs that offered the
-  model the same thing group together.
+  again, `"resumed" => true`, when it resumes after an approval or a
+  delegation, under the next epoch. `"tools"` names every tool offered,
+  `"deferred"` the ones among them the model loads through tool search,
+  `"skills"` the skills it may load, and `"delegates"` the agents it may
+  ask. Its `"agent_fingerprint"` is a sha256 over the system prompt, the
+  tool schemas, the model id, which tools are deferred, the output
+  schema, the skills offered (names, descriptions, and their tools'
+  schemas), and the delegates' keys, so runs that offered the model the
+  same thing group together.
 - A `:model_call` entry records each call to the model, a call cut off
   by a cancel included, with the usage it had reported. A `:tool_call`
   entry records each tool call started, with the arguments it ran with
@@ -237,7 +293,10 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   before it answered, so what it did is unknown. A `:skill_load` entry
   records each skill the model loaded (`Clementine.Skill`), with the
   tools it brought and a sha256 of the body the model read, just before
-  the `use_skill` call that loaded it.
+  the `use_skill` call that loaded it. A `:delegate` entry records each
+  child a `delegate` call started, with its agent, its run id (`trace/1`
+  of it is the child's own trace), and how it ended, just before the
+  call's `:tool_call` entry, when the parent resumes.
 - The runner writes new entries at every iteration boundary, fenced on
   the epoch like the heartbeat, and the rest with the run's end or park,
   in the same transaction: `run_finished/2` already sees the whole trace.

@@ -362,6 +362,8 @@ moment agent work must survive browser disconnects, deploys, worker
 restarts, or approval pauses, the same `Runner.execute/2` runs against a
 durable `Clementine.Lifecycle` backed by your own database table — with
 claims, lease fencing, heartbeats, a reaper, checkpointed suspension, and
-exactly-one-terminal-writer semantics.
+exactly-one-terminal-writer semantics. An agent that asks other agents
+and waits for their answers (`delegates:`, `Clementine.Delegation`)
+needs it too.
 
 Continue with [Durable Execution](durable-execution.md).

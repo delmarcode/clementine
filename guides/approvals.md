@@ -224,3 +224,11 @@ Two product consequences worth deciding up front:
   that the agent no longer offers. A run that loaded skills resumes with
   them loaded, so keep offering them while runs that loaded them may be
   parked.
+
+A run also parks on its `delegate` calls (`Clementine.Delegation`):
+`waiting`, with the reason `{:external, {:delegation, child_ids}}`, until
+the agents it asked have ended. That park takes no decision
+(`Clementine.Runs.resume/2` returns `{:error, :delegating}`), but
+`max_wait:` and cancel apply to it as above, and its end cancels the
+children. A batch holding both a gated call and a `delegate` call waits
+for the decision first, then for the children.

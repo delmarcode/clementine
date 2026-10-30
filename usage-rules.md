@@ -61,8 +61,10 @@ lifecycle, or a reaper into the app.
   caller's transaction the run and its job commit with it.
 - `resume/2` takes `{:approved, meta}` or `{:denied, meta}` for a waiting
   run; a denial's `meta[:message]` reaches the model. It returns
-  `{:error, :not_found | :not_waiting}`, or the host's refusal. The claim
-  that follows resolves the subject and actor again.
+  `{:error, :not_found | :not_waiting}`, `{:error, :delegating}` for a run
+  waiting on the agents it asked (it resumes when they end), or the
+  host's refusal. The claim that follows resolves the subject and actor
+  again.
 - `cancel/1` returns `{:ok, :finished}` for a queued or waiting run and
   `{:ok, :flagged}` for a running one. The flag reaches the run's process
   on whichever node runs it, which aborts the model call in flight and
@@ -89,8 +91,10 @@ lifecycle, or a reaper into the app.
   the tools offered, the agent's fingerprint, the system prompt), each
   model call (`:model_call`: usage, timing, what it said), each tool
   call (`:tool_call`: name, arguments, result, timing, and the approval
-  it waited on), and each skill loaded (`:skill_load`: its name, the
-  tools it brought, and a hash of the body it read). It commits with the run's end, so `run_finished/2` can
+  it waited on), each skill loaded (`:skill_load`: its name, the tools
+  it brought, and a hash of the body it read), and each child a
+  `delegate` call started (`:delegate`: its agent, its run id, how it
+  ended). It commits with the run's end, so `run_finished/2` can
   read it. Read tool names in order from it rather than storing your
   own: `for %{kind: :tool_call, payload: %{"name" => name}} <- trace,
   do: name`. Like `get/1` it checks nothing: check the subject or actor
@@ -190,6 +194,46 @@ description: &1.description, body: &1.body, tools: ...))`.
   and a run whose `agent/1` sets `skills` past `Agent.new/1` fails as
   `:invalid_skills` before anything runs. Two skills may share a tool
   module.
+
+## Asking other agents: `delegates:`
+
+A run that needs another agent's answer before it can go on asks it
+with `delegate`, not a tool that calls `Runs.start/3`, and not a loop of
+its own:
+
+```elixir
+use Clementine.Agent,
+  key: "planner",
+  model: :claude_sonnet,
+  instructions: "Plan the launch. Ask the researcher for facts you lack.",
+  delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
+```
+
+- The model sees a `delegate` tool taking `agent` (an enum of the
+  delegates' keys) and `prompt`. Each call starts a run of that agent,
+  a child with the parent's subject and actor, `parent_id` the parent's,
+  tag `{:delegate, tool_use_id}`, and metadata
+  `%{"delegated_by" => parent_key}`. The child sees only the prompt, so
+  say in the instructions what each delegate is for.
+- The parent parks `waiting` and resumes on a new job when the last
+  child ends; each call's result is its child's output (text as is,
+  anything else JSON-encoded) or, for a child that failed, was cancelled,
+  or was interrupted, an error the model reads. The children of one
+  batch start in the transaction that parks the parent, after the
+  batch's other calls and any approval they need.
+- A delegate runs tasks: a turn agent is refused at the call. A child
+  needs its lane on the subject, so a delegate with an active task there
+  (or a second call to one agent in a batch) is refused when the parent
+  parks. A parent with no subject has no lanes to refuse.
+- List the delegates in the child spec's `agents:` too. `agent/1` may
+  offer different ones by subject or actor; no tool is named `delegate`.
+- `cancel/1` of a waiting parent cancels its live children with it.
+  Cancelling one child settles its call as cancelled. A child the reaper
+  interrupts resumes the parent too. `resume/2` refuses a waiting
+  parent with `{:error, :delegating}`.
+- Fan-out a product controls (start N, decide on each answer, keep
+  answering the user meanwhile) is a loop's job, not `delegate`:
+  `delegate` blocks the run that asks until every child ends.
 
 ## A thread: `Clementine.Thread` and `Runs.send/3`
 

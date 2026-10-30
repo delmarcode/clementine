@@ -43,6 +43,7 @@ defmodule Clementine.MixProject do
           Clementine,
           Clementine.Agent,
           Clementine.Skill,
+          Clementine.Delegation,
           Clementine.EngineTool,
           Clementine.AgentServer,
           Clementine.Rollout,
@@ -76,6 +77,7 @@ defmodule Clementine.MixProject do
           Clementine.ResumeToken,
           Clementine.Pending,
           Clementine.Pending.ToolApproval,
+          Clementine.Pending.Delegation,
           Clementine.ApprovalRequest
         ],
         Reaper: [
