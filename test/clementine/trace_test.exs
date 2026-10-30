@@ -487,6 +487,58 @@ defmodule Clementine.TraceTest do
     end
   end
 
+  describe "the recorder" do
+    test "numbers entries per execution, keeps them through a blip, and drops them only once written" do
+      test = self()
+      replies = :counters.new(1, [])
+
+      flush = fn entries ->
+        send(test, {:flushed, Enum.map(entries, & &1.seq)})
+
+        case :counters.get(replies, 1) do
+          0 -> {:error, :db_blip}
+          1 -> :ok
+          _ -> {:error, :lost_lease}
+        end
+      end
+
+      recorder = Clementine.Trace.Recorder.new("run-1", 3, flush)
+      :ok = Clementine.Trace.Recorder.record(recorder, :execution, %{})
+      :ok = Clementine.Trace.Recorder.record(recorder, :model_call, %{})
+
+      # A blip keeps the entries for the next write.
+      assert :ok = Clementine.Trace.Recorder.flush(recorder)
+      assert_received {:flushed, [1, 2]}
+
+      assert [%Entry{run_id: "run-1", epoch: 3, seq: 1}, %Entry{seq: 2}] =
+               Clementine.Trace.Recorder.pending(recorder)
+
+      :counters.add(replies, 1, 1)
+      assert :ok = Clementine.Trace.Recorder.flush(recorder)
+      assert_received {:flushed, [1, 2]}
+      assert Clementine.Trace.Recorder.pending(recorder) == []
+
+      # Nothing pending writes nothing.
+      assert :ok = Clementine.Trace.Recorder.flush(recorder)
+      refute_received {:flushed, _}
+
+      :counters.add(replies, 1, 1)
+      :ok = Clementine.Trace.Recorder.record(recorder, :tool_call, %{})
+      assert :lost_lease = Clementine.Trace.Recorder.flush(recorder)
+      assert [%Entry{seq: 3, kind: :tool_call}] = Clementine.Trace.Recorder.pending(recorder)
+
+      assert :ok = Clementine.Trace.Recorder.close(recorder)
+    end
+  end
+
+  describe "entry kinds" do
+    test "a stored kind reads back as its atom, and one a later version wrote stays text" do
+      assert Entry.kinds() == [:execution, :model_call, :tool_call]
+      assert Entry.decode_kind("tool_call") == :tool_call
+      assert Entry.decode_kind("skill_load") == "skill_load"
+    end
+  end
+
   describe "the fingerprint" do
     test "moves with the instructions, the tool schemas, and the model, and nothing else" do
       base = Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
