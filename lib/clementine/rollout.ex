@@ -595,15 +595,15 @@ defmodule Clementine.Rollout do
     started = System.monotonic_time()
     stream = LLM.stream(exec.model, exec.system, exec.messages, exec.tools, stream_opts(exec))
 
-    {acc, signal, start_usage} =
+    {acc, signal} =
       try do
-        Enum.reduce_while(stream, {Accumulator.new(), nil, %{}}, fn
-          {:signal, message}, {acc, _signal, start_usage} ->
-            {:halt, {acc, message, start_usage}}
+        Enum.reduce_while(stream, {Accumulator.new(), nil}, fn
+          {:signal, message}, {acc, _signal} ->
+            {:halt, {acc, message}}
 
-          event, {acc, nil, start_usage} ->
+          event, {acc, nil} ->
             forward_stream_event(exec, event)
-            {:cont, {Accumulator.process(acc, event), nil, start_usage(start_usage, event)}}
+            {:cont, {Accumulator.process(acc, event), nil}}
         end)
       rescue
         e ->
@@ -616,16 +616,14 @@ defmodule Clementine.Rollout do
       end
 
     duration = System.monotonic_time() - started
-    # The provider's usage so far: the final counts where the stream got
-    # that far, over what its start reported (the input count).
-    usage = Map.merge(start_usage, acc.usage)
 
     cond do
       signal != nil ->
         # Aborted by a runner signal: no provider stop_reason exists, and
-        # the partial usage is what actually burned.
-        emit_llm_stop(metadata, duration, Clementine.Usage.new(usage), nil)
-        {:signal, signal, %{Accumulator.to_response(acc) | usage: usage}, duration}
+        # the partial usage is what actually burned: the accumulator keeps
+        # the input count the stream's start reported.
+        emit_llm_stop(metadata, duration, Clementine.Usage.new(acc.usage), nil)
+        {:signal, signal, Accumulator.to_response(acc), duration}
 
       Accumulator.error?(acc) ->
         :telemetry.execute(
@@ -634,10 +632,10 @@ defmodule Clementine.Rollout do
           Map.merge(metadata, %{kind: :error, reason: acc.error})
         )
 
-        {:error, acc.error, usage, duration}
+        {:error, acc.error, acc.usage, duration}
 
       true ->
-        response = %{Accumulator.to_response(acc) | usage: usage}
+        response = Accumulator.to_response(acc)
 
         emit_llm_stop(
           metadata,
@@ -649,13 +647,6 @@ defmodule Clementine.Rollout do
         {:ok, response, duration}
     end
   end
-
-  # A stream's start event carries the input count; the counts at its end
-  # supersede it, so it is kept apart and merged under them.
-  defp start_usage(_start_usage, {:message_start, %{"usage" => usage}}) when is_map(usage),
-    do: usage
-
-  defp start_usage(start_usage, _event), do: start_usage
 
   defp emit_llm_stop(metadata, duration, %Clementine.Usage{} = usage, stop_reason) do
     :telemetry.execute(

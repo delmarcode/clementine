@@ -491,6 +491,31 @@ defmodule Clementine.LLM.StreamParserTest do
   end
 
   describe "Accumulator" do
+    test "usage keeps the start's input count under the end's counts (C13)" do
+      started =
+        Accumulator.process(
+          Accumulator.new(),
+          {:message_start, %{"usage" => %{"input_tokens" => 42, "output_tokens" => 1}}}
+        )
+
+      # Cut off before the end: the start's counts are what burned.
+      assert Accumulator.to_response(started).usage == %{
+               "input_tokens" => 42,
+               "output_tokens" => 1
+             }
+
+      finished =
+        Accumulator.process(
+          started,
+          {:message_delta, %{"stop_reason" => "end_turn"}, %{"output_tokens" => 30}}
+        )
+
+      assert Accumulator.to_response(finished).usage == %{
+               "input_tokens" => 42,
+               "output_tokens" => 30
+             }
+    end
+
     test "accumulates text deltas" do
       acc =
         Accumulator.new()

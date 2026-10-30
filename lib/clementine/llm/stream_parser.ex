@@ -330,6 +330,11 @@ defmodule Clementine.LLM.StreamParser do
     result follows its call, the text on either side of a search stays on
     its side, and a provider that binds a thinking block to what precedes
     it sees exactly that.
+
+    `usage` is what the stream reported so far: the counts its start
+    carried (the input count), under whatever its end reports. A stream
+    cut off before its end, by a cancel or a provider error, still has
+    the input it burned.
     """
 
     alias Clementine.LLM.Message.Content
@@ -431,6 +436,12 @@ defmodule Clementine.LLM.StreamParser do
 
     def process(%__MODULE__{} = acc, {:content_block_stop, _}) do
       close_text(acc)
+    end
+
+    # The start's counts go under any already seen; the end's go over
+    # them (message_delta below).
+    def process(%__MODULE__{} = acc, {:message_start, %{"usage" => usage}}) when is_map(usage) do
+      %{acc | usage: Map.merge(usage, acc.usage)}
     end
 
     def process(%__MODULE__{} = acc, {:message_delta, %{"stop_reason" => reason}, usage}) do
