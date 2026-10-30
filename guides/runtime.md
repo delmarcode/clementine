@@ -166,6 +166,11 @@ Clementine.Runs.latest({"conversation", id}, turn: true)            # the thread
 Clementine.Runs.list(actor: {"user", id}, limit: 50)                # an account's runs
 ```
 
+A completed run stores its output in `result["output"]`: the answer's
+text, or, for an agent with `output_schema:`, the decoded answer
+(`%{"verdict" => "pass", ...}`), the same map `run_finished/2` sees in
+`Result.Completed`'s `output`.
+
 - `start/3` inserts the run and its Oban job in one transaction, and
   copies the agent's `turn` to the row. A start in a busy lane returns
   `{:error, :active_run_exists}`; a turn without a subject id,

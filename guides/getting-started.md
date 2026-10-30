@@ -169,6 +169,47 @@ so history that stores and replays a turn's messages keeps the tools it
 found. Providers without tool search get deferred tools as ordinary
 tools.
 
+## Structured output
+
+When code reads the answer (a grader's verdict, a classifier's label, a
+planner's next steps), give the agent the answer's JSON schema as
+`output_schema:`, and `result.output` is the decoded map instead of
+text:
+
+<!-- guide-sample: parse-only -->
+```elixir
+agent =
+  Clementine.Agent.new(
+    model: :claude_sonnet,
+    instructions: "Classify the support ticket.",
+    tools: [MyApp.Tools.LookupCustomer],
+    output_schema: %{
+      "type" => "object",
+      "properties" => %{
+        "queue" => %{"type" => "string", "enum" => ["billing", "bugs", "other"]},
+        "urgent" => %{"type" => "boolean"}
+      },
+      "required" => ["queue", "urgent"],
+      "additionalProperties" => false
+    }
+  )
+
+{:ok, %Clementine.Result.Completed{output: %{"queue" => queue, "urgent" => urgent}}} =
+  Clementine.run(agent, ticket_text)
+```
+
+The run calls its tools as it likes; only the answer that ends it is
+constrained. The schema goes to the provider as its own structured
+output (Anthropic's `output_config.format`, OpenAI's `text.format`),
+which constrains the model to it, so write it in the subset providers
+accept: an object at the root, `"additionalProperties": false` on every
+object, and, for OpenAI, every property listed in `required` (type an
+optional one `["string", "null"]`). The engine decodes the answer and
+checks it against the schema too. An answer that does not decode or
+match, as when the model refuses or runs out of tokens, fails the run
+with a `Clementine.Error` of code `:invalid_output`; whether to try
+again is outer control (below).
+
 ## Streaming
 
 `Clementine.stream/3` returns a lazy enumerable of `Clementine.Event`

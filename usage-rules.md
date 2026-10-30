@@ -405,6 +405,32 @@ use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "..."
   tool), so the thread keeps working, but the edit restarts the prompt
   cache and may void earlier thinking on models that verify it.
 
+## Structured output: `output_schema:`
+
+An agent whose answer code reads gives the answer's JSON schema:
+
+```elixir
+use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
+  output_schema: %{"type" => "object", "properties" => %{"verdict" => %{"type" => "string"}},
+                   "required" => ["verdict"], "additionalProperties" => false}
+```
+
+- A completed run's `output` is the decoded answer, a map with string
+  keys: what `run_finished/2` receives, what `run.result["output"]`
+  stores, and what a loop's `{:completed, tag, result}` carries. Match
+  on it; never parse text. Without `output_schema:`, `output` is text.
+- The run uses its tools freely; only the final answer is constrained,
+  through the provider's own structured output.
+- The root is an object; the build fails otherwise. Put
+  `"additionalProperties": false` on every object, and for OpenAI list
+  every property in `required` (type an optional one
+  `["string", "null"]`). The provider refuses a schema outside its
+  subset, and the run fails with its error.
+- An answer that does not decode or match fails the run:
+  `Result.Failed` with a `Clementine.Error` of code `:invalid_output`,
+  whose `raw["output"]` is the text the model wrote. There is no retry
+  inside the run; retry from a loop or your own code.
+
 ## Never
 
 - Never send mail, call a service, broadcast, or write files in

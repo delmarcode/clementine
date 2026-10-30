@@ -252,6 +252,23 @@ gpt_5_high: [provider: :openai, id: "gpt-5", reasoning: :high],
 Clementine.LLM.call(:gpt_5_low, system, messages, tools, reasoning: :high)
 ```
 
+## Structured output
+
+An agent's `output_schema:` goes to the provider as its own structured
+output, which constrains the model's text answer to the schema (tool
+calls are unaffected):
+
+| Provider | Request field |
+|---|---|
+| `:anthropic` | `output_config.format`: `{"type": "json_schema", "schema": ...}`, beside any reasoning `effort` |
+| `:openai` | `text.format`: `{"type": "json_schema", "name": "output", "schema": ..., "strict": true}` |
+| Chat Completions (`:openrouter`, `:bedrock`, `:vertex`, `:openai_compatible`) | `response_format`: `{"type": "json_schema", "json_schema": {"name": "output", "schema": ..., "strict": true}}` |
+
+A model or server without structured outputs refuses the request, or,
+on some OpenAI-compatible servers, ignores the field; the engine checks
+the answer either way (`Clementine.OutputSchema`), so describe the
+answer's shape in the instructions too when an agent runs there.
+
 ## Adding a model, start to finish
 
 1. Find the lane. First-party Anthropic/OpenAI → `:anthropic`/`:openai`.

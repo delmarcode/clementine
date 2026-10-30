@@ -419,6 +419,44 @@ leftovers sweep to dead letters; a child spawned in the halting step is
 retired before it exists, and nobody hears it. `{:halt, result}` is a
 decision like any other.
 
+### A judge that is a model
+
+When grading needs a model, the grader is a child like any other, and
+`output_schema:` on its agent makes its answer a map the loop matches
+on rather than text it parses:
+
+```elixir
+defmodule MyApp.Agents.Grader do
+  use Clementine.Agent,
+    key: "grader",
+    model: :claude_sonnet,
+    instructions: "Grade the draft against the rubric.",
+    output_schema: %{
+      "type" => "object",
+      "properties" => %{
+        "verdict" => %{"type" => "string", "enum" => ["pass", "fail"]},
+        "feedback" => %{"type" => "string"}
+      },
+      "required" => ["verdict", "feedback"],
+      "additionalProperties" => false
+    }
+end
+```
+
+<!-- guide-sample: parse-only -->
+```elixir
+def handle({:completed, {:grade, _n}, %Result.Completed{output: %{"verdict" => "pass"}}}, state),
+  do: {:halt, Result.completed(output: state["draft"]), state}
+
+def handle({:completed, {:grade, n}, %Result.Completed{output: %{"feedback" => feedback}}}, state),
+  do: {:ok, state, [{:run, {:attempt, n + 1}, attempt(state["prompt"] <> "\n\n" <> feedback, n + 1)}]}
+```
+
+The completion carries the same map the child's row stores in
+`result["output"]`. A grader whose answer does not match its schema
+ends `Result.Failed` with code `:invalid_output`, and the loop decides
+on that like any failed child.
+
 ## The watcher
 
 A cron with memory and judgment. `init` arms a timer; each elapse starts
