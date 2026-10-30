@@ -27,6 +27,8 @@ defmodule Clementine.OutputSchema do
 
   alias Clementine.LLM.Message.Content
 
+  @types ~w(object array string integer number boolean null)
+
   @typedoc "A JSON schema with string keys, its root an object."
   @type t :: %{required(String.t()) => term()}
 
@@ -38,7 +40,8 @@ defmodule Clementine.OutputSchema do
   `use Clementine.Agent` fails the build.
 
   The keywords the check reads must have their JSON Schema shapes
-  wherever they appear: `type` a string or a list of strings,
+  wherever they appear: `type` one of JSON Schema's seven type names or
+  a list of them,
   `properties` and `$defs`/`definitions` objects of schemas, `required`
   a list of strings, `items` and `additionalProperties` a schema,
   `enum`, `anyOf`, and `allOf` lists, `$ref` a string. Normalizing a
@@ -107,8 +110,16 @@ defmodule Clementine.OutputSchema do
     do: bad_shape!(path, "a schema (an object or a boolean)", other)
 
   defp check_shape!("type", type, path) do
-    unless is_binary(type) or (is_list(type) and type != [] and Enum.all?(type, &is_binary/1)),
-      do: bad_shape!(at(path, "type"), "a type name or a list of type names", type)
+    names = List.wrap(type)
+
+    unless names != [] and (is_binary(type) or is_list(type)) and
+             Enum.all?(names, &(&1 in @types)),
+           do:
+             bad_shape!(
+               at(path, "type"),
+               "one of #{Enum.join(@types, ", ")}, or a list of them",
+               type
+             )
   end
 
   defp check_shape!(keyword, schemas, path)
