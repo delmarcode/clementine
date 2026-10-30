@@ -42,7 +42,8 @@ defmodule Clementine.Rollout do
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
   alias Clementine.LLM.Message.{Content, ToolResultMessage}
-  alias Clementine.{ApprovalRequest, LLM, Pending, Suspension, Tool, ToolInput, ToolRunner}
+  alias Clementine.{ApprovalRequest, LLM, Pending, Suspension, Tool, ToolInput, ToolRunner, Trace}
+  alias Clementine.Trace.Recorder
 
   @default_max_iterations 10
 
@@ -108,7 +109,8 @@ defmodule Clementine.Rollout do
       tools: agent.tools,
       context: rollout.context,
       messages: rollout.messages,
-      max_iterations: Keyword.get(limits(rollout), :max_iterations, @default_max_iterations)
+      max_iterations: Keyword.get(limits(rollout), :max_iterations, @default_max_iterations),
+      trace: Trace.validate_fidelity!(agent.trace)
     ]
   end
 
@@ -117,7 +119,8 @@ defmodule Clementine.Rollout do
     # Loop state for `execute/2`: the runner-supplied closures, the
     # accumulated typed usage, and `prefix_len` — where history + input end
     # and generated messages begin, so `Result.Completed` can separate the
-    # two.
+    # two. `recorder` is the runner's trace buffer (nil: no trace), and
+    # `fidelity` the agent's `trace:`.
     defstruct [
       :model,
       :system,
@@ -125,6 +128,7 @@ defmodule Clementine.Rollout do
       :context,
       :max_iterations,
       :emit,
+      :recorder,
       :cancel?,
       :mark_effects,
       :deadline,
@@ -134,7 +138,8 @@ defmodule Clementine.Rollout do
       messages: [],
       iteration: 0,
       usage: %Clementine.Usage{},
-      fence_raised?: false
+      fence_raised?: false,
+      fidelity: :content
     ]
   end
 
@@ -175,6 +180,11 @@ defmodule Clementine.Rollout do
     never a bare atom.
   - `:emit` - a `Clementine.Events.Stamper` for execution events; omitted
     means no events.
+  - `:trace` - the runner's trace buffer: the rollout records an entry
+    for the execution, each model call, and each settled tool call
+    (`Clementine.Trace`), and writes the new ones at every iteration
+    boundary before it gathers; a write that finds the lease lost
+    unwinds as `:lost_lease`. Omitted means no trace.
   - `:cancel?` - zero-arity closure that reads the run's cancel flag,
     polled at iteration boundaries (before each gather, which is also
     after each tool batch).
@@ -221,6 +231,8 @@ defmodule Clementine.Rollout do
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       emit: Keyword.get(opts, :emit),
+      recorder: Keyword.get(opts, :trace),
+      fidelity: Keyword.fetch!(config, :trace),
       cancel?: Keyword.get(opts, :cancel?, fn -> :none end),
       mark_effects: Keyword.get(opts, :mark_effects, fn -> :ok end),
       deadline: Keyword.get(opts, :deadline),
@@ -236,7 +248,10 @@ defmodule Clementine.Rollout do
     )
 
     try do
-      case restore(exec, Keyword.get(opts, :resume), rollout) do
+      resume = Keyword.get(opts, :resume)
+      record_execution(exec, resume != nil)
+
+      case restore(exec, resume, rollout) do
         {:ok, %Execution{} = exec} ->
           boundary(exec)
 
@@ -345,7 +360,7 @@ defmodule Clementine.Rollout do
          {:ok, pending_use, batch} <- pending_batch(exec, pending) do
       case payload do
         {:approved, _meta} ->
-          case execute_now(exec, [pending_use], pending.completed_results) do
+          case execute_now(exec, [pending_use], pending.completed_results, payload) do
             {:ok, %Execution{} = exec, completed} -> settle_batch(exec, batch, completed)
             {:error, %Clementine.Error{} = error} -> fail(exec, error)
             unwound -> conclude(exec, unwound)
@@ -360,6 +375,7 @@ defmodule Clementine.Rollout do
             is_error: true
           })
 
+          record_tool_call(exec, pending_use, denial, 0, payload)
           settle_batch(exec, batch, Map.put(pending.completed_results, pending_use.id, denial))
 
         other ->
@@ -448,12 +464,15 @@ defmodule Clementine.Rollout do
 
   # The iteration boundary: every check the loop owes between one Act and
   # the next Gather — runner signals, the execution deadline, the
-  # cooperative cancel poll, and the iteration cap, in that order.
+  # cooperative cancel poll, and the iteration cap, in that order — and,
+  # when the loop goes on, the trace write of what the last iteration did.
+  # An exit here leaves the entries to the write that ends the run.
   defp boundary(%Execution{} = exec) do
     with :continue <- check_signals(),
          :continue <- check_deadline(exec),
          :continue <- check_cancel(exec),
-         :continue <- check_iterations(exec) do
+         :continue <- check_iterations(exec),
+         :continue <- flush_trace(exec) do
       gather(%{exec | iteration: exec.iteration + 1})
     else
       {:error, %Clementine.Error{} = error} -> fail(exec, error)
@@ -499,14 +518,52 @@ defmodule Clementine.Rollout do
 
   defp check_iterations(%Execution{}), do: :continue
 
+  defp flush_trace(%Execution{recorder: nil}), do: :continue
+
+  defp flush_trace(%Execution{recorder: recorder}) do
+    case Recorder.flush(recorder) do
+      :ok -> :continue
+      :lost_lease -> :lost_lease
+    end
+  end
+
+  # Every call to the model is recorded, and so is what it burned: a call
+  # a signal aborts or a provider error ends keeps the usage its stream
+  # reported (the input count from its start, the output so far), so a
+  # cancelled or failed run is charged for it.
   defp gather(%Execution{} = exec) do
     emit_event(exec, :iteration_start, %{n: exec.iteration})
 
     case stream_response(exec) do
-      {:ok, response} -> act(record_usage(exec, response), response)
-      {:signal, signal} -> conclude(exec, unwind(signal))
-      {:error, reason} -> fail(exec, Clementine.Error.normalize(reason))
+      {:ok, response, duration} ->
+        exec = record_usage(exec, response)
+        record_model_call(exec, duration, response.stop_reason, response.usage, response.content)
+        act(exec, response)
+
+      {:signal, signal, partial, duration} ->
+        exec = record_usage(exec, partial)
+        record_model_call(exec, duration, nil, partial.usage, partial.content)
+        conclude(exec, unwind(signal))
+
+      {:error, reason, usage, duration} ->
+        exec = record_usage(exec, %{usage: usage})
+        record_model_call(exec, duration, nil, usage, nil)
+        fail(exec, Clementine.Error.normalize(reason))
     end
+  end
+
+  defp record_model_call(exec, duration, stop_reason, usage, content) do
+    record(
+      exec,
+      :model_call,
+      Trace.model_call(
+        exec.iteration,
+        to_ms(duration),
+        stop_reason,
+        Clementine.Usage.new(usage),
+        content
+      )
+    )
   end
 
   defp stream_response(%Execution{} = exec) do
@@ -529,15 +586,15 @@ defmodule Clementine.Rollout do
     started = System.monotonic_time()
     stream = LLM.stream(exec.model, exec.system, exec.messages, exec.tools, stream_opts(exec))
 
-    {acc, signal} =
+    {acc, signal, start_usage} =
       try do
-        Enum.reduce_while(stream, {Accumulator.new(), nil}, fn
-          {:signal, message}, {acc, _signal} ->
-            {:halt, {acc, message}}
+        Enum.reduce_while(stream, {Accumulator.new(), nil, %{}}, fn
+          {:signal, message}, {acc, _signal, start_usage} ->
+            {:halt, {acc, message, start_usage}}
 
-          event, {acc, nil} ->
+          event, {acc, nil, start_usage} ->
             forward_stream_event(exec, event)
-            {:cont, {Accumulator.process(acc, event), nil}}
+            {:cont, {Accumulator.process(acc, event), nil, start_usage(start_usage, event)}}
         end)
       rescue
         e ->
@@ -550,13 +607,16 @@ defmodule Clementine.Rollout do
       end
 
     duration = System.monotonic_time() - started
+    # The provider's usage so far: the final counts where the stream got
+    # that far, over what its start reported (the input count).
+    usage = Map.merge(start_usage, acc.usage)
 
     cond do
       signal != nil ->
         # Aborted by a runner signal: no provider stop_reason exists, and
         # the partial usage is what actually burned.
-        emit_llm_stop(metadata, duration, Clementine.Usage.new(acc.usage), nil)
-        {:signal, signal}
+        emit_llm_stop(metadata, duration, Clementine.Usage.new(usage), nil)
+        {:signal, signal, %{Accumulator.to_response(acc) | usage: usage}, duration}
 
       Accumulator.error?(acc) ->
         :telemetry.execute(
@@ -565,10 +625,10 @@ defmodule Clementine.Rollout do
           Map.merge(metadata, %{kind: :error, reason: acc.error})
         )
 
-        {:error, acc.error}
+        {:error, acc.error, usage, duration}
 
       true ->
-        response = Accumulator.to_response(acc)
+        response = %{Accumulator.to_response(acc) | usage: usage}
 
         emit_llm_stop(
           metadata,
@@ -577,9 +637,16 @@ defmodule Clementine.Rollout do
           response.stop_reason
         )
 
-        {:ok, response}
+        {:ok, response, duration}
     end
   end
+
+  # A stream's start event carries the input count; the counts at its end
+  # supersede it, so it is kept apart and merged under them.
+  defp start_usage(_start_usage, {:message_start, %{"usage" => usage}}) when is_map(usage),
+    do: usage
+
+  defp start_usage(start_usage, _event), do: start_usage
 
   defp emit_llm_stop(metadata, duration, %Clementine.Usage{} = usage, stop_reason) do
     :telemetry.execute(
@@ -728,18 +795,58 @@ defmodule Clementine.Rollout do
   # exactly these calls: only code that runs now can cause an effect, so
   # a parked gated call contributes nothing to the fence decision — and
   # settles their normalized results into the batch map.
-  defp execute_now(%Execution{} = exec, [], completed), do: {:ok, exec, completed}
+  # `approval` is the decision a resumed call ran under, for its trace
+  # entry; nil for calls that needed none.
+  defp execute_now(exec, calls, completed, approval \\ nil)
 
-  defp execute_now(%Execution{} = exec, calls, completed) do
+  defp execute_now(%Execution{} = exec, [], completed, _approval), do: {:ok, exec, completed}
+
+  defp execute_now(%Execution{} = exec, calls, completed, approval) do
     tool_calls = Enum.map(calls, fn t -> %{id: t.id, name: t.name, input: t.input} end)
     context = Map.put(exec.context, :_clementine_iteration, exec.iteration)
 
-    with {:continue, %Execution{} = exec} <- raise_fence(exec, calls),
-         {:ok, results} <-
-           ToolRunner.run_batch(exec.tools, tool_calls, context, batch_opts(exec)) do
-      Enum.each(results, &emit_tool_result(exec, &1))
-      {:ok, exec, Enum.reduce(results, completed, &settle_result/2)}
+    with {:continue, %Execution{} = exec} <- raise_fence(exec, calls) do
+      uses = Map.new(calls, &{&1.id, &1})
+
+      case ToolRunner.run_batch(exec.tools, tool_calls, context, batch_opts(exec)) do
+        {:ok, results} ->
+          settled =
+            Enum.reduce(results, completed, fn {id, result, duration_ms}, completed ->
+              emit_tool_result(exec, {id, result})
+              completed = settle_result({id, result}, completed)
+              record_tool_call(exec, Map.fetch!(uses, id), completed[id], duration_ms, approval)
+              completed
+            end)
+
+          {:ok, exec, settled}
+
+        # The model never sees these, but they ran: the trace keeps them.
+        {:cancelled, reason, settled} ->
+          record_abandoned(exec, uses, settled, approval)
+          {:cancelled, reason}
+
+        {:drained, settled} ->
+          record_abandoned(exec, uses, settled, approval)
+          :drained
+
+        :lost_lease ->
+          :lost_lease
+      end
     end
+  end
+
+  # A cancel or a drain cut the batch short: every call is still on the
+  # record, the ones killed before they answered marked so, since what
+  # they did is unknown.
+  defp record_abandoned(exec, uses, settled, approval) do
+    Enum.each(settled, fn
+      {id, :killed, duration_ms} ->
+        record_tool_call(exec, Map.fetch!(uses, id), :killed, duration_ms, approval)
+
+      {id, result, duration_ms} ->
+        %{^id => tool_result} = settle_result({id, result}, %{})
+        record_tool_call(exec, Map.fetch!(uses, id), tool_result, duration_ms, approval)
+    end)
   end
 
   # A settled result keeps exactly the content and error flag the model
@@ -752,6 +859,30 @@ defmodule Clementine.Rollout do
       content: Clementine.ToolResult.content(normalized),
       is_error: Clementine.ToolResult.error?(normalized)
     })
+  end
+
+  defp record_tool_call(exec, tool_use, result, duration_ms, approval) do
+    {content, is_error, killed} =
+      case result do
+        %Clementine.ToolResult{content: content, is_error: is_error} -> {content, is_error, false}
+        :killed -> {nil, true, true}
+      end
+
+    record(
+      exec,
+      :tool_call,
+      Trace.tool_call(%{
+        iteration: exec.iteration,
+        tool_use_id: tool_use.id,
+        name: tool_use.name,
+        args: tool_use.input,
+        result: content,
+        is_error: is_error,
+        killed: killed,
+        duration_ms: duration_ms,
+        approval: approval
+      })
+    )
   end
 
   # The batch is fully settled: results return to the model in tool-use
@@ -910,6 +1041,21 @@ defmodule Clementine.Rollout do
       %{model: exec.model, kind: kind, reason: reason, stacktrace: stacktrace}
     )
   end
+
+  # What this execution offers the model, once, before anything runs.
+  defp record_execution(%Execution{recorder: nil}, _resumed?), do: :ok
+
+  defp record_execution(%Execution{} = exec, resumed?) do
+    record(exec, :execution, Trace.execution(exec.model, exec.system, exec.tools, resumed?))
+  end
+
+  defp record(%Execution{recorder: nil}, _kind, _payload), do: :ok
+
+  defp record(%Execution{recorder: recorder, fidelity: fidelity}, kind, payload) do
+    Recorder.record(recorder, kind, Trace.payload(kind, payload, fidelity))
+  end
+
+  defp to_ms(native), do: System.convert_time_unit(native, :native, :millisecond)
 
   defp emit_event(%Execution{emit: nil}, _type, _payload), do: :ok
 

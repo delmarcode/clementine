@@ -59,11 +59,23 @@ defmodule Clementine.Loop.InboxCodec do
   @doc """
   The completion payload from its stored halves — the child-terminal
   projection glue's door, where only the child row's `tag_key` exists.
+
+  A completed child's result travels as its `output` and `usage` only:
+  every path into an inbox (the child's own terminal, the reaper's
+  synthesized completion, the in-memory loop) comes through here, so a
+  controller sees one shape whichever delivered it, and an inbox row
+  never holds a transcript. A controller that wants more reads the
+  child's trace.
   """
   @spec completion_payload(String.t(), Result.t()) :: map()
   def completion_payload(tag_key, result) when is_binary(tag_key) do
-    %{"tag_key" => tag_key, "result" => LifecycleCodec.encode_term(result)}
+    %{"tag_key" => tag_key, "result" => LifecycleCodec.encode_term(summary(result))}
   end
+
+  defp summary(%Result.Completed{output: output, usage: usage}),
+    do: Result.completed(output: output, usage: usage)
+
+  defp summary(result), do: result
 
   @doc """
   The replay-stable dedup key for a child's completion append:

@@ -4,7 +4,8 @@ defmodule Clementine.Test.MemoryLifecycle do
   tests: exact `(status, epoch)` matching, absent-key-untouched /
   explicit-nil-writes-NULL set semantics, symbolic `:now` /
   `{:now_plus, ms}` resolution against a single clock, and terminal-result
-  projections recorded for assertions.
+  projections and trace entries recorded for assertions (each only when
+  its write commits).
 
   The store is an Agent, so applies serialize — which is exactly a
   single-writer storage engine, making concurrent-claim races honest.
@@ -16,7 +17,7 @@ defmodule Clementine.Test.MemoryLifecycle do
   alias Clementine.Lifecycle.{Facts, Transition}
 
   def start_store do
-    {:ok, store} = Agent.start_link(fn -> %{runs: %{}, projections: []} end)
+    {:ok, store} = Agent.start_link(fn -> %{runs: %{}, projections: [], traces: %{}} end)
     store
   end
 
@@ -39,6 +40,11 @@ defmodule Clementine.Test.MemoryLifecycle do
   @doc "Terminal results the host projection saw, in commit order."
   def projections(store) do
     Agent.get(store, fn state -> state.projections end)
+  end
+
+  @doc "The trace entries committed for `ref`, oldest first."
+  def trace(store, ref) do
+    Agent.get(store, fn state -> Map.get(state.traces, ref, []) end)
   end
 
   @impl true
@@ -72,6 +78,14 @@ defmodule Clementine.Test.MemoryLifecycle do
               else
                 state
               end
+
+            state =
+              update_in(
+                state.traces,
+                &Map.update(&1, transition.run_ref, transition.trace, fn t ->
+                  t ++ transition.trace
+                end)
+              )
 
             {{:ok, new_facts}, state}
           else

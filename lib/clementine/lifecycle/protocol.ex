@@ -5,8 +5,8 @@ defmodule Clementine.Lifecycle.Protocol do
   # text below is kept for the library's own readers.
   #
   #   The lifecycle protocol: every named operation of durable execution —
-  #   claim, heartbeat, cancellation, effect fence, suspend, resume, cancel
-  #   request, finish, interrupt, requeue — implemented once against the
+  #   claim, heartbeat, trace, cancellation, effect fence, suspend, resume,
+  #   cancel request, finish, interrupt, requeue — implemented once against the
   #   two-function `Clementine.Lifecycle` behaviour.
   #
   #   Every write is a compare-and-swap guarded by an exact `(status, epoch)`
@@ -27,7 +27,8 @@ defmodule Clementine.Lifecycle.Protocol do
   #
   #   Committed writes emit `[:clementine, :run, ...]` telemetry events after
   #   their CAS succeeds (the two flag writes — the effect fence and the
-  #   cooperative cancel flag — are the deliberate exceptions), and every
+  #   cooperative cancel flag — and the trace write are the deliberate
+  #   exceptions), and every
   #   lease-holding operation that discovers lease loss emits `:lease_lost` —
   #   so run-level observability rides the protocol itself, not any
   #   particular caller. Shapes are documented in `Clementine.Telemetry`.
@@ -148,6 +149,42 @@ defmodule Clementine.Lifecycle.Protocol do
     end
   end
 
+  ## Trace
+
+  @doc """
+  Writes trace entries the execution recorded since its last write: the
+  iteration-boundary flush. A guarded write like the heartbeat, which it
+  also is (`heartbeat_at` moves), so a superseded executor writes no
+  entries: `:stale` maps to `:lost_lease` and is definitive, and any other
+  error is transient, the entries staying with the execution for its next
+  write or its end. It carries no usage sample: the heartbeat is the one
+  writer of usage while the run executes, so a sample taken earlier can
+  never land after a later one.
+  """
+  @spec record_trace(Lease.t(), [Clementine.Trace.Entry.t()]) ::
+          :ok | {:error, :lost_lease} | {:error, term()}
+  def record_trace(%Lease{} = lease, entries) when is_list(entries) do
+    transition = %Transition{
+      op: :record_trace,
+      run_ref: lease.run_ref,
+      expect: running_expect(lease),
+      set: %{heartbeat_at: :now},
+      trace: entries
+    }
+
+    case lease.lifecycle.apply(transition, lease.ctx) do
+      {:ok, _facts} ->
+        :ok
+
+      {:error, :stale} ->
+        emit(:lease_lost, %{}, lease_metadata(lease))
+        {:error, :lost_lease}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   ## Cancellation intent
 
   @doc """
@@ -215,8 +252,10 @@ defmodule Clementine.Lifecycle.Protocol do
   time spent queued or running before the park.
 
   The rollout produced the `Suspension.Request` body; the runner supplies
-  `cursor:` (its event stamper position) and `rollout_id:`; this function
-  derives the token from the lease and persists the assembled suspension.
+  `cursor:` (its event stamper position), `rollout_id:`, and `trace:`
+  (the trace entries not yet written, which commit with the park); this
+  function derives the token from the lease and persists the assembled
+  suspension.
 
   After its own CAS succeeds, `suspend` re-fetches and checks the cancel
   flag: a cancel request that won the write order just before the suspend
@@ -263,7 +302,8 @@ defmodule Clementine.Lifecycle.Protocol do
         heartbeat_at: nil,
         queued_at: :now,
         usage: request.usage
-      }
+      },
+      trace: Keyword.get(opts, :trace, [])
     }
 
     case apply_with_retry(lease.lifecycle, transition, lease.ctx) do
@@ -507,13 +547,14 @@ defmodule Clementine.Lifecycle.Protocol do
   statuses are dead ends, and a `:stale` here disambiguates to
   `:already_terminal` (the reaper won) or `:lost_lease` (someone else owns
   the run now). Transient storage errors retry under the still-live
-  heartbeat; `:stale` never retries.
+  heartbeat; `:stale` never retries. `trace:` carries the trace entries
+  the execution has not written yet, which commit with the end.
   """
-  @spec finish(Lease.t(), Result.t()) ::
+  @spec finish(Lease.t(), Result.t(), keyword()) ::
           {:ok, Facts.t()}
           | {:error, :lost_lease | :already_terminal}
           | {:error, term()}
-  def finish(%Lease{} = lease, result) do
+  def finish(%Lease{} = lease, result, opts \\ []) do
     set =
       %{status: Result.status(result), usage: Result.usage(result), finished_at: :now}
       |> put_terminal_detail(result)
@@ -523,7 +564,8 @@ defmodule Clementine.Lifecycle.Protocol do
       run_ref: lease.run_ref,
       expect: running_expect(lease),
       set: set,
-      result: result
+      result: result,
+      trace: Keyword.get(opts, :trace, [])
     }
 
     case apply_with_retry(lease.lifecycle, transition, lease.ctx) do
@@ -604,15 +646,25 @@ defmodule Clementine.Lifecycle.Protocol do
   the world is exactly what this design exists to prevent. The epoch is
   untouched (the next claim increments it, and because epochs count claims
   they double as the attempt counter). Field hygiene clears the executor
-  fields. This arity is the drain flavor, fired by the runner holding the
-  lease; see `requeue/4` for the reaper flavor.
+  fields. This flavor, `requeue(lease, reason, opts)`, is the drain's,
+  fired by the runner holding the lease; `trace:` carries the trace
+  entries the execution has not written, which commit with the requeue.
+  `requeue(lifecycle, facts, reason)` and `requeue/4` are the reaper
+  flavor.
   """
   @spec requeue(Lease.t(), term()) ::
           {:ok, Facts.t()} | {:error, :effects_present | :lost_lease | term()}
-  def requeue(%Lease{} = lease, reason) do
+  def requeue(%Lease{} = lease, reason), do: requeue(lease, reason, [])
+
+  @spec requeue(Lease.t(), term(), keyword()) ::
+          {:ok, Facts.t()} | {:error, :effects_present | :lost_lease | term()}
+  @spec requeue(module(), Facts.t(), term()) ::
+          {:ok, Facts.t()}
+          | {:error, :effects_present | {:not_requeueable, Facts.status()} | :stale | term()}
+  def requeue(%Lease{} = lease, reason, opts) when is_list(opts) do
     case lease.lifecycle.fetch(lease.run_ref, lease.ctx) do
       {:ok, %Facts{status: :running, epoch: epoch} = facts} when epoch == lease.epoch ->
-        do_requeue(lease.lifecycle, facts, reason, lease.ctx)
+        do_requeue(lease.lifecycle, facts, reason, lease.ctx, Keyword.get(opts, :trace, []))
 
       {:ok, %Facts{}} ->
         emit(:lease_lost, %{}, lease_metadata(lease))
@@ -630,24 +682,24 @@ defmodule Clementine.Lifecycle.Protocol do
   stale-fetched terminal snapshot) is refused with a clean error, for the
   same reason `interrupt/4` refuses terminal facts.
   """
+  def requeue(lifecycle, %Facts{} = facts, reason), do: requeue(lifecycle, facts, reason, nil)
+
   @spec requeue(module(), Facts.t(), term(), term()) ::
           {:ok, Facts.t()}
           | {:error, :effects_present | {:not_requeueable, Facts.status()} | :stale | term()}
-  def requeue(lifecycle, facts, reason, ctx \\ nil)
-
   def requeue(lifecycle, %Facts{status: :running} = facts, reason, ctx) do
-    do_requeue(lifecycle, facts, reason, ctx)
+    do_requeue(lifecycle, facts, reason, ctx, [])
   end
 
   def requeue(_lifecycle, %Facts{} = facts, _reason, _ctx) do
     {:error, {:not_requeueable, facts.status}}
   end
 
-  defp do_requeue(_lifecycle, %Facts{effects?: true}, _reason, _ctx) do
+  defp do_requeue(_lifecycle, %Facts{effects?: true}, _reason, _ctx, _trace) do
     {:error, :effects_present}
   end
 
-  defp do_requeue(lifecycle, %Facts{} = facts, reason, ctx) do
+  defp do_requeue(lifecycle, %Facts{} = facts, reason, ctx, trace) do
     transition = %Transition{
       op: :requeue,
       run_ref: facts.ref,
@@ -659,7 +711,8 @@ defmodule Clementine.Lifecycle.Protocol do
         deadline: nil,
         heartbeat_at: nil
       },
-      meta: %{reason: reason}
+      meta: %{reason: reason},
+      trace: trace
     }
 
     case lifecycle.apply(transition, ctx) do

@@ -87,6 +87,8 @@ defmodule Clementine.MixProject do
           Clementine.Loop.StoredInput
         ],
         "Events & observation": [
+          Clementine.Trace,
+          Clementine.Trace.Entry,
           Clementine.Event,
           Clementine.Events,
           Clementine.Events.Null,

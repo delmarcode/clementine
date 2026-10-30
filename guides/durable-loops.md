@@ -35,7 +35,7 @@ This guide wires a conversation thread end to end: the controller, the
 child spec, starting and feeding, cancellation, and what the runtime does
 underneath; the judge and watcher shapes and the local script path close
 it out. It assumes the [runtime guide](runtime.md)'s setup (the child
-after Oban, the migration at version 3, a turn agent for the thread).
+after Oban, the migration at version 4, a turn agent for the thread).
 The operations story (telemetry, paging signals, and the loop doctor) is
 [its own guide](loop-operations.md).
 
@@ -345,7 +345,11 @@ matches on the kind.
   beside the rest, and `context.metadata` is what the `{:run, ...}`
   action set. When it ends, however it ends, its terminal transaction
   appends `{:completed, tag, result}` to the loop's inbox, exactly once,
-  and the loop wakes after the commit.
+  and the loop wakes after the commit. A completed child's result carries
+  its `output` and `usage` and no transcript (`messages` is empty, as
+  when the loop sweep synthesizes a lost completion from the child's
+  row): a controller decides on the outcome, and one that needs what the
+  child did reads `Clementine.Runs.trace/1` for the child.
 - **Timers** are Oban jobs scheduled in the step's commit
   (worker `Runs.TimerWorker`); a fire appends `{:elapsed, tag}` under
   the schedule's own dedup key, so a redelivered fire is a duplicate and
