@@ -387,6 +387,130 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       assert Enum.sort(delivered) == Enum.sort(sent)
     end
 
+    ## send if_idle
+
+    def send_if_idle_refusals do
+      loop = parked!()
+
+      # Idle: nothing live, nothing pending.
+      assert {:ok, :appended} = Runs.send(loop.id, message("quiet"), if_idle: true)
+      assert {:parked, _} = step!(loop)
+      assert "message:quiet" in log!(loop)
+
+      # A live child: refused, and nothing of the message exists.
+      child = spawn_child!(loop, {:reply, 1})
+      assert {:error, :busy} = Runs.send(loop.id, message("busy-child"), if_idle: true)
+      assert pending!(loop) == []
+      assert fetch!(loop).status == :waiting
+
+      # The default never refuses: queueing is the controller's.
+      assert {:ok, :appended} = Runs.send(loop.id, message("queued-anyway"))
+
+      # A redelivery of a message the inbox already holds is a duplicate
+      # before it is a refusal, pending or consumed.
+      assert {:ok, :appended} = Runs.send(loop.id, message("keyed"), dedup_key: "keyed")
+
+      assert {:ok, :duplicate} =
+               Runs.send(loop.id, message("keyed"), dedup_key: "keyed", if_idle: true)
+
+      assert {:parked, _} = step!(loop)
+      assert "message:queued-anyway" in log!(loop)
+      assert "message:keyed" in log!(loop)
+
+      # Consumed, the row is gone and its key with it: the receipt for a
+      # redelivery after the drain is the app's, and this one is refused.
+      assert {:error, :busy} =
+               Runs.send(loop.id, message("keyed"), dedup_key: "keyed", if_idle: true)
+
+      # The child ends: its completion waits in the inbox, so still busy,
+      # until the step that folds it.
+      expect_turn(text_events("Done."))
+      assert :ok = perform_job(Worker, %{"run_id" => child.id})
+      assert [%StoredInput{input: %Input{kind: :completed}}] = pending!(loop)
+      assert {:error, :busy} = Runs.send(loop.id, message("busy-inbox"), if_idle: true)
+      assert {:parked, _} = step!(loop)
+      assert {:ok, :appended} = Runs.send(loop.id, message("quiet-again"), if_idle: true)
+      assert {:parked, _} = step!(loop)
+
+      # A pending cancel: the next step is a cascade that would never read
+      # the message.
+      assert {:ok, :flagged} = Runs.cancel(loop.id)
+      assert {:error, :busy} = Runs.send(loop.id, message("busy-cancel"), if_idle: true)
+      assert {:finished, %Facts{status: :cancelled}} = step!(loop)
+
+      # Ended: dead-lettered, as any send, so the sender knows which.
+      assert {:ok, :dead_lettered} = Runs.send(loop.id, message("late"), if_idle: true)
+
+      # Nothing refused ever reached the controller.
+      refute Enum.any?(log!(loop), &String.starts_with?(&1, "message:busy"))
+    end
+
+    def send_if_idle_racing_a_step do
+      loop = parked!()
+      send!(loop, message(1))
+
+      # A step in flight has drained its window but not yet committed:
+      # the input it read is still pending under the lock, so a send that
+      # wants idle is refused, and nothing of it lands for the park
+      # re-check to see.
+      lease = claim!(loop)
+      commit = commit!(loop, lease)
+      assert commit.op == :park
+      assert {:error, :busy} = Runs.send(loop.id, message("racer"), if_idle: true)
+      assert {:ok, %Facts{status: :waiting}} = Loops.apply_step(commit, nil)
+      assert pending!(loop) == []
+
+      # Once the park committed, the loop is idle and the send lands,
+      # waking it in the same unit.
+      assert {:ok, :appended} = Runs.send(loop.id, message("after"), if_idle: true)
+      assert fetch!(loop).status == :queued
+      assert {:parked, _} = step!(loop)
+      assert log!(loop) == ["init", "message:1", "message:after"]
+    end
+
+    def send_if_idle_concurrent do
+      loop = parked!()
+
+      tasks =
+        for i <- 1..@concurrent_appenders do
+          Elixir.Task.async(fn ->
+            receive do
+              :go -> Runs.send(loop.id, message(i), dedup_key: "idle:#{i}", if_idle: true)
+            end
+          end)
+        end
+
+      Enum.each(tasks, &send(&1.pid, :go))
+      results = Elixir.Task.await_many(tasks, 30_000)
+
+      # The first through the lock finds the loop idle; every other finds
+      # its message pending.
+      assert Enum.count(results, &(&1 == {:ok, :appended})) == 1
+      assert Enum.count(results, &(&1 == {:error, :busy})) == @concurrent_appenders - 1
+
+      assert {:parked, _} = step!(loop)
+      assert Enum.count(log!(loop), &String.starts_with?(&1, "message:")) == 1
+      assert pending!(loop) == []
+    end
+
+    def send_if_idle_inside_a_transaction do
+      loop = parked!()
+      _child = spawn_child!(loop, {:reply, 1})
+      repo = repo()
+
+      # The refusal leaves the caller's transaction good: the work after
+      # it commits.
+      assert {:ok, {:error, :busy}} =
+               repo.transaction(fn ->
+                 result = Runs.send(loop.id, message("busy"), if_idle: true)
+                 {:ok, :appended} = Runs.send(loop.id, message("kept"))
+                 result
+               end)
+
+      assert [%StoredInput{input: %Input{kind: :message, payload: %{"id" => "kept"}}}] =
+               pending!(loop)
+    end
+
     ## wrong-state calls
 
     def kind_guards do
@@ -800,13 +924,13 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
 
     def child_builds_at_claim do
       loop = parked!(subject: {"thread", "t-build"}, actor: {"user", "u-1"})
-      send!(loop, spawn_payload({:reply, 1}, Turn))
+      send!(loop, spawn_payload({:reply, 1}, Turn, %{"metadata" => %{"today" => "2026-10-28"}}))
       assert {:parked, _} = step!(loop)
       {:ok, child} = Runs.child(loop.id, {:reply, 1})
 
       # The child builds like any run: history/1 with the subject and actor
-      # resolved, and its tool sees the run's context, parent and tag
-      # included.
+      # resolved, and its tool sees the run's context, parent, tag and the
+      # metadata the {:run, ...} action set included.
       expect_turn(tool_events("toolu_1", "context", %{}))
       expect_turn(text_events("Answered."))
       assert :ok = perform_job(Worker, %{"run_id" => child.id})
@@ -822,6 +946,7 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       assert context.actor == %{user: "u-1"}
       assert context.parent_id == loop.id
       assert context.tag == {:reply, "1"}
+      assert context.metadata == %{"today" => "2026-10-28"}
 
       assert %AgentRun{status: "completed", result: %{"output" => "Answered."}} =
                Runs.get(child.id)
@@ -1030,6 +1155,37 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
       assert "message:again" in log!(loop)
     end
 
+    def spawn_cancelled_in_one_drain do
+      # A spawn and its cancel in one drain (interrupt mode's double-send):
+      # the spawn is retired before it is ever inserted — no row, no job,
+      # no completion — and the controller hears the child's Cancelled end
+      # inline, in the same fold, as a row would otherwise have reported
+      # it later. The tag re-arms at once: a third input re-spawning it in
+      # the same drain is the commit's one child.
+      loop = parked!()
+      send!(loop, spawn_payload({:reply, 1}))
+      send!(loop, %{"id" => "stop", "actions" => [{:cancel, {:reply, 1}}]})
+      send!(loop, spawn_payload({:reply, 1}, Task, %{"metadata" => %{"attempt" => 2}}))
+
+      assert {:parked, _} = step!(loop)
+
+      assert [%AgentRun{status: "queued", metadata: %{"attempt" => 2}} = child] =
+               Runs.list(parent: loop.id)
+
+      assert {:ok, %AgentRun{id: id}} = Runs.child(loop.id, {:reply, 1})
+      assert id == child.id
+      refute_received {:run_finished, %AgentRun{kind: "rollout"}, _result}
+
+      assert Enum.take(log!(loop), -4) == [
+               "message:spawn",
+               "message:stop",
+               "completed:{:reply, 1}:cancelled",
+               "message:spawn"
+             ]
+
+      assert Loops.dead_letters(loop.id, 50, nil) == []
+    end
+
     ## cancel/1
 
     def cascade_orders_queued_child do
@@ -1146,26 +1302,65 @@ if Code.ensure_loaded?(Oban.Testing) and Code.ensure_loaded?(Mox) do
     end
 
     def halt_in_the_spawning_step do
-      # One drain spawns a child and then halts the loop: the cascade
-      # cancels the child it has only just inserted, inside the same unit,
-      # and the loop ends after it.
+      # One drain spawns a child and then halts the loop: the spawn is
+      # retired before it is ever inserted — no row, no job, no
+      # completion, and nobody hears it — and with nothing in flight the
+      # loop finishes in this very step, without a cascade.
       loop = parked!()
       send!(loop, spawn_payload({:reply, 1}))
       send!(loop, %{"halt" => "done"})
 
-      assert {:continued, _} = step!(loop)
-      assert [%AgentRun{status: "cancelled"} = child] = Runs.list(parent: loop.id)
+      assert {:finished, %Facts{status: :completed}} = step!(loop)
+      assert Runs.list(parent: loop.id) == []
+      refute_received {:run_finished, %AgentRun{kind: "rollout"}, _result}
 
-      assert_received {:run_finished, %AgentRun{id: id},
-                       %Result.Cancelled{reason: %{"code" => "loop_cascade"}}}
-                      when id == child.id
-
-      # The cascade absorbs the completion without the controller, and the
-      # halt's result wins.
-      quiesce!(loop)
       assert %AgentRun{status: "completed", result: %{"output" => "done"}} = Runs.get(loop.id)
       assert envelope!(loop).children == %{}
+      refute Enum.any?(log!(loop), &String.starts_with?(&1, "completed:"))
+      assert pending!(loop) == []
       assert Loops.dead_letters(loop.id, 50, nil) == []
+    end
+
+    def halt_behind_a_completion_in_one_drain do
+      # A committed child's completion and a halt in one drain: the
+      # completion retires the tag before the halt reaches it, so there is
+      # nothing to cascade over and the loop finishes in this step, the
+      # controller having heard the completion.
+      loop = parked!()
+      child = spawn_child!(loop, {:reply, 1})
+      assert {:ok, :finished} = Runs.cancel(child.id)
+      send!(loop, %{"halt" => "done"})
+
+      assert {:finished, %Facts{status: :completed}} = step!(loop)
+      assert Enum.take(log!(loop), -2) == ["completed:{:reply, 1}:cancelled", "halt:done"]
+      assert %AgentRun{status: "completed", result: %{"output" => "done"}} = Runs.get(loop.id)
+      assert envelope!(loop).children == %{}
+      assert pending!(loop) == []
+    end
+
+    def halt_behind_a_respawn_in_one_drain do
+      # A completion, a re-spawn under the re-armed tag, and a halt in one
+      # drain: the re-spawn is retired before it is inserted, nothing is
+      # inserted for it, and the loop finishes now. The first child's row
+      # is the only one that ever existed.
+      loop = parked!()
+      first = spawn_child!(loop, {:reply, 1})
+      assert {:ok, :finished} = Runs.cancel(first.id)
+      send!(loop, spawn_payload({:reply, 1}))
+      send!(loop, %{"halt" => "done"})
+
+      assert {:finished, %Facts{status: :completed}} = step!(loop)
+      assert [%AgentRun{id: id, status: "cancelled"}] = Runs.list(parent: loop.id)
+      assert id == first.id
+
+      assert Enum.take(log!(loop), -3) == [
+               "completed:{:reply, 1}:cancelled",
+               "message:spawn",
+               "halt:done"
+             ]
+
+      assert envelope!(loop).children == %{}
+      assert pending!(loop) == []
     end
 
     def cascade_completion_behind_long_backlog do

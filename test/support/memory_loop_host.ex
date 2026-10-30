@@ -377,10 +377,10 @@ defmodule Clementine.Test.MemoryLoopHost do
           state = put_in(state.runs[commit.loop_ref], apply_set(facts, commit.set, now))
           state = mark_dead(state, commit, now)
           state = insert_appends(state, commit, now)
+          state = cancel_children(state, commit, now)
           {state, child_fills} = spawn_children(state, commit, now)
           {state, timer_fills} = schedule_timers(state, commit)
           state = retire_timers(state, commit)
-          state = cancel_children(state, commit, child_fills, now)
 
           case execute_sends(state, commit, now) do
             {:error, reason} ->
@@ -458,16 +458,23 @@ defmodule Clementine.Test.MemoryLoopHost do
     end)
   end
 
-  # Cascade cargo, exactly the Ecto adapter's semantics: queued/waiting
-  # children direct-terminalize with Result.Cancelled — their glue
-  # (record_result) appends completions to this very loop inside this
-  # very unit, where the park re-check sees them; running children get
-  # the cooperative flag; terminal or missing children are tolerated.
-  defp cancel_children(state, %StepCommit{cancel_children: tag_keys} = commit, fills, now) do
+  # Cascade cargo, exactly the Ecto adapter's semantics: cancels run
+  # before the step's spawns and name committed children only (a spawn of
+  # the same drain is retired by the step core, never named here);
+  # queued/waiting children direct-terminalize with Result.Cancelled —
+  # their glue (record_result) appends completions to this very loop
+  # inside this very unit, where the park re-check sees them; running
+  # children get the cooperative flag; terminal or missing children are
+  # tolerated.
+  defp cancel_children(state, %StepCommit{cancel_children: tag_keys} = commit, now) do
     stored = StepCommit.envelope(commit)
 
     Enum.reduce(tag_keys, state, fn tag_key, state ->
-      ref = Map.get(fills, tag_key) || (stored && Map.get(stored.children, tag_key))
+      ref =
+        (stored && Map.get(stored.children, tag_key)) ||
+          raise ArgumentError,
+                "cancel for #{inspect(tag_key)} names no committed child: the step core " <>
+                  "cancels committed children only"
 
       case Map.get(state.runs, ref) do
         nil ->

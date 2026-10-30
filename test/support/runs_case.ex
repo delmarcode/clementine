@@ -302,7 +302,8 @@ end
 defmodule Clementine.RunsCase.Context do
   @moduledoc """
   A test tool that reports what a tool sees of its run: `run_id`,
-  `agent_key`, `turn`, `subject`, and `actor`, as `inspect/1` renders them.
+  `agent_key`, `turn`, `subject`, `actor`, and `metadata`, as `inspect/1`
+  renders them.
   """
   use Clementine.Tool,
     name: "context",
@@ -312,7 +313,7 @@ defmodule Clementine.RunsCase.Context do
 
   @impl true
   def run(_args, context) do
-    {:ok, inspect(Map.take(context, [:run_id, :agent_key, :turn, :subject, :actor]))}
+    {:ok, inspect(Map.take(context, [:run_id, :agent_key, :turn, :subject, :actor, :metadata]))}
   end
 end
 

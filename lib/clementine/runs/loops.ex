@@ -58,6 +58,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
               [envelope: :envelope, state_version: :state_version]
 
     @terminal_statuses Enum.map(Facts.terminal_statuses(), &Atom.to_string/1)
+    @active_statuses Enum.map(Facts.active_statuses(), &Atom.to_string/1)
 
     @typedoc "What `append/3` and the fire door answer."
     @type append_outcome :: {:ok, :appended | :duplicate | :dead_lettered}
@@ -256,13 +257,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
            :ok <- consume(config, commit),
            :ok <- mark_dead(config, commit),
            :ok <- insert_appends(config, commit),
-           :ok <- cancel_children(commit, :existing, %{}),
+           :ok <- cancel_children(commit),
            {:ok, children} <- spawn_children(config, row, commit),
            {:ok, timers} <- schedule_timers(config, row, commit),
            :ok <- retire_timers(config, row, commit),
            :ok <- execute_sends(config, row, commit),
            :ok <- write_envelope(config, commit, children, timers),
-           :ok <- cancel_children(commit, :spawned, children),
            :ok <- settle_transition(config, row, commit),
            :ok <- project_finish(config, commit, ctx),
            :ok <- terminal_sweep(config, commit) do
@@ -578,32 +578,26 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # runner once the unit commits. Already-terminal and missing children
     # are tolerated: their completions are en route, or the loop sweep's
     # :reconcile_children verdict will synthesize them.
-    # Cancels of the children the envelope already holds go before the
-    # step's spawns: a cancelled child that was never claimed ends inside
-    # this unit and frees its lane, so a controller interrupts it and
-    # starts its successor in one step, while a running child only takes
-    # the flag. A halt in the very step that spawned a child (the drain
-    # spawns, its next input halts) cascades to that child too; it has no
-    # ref until it is inserted, and its completion finds its tag through
-    # the parent's envelope, so those cancels follow the envelope write.
-    # The step core refuses a controller's own {:cancel, tag} for a
-    # same-step spawn, so only the cascade reaches the second phase.
-    defp cancel_children(%StepCommit{cancel_children: []}, _phase, _spawned), do: :ok
+    # Cancels run before the step's spawns: a cancelled child that was
+    # never claimed ends inside this unit and frees its lane, so a
+    # controller interrupts it and starts its successor in one step,
+    # while a running child only takes the flag. Every cancel names a
+    # child the commit's envelope holds with its ref: the step core
+    # retires a spawn of its own drain instead of cancelling it (the
+    # per-tag rule), so a missing ref is a core bug, never a race.
+    defp cancel_children(%StepCommit{cancel_children: []}), do: :ok
 
-    defp cancel_children(%StepCommit{cancel_children: tag_keys} = commit, phase, spawned) do
+    defp cancel_children(%StepCommit{cancel_children: tag_keys} = commit) do
       stored = StepCommit.envelope(commit)
       reason = cancel_reason(commit)
 
-      tag_keys
-      |> Enum.flat_map(fn tag_key ->
-        case {phase, stored && Map.get(stored.children, tag_key)} do
-          {:existing, nil} -> []
-          {:existing, ref} -> [ref]
-          {:spawned, nil} -> [spawned_ref!(spawned, tag_key)]
-          {:spawned, _ref} -> []
-        end
-      end)
-      |> Enum.reduce_while(:ok, fn ref, :ok ->
+      Enum.reduce_while(tag_keys, :ok, fn tag_key, :ok ->
+        ref =
+          (stored && Map.get(stored.children, tag_key)) ||
+            raise ArgumentError,
+                  "cancel for #{inspect(tag_key)} names no committed child: the step core " <>
+                    "cancels committed children only and retires a spawn of its own drain"
+
         case Protocol.request_cancel(Lifecycle, ref, reason) do
           {:ok, _} -> {:cont, :ok}
           {:error, :already_terminal} -> {:cont, :ok}
@@ -611,13 +605,6 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           {:error, reason} -> {:halt, {:error, {:cancel_child_failed, ref, reason}}}
         end
       end)
-    end
-
-    defp spawned_ref!(spawned, tag_key) do
-      Map.get(spawned, tag_key) ||
-        raise ArgumentError,
-              "cancel for #{inspect(tag_key)} names no child: the commit's envelope must " <>
-                "carry every live child"
     end
 
     # The loop's own end (a halt with children in flight, or a cancel flag)
@@ -800,11 +787,19 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     ## append: atomicity sentence 2
 
     @doc false
-    @spec append(Ecto.UUID.t(), Input.t(), String.t() | nil) ::
-            append_outcome() | {:error, :not_found | :not_a_loop | term()}
-    def append(loop_id, %Input{} = input, dedup_key)
+    # `if_idle: true` refuses a message under the same lock, before any
+    # write, when a child of the loop is active, an input waits in its
+    # inbox, or a cancel is pending on it. A redelivery the dedup key
+    # already answered is `:duplicate` first, as it would be without the
+    # option: the message was accepted, whatever the loop is doing now.
+    # The refusal is a return, not a rollback: nothing was written, and a
+    # caller's enclosing transaction stays good.
+    @spec append(Ecto.UUID.t(), Input.t(), String.t() | nil, keyword()) ::
+            append_outcome() | {:error, :not_found | :not_a_loop | :busy | term()}
+    def append(loop_id, %Input{} = input, dedup_key, opts \\ [])
         when is_binary(dedup_key) or is_nil(dedup_key) do
       %Config{repo: repo} = config = Config.fetch!()
+      if_idle? = Keyword.get(opts, :if_idle, false)
 
       # Inside a caller's transaction the row and the job commit with it,
       # and the host hears of the wake through the claim that follows: a
@@ -818,7 +813,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             nil ->
               repo.rollback(:not_found)
 
-            %AgentRun{kind: "loop"} = row ->
+            %AgentRun{kind: "loop", status: status} = row
+            when status in @terminal_statuses or not if_idle? ->
               {kind, payload} =
                 InboxCodec.encode_input(input, vocabulary: vocabulary(config, row))
 
@@ -828,11 +824,54 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
                 emit?: announce?
               )
 
+            %AgentRun{kind: "loop"} = row ->
+              if not delivered?(config, row, dedup_key) and busy?(config, row) do
+                :busy
+              else
+                {kind, payload} =
+                  InboxCodec.encode_input(input, vocabulary: vocabulary(config, row))
+
+                deliver_locked(config, row, kind, payload, dedup_key,
+                  wake?: true,
+                  notify?: announce?,
+                  emit?: announce?
+                )
+              end
+
             %AgentRun{} ->
               repo.rollback(:not_a_loop)
           end
         end)
       end)
+      |> case do
+        {:ok, :busy} -> {:error, :busy}
+        other -> other
+      end
+    end
+
+    # A dedup key the loop's inbox already holds, live or dead: the insert
+    # below would answer :duplicate, and a refusal must not come first.
+    defp delivered?(_config, _row, nil), do: false
+
+    defp delivered?(%Config{repo: repo}, %AgentRun{id: loop_id}, dedup_key) do
+      repo.exists?(
+        from(i in @inbox,
+          where: i.run_id == type(^loop_id, Ecto.UUID),
+          where: i.dedup_key == ^dedup_key
+        )
+      )
+    end
+
+    # Idle means the loop has nothing to do and nothing coming: no live
+    # child, an empty inbox (completions included), and no cancel flag,
+    # which would make the next step a cascade that never reads the
+    # message. Read under the row lock, so a step's park or another
+    # append cannot slip between the check and the insert.
+    defp busy?(%Config{repo: repo} = config, %AgentRun{id: loop_id, cancel: cancel}) do
+      cancel != nil or pending_exists?(config, loop_id, :any) or
+        repo.exists?(
+          from(r in AgentRun, where: r.parent_id == ^loop_id and r.status in @active_statuses)
+        )
     end
 
     # The serialization point: the run-row lock closes the lost-wakeup

@@ -127,7 +127,7 @@ context: %{
 }
 ```
 
-Filesystem paths are scoped to the agent's `:working_dir` or `:workspace_root`; parent traversal and symlink escapes outside that root return an error.
+Filesystem paths are scoped to the agent's `:working_dir` or `:workspace_root`; parent traversal and symlink escapes outside that root return an error. In-process the default root is the current directory; on the durable runtime (`Clementine.Runs`) there is none: the agent sets `working_dir` in `agent/1`'s `tool_context:`, and a built-in file or shell tool refuses without it.
 
 ### Verifiers
 

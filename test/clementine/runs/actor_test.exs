@@ -22,7 +22,13 @@ defmodule Clementine.Runs.ActorTest do
   end
 
   test "the host resolves the actor for the agent and its tools, with the rest of the context" do
-    {:ok, run} = Runs.start(Lookup, "Who am I?", subject: {"ticket", 42}, actor: {"user", "ada"})
+    {:ok, run} =
+      Runs.start(Lookup, "Who am I?",
+        subject: {"ticket", 42},
+        actor: {"user", "ada"},
+        metadata: %{"today" => "2026-10-28"}
+      )
+
     run_id = run.id
 
     expect(Clementine.LLM.MockClient, :stream, fn _model, system, _messages, _tools, _opts ->
@@ -37,6 +43,8 @@ defmodule Clementine.Runs.ActorTest do
       assert context =~ "turn: false"
       assert context =~ ~s(subject: %{ticket: \\"42\\"})
       assert context =~ ~s(actor: %{user: \\"ada\\"})
+      # The run's metadata, as start/3 stored it, without re-reading the row.
+      assert context =~ ~s(metadata: %{\\"today\\" => \\"2026-10-28\\"})
       text_events("Done.")
     end)
 

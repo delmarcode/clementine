@@ -137,7 +137,9 @@ running, or waiting) are exclusive, held by one unique index:
 
 Busy means refused: `start/3` returns `{:error, :active_run_exists}`. A
 thread that should queue messages instead gets a loop, which holds the
-lane and starts one turn at a time: see [Durable Loops](durable-loops.md).
+lane and starts one turn at a time: `Clementine.Thread`, the controller
+that ships with the runtime, or one of your own; see
+[Durable Loops](durable-loops.md).
 
 ## Running agents
 
@@ -311,7 +313,8 @@ transaction (they raise inside one, because the host would hear of their
 writes before the caller's commit). The resolved subject and actor reach
 `agent/1` and `history/1` as `run.subject` and `run.actor`, and every
 tool as `context.subject` and `context.actor`, beside `context.run_id`,
-`context.agent_key`, and `context.turn`.
+`context.agent_key`, `context.turn`, and `context.metadata` (the run's
+metadata as `start/3` stored it).
 
 Coding agents working in the app get these rules from
 [`usage-rules.md`](../usage-rules.md), which the

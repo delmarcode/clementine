@@ -42,7 +42,8 @@ lifecycle, or a reaper into the app.
   has no lane and blocks nothing.
 - Busy means refused: a start in a busy lane returns
   `{:error, :active_run_exists}`. Queueing is a loop's job, not the
-  runtime's.
+  runtime's: a thread that must answer every message gets
+  `Clementine.Thread`, below.
 
 ## The API: `Clementine.Runs`
 
@@ -68,6 +69,17 @@ lifecycle, or a reaper into the app.
   ends the run `cancelled`, unless it was already ending. A run that has
   ended returns `{:error, :already_terminal}`. Check who may cancel before
   calling it.
+- `purge/1` erases a subject's runs: `purge({"conversation", id})`
+  deletes every run whose subject that is and every descendant of a loop
+  among them (a child's subject may differ from its loop's), with their
+  inbox rows, and returns `{:ok, count}`. While any of them is queued,
+  running or waiting, loops included, it returns `{:error, :active}` and
+  deletes nothing: cancel the thread's loop first and purge once it has
+  ended, from `run_committed/2`. It works inside the caller's
+  transaction, so delete the subject's own row in the same unit; the
+  refusal is a return, not a rollback. Only Clementine writes
+  `agent_runs`, and this is how an app erases what a deleted thread's
+  prompts and replies left in `input` and `result`.
 - Call `resume/2` and `cancel/1` outside a transaction: inside one they
   raise.
 - `get/1` returns the run or `nil`. Read `agent_runs` freely; only
@@ -119,6 +131,91 @@ end
 - `history/1` runs when a run starts, with `run.subject` and `run.actor`
   resolved. A run that resumes after an approval continues from its
   checkpoint and does not call it.
+
+## A thread: `Clementine.Thread` and `Runs.send/3`
+
+A thread that must answer every message, in order, gets a loop: a
+standing run that holds the thread's lane and starts one turn at a time.
+`Clementine.Thread` is the controller; list it in `agents:` beside the
+turn agent, start one loop per thread in the transaction that creates
+the thread, and send each message to it in the transaction that stores
+the message.
+
+```elixir
+{:ok, loop} =
+  Clementine.Runs.start_loop(Clementine.Thread, %{"agent" => "chat"},
+    subject: {"conversation", conversation.id},
+    actor: {"user", user.id}
+  )
+
+{:ok, :appended} =
+  Clementine.Runs.send(
+    loop.id,
+    %{"prompt" => content, "id" => message.id, "metadata" => %{"message_id" => message.id}},
+    dedup_key: message.id
+  )
+```
+
+- `start_loop/3` is insert-or-get on the lane: a second start of the
+  same controller on the same subject returns
+  `{:ok, :already_exists, loop}`. The thread's loop is
+  `Runs.active(subject, kind: :loop)`; store nothing on the thread.
+- The args are the thread's policy: `"agent"`, the turn agent's key;
+  `"busy"`, `"queue"` (the default) or `"interrupt"`, what a message does
+  while a turn runs; `"on_failure"`, `"surface"` (the default) or
+  `"retry"` after `"retry_after_ms"` (five minutes); `"retry_interrupted"`
+  (`true`), one immediate retry of a turn whose node died. A turn is
+  retried at most once, under the same tag. Bad args end the loop
+  `failed` in its first step.
+- `send/3` appends the message, wakes the loop, and enqueues its step in
+  one transaction. Inside the caller's transaction they commit with it
+  and the job steps the loop at the commit; outside one the step runs at
+  once, in a task on this node, and `send/3` returns before the turn
+  exists. The reply carries no run id: the turn is
+  `Runs.child(loop.id, {:turn, message.id})` once it starts, and the host
+  hears it as `run_transition(run, :claimed)` and then its events.
+- `Clementine.Thread.waiting(loop.id)` is the ids of the messages the
+  thread holds but has not started a turn for, in the order it will
+  answer them: the queue behind the current turn, then what no step has
+  drained from the inbox (a message sent without an id under the counter
+  id the thread will give it). The current turn's message is not in it,
+  nor a failed turn waiting out its retry, which is that turn retried
+  under its own id; a thread that is ending or has ended holds nothing.
+  `Runs.pending/2` is the raw inbox and empties as steps drain it, so it
+  is not what a thread holds.
+- `dedup_key:` makes a redelivery `{:ok, :duplicate}`. `if_idle: true`
+  refuses with `{:error, :busy}` unless no turn is live, nothing waits in
+  the inbox, and no cancel is pending, for a prompt that should only
+  start a turn on a quiet thread; the check runs under the loop's row
+  lock, so the controller never sees a refused message. A loop that has
+  ended answers `{:ok, :dead_lettered}`.
+- A message is `"prompt"` plus, optionally, `"id"` (the turn's tag id, a
+  nonblank string or an integer), `"metadata"` (a plain-JSON map stored
+  on the turn's row, which its tools see as `context.metadata`), and
+  `"actor"` (`[type, id]`, both nonblank, this
+  one turn's authority). The thread checks a message the way the turn's
+  row would, at the message, so one the row would refuse is dead-lettered
+  on its own and never waits in the queue behind a running turn. The
+  thread holds no transcript: the turn agent's `history/1` reads the
+  thread, and `run_finished/2` stores what the turn said with the turn's
+  id.
+- `Runs.cancel/1` on the turn (`Runs.active(subject)`) stops it and the
+  thread answers the next message; on the loop, it ends the thread,
+  cancels the turn in flight, and keeps queued messages as dead letters.
+  Both outside a transaction. Deleting the thread is `Runs.cancel(loop.id)`,
+  then `Runs.purge(subject)` once the loop has ended.
+- A turn's end is one rule, whichever way it comes. A turn cancelled in
+  the step that spawned it (interrupt mode's double-send, or a halt
+  behind a spawn) never exists: no row, no `run_finished/2`, no
+  `stream_end`. The controller hears its `Cancelled` end inline, and a
+  client in interrupt mode renders the superseded message's turn as
+  never having started. A cancel of a turn with a row is one flag, and
+  its `Cancelled` completion arrives on a later step; a completion
+  retires the tag and any flag on it. A halt cancels turns with rows and
+  ends the loop at once when there are none.
+- A policy the thread lacks is a controller of your own:
+  `use Clementine.Loop, key: "..."`, listed in `agents:` and started and
+  fed the same way; the Durable Loops guide wires one.
 
 ## The host module: which callback
 
@@ -254,7 +351,16 @@ def resolve_actor(_type, _id), do: {:ok, nil}
 
 Tools see `context.run_id`, `context.agent_key`, `context.turn`,
 `context.subject`, and `context.actor` (with `subject_type`,
-`subject_id`, `actor_type`, and `actor_id` as stored).
+`subject_id`, `actor_type`, and `actor_id` as stored), and
+`context.metadata`, the run's metadata as `start/3` stored it or, on a
+loop's child, as the `{:run, ...}` action set it. An agent adds to that
+through `agent/1`'s `tool_context:` (a `working_dir` and `capabilities`
+for the built-in file and shell tools, a sandbox handle for its own)
+under the runtime's keys, which always win. A built-in file or shell
+tool in a durable run resolves paths only under a `working_dir` (or
+`workspace_root`) set that way: there is no fallback to the app's own
+directory, unlike the in-process path, and without one the tool returns
+an error.
 
 ## Never
 
@@ -270,8 +376,8 @@ Tools see `context.run_id`, `context.agent_key`, `context.turn`,
   job inserted in `run_finished/2`.
 - Never write the database from `run_event/2`. Store the conversation
   from the run's result in `run_finished/2`.
-- Never write `agent_runs`, or insert, cancel, or retry a run's Oban job
-  yourself.
+- Never write `agent_runs` or `agent_run_inbox`, or insert, cancel, or
+  retry a run's or a loop's Oban job yourself. `send/3` steps a loop.
 - Never call `Clementine.Runs.resume/2` or `cancel/1` inside a
   transaction.
 - Never call `Clementine.Lifecycle.*` (the protocol, the Ecto adapter,
@@ -290,10 +396,14 @@ meet is a change to Clementine.
 
 ## Testing
 
-Oban runs in `:manual` testing mode, so the reaper does not start. Execute
-a run with `perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})`,
-and script the model with `MyApp.AgentsCase`'s `expect_turn/1`,
-`text_events/1`, and `tool_events/3`. Every host callback, `run_event/2`
+Oban runs in `:manual` testing mode, so the reaper does not start and
+`send/3` steps nothing inline. Execute a run with
+`perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})`, and a
+loop's step with `perform_job(Clementine.Runs.StepWorker, %{"run_id" =>
+loop.id})` (a thread's first step runs `init/1`; the next starts the
+turn a `send/3` asked for, which `Runs.child/2` then finds). Script the
+model with `MyApp.AgentsCase`'s `expect_turn/1`, `text_events/1`, and
+`tool_events/3`. Every host callback, `run_event/2`
 included, has returned by the time `perform_job/2` does, so a test that
 subscribed first finds the broadcasts in its mailbox.
 

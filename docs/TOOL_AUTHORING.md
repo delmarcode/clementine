@@ -244,7 +244,7 @@ The second argument to `run/2` is a context map. Available keys:
 
 | Key | Type | Description |
 |---|---|---|
-| `:working_dir` | string | Working directory for the agent (resolve relative paths against this) |
+| `:working_dir` | string | Working directory for the agent (resolve relative paths against this). In-process it defaults to the current directory; on the durable runtime it has no default, and the built-in tools refuse without one |
 | `:workspace_root` | string | Optional stricter root for built-in filesystem and shell tools |
 | `:capabilities` | map | Explicit built-in tool capabilities, e.g. `%{read: true, write: false, shell: false}` |
 | `:agent_pid` | pid | PID of the agent GenServer |
@@ -258,8 +258,15 @@ On the durable runtime (`Clementine.Runs`) every tool also sees the run it serve
 | `:turn` | boolean | Whether the run is a turn on a thread |
 | `:subject` | term | What the run is about, as `Clementine.Host.resolve_subject/2` resolved it (`:subject_type` and `:subject_id` as stored) |
 | `:actor` | term | Whose authority the run acts with, as `Clementine.Host.resolve_actor/2` resolved it (`:actor_type` and `:actor_id` as stored) |
+| `:metadata` | map | The run's metadata, as `Clementine.Runs.start/3` stored it or as a loop's `{:run, ...}` action set it |
+| `:parent_id` | string or nil | On a loop's child, the loop's id |
+| `:tag` | `{kind, id}` or nil | On a loop's child, its tag |
 
-You can pass additional context keys when starting the agent or calling `ToolRunner.execute/4` directly.
+On the durable runtime an agent adds keys for its tools through `agent/1`'s
+`tool_context:` (`Clementine.Agent.new(..., tool_context: %{working_dir: dir, capabilities: %{read: true}})`);
+the runtime's keys above are merged over it and always win. In-process you
+pass additional context keys when starting the agent or calling
+`ToolRunner.execute/4` directly.
 
 ### Built-in tool capabilities
 
@@ -280,7 +287,9 @@ context = %{
 Filesystem paths are expanded under `:workspace_root` when present, otherwise
 under `:working_dir`. Absolute paths are accepted only if they remain inside
 that root after expansion and symlink resolution; parent traversal or symlink
-escape outside the root returns an error.
+escape outside the root returns an error. In-process, a context with neither
+root resolves under the current directory; on the durable runtime (a context
+carrying `:run_id`) it never does, and the tool returns an error instead.
 
 ### Resolving paths
 

@@ -82,6 +82,7 @@ defmodule Clementine.MixProject do
         ],
         "Durable loops": [
           Clementine.Loop,
+          Clementine.Thread,
           Clementine.Loop.Report,
           Clementine.Loop.StoredInput
         ],

@@ -71,13 +71,18 @@ defmodule Clementine.Loop do
   `[type, id]` (both default to the loop's own) and `"metadata"`.
   `{:cancel, tag}` flags the live child under the tag, and its
   `Clementine.Result.Cancelled` completion arrives like any other; a tag
-  with no live child is a no-op. The lane holds inside a loop: a step
-  that would start a second active turn on one thread fails. Cancels run
-  before spawns in a step's commit, so a child that was never claimed
-  ends inside the step and frees its lane, and `{:cancel, tag}` with the
-  successor's `{:run, ...}` in one step interrupts it; a running child
-  only takes the flag, and its successor starts on its `Cancelled`
-  completion.
+  with no live child is a no-op. A child spawned earlier in the same
+  step never comes to exist: its spawn is retired and `handle/2` hears
+  its `Cancelled` completion at once, in the same step, so a controller
+  need not know whether the child it cancels was started in this step or
+  an earlier one. The lane holds inside a loop: a step that would start
+  a second active turn on one thread fails. Cancels run before spawns in
+  a step's commit, so a child that was never claimed ends inside the
+  step and frees its lane, and `{:cancel, tag}` with the successor's
+  `{:run, ...}` in one step interrupts it; a running child only takes
+  the flag, and its successor starts on its `Cancelled` completion.
+  `Clementine.Thread` is the thread controller that ships with the
+  runtime.
   """
 
   alias Clementine.Result

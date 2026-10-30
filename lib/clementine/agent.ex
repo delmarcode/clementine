@@ -92,7 +92,8 @@ defmodule Clementine.Agent do
             instructions: nil,
             tools: [],
             defaults: [],
-            policy: %{}
+            policy: %{},
+            tool_context: %{}
 
   @type t :: %__MODULE__{
           id: term(),
@@ -100,7 +101,8 @@ defmodule Clementine.Agent do
           instructions: String.t() | nil,
           tools: [module()],
           defaults: keyword(),
-          policy: map()
+          policy: map(),
+          tool_context: map()
         }
 
   @doc """
@@ -121,6 +123,15 @@ defmodule Clementine.Agent do
   `run.subject` and `run.actor` hold what the host resolved
   (`c:Clementine.Host.resolve_subject/2`, `c:Clementine.Host.resolve_actor/2`).
   `use Clementine.Agent` with the agent's fields defines it.
+
+  `tool_context:` is what this execution's tools see beyond the run: a
+  `working_dir` and `capabilities` for the built-in file and shell tools,
+  a sandbox or session handle for the agent's own. The runtime merges it
+  under its own keys (`run_id`, `agent_key`, `turn`, `subject`, `actor`,
+  `metadata`, `parent_id`, `tag`), which always win: an agent adds to
+  what its tools see, never changes what the run is. On the durable
+  runtime a built-in file or shell tool has no working directory unless
+  this sets one, and refuses rather than fall back to the app's own.
   """
   @callback agent(run :: Clementine.Runs.AgentRun.t()) :: t()
 
@@ -151,7 +162,8 @@ defmodule Clementine.Agent do
   Releases what one execution of `run` held, after it ends however it
   ends: a sandbox, a session with a tool server, a temporary directory.
   `context` is the map the run's tools saw (`run_id`, `agent_key`,
-  `turn`, `subject`, `actor`, `parent_id`, `tag`); an `c:agent/1` that
+  `turn`, `subject`, `actor`, `parent_id`, `tag`, `metadata`); an
+  `c:agent/1` that
   opens a resource keeps its handle somewhere the tools and this callback
   both reach, such as the process dictionary, or reads it back from
   `run.id`.
@@ -235,6 +247,10 @@ defmodule Clementine.Agent do
   - `:tools` - tool modules
   - `:defaults` - default rollout limits (`max_iterations:`, `max_duration:`)
   - `:policy` - host-app policy/config passthrough (opaque to Clementine)
+  - `:tool_context` - keys every tool of the execution sees (`working_dir:`,
+    `capabilities:`, an app's own handles), under the runtime's keys, which
+    win; on the durable runtime, the one place a built-in file tool's
+    `working_dir` comes from
   """
   @spec new(keyword()) :: t()
   def new(opts) when is_list(opts), do: struct!(__MODULE__, opts)

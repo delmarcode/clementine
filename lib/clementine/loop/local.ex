@@ -565,10 +565,10 @@ defmodule Clementine.Loop.Local do
          state = put_in(state.runs[commit.loop_ref], apply_set(facts, commit.set, state.now)),
          state = mark_dead(state, commit),
          state = insert_appends(state, commit),
+         state = cancel_children(state, commit),
          {state, child_fills} = spawn_children(state, commit),
          {state, timer_fills} = schedule_timers(state, commit),
          state = retire_timers(state, commit),
-         state = cancel_children(state, commit, child_fills),
          {:ok, state} <- execute_sends(state, commit) do
       state =
         state
@@ -661,16 +661,22 @@ defmodule Clementine.Loop.Local do
     end)
   end
 
-  # Cascade cargo: queued children direct-terminalize with
+  # Cascade cargo, before the step's spawns and naming committed children
+  # only (a spawn of the same drain is retired by the step core, never
+  # named here): queued children direct-terminalize with
   # Result.Cancelled — record_result appends their completions to this
   # very loop inside this very unit, where the park re-check sees them.
   # Terminal children are tolerated; :running cannot exist between drive
   # iterations, but the production branch stays for honesty.
-  defp cancel_children(state, %StepCommit{cancel_children: tag_keys} = commit, fills) do
+  defp cancel_children(state, %StepCommit{cancel_children: tag_keys} = commit) do
     stored = StepCommit.envelope(commit)
 
     Enum.reduce(tag_keys, state, fn tag_key, state ->
-      ref = Map.get(fills, tag_key) || (stored && Map.get(stored.children, tag_key))
+      ref =
+        (stored && Map.get(stored.children, tag_key)) ||
+          raise ArgumentError,
+                "cancel for #{inspect(tag_key)} names no committed child: the step core " <>
+                  "cancels committed children only"
 
       case Map.get(state.runs, ref) do
         nil ->
