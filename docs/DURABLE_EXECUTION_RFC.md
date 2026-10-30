@@ -480,6 +480,8 @@ The app owns product meaning:
 - Product tables, tenancy, permissions, and user-visible run meanings.
 - Whether a run is a chat turn, eval run, workflow run, or scheduled watch.
 - Which users can approve a tool call, and the approval UI.
+- Which `{:policy, term}` tool calls run, wait for approval, or are refused
+  (the tool policy callback).
 - Which product records are written at terminal commit (the projection).
 - PubSub topics and channel payloads.
 - Agent storage and runtime data resolution.
@@ -1645,12 +1647,18 @@ remains the discriminator for the un-checkpointed tail.
 Tool metadata stays minimal and non-final beyond these two fields:
 
 ```elixir
-approval: :never | :required | {:policy, term()}   # v1 honors :never/:required
+approval: :never | :required | {:policy, term()}
 retry:    :safe | :unsafe | :unknown               # :unknown treated as :unsafe
 ```
 
-`{:policy, term}` is reserved; resolving it (an app callback at rollout
-construction) is non-final until a real policy engine demands a shape.
+`{:policy, term}` is resolved per call, not at rollout construction: the
+engine asks an app callback (`authorize_tool`, given to
+`Clementine.Runner.execute/2`; `Clementine.Host.authorize_tool/3` on the
+durable runtime) about each call before its batch runs anything, with the
+call's arguments and `term`. `:allow` runs it, `:require_approval` parks
+it as `:required` would, and `{:deny, reason}` settles it as an error tool
+result. The callback fails closed: a raise or any other answer denies the
+call. Without a callback, `{:policy, term}` gates like `:required`.
 
 ## The Reaper
 
@@ -2529,6 +2537,8 @@ Decided:
 - Suspension is a durable checkpoint; resume is snapshot restoration by
   epoch-stamped token, re-entering through `queued`.
 - Resume references are epoch-stamped, type-checked capabilities.
+- `{:policy, term}` approval resolves per call through an app callback that
+  answers allow, require approval, or deny, and fails closed.
 - Two-tier failure handling; finish at most once per run; terminal states are
   dead ends; exactly one terminal writer; every terminal transition carries
   its `Result`, so the projection fires uniformly (reaps included).
@@ -2558,7 +2568,6 @@ Decided:
 Non-final:
 
 - Exact event payload fields and durability tiers beyond live-only.
-- `{:policy, term}` approval resolution shape.
 - Token/cost budget enforcement (deadline pattern is the template).
 - Checkpoint cadence beyond suspend (the ledger), retry-from-checkpoint, and
   drain-to-checkpoint.

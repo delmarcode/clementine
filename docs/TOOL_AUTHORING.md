@@ -120,11 +120,13 @@ The declaration has two consequences:
   killing an effectful tool mid-flight creates unknowable external state.
 
 **`approval: :never | :required | {:policy, term}`** (default `:never`).
-Anything but `:never` asks the engine to pause for a human decision before
-executing the call. `{:policy, term}` is a reserved shape. The
-suspend-for-approval flow arrives with gated tools; until it lands, the
-engine fails closed (`%Clementine.Error{code: :approval_unsupported}`)
-rather than execute an approval-gated tool ungated.
+`:required` parks the run for a human decision before each call executes
+(see `guides/approvals.md`). `{:policy, term}` asks the host's tool policy
+about each call (`Clementine.Host.authorize_tool/3`, given `term`), which
+runs it, parks it like `:required`, or refuses it with an error the model
+reads; a policy that raises or answers anything else refuses it. Without a
+policy, `{:policy, term}` gates like `:required`. The ephemeral path
+(`Clementine.run/3`) cannot park, so it raises on a gated call.
 
 When in doubt, declare nothing: `:unknown` + `:never` is the conservative
 posture — never killed early, never retried, never silently gated.

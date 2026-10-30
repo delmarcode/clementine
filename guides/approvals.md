@@ -37,9 +37,82 @@ end
 ```
 
 `approval: :required` gates every call to this tool. `:never` (the
-default) never gates. `{:policy, term}` is reserved for app-resolved
-policies; until policy resolution exists, it gates exactly like
-`:required` — the safe reading of an unresolved policy.
+default) never gates. `{:policy, term}` lets your app decide per call,
+below.
+
+## Let a policy decide
+
+Most calls to a sensitive tool don't need a human: a refund under the
+limit, a deploy to staging, a manager acting on their own team. Declare
+the tool `approval: {:policy, term}` and answer for each call in your
+host module's `authorize_tool/3`:
+
+```elixir
+defmodule MyApp.Tools.Refund do
+  use Clementine.Tool,
+    name: "refund",
+    description: "Refund an order, in cents",
+    approval: {:policy, :refund},
+    retry: :unsafe,
+    parameters: [
+      order_id: [type: :string, required: true],
+      amount_cents: [type: :integer, required: true]
+    ]
+
+  @impl true
+  def run(%{order_id: id, amount_cents: cents}, _context) do
+    {:ok, "Refunded #{cents} cents on order #{id}"}
+  end
+end
+
+defmodule MyApp.Agents.Host do
+  @behaviour Clementine.Host
+
+  alias Clementine.ApprovalRequest
+
+  @impl true
+  def authorize_tool(run, %ApprovalRequest{args: %{"amount_cents" => cents}}, :refund) do
+    cond do
+      not MyApp.Accounts.may_refund?(run.actor) -> {:deny, "You may not issue refunds."}
+      cents > 50_00 -> :require_approval
+      true -> :allow
+    end
+  end
+
+  def authorize_tool(_run, _request, _term), do: {:deny, "No policy covers this tool."}
+end
+```
+
+The engine asks before the call's batch runs anything, with the run as
+your agent's `agent/1` saw it (`run.subject` and `run.actor` resolved),
+the call as a `Clementine.ApprovalRequest` (the tool's name and exactly
+the arguments that would run), and the tool's `term`:
+
+- `:allow` runs the call with its batch.
+- `:require_approval` parks the run for a decision, exactly as
+  `approval: :required` would: everything below applies, and the resume
+  settles the call without asking the policy again.
+- `{:deny, reason}` runs nothing. The call settles as an error tool
+  result carrying `reason`, a string the model reads and can answer, and
+  the batch goes on.
+
+The policy fails closed. A raise, an exit, a throw, or any other answer
+denies the call, logs why, and tells the model only that the tool's
+policy check failed. Without `authorize_tool/3`, a `{:policy, term}`
+tool gates every call like `:required`.
+
+It covers every tool the run offers: the agent's own, deferred ones, and
+those a loaded skill brought. Engine tools (`use_skill`, `delegate`)
+carry no approval, because which skills and agents a run may use is
+`agent/1`'s decision; a run a `delegate` call started is asked about
+with its own run, which carries the parent's subject and actor.
+
+`authorize_tool/3` runs in the run's process at every call, so keep it
+fast and read-only. A call still waiting when its batch parks for
+another call's decision is asked about again when the run resumes. The
+run's trace records each verdict in the call's `:tool_call` entry, under
+`"policy"`, beside the `"approval"` that settled a parked one
+(`Clementine.Trace`).
 
 ## What happens at the gate
 

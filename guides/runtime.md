@@ -183,7 +183,9 @@ text, or, for an agent with `output_schema:`, the decoded answer
   `kind: :loop`.
 - `resume/2` takes a waiting run's decision, `{:approved, meta}` or
   `{:denied, meta}`. A tool declared `approval: :required` parks its run
-  in `waiting` before it executes (see [Approvals](approvals.md)). The
+  in `waiting` before it executes, and one declared `{:policy, term}`
+  does when the host's `authorize_tool/3` says so (see
+  [Approvals](approvals.md)). The
   resume and the run's new job commit in one transaction, so a sweep can
   never find the resumed run without a job, and the claim that follows
   resolves the subject and actor again. A run waiting on the agents it
@@ -286,7 +288,8 @@ Clementine.Runs.trace(run.id)
 #=>                "usage" => %{"input_tokens" => 1204, "output_tokens" => 38}, "content" => […]}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 3, kind: :tool_call,
 #=>     payload: %{"name" => "lookup", "args" => %{"query" => "…"}, "result" => "…",
-#=>                "is_error" => false, "duration_ms" => 40, "approval" => nil, …}},
+#=>                "is_error" => false, "duration_ms" => 40, "approval" => nil,
+#=>                "policy" => nil, …}},
 #=>   …
 #=> ]
 
@@ -307,7 +310,10 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   by a cancel included, with the usage it had reported. A `:tool_call`
   entry records each tool call started, with the arguments it ran with
   and the decision it waited on (`"approval" => %{"verdict" => "approved",
-  "by" => ...}`). A call a cancel or a drain cut off is there too: with
+  "by" => ...}`); a call to a `{:policy, term}` tool also carries the
+  tool policy's verdict (`"policy" => %{"verdict" => "allow" |
+  "require_approval" | "deny", "reason" => ..., "failed" => ...}`), and a
+  call it denied ran nothing. A call a cancel or a drain cut off is there too: with
   its result if it had one, and `"killed" => true` if it was killed
   before it answered, so what it did is unknown. A `:skill_load` entry
   records each skill the model loaded (`Clementine.Skill`), with the
@@ -335,7 +341,7 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 
 ## The host module
 
-Seven questions belong to the app, and one optional module answers them.
+Eight questions belong to the app, and one optional module answers them.
 Every callback is optional:
 
 ```elixir
@@ -351,6 +357,20 @@ defmodule MyApp.Agents.Host do
   end
 
   def authorize_resume(_run, _decision), do: {:error, :forbidden}
+
+  # Whether a call to a tool declared approval: {:policy, term} runs,
+  # waits for approval, or is refused with a reason the model reads.
+  # Before the call's batch runs anything; a raise denies the call.
+  @impl true
+  def authorize_tool(run, %Clementine.ApprovalRequest{args: args}, :refund) do
+    cond do
+      not MyApp.Accounts.may_refund?(run.actor) -> {:deny, "You may not issue refunds."}
+      args["amount_cents"] > 50_00 -> :require_approval
+      true -> :allow
+    end
+  end
+
+  def authorize_tool(_run, _request, _term), do: {:deny, "No policy covers this tool."}
 
   # Tokens and tool activity while a run executes, for a UI. In a process
   # of its own, in order, outside any transaction.

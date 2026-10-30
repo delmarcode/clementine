@@ -90,8 +90,8 @@ lifecycle, or a reaper into the app.
   `Clementine.Trace.Entry` for each execution (`:execution`: the model,
   the tools offered, the agent's fingerprint, the system prompt), each
   model call (`:model_call`: usage, timing, what it said), each tool
-  call (`:tool_call`: name, arguments, result, timing, and the approval
-  it waited on), each skill loaded (`:skill_load`: its name, the tools
+  call (`:tool_call`: name, arguments, result, timing, the approval it
+  waited on, and the tool policy's verdict), each skill loaded (`:skill_load`: its name, the tools
   it brought, and a hash of the body it read), and each child a
   `delegate` call started (`:delegate`: its agent, its run id, how it
   ended). It commits with the run's end, so `run_finished/2` can
@@ -183,8 +183,9 @@ description: &1.description, body: &1.body, tools: ...))`.
   unloaded.
 - `agent/1` decides which skills a run may load, with its subject and
   actor resolved: tenancy and authority go there, never in the body.
-- A skill's tools are ordinary tools: `approval:` parks the run, and the
-  resume offers the loaded skills' tools again. Keep offering a skill
+- A skill's tools are ordinary tools: `approval:` parks the run (or asks
+  `authorize_tool/3`, for `{:policy, term}`), and the resume offers the
+  loaded skills' tools again. Keep offering a skill
   while runs that loaded it may be parked: a resume whose agent dropped
   it fails as `:incompatible_checkpoint`.
 - Every tool the agent may offer, its own (`tools:` and `deferred:`) and
@@ -426,6 +427,39 @@ def authorize_resume(run, {_verdict, %{by: user_id}}) do
 end
 ```
 
+`authorize_tool/3` is the tool policy: it decides each call to a tool
+declared `approval: {:policy, term}`, before the call's batch runs
+anything. It gets the run with `run.subject` and `run.actor` resolved,
+the call as a `Clementine.ApprovalRequest` (`tool_name`, and the `args`
+that would run), and the tool's `term`, and answers `:allow` (run it),
+`:require_approval` (park the run for `resume/2`, as `:required`
+does), or `{:deny, reason}` (the call runs nothing and the model reads
+`reason`, a string).
+
+```elixir
+@impl true
+def authorize_tool(run, %Clementine.ApprovalRequest{args: args}, :refund) do
+  cond do
+    not MyApp.Accounts.may_refund?(run.actor) -> {:deny, "You may not issue refunds."}
+    args["amount_cents"] > 50_00 -> :require_approval
+    true -> :allow
+  end
+end
+```
+
+- It fails closed: a raise, an exit, a throw, or any other answer
+  denies the call and logs why. Without the callback, a
+  `{:policy, term}` tool gates every call like `:required`.
+- It covers every tool the run offers, deferred ones and a loaded
+  skill's included. `use_skill` and `delegate` carry no approval: offer
+  skills and delegates by actor in `agent/1`. A delegated child is asked
+  about with its own run, which carries the parent's subject and actor.
+- It runs in the run's process at every call: keep it fast and
+  read-only. A call still waiting when its batch parks is asked about
+  again on the resume; the call a decision settled is not.
+- The trace's `:tool_call` entry records the verdict under `"policy"`,
+  beside `"approval"`.
+
 `resolve_subject/2` turns the stored `{type, id}` into what the agent works
 on, at every claim. Agents read it as `run.subject` and tools as
 `context.subject`; `{:error, reason}` cancels the run, and so does a
@@ -491,8 +525,9 @@ use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "..."
   model sees `tools:` up front and loads the deferred tools it needs by
   searching their names, descriptions, and argument names, so write
   those to be found. Any other provider gets them as ordinary tools.
-- Once found, a deferred tool is an ordinary tool: `approval:`,
-  `retry:`, and the tool context apply, and a gated one parks the run.
+- Once found, a deferred tool is an ordinary tool: `approval:` (with
+  `authorize_tool/3` for `{:policy, term}`), `retry:`, and the tool
+  context apply, and a gated one parks the run.
 - A tool is in `tools:` or `deferred:`, never both; the build fails.
 - The search is part of the turn: `result.messages` carries it as
   `Content.ServerToolUse` and `Content.ServerToolResult`, which
@@ -547,8 +582,9 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
 - Never do slow work in any callback. `run_finished/2` holds the run's
   transaction open, `run_committed/2` and `run_transition/2` run in the
   run's worker, the reaper's sweep, or the caller of `resume/2` or
-  `cancel/1`, and `run_event/2` runs once per token. Slow work is an Oban
-  job inserted in `run_finished/2`.
+  `cancel/1`, `run_event/2` runs once per token, and `authorize_tool/3`
+  before each call it decides. Slow work is an Oban job inserted in
+  `run_finished/2`.
 - Never write the database from `run_event/2`. Store the conversation
   from the run's result in `run_finished/2`.
 - Never write `agent_runs`, `agent_run_inbox`, or `agent_run_trace`, or
