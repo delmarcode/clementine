@@ -113,7 +113,10 @@ defmodule Clementine.ToolPolicyTest do
       ctx: store,
       executor_id: "test:policy",
       heartbeat: false,
-      authorize_tool: policy
+      authorize_tool: policy,
+      # The runtime that starts a delegate's children says so; this
+      # lifecycle stands in for it.
+      delegation: true
     )
   end
 

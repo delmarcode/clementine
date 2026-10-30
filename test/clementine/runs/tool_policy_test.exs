@@ -51,6 +51,7 @@ defmodule Clementine.Runs.ToolPolicyTest do
       key: "test_manager",
       model: :claude_sonnet,
       instructions: "Get refunds done.",
+      tools: [Refund],
       delegates: [Cashier]
   end
 
@@ -108,6 +109,26 @@ defmodule Clementine.Runs.ToolPolicyTest do
     |> Runs.trace()
     |> Enum.find(&(&1.kind == :tool_call and &1.payload["tool_use_id"] == tool_use_id))
     |> Map.fetch!(:payload)
+  end
+
+  # A model turn that makes every call in `calls`, in order.
+  defp calls(calls) do
+    blocks =
+      calls
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {{id, name, input}, index} ->
+        [
+          {:tool_use_start, id, name},
+          {:input_json_delta, id, Jason.encode!(input)},
+          {:content_block_stop, index}
+        ]
+      end)
+
+    blocks ++
+      [
+        {:message_delta, %{"stop_reason" => "tool_use"},
+         %{"input_tokens" => 10, "output_tokens" => 5}}
+      ]
   end
 
   defp stored_checkpoint(run_id) do
@@ -302,6 +323,91 @@ defmodule Clementine.Runs.ToolPolicyTest do
     expect_turn_reading("Refunded o-1.", text_events("Done."))
     assert :ok = perform_job(Worker, %{"run_id" => parent.id})
     assert %AgentRun{status: "completed"} = Runs.get(parent.id)
+  end
+
+  describe "a batch holding a policy call and a delegate call" do
+    setup do
+      {:ok, parent} =
+        Runs.start(Manager, "Refund o-1, and have the cashier refund o-2",
+          subject: {"ticket", "t-1"},
+          actor: {"user", "ada"}
+        )
+
+      expect_turn(
+        calls([
+          {"tu_1", "delegate", %{"agent" => "test_cashier", "prompt" => "Refund o-2."}},
+          {"tu_2", "refund", refund("o-1", 900_00)}
+        ])
+      )
+
+      assert :ok = perform_job(Worker, %{"run_id" => parent.id})
+
+      # The policy parks the refund for approval first: no child yet.
+      assert %AgentRun{status: "waiting"} = Runs.get(parent.id)
+
+      assert %{
+               "shape" => "tool_approval",
+               "tool_use_id" => "tu_2",
+               "policy" => "require_approval"
+             } =
+               stored_checkpoint(parent.id)["pending"]
+
+      assert Runs.list(parent: parent.id) == []
+      assert_received {:authorize_tool, _run, %ApprovalRequest{tool_use_id: "tu_2"}, :refund}
+      refute_received {:authorize_tool, _run, _request, _term}
+
+      %{parent: parent}
+    end
+
+    test "the approval's resume asks again, runs the call, then starts the child", %{
+      parent: parent
+    } do
+      assert :ok = Runs.resume(parent.id, {:approved, %{by: "alice"}})
+      assert :ok = perform_job(Worker, %{"run_id" => parent.id})
+      assert_received {:authorize_tool, _run, %ApprovalRequest{tool_use_id: "tu_2"}, :refund}
+
+      assert [%AgentRun{id: child_id}] = Runs.list(parent: parent.id)
+      assert %AgentRun{status: "waiting"} = Runs.get(parent.id)
+
+      expect_turn(text_events("Refunded o-2."))
+      assert :ok = perform_job(Worker, %{"run_id" => child_id})
+
+      expect_turn_reading("Refunded 90000 on o-1.", text_events("Both refunded."))
+      assert :ok = perform_job(Worker, %{"run_id" => parent.id})
+      assert %AgentRun{status: "completed"} = Runs.get(parent.id)
+
+      assert %{
+               "approval" => %{"verdict" => "approved", "by" => "alice"},
+               "policy" => %{"verdict" => "require_approval"}
+             } = tool_call(parent.id, "tu_2")
+    end
+
+    test "a deny on the approval's resume settles the call, and the child still starts", %{
+      parent: parent
+    } do
+      {1, _} =
+        TestRepo.update_all(from(r in AgentRun, where: r.id == ^parent.id),
+          set: [metadata: %{"refunds" => "revoked"}]
+        )
+
+      assert :ok = Runs.resume(parent.id, {:approved, %{by: "alice"}})
+      assert :ok = perform_job(Worker, %{"run_id" => parent.id})
+
+      assert [%AgentRun{id: child_id}] = Runs.list(parent: parent.id)
+
+      expect_turn(text_events("Refunded o-2."))
+      assert :ok = perform_job(Worker, %{"run_id" => child_id})
+
+      expect_turn_reading("Refund authority was revoked.", text_events("One of two."))
+      assert :ok = perform_job(Worker, %{"run_id" => parent.id})
+      assert %AgentRun{status: "completed"} = Runs.get(parent.id)
+
+      assert %{
+               "approval" => %{"verdict" => "approved"},
+               "policy" => %{"verdict" => "deny"},
+               "is_error" => true
+             } = tool_call(parent.id, "tu_2")
+    end
   end
 
   @tag host: Clementine.RunsCase.Host
