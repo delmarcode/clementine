@@ -399,9 +399,11 @@ use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "..."
   `Content.ServerToolUse` and `Content.ServerToolResult`, which
   `to_map/1` and `from_map/1` round-trip. Store and replay them with the
   rest; the API reads them to keep the tools the search loaded.
-- Keep `deferred:` stable across a thread's turns, as `tools:`: history
-  names the tools a search loaded, and the API refuses a name the
-  request no longer carries.
+- Removing a deferred tool, by a deploy or by an `agent/1` that offers
+  some actors less, costs edited history. On replay, earlier searches
+  lose their references to it (all of them, on a request with no search
+  tool), so the thread keeps working, but the edit restarts the prompt
+  cache and may void earlier thinking on models that verify it.
 
 ## Never
 

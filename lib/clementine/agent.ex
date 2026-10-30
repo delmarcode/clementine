@@ -61,8 +61,10 @@ defmodule Clementine.Agent do
   search). A deferred tool is an ordinary `Clementine.Tool`: once found
   it runs like any other, and `approval:`, `retry:`, and the tool context
   apply unchanged. A provider without tool search gets deferred tools as
-  ordinary tools. Keep the list stable across a thread's turns, as for
-  `tools:`: history refers to the tools a search loaded by name.
+  ordinary tools. A tool that leaves the list drops out of the earlier
+  searches a thread's history replays, so the thread keeps working; that
+  edits the replayed history, which restarts the prompt cache and may
+  void earlier thinking on models that verify it.
 
   ## Turns and tasks
 

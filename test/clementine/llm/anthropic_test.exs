@@ -192,6 +192,17 @@ defmodule Clementine.LLM.AnthropicTest do
   describe "deferred tools" do
     alias Clementine.Test.Tools.{Add, Echo, GatedDeploy}
 
+    defmodule GetWeather do
+      @moduledoc false
+      use Clementine.Tool,
+        name: "get_weather",
+        description: "Get the weather at a specific location",
+        parameters: [location: [type: :string, required: true]]
+
+      @impl true
+      def run(_args, _context), do: {:ok, "Sunny"}
+    end
+
     test "stream/5 sends deferred tools with defer_loading, beside the tool search tool", %{
       bypass: bypass
     } do
@@ -291,6 +302,87 @@ defmodule Clementine.LLM.AnthropicTest do
       end
     end
 
+    test "a request without the search tool leaves past searches out of history", %{
+      bypass: bypass
+    } do
+      test = self()
+
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test, {:request, Jason.decode!(body)})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("ok"))
+      end)
+
+      # No deferred tool left on a model with tool search, then deferred
+      # tools on a model without it: neither request carries the search
+      # tool, so neither may replay a search.
+      Anthropic.call(:claude_test, "system", searched_history(), [Echo])
+
+      Anthropic.call({:anthropic, "claude-opus-4-1"}, "system", searched_history(), [Echo, Add],
+        deferred: [Add]
+      )
+
+      for _request <- 1..2 do
+        assert_received {:request, request}
+        refute Enum.any?(request["tools"], &Map.has_key?(&1, "type"))
+
+        assert [
+                 %{"role" => "user"},
+                 %{"role" => "assistant", "content" => [%{"type" => "text"}]},
+                 %{"role" => "user", "content" => "Next?"},
+                 %{
+                   "role" => "assistant",
+                   "content" => [
+                     %{"type" => "text"},
+                     %{"type" => "text"},
+                     %{"type" => "tool_use", "name" => "echo"}
+                   ]
+                 },
+                 %{"role" => "user", "content" => [%{"type" => "tool_result"}]}
+               ] = request["messages"]
+      end
+    end
+
+    test "a request with the search tool replays only references to tools it carries", %{
+      bypass: bypass
+    } do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        assert [_user, _searched_only, _nothing_found, _next, %{"content" => content}, _results] =
+                 request["messages"]
+
+        assert [
+                 %{"type" => "text"},
+                 %{"type" => "server_tool_use", "id" => "srvtoolu_2"},
+                 %{
+                   "type" => "tool_search_tool_result",
+                   "tool_use_id" => "srvtoolu_2",
+                   "content" => %{
+                     "type" => "tool_search_tool_search_result",
+                     "tool_references" => [%{"type" => "tool_reference", "tool_name" => "echo"}]
+                   }
+                 },
+                 %{"type" => "text"},
+                 %{"type" => "tool_use"}
+               ] = content
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("ok"))
+      end)
+
+      # "issue_refund" left the agent since the search found it.
+      assert {:ok, %Response{}} =
+               Anthropic.call(:claude_test, "system", searched_history(), [Add, Echo],
+                 deferred: [Echo]
+               )
+    end
+
     test "stream/5 collects a tool search turn in the order the API sent it", %{bypass: bypass} do
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         conn
@@ -380,7 +472,10 @@ defmodule Clementine.LLM.AnthropicTest do
         %ToolResultMessage{content: [Content.tool_result("toolu_01XYZ789", "Sunny")]}
       ]
 
-      assert {:ok, %Response{}} = Anthropic.call(:claude_test, "system", messages, [Echo])
+      assert {:ok, %Response{}} =
+               Anthropic.call(:claude_test, "system", messages, [Echo, GetWeather],
+                 deferred: [GetWeather]
+               )
     end
   end
 
@@ -400,6 +495,44 @@ defmodule Clementine.LLM.AnthropicTest do
 
       assert [{:error, {:api_error, 404, ^error_body}}] = events
     end
+  end
+
+  # A thread with two searches: one stored as a message of its own that
+  # found nothing, and one that loaded "issue_refund" and "echo" and led
+  # to a call of "echo".
+  defp searched_history do
+    references = fn names ->
+      %{
+        "type" => "tool_search_tool_search_result",
+        "tool_references" => Enum.map(names, &%{"type" => "tool_reference", "tool_name" => &1})
+      }
+    end
+
+    [
+      UserMessage.new("Hi"),
+      %AssistantMessage{
+        content: [
+          Content.server_tool_use("srvtoolu_1", "tool_search_tool_regex", %{"pattern" => "x"}),
+          Content.server_tool_result("srvtoolu_1", "tool_search_tool_result", references.([]))
+        ]
+      },
+      %AssistantMessage{content: [Content.text("Nothing found.")]},
+      UserMessage.new("Next?"),
+      %AssistantMessage{
+        content: [
+          Content.text("Searching."),
+          Content.server_tool_use("srvtoolu_2", "tool_search_tool_regex", %{"pattern" => "e"}),
+          Content.server_tool_result(
+            "srvtoolu_2",
+            "tool_search_tool_result",
+            references.(["issue_refund", "echo"])
+          ),
+          Content.text("Found it."),
+          Content.tool_use("toolu_1", "echo", %{"message" => "hi"})
+        ]
+      },
+      %ToolResultMessage{content: [Content.tool_result("toolu_1", "Echo: hi")]}
+    ]
   end
 
   # The response format of the Messages API's tool search documentation.

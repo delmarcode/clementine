@@ -38,7 +38,9 @@ defmodule Clementine.LLM.Anthropic do
   their deferred tools go as ordinary tools. The search's
   `server_tool_use` and `tool_search_tool_result` blocks come back as
   `Clementine.LLM.Message.Content.ServerToolUse` and `ServerToolResult`
-  and must be replayed with the turn, which history does. The search runs
+  and are replayed with the turn as far as the request can honour them:
+  a reference to a tool the request no longer carries is left out, and a
+  request without the search tool leaves past searches out. The search runs
   inside the response, so its stream emits `{:server_tool_use_start, id,
   name}`, `{:server_tool_input_delta, id, json}`, and
   `{:server_tool_result, block}` rather than the client tool events.
@@ -266,10 +268,13 @@ defmodule Clementine.LLM.Anthropic do
         Keyword.get(resolved.defaults, :max_tokens, @default_max_tokens)
       )
 
+    encoded_tools =
+      if tools != nil and tools != [], do: Tools.encode_all(tools, deferred(model_id, opts))
+
     body = %{
       "model" => model_id,
       "max_tokens" => max_tokens,
-      "messages" => format_messages(messages)
+      "messages" => Messages.encode_all(messages, tool_search: loadable(encoded_tools))
     }
 
     body = maybe_put_reasoning(body, Keyword.get(opts, :reasoning, resolved.reasoning))
@@ -281,14 +286,18 @@ defmodule Clementine.LLM.Anthropic do
         body
       end
 
-    body =
-      if tools != nil and tools != [] do
-        Map.put(body, "tools", Tools.encode_all(tools, deferred(model_id, opts)))
-      else
-        body
-      end
+    if encoded_tools, do: Map.put(body, "tools", encoded_tools), else: body
+  end
 
-    body
+  # What this request's tool search can load, read off its own tools: their
+  # names when it carries the search tool, nil when it does not. History's
+  # past searches replay only that far (`Messages.encode_all/2`).
+  defp loadable(nil), do: nil
+
+  defp loadable(encoded_tools) do
+    if Enum.any?(encoded_tools, &Tools.search_tool?/1) do
+      MapSet.new(encoded_tools, & &1["name"])
+    end
   end
 
   # A model without tool search gets its deferred tools as ordinary tools,
@@ -335,10 +344,6 @@ defmodule Clementine.LLM.Anthropic do
     end
 
     resolved
-  end
-
-  defp format_messages(messages) do
-    Messages.encode_all(messages)
   end
 
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do

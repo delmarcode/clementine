@@ -19,9 +19,51 @@ defmodule Clementine.LLM.Anthropic.Messages do
     %{"role" => "user", "content" => Enum.map(content, &encode_content/1)}
   end
 
-  def encode_all(messages) when is_list(messages) do
-    Enum.map(messages, &encode/1)
+  # `tool_search:` says what this request's tool search can load: the
+  # names of its tools, or nil when it carries no search tool. History
+  # replays a past search only as far as the request can honour it — the
+  # API refuses a reference to a tool the request lacks, and a search
+  # block without the search tool — so a thread whose tool left the
+  # request (a deploy, an actor agent/1 offers less, a model without tool
+  # search) keeps working. That edits the replayed turn, which may cost
+  # its thinking blocks on models that check them. Without the option,
+  # history replays as stored.
+  def encode_all(messages, opts \\ []) when is_list(messages) do
+    case Keyword.fetch(opts, :tool_search) do
+      :error ->
+        Enum.map(messages, &encode/1)
+
+      {:ok, loadable} ->
+        Enum.flat_map(messages, fn
+          %AssistantMessage{content: content} = message ->
+            case Enum.flat_map(content, &replayable(&1, loadable)) do
+              [] -> []
+              content -> [encode(%{message | content: content})]
+            end
+
+          message ->
+            [encode(message)]
+        end)
+    end
   end
+
+  defp replayable(%Content.ServerToolUse{name: "tool_search_tool_" <> _}, nil), do: []
+
+  defp replayable(%Content.ServerToolResult{block_type: "tool_search_tool_result"}, nil), do: []
+
+  defp replayable(
+         %Content.ServerToolResult{
+           block_type: "tool_search_tool_result",
+           content: %{"tool_references" => references} = content
+         } = result,
+         %MapSet{} = loadable
+       )
+       when is_list(references) do
+    references = Enum.filter(references, &MapSet.member?(loadable, &1["tool_name"]))
+    [%{result | content: %{content | "tool_references" => references}}]
+  end
+
+  defp replayable(block, _loadable), do: [block]
 
   def decode_assistant(%{"role" => "assistant", "content" => content}) when is_list(content) do
     AssistantMessage.new(Enum.map(content, &decode_content/1))
