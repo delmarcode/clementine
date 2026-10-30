@@ -619,6 +619,53 @@ defmodule Clementine.ToolPolicyTest do
                tool_call(store, ref, "tu_1")
     end
 
+    test "that runs out the deadline beside a gated call fails the run rather than parking " <>
+           "it, which would give the resume a fresh budget",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      expect_gather(
+        tool_events([{"tu_1", "gated_deploy", %{"env" => "prod"}}, refund("tu_2", "o-1", 500)])
+      )
+
+      run = build_run(ref, [tools: [GatedDeploy, Refund]], limits: [max_duration: 300])
+
+      capture_log(fn ->
+        assert {:finished, %Facts{status: :failed, suspension: nil}} =
+                 execute(run, store, policy(fn _ -> Process.sleep(:infinity) end))
+      end)
+
+      assert [{_ref, %Clementine.Result.Failed{error: %{code: :deadline_exceeded}}}] =
+               MemoryLifecycle.projections(store)
+    end
+
+    test "that runs out the deadline on an approval's resume, beside a gated call, fails the " <>
+           "run rather than parking it again",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      expect_gather(
+        tool_events([refund("tu_1", "o-1", 90_000), {"tu_2", "gated_deploy", %{"env" => "prod"}}])
+      )
+
+      run = build_run(ref, [tools: [GatedDeploy, Refund]], limits: [max_duration: 300])
+      {answer, policy} = switchable(fn _ -> :require_approval end)
+      assert {:suspended, token} = execute(run, store, policy)
+
+      Agent.update(answer, fn _ -> fn _ -> Process.sleep(:infinity) end end)
+      {:ok, _} = Protocol.resume(MemoryLifecycle, token, {:approved, %{by: "u1"}}, store)
+
+      # The run ends; it does not park on the gated call a second time.
+      capture_log(fn ->
+        assert {:finished, %Facts{status: :failed}} = execute(run, store, policy)
+      end)
+
+      refute_received {:refunded, _}
+
+      assert [{_ref, %Clementine.Result.Failed{error: %{code: :deadline_exceeded}}}] =
+               MemoryLifecycle.projections(store)
+    end
+
     test "is stopped at once by a cancel that lands while it answers: nothing runs",
          %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)

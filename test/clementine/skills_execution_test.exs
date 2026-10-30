@@ -371,6 +371,34 @@ defmodule Clementine.SkillsExecutionTest do
              } = Enum.find(trace, &(&1.kind == :tool_call))
     end
 
+    test "whose body runs out the deadline beside a gated call fails the run rather than " <>
+           "parking it",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      expect_gather(
+        tool_events([
+          {"tu_1", "use_skill", %{"name" => "stuck"}},
+          {"tu_2", "gated_deploy", %{"env" => "prod"}}
+        ])
+      )
+
+      stuck =
+        Skill.new(
+          name: "stuck",
+          description: "Reads its body from a server that never answers.",
+          body: fn _ -> Process.sleep(:infinity) end
+        )
+
+      run =
+        build_run(ref, [tools: [Echo, GatedDeploy], skills: [stuck]], limits: [max_duration: 300])
+
+      assert {:finished, %Facts{status: :failed, suspension: nil}} = execute(run, store)
+
+      assert [{_ref, %Result.Failed{error: %{code: :deadline_exceeded}}}] =
+               MemoryLifecycle.projections(store)
+    end
+
     test "leaves the effect fence down: loading a skill acts on nothing outside the run" do
       test = self()
       expect_gather(tool_events([{"tu_1", "use_skill", %{"name" => "notes"}}]))

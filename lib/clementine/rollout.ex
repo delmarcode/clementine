@@ -658,27 +658,30 @@ defmodule Clementine.Rollout do
   # tool policy, asked once more, now denies it: then it settles as the
   # deny, and its trace entry carries the approval beside it.
   defp resolve_approved(%Execution{} = exec, pending, pending_use, batch, payload) do
-    case reauthorize(exec, pending_use, pending) do
-      {:unwind, unwound} ->
-        conclude(exec, unwound)
+    with {:ok, decision} <- reauthorize(exec, pending_use, pending),
+         :continue <- after_host_code(exec, [pending_use]) do
+      case decision do
+        {:deny, verdict} ->
+          completed =
+            settle_denied(exec, pending_use, verdict, pending.completed_results,
+              approval: payload
+            )
 
-      {:deny, verdict} ->
-        completed =
-          settle_denied(exec, pending_use, verdict, pending.completed_results, approval: payload)
-
-        settle_batch(exec, batch, completed)
-
-      {:run, verdict} ->
-        verdicts = if verdict, do: %{pending_use.id => verdict}, else: %{}
-
-        with :continue <- check_signals(),
-             {:ok, %Execution{} = exec, completed} <-
-               execute_now(exec, [pending_use], pending.completed_results, payload, verdicts) do
           settle_batch(exec, batch, completed)
-        else
-          {:error, %Clementine.Error{} = error} -> fail(exec, error)
-          unwound -> conclude(exec, unwound)
-        end
+
+        {:run, verdict} ->
+          verdicts = if verdict, do: %{pending_use.id => verdict}, else: %{}
+
+          case execute_now(exec, [pending_use], pending.completed_results, payload, verdicts) do
+            {:ok, %Execution{} = exec, completed} -> settle_batch(exec, batch, completed)
+            {:error, %Clementine.Error{} = error} -> fail(exec, error)
+            unwound -> conclude(exec, unwound)
+          end
+      end
+    else
+      {:unwind, unwound} -> conclude(exec, unwound)
+      {:error, %Clementine.Error{} = error} -> fail(exec, error)
+      unwound -> conclude(exec, unwound)
     end
   end
 
@@ -1172,9 +1175,10 @@ defmodule Clementine.Rollout do
 
     with {:ok, %Execution{} = exec, completed, held} <-
            settle_engine_calls(exec, engine, completed),
-         :continue <- signals_after(engine) do
+         :continue <- after_host_code(exec, engine) do
       settle_world(exec, tool_uses, repair_after_loads(exec, engine, world), completed, held)
     else
+      {:error, %Clementine.Error{} = error} -> fail(exec, error)
       unwound -> conclude(exec, unwound)
     end
   end
@@ -1183,15 +1187,21 @@ defmodule Clementine.Rollout do
   # host's authorize_tool) through Clementine.HostCall, which unwinds on
   # a signal that lands while the code runs. One that lands just after is
   # honored here, before the fence write and before any tool starts, as
-  # one that arrived during the gather is. `calls` are those whose
-  # settling ran host code; none means nothing ran.
-  defp signals_after([] = _calls), do: :continue
-  defp signals_after(_calls), do: check_signals()
+  # one that arrived during the gather is. Host code may also run out the
+  # execution's deadline (HostCall's bound is the time left): that is
+  # honored here too, so an expired execution neither starts tools nor
+  # parks, which would hand the run a fresh budget on its resume. `calls`
+  # are those whose settling ran host code; none means nothing ran.
+  defp after_host_code(_exec, [] = _calls), do: :continue
+
+  defp after_host_code(exec, _calls) do
+    with :continue <- check_signals(), do: check_deadline(exec)
+  end
 
   defp settle_world(%Execution{} = exec, tool_uses, world, completed, held) do
     # Each verdict is an answer the policy gave, so host code ran.
     with {:ok, {gated, ungated, completed, verdicts}} <- gate_calls(exec, world, completed),
-         :continue <- signals_after(Map.keys(verdicts)) do
+         :continue <- after_host_code(exec, Map.keys(verdicts)) do
       case execute_now(exec, ungated, completed, nil, verdicts) do
         {:ok, %Execution{} = exec, completed} ->
           cond do
@@ -1212,6 +1222,7 @@ defmodule Clementine.Rollout do
           conclude(exec, unwound)
       end
     else
+      {:error, %Clementine.Error{} = error} -> fail(exec, error)
       unwound -> conclude(exec, unwound)
     end
   end
@@ -1339,19 +1350,20 @@ defmodule Clementine.Rollout do
   # the approval already given. Without a policy, or for a tool that no
   # longer declares one, the approval decides, and the trace keeps the
   # verdict that parked it.
-  defp reauthorize(%Execution{authorize_tool: nil}, _call, pending), do: {:run, pending.policy}
+  defp reauthorize(%Execution{authorize_tool: nil}, _call, pending),
+    do: {:ok, {:run, pending.policy}}
 
   defp reauthorize(%Execution{} = exec, call, pending) do
     case Tool.approval(Tool.find_by_name(exec.tools, call.name)) do
       {:policy, term} ->
         case authorize(exec, call, term) do
           {:unwind, _unwound} = unwind -> unwind
-          verdict when verdict in [:allow, :require_approval] -> {:run, verdict}
-          denied -> {:deny, denied}
+          verdict when verdict in [:allow, :require_approval] -> {:ok, {:run, verdict}}
+          denied -> {:ok, {:deny, denied}}
         end
 
       _declared ->
-        {:run, pending.policy}
+        {:ok, {:run, pending.policy}}
     end
   end
 
