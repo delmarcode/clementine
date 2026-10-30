@@ -66,6 +66,36 @@ defmodule Clementine.Agent do
   edits the replayed history, which restarts the prompt cache and may
   void earlier thinking on models that verify it.
 
+  ## Structured output
+
+  An agent whose answer code reads (a grader's verdict, a planner's next
+  steps, a loop's decision) gives the answer's JSON schema as
+  `output_schema:`:
+
+      use Clementine.Agent,
+        key: "grader",
+        model: :claude_sonnet,
+        instructions: "Grade the essay against the rubric.",
+        tools: [MyApp.Tools.FetchRubric],
+        output_schema: %{
+          "type" => "object",
+          "properties" => %{
+            "verdict" => %{"type" => "string", "enum" => ["pass", "fail"]},
+            "reasons" => %{"type" => "array", "items" => %{"type" => "string"}}
+          },
+          "required" => ["verdict", "reasons"],
+          "additionalProperties" => false
+        }
+
+  A completed run's `Clementine.Result.Completed` `output` is then the
+  decoded answer, a map with string keys, rather than text: what
+  `c:Clementine.Host.run_finished/2` receives, what `run.result["output"]`
+  stores, and what a loop's `{:completed, tag, result}` carries. The run
+  still calls its tools as it likes; only the answer that ends it is
+  constrained, through the provider's own structured output. An answer
+  that does not decode or match fails the run with a `Clementine.Error`
+  of code `:invalid_output`. See `Clementine.OutputSchema`.
+
   ## Turns and tasks
 
   A run is a **turn** or a **task**. A turn is a run on a thread: its
@@ -127,6 +157,7 @@ defmodule Clementine.Agent do
             instructions: nil,
             tools: [],
             deferred: [],
+            output_schema: nil,
             defaults: [],
             policy: %{},
             tool_context: %{},
@@ -138,6 +169,7 @@ defmodule Clementine.Agent do
           instructions: String.t() | nil,
           tools: [module()],
           deferred: [module()],
+          output_schema: Clementine.OutputSchema.t() | nil,
           defaults: keyword(),
           policy: map(),
           tool_context: map(),
@@ -287,6 +319,9 @@ defmodule Clementine.Agent do
   - `:deferred` - tool modules the model loads on demand through the
     provider's tool search, rather than seeing up front (see "Deferred
     tools" above); a tool is in `:tools` or `:deferred`, not both
+  - `:output_schema` - the JSON schema of the final answer, its root an
+    object; with it, a completed run's `output` is the decoded map (see
+    "Structured output" above). Atom keys become strings
   - `:defaults` - default rollout limits (`max_iterations:`, `max_duration:`)
   - `:policy` - host-app policy/config passthrough (opaque to Clementine)
   - `:tool_context` - keys every tool of the execution sees (`working_dir:`,
@@ -303,11 +338,16 @@ defmodule Clementine.Agent do
 
     case Enum.filter(agent.deferred, &(&1 in agent.tools)) do
       [] ->
-        agent
+        normalize_output_schema(agent)
 
       both ->
         raise ArgumentError,
               "a tool is in tools: or deferred:, not both; found in both: #{inspect(both)}"
     end
   end
+
+  defp normalize_output_schema(%__MODULE__{output_schema: nil} = agent), do: agent
+
+  defp normalize_output_schema(%__MODULE__{output_schema: schema} = agent),
+    do: %{agent | output_schema: Clementine.OutputSchema.normalize!(schema)}
 end

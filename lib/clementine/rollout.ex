@@ -113,6 +113,7 @@ defmodule Clementine.Rollout do
       system: agent.instructions,
       tools: agent.tools ++ deferred,
       deferred: deferred,
+      output_schema: agent.output_schema,
       context: rollout.context,
       messages: rollout.messages,
       max_iterations: Keyword.get(limits(rollout), :max_iterations, @default_max_iterations),
@@ -132,6 +133,7 @@ defmodule Clementine.Rollout do
       :system,
       :tools,
       :deferred,
+      :output_schema,
       :context,
       :max_iterations,
       :emit,
@@ -237,6 +239,7 @@ defmodule Clementine.Rollout do
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
       deferred: Keyword.get(config, :deferred, []),
+      output_schema: Keyword.get(config, :output_schema),
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       emit: Keyword.get(opts, :emit),
@@ -708,16 +711,22 @@ defmodule Clementine.Rollout do
         boundary(%{exec | paused?: true})
 
       true ->
-        conclude(
-          exec,
-          {:ok,
-           Clementine.Result.completed(
-             input_message: exec.input_message,
-             messages: Enum.drop(exec.messages, exec.prefix_len),
-             output: exec.messages |> List.last() |> AssistantMessage.get_text(),
-             usage: exec.usage
-           )}
-        )
+        case final_output(exec, List.last(exec.messages), response) do
+          {:ok, output} ->
+            conclude(
+              exec,
+              {:ok,
+               Clementine.Result.completed(
+                 input_message: exec.input_message,
+                 messages: Enum.drop(exec.messages, exec.prefix_len),
+                 output: output,
+                 usage: exec.usage
+               )}
+            )
+
+          {:error, %Clementine.Error{} = error} ->
+            fail(exec, error)
+        end
     end
   end
 
@@ -729,6 +738,21 @@ defmodule Clementine.Rollout do
   defp append_turn(%Execution{messages: messages}, content) do
     messages ++ [AssistantMessage.new(content)]
   end
+
+  # The output is the final turn's text, the paused turn's included. An
+  # agent with an output_schema answers in JSON: the output is the decoded
+  # map, and an answer that does not decode or match fails the run
+  # (Clementine.OutputSchema).
+  defp final_output(%Execution{output_schema: nil}, %AssistantMessage{} = turn, _response),
+    do: {:ok, AssistantMessage.get_text(turn)}
+
+  defp final_output(%Execution{output_schema: schema}, %AssistantMessage{} = turn, response),
+    do:
+      Clementine.OutputSchema.decode(
+        schema,
+        AssistantMessage.get_text(turn),
+        response.stop_reason
+      )
 
   # A signal that arrived during the gather is already in the mailbox:
   # honor it before the fence write and before any tool starts — a
@@ -970,15 +994,21 @@ defmodule Clementine.Rollout do
     end)
   end
 
-  defp stream_opts(%Execution{deadline: nil, deferred: deferred}), do: deferred_opts(deferred)
+  defp stream_opts(%Execution{deadline: nil} = exec), do: request_opts(exec)
 
-  defp stream_opts(%Execution{deadline: deadline, deferred: deferred}) do
+  defp stream_opts(%Execution{deadline: deadline} = exec) do
     [receive_timeout: min(@provider_receive_timeout, remaining_ms(deadline))] ++
-      deferred_opts(deferred)
+      request_opts(exec)
   end
+
+  defp request_opts(%Execution{} = exec),
+    do: deferred_opts(exec.deferred) ++ output_schema_opts(exec.output_schema)
 
   defp deferred_opts([]), do: []
   defp deferred_opts(deferred), do: [deferred: deferred]
+
+  defp output_schema_opts(nil), do: []
+  defp output_schema_opts(schema), do: [output_schema: schema]
 
   defp batch_opts(%Execution{deadline: nil}), do: []
 

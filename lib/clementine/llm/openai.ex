@@ -3,6 +3,15 @@ defmodule Clementine.LLM.OpenAI do
   OpenAI Responses API client.
 
   Supports synchronous and streaming requests, including tool calls.
+
+  A JSON schema in the `:output_schema` request option goes as the
+  Responses API's Structured Outputs, `text.format` with
+  `"type": "json_schema"` and `"strict": true`, which constrains the
+  model's text answer to it; function calls are unaffected. Strict mode
+  takes OpenAI's supported subset: every object needs
+  `"additionalProperties": false` and lists all of its properties in
+  `required` (an optional one is typed `["string", "null"]`), and the
+  API refuses a schema outside it.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -206,7 +215,10 @@ defmodule Clementine.LLM.OpenAI do
       "max_output_tokens" => max_output_tokens
     }
 
-    body = maybe_put_reasoning(body, Keyword.get(opts, :reasoning, resolved.reasoning))
+    body =
+      body
+      |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
+      |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
 
     body =
       if is_binary(system) and system != "" do
@@ -228,6 +240,19 @@ defmodule Clementine.LLM.OpenAI do
 
   defp maybe_put_reasoning(body, reasoning) do
     Map.merge(body, Reasoning.to_provider_config!(:openai, reasoning))
+  end
+
+  defp maybe_put_output_schema(body, nil), do: body
+
+  defp maybe_put_output_schema(body, schema) do
+    Map.put(body, "text", %{
+      "format" => %{
+        "type" => "json_schema",
+        "name" => "output",
+        "schema" => schema,
+        "strict" => true
+      }
+    })
   end
 
   defp build_headers do

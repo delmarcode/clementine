@@ -44,6 +44,17 @@ defmodule Clementine.LLM.Anthropic do
   inside the response, so its stream emits `{:server_tool_use_start, id,
   name}`, `{:server_tool_input_delta, id, json}`, and
   `{:server_tool_result, block}` rather than the client tool events.
+
+  ## Structured output
+
+  A JSON schema in the `:output_schema` request option goes as
+  `output_config.format` (`{"type": "json_schema", "schema": ...}`,
+  beside any reasoning `effort`), which constrains Claude's text answer
+  to it; tool calls are unaffected. The API takes the subset of JSON
+  Schema its structured outputs document: every object needs
+  `"additionalProperties": false`, and constraints such as `minimum` or
+  `maxLength` are refused. A model without structured outputs refuses
+  the request.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -277,7 +288,10 @@ defmodule Clementine.LLM.Anthropic do
       "messages" => Messages.encode_all(messages, tool_search: loadable(encoded_tools))
     }
 
-    body = maybe_put_reasoning(body, Keyword.get(opts, :reasoning, resolved.reasoning))
+    body =
+      body
+      |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
+      |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
 
     body =
       if system != nil and system != "" do
@@ -310,6 +324,15 @@ defmodule Clementine.LLM.Anthropic do
 
   defp maybe_put_reasoning(body, reasoning) do
     Map.merge(body, Reasoning.to_provider_config!(:anthropic, reasoning))
+  end
+
+  # output_config may already carry the reasoning effort; the format
+  # joins it.
+  defp maybe_put_output_schema(body, nil), do: body
+
+  defp maybe_put_output_schema(body, schema) do
+    format = %{"type" => "json_schema", "schema" => schema}
+    Map.update(body, "output_config", %{"format" => format}, &Map.put(&1, "format", format))
   end
 
   defp build_headers do

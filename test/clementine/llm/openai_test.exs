@@ -219,6 +219,79 @@ defmodule Clementine.LLM.OpenAITest do
              )
   end
 
+  test "call/5 sends an output schema as strict Structured Outputs in text.format",
+       %{bypass: bypass} do
+    schema = %{
+      "type" => "object",
+      "properties" => %{"verdict" => %{"type" => "string"}},
+      "required" => ["verdict"],
+      "additionalProperties" => false
+    }
+
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+
+      assert request["text"] == %{
+               "format" => %{
+                 "type" => "json_schema",
+                 "name" => "output",
+                 "schema" => schema,
+                 "strict" => true
+               }
+             }
+
+      # Function calls stay as they were.
+      assert [%{"type" => "function", "name" => "echo"}] = request["tools"]
+      assert request["tool_choice"] == "auto"
+
+      response = %{
+        "id" => "resp_4",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => ~s({"verdict":"pass"})}]
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
+      }
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, Jason.encode!(response))
+    end)
+
+    assert {:ok, %Response{content: [%Content.Text{text: ~s({"verdict":"pass"})}]}} =
+             OpenAI.call(
+               :gpt_test,
+               "system",
+               [UserMessage.new("Hi")],
+               [Clementine.Test.Tools.Echo],
+               output_schema: schema
+             )
+  end
+
+  test "call/5 sends no text.format without an output schema", %{bypass: bypass} do
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      refute Map.has_key?(Jason.decode!(body), "text")
+
+      response = %{
+        "id" => "resp_5",
+        "output" => [
+          %{"type" => "message", "content" => [%{"type" => "output_text", "text" => "ok"}]}
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 1}
+      }
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, Jason.encode!(response))
+    end)
+
+    assert {:ok, %Response{}} = OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [])
+  end
+
   test "call/5 parses tool calls", %{bypass: bypass} do
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       response = %{

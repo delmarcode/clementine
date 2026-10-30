@@ -35,6 +35,11 @@ defmodule Clementine.LLM do
       front. A provider with tool search (Anthropic) sends them with
       `defer_loading: true`, beside its search tool, and the model loads
       the ones it needs; any other provider sends them as ordinary tools.
+    - `:output_schema` - A JSON schema (string keys) the model's text
+      answer must follow, sent as the provider's structured output:
+      Anthropic's `output_config.format`, OpenAI's `text.format`, the
+      Chat Completions dialect's `response_format`. Tool calls are
+      unconstrained.
 
   ## Returns
 

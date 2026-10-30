@@ -116,6 +116,58 @@ defmodule Clementine.LLM.AnthropicTest do
     end
   end
 
+  describe "structured output" do
+    @output_schema %{
+      "type" => "object",
+      "properties" => %{"verdict" => %{"type" => "string"}},
+      "required" => ["verdict"],
+      "additionalProperties" => false
+    }
+
+    test "call/5 sends the schema as output_config.format", %{bypass: bypass} do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        assert request["output_config"] == %{
+                 "format" => %{"type" => "json_schema", "schema" => @output_schema}
+               }
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response(~s({"verdict": "pass"})))
+      end)
+
+      assert {:ok, %Response{content: [%Content.Text{text: ~s({"verdict": "pass"})}]}} =
+               Anthropic.call(:claude_test, "system", [UserMessage.new("Hi")], [],
+                 output_schema: @output_schema
+               )
+    end
+
+    test "call/5 puts the format beside a configured reasoning effort", %{bypass: bypass} do
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        assert request["thinking"] == %{"type" => "adaptive"}
+
+        assert request["output_config"] == %{
+                 "effort" => "high",
+                 "format" => %{"type" => "json_schema", "schema" => @output_schema}
+               }
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response(~s({"verdict": "pass"})))
+      end)
+
+      assert {:ok, %Response{}} =
+               Anthropic.call(:claude_reasoning, "system", [UserMessage.new("Hi")], [],
+                 output_schema: @output_schema
+               )
+    end
+  end
+
   describe "thinking blocks" do
     test "call/5 parses thinking blocks and skips unknown block types", %{bypass: bypass} do
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->

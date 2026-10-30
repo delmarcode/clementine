@@ -47,6 +47,7 @@ defmodule Clementine.MixProject do
           Clementine.Run,
           Clementine.Runner,
           Clementine.Result,
+          Clementine.OutputSchema,
           Clementine.Error,
           Clementine.Usage,
           Clementine.Verifier

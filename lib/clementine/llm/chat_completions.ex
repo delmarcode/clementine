@@ -37,6 +37,14 @@ defmodule Clementine.LLM.ChatCompletions do
 
   `base_url` follows the OpenAI SDK convention: the client appends
   `/chat/completions`.
+
+  A JSON schema in the `:output_schema` request option goes as the
+  dialect's `response_format` (`{"type": "json_schema", "json_schema":
+  {"name": "output", "schema": ..., "strict": true}}`). Support varies
+  by server and model: one without structured outputs may refuse the
+  request or ignore the field, and an answer that does not match then
+  fails the run (`Clementine.OutputSchema`), so an agent served this way
+  describes the answer's shape in its instructions as well.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -245,11 +253,9 @@ defmodule Clementine.LLM.ChatCompletions do
     }
 
     body =
-      maybe_put_reasoning(
-        body,
-        resolved.provider,
-        Keyword.get(opts, :reasoning, resolved.reasoning)
-      )
+      body
+      |> maybe_put_reasoning(resolved.provider, Keyword.get(opts, :reasoning, resolved.reasoning))
+      |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
 
     if is_list(tools) and tools != [] do
       body
@@ -274,6 +280,15 @@ defmodule Clementine.LLM.ChatCompletions do
 
   defp maybe_put_reasoning(body, provider, reasoning) do
     Map.merge(body, Reasoning.to_provider_config!(provider, reasoning))
+  end
+
+  defp maybe_put_output_schema(body, nil), do: body
+
+  defp maybe_put_output_schema(body, schema) do
+    Map.put(body, "response_format", %{
+      "type" => "json_schema",
+      "json_schema" => %{"name" => "output", "schema" => schema, "strict" => true}
+    })
   end
 
   defp build_headers(resolved) do

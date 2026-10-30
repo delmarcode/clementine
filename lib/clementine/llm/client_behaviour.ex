@@ -10,7 +10,8 @@ defmodule Clementine.LLM.ClientBehaviour do
   @type tools :: [module()]
   # `:deferred` names tools in `tools` the model may load on demand; a
   # client without tool search sends them as ordinary tools (see
-  # `Clementine.LLM.call/5`).
+  # `Clementine.LLM.call/5`). `:output_schema` is a JSON schema the
+  # text answer follows, sent as the provider's structured output.
   @type opts :: keyword()
 
   @type response :: Clementine.LLM.Response.t()
