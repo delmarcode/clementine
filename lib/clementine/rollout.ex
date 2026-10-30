@@ -260,10 +260,7 @@ defmodule Clementine.Rollout do
     )
 
     try do
-      resume = Keyword.get(opts, :resume)
-      record_execution(exec, resume != nil)
-
-      case prepare(exec, resume, rollout) do
+      case prepare(exec, Keyword.get(opts, :resume), rollout) do
         {:ok, %Execution{} = exec} ->
           boundary(exec)
 
@@ -286,14 +283,22 @@ defmodule Clementine.Rollout do
 
   # Agent.new/1 normalizes an output_schema, but an agent/1 may set the
   # struct's field directly: normalize it here too (a normalized schema
-  # comes back unchanged), and fail the run on one that is not a schema
+  # comes back unchanged), so the execution's trace entry fingerprints the
+  # schema the run uses, and fail the run on one that is not a schema
   # before anything executes.
-  defp prepare(%Execution{output_schema: nil} = exec, resume, rollout),
-    do: restore(exec, resume, rollout)
+  defp prepare(%Execution{} = exec, resume, rollout) do
+    {exec, checked} = normalize_output_schema(exec)
+    record_execution(exec, resume != nil)
+    with :ok <- checked, do: restore(exec, resume, rollout)
+  end
 
-  defp prepare(%Execution{output_schema: schema} = exec, resume, rollout) do
-    with {:ok, schema} <- Clementine.OutputSchema.normalize(schema),
-         do: restore(%{exec | output_schema: schema}, resume, rollout)
+  defp normalize_output_schema(%Execution{output_schema: nil} = exec), do: {exec, :ok}
+
+  defp normalize_output_schema(%Execution{output_schema: schema} = exec) do
+    case Clementine.OutputSchema.normalize(schema) do
+      {:ok, schema} -> {%{exec | output_schema: schema}, :ok}
+      {:error, %Clementine.Error{}} = error -> {exec, error}
+    end
   end
 
   # Fresh start: history, then the materialized input message.
@@ -1110,7 +1115,10 @@ defmodule Clementine.Rollout do
     record(
       exec,
       :execution,
-      Trace.execution(exec.model, exec.system, exec.tools, resumed?, deferred: exec.deferred)
+      Trace.execution(exec.model, exec.system, exec.tools, resumed?,
+        deferred: exec.deferred,
+        output_schema: exec.output_schema
+      )
     )
   end
 

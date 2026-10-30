@@ -224,8 +224,8 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   the next epoch. `"tools"` names every tool offered, and `"deferred"`
   the ones among them the model loads through tool search. Its
   `"agent_fingerprint"` is a sha256 over the system prompt, the tool
-  schemas, the model id, and which tools are deferred, so runs that
-  offered the model the same thing group together.
+  schemas, the model id, which tools are deferred, and the output
+  schema, so runs that offered the model the same thing group together.
 - A `:model_call` entry records each call to the model, a call cut off
   by a cancel included, with the usage it had reported. A `:tool_call`
   entry records each tool call started, with the arguments it ran with

@@ -15,8 +15,8 @@ defmodule Clementine.Trace do
     resumes after an approval.
     - `"model"` — the model's resolved id
     - `"agent_fingerprint"` — a sha256 over the instructions, the tool
-      schemas, and the model id, and over which tools are deferred when
-      any are, in lowercase hex. Executions with the same fingerprint
+      schemas, and the model id, and over which tools are deferred and
+      the output schema when the agent has them, in lowercase hex. Executions with the same fingerprint
       offered the model the same thing.
     - `"instructions"` — the system prompt the execution sent
     - `"tools"` — the names of the tools offered, in order, deferred ones
@@ -173,10 +173,11 @@ defmodule Clementine.Trace do
   across deploys and VM versions while the agent is unchanged.
 
   `offer` is what else the execution offers the model: `deferred:`, the
-  tools in `tools` it loads through the provider's tool search. Each
-  enters the fingerprint only when set, so an agent without it keeps the
-  fingerprint it had; moving a tool between `tools:` and `deferred:`
-  changes it.
+  tools in `tools` it loads through the provider's tool search, and
+  `output_schema:`, the JSON schema its final answer follows (canonical
+  JSON too). Each enters the fingerprint only when set, so an agent
+  without it keeps the fingerprint it had; moving a tool between
+  `tools:` and `deferred:`, or changing the schema, changes it.
   """
   @spec fingerprint(
           Clementine.LLM.ModelRegistry.model_ref(),
@@ -199,10 +200,12 @@ defmodule Clementine.Trace do
   end
 
   defp offered(offer) do
-    case Keyword.get(offer, :deferred, []) do
-      [] -> %{}
-      deferred -> %{"deferred" => Enum.map(deferred, & &1.__name__())}
-    end
+    Enum.reduce(offer, %{}, fn
+      {:deferred, []}, acc -> acc
+      {:deferred, tools}, acc -> Map.put(acc, "deferred", Enum.map(tools, & &1.__name__()))
+      {:output_schema, nil}, acc -> acc
+      {:output_schema, schema}, acc -> Map.put(acc, "output_schema", schema)
+    end)
   end
 
   # The provider's id for a model reference; a reference the catalog does
