@@ -91,6 +91,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
                ]
 
         refute Map.has_key?(request, "reasoning")
+        refute Map.has_key?(request, "response_format")
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
@@ -103,6 +104,90 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       assert [%Content.Text{text: "Hello from OpenRouter"}] = response.content
       assert response.stop_reason == "end_turn"
       assert response.usage["completion_tokens"] == 4
+    end
+
+    test "call/5 sends an output schema as response_format", %{bypass: bypass} do
+      schema = %{
+        "type" => "object",
+        "properties" => %{"verdict" => %{"type" => "string"}},
+        "required" => ["verdict"],
+        "additionalProperties" => false
+      }
+
+      Bypass.expect(bypass, "POST", "/api/v1/chat/completions", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        assert request["response_format"] == %{
+                 "type" => "json_schema",
+                 "json_schema" => %{"name" => "output", "schema" => schema, "strict" => true}
+               }
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response(~s({"verdict": "pass"})))
+      end)
+
+      assert {:ok, %Response{content: [%Content.Text{text: ~s({"verdict": "pass"})}]}} =
+               ChatCompletions.call(:deepseek, "system", [UserMessage.new("Hi")], [],
+                 output_schema: schema
+               )
+    end
+
+    test "call/5 sends no response_format for a structured_output: :instructions model",
+         %{bypass: bypass} do
+      Application.put_env(:clementine, :models,
+        deepseek: [provider: :openrouter, id: "deepseek/deepseek-v3.2"],
+        grammar_bound: [
+          provider: :openrouter,
+          id: "deepseek/deepseek-v3.2",
+          structured_output: :instructions
+        ]
+      )
+
+      Bypass.expect(bypass, "POST", "/api/v1/chat/completions", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        refute Map.has_key?(Jason.decode!(body), "response_format")
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response(~s({"verdict": "pass"})))
+      end)
+
+      assert {:ok, %Response{}} =
+               ChatCompletions.call(:grammar_bound, "system", [UserMessage.new("Hi")], [],
+                 output_schema: %{"type" => "object"}
+               )
+    end
+
+    test "call/5 reads a refusal as the turn's text with stop reason refusal", %{bypass: bypass} do
+      Bypass.expect(bypass, "POST", "/api/v1/chat/completions", fn conn ->
+        body =
+          Jason.encode!(%{
+            "choices" => [
+              %{
+                "index" => 0,
+                "message" => %{
+                  "role" => "assistant",
+                  "content" => nil,
+                  "refusal" => "I can't help with that."
+                },
+                "finish_reason" => "stop"
+              }
+            ],
+            "usage" => %{"prompt_tokens" => 12, "completion_tokens" => 6}
+          })
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, body)
+      end)
+
+      assert {:ok, %Response{} = response} =
+               ChatCompletions.call(:deepseek, "system", [UserMessage.new("Hi")], [])
+
+      assert [%Content.Text{text: "I can't help with that."}] = response.content
+      assert response.stop_reason == "refusal"
     end
 
     test "call/5 includes configured reasoning", %{bypass: bypass} do

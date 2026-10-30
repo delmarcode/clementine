@@ -25,7 +25,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     alias Clementine.Lifecycle.{Facts, Protocol}
     alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
-    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, DrainNotifier, Lifecycle}
+    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, Delegations, DrainNotifier}
+    alias Clementine.Runs.Lifecycle
 
     # The wall-clock budget of one execution, minted fresh at every claim,
     # unless the agent sets `defaults: [max_duration: ...]`.
@@ -60,6 +61,14 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
         {:finished, _facts} ->
           # Any terminal; the projection committed with it.
+          :ok
+
+        {:suspended, %Clementine.ResumeToken{reason_type: :external}} ->
+          # Parked on the agents it asked. Its children's ends resume it;
+          # a park whose children have all ended already (none started)
+          # resumes now, once this execution is over, so its next one is
+          # claimed after after_execution/2 has run.
+          _ = Delegations.reconcile(run_id)
           :ok
 
         {:suspended, _token} ->
@@ -111,8 +120,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
         %AgentRun{} = row ->
           case build(config, row) do
-            {:ok, run} -> execute_built(config, row, run, executor_id)
-            {:error, reason} -> cancel_unstartable(row.id, reason)
+            {:ok, run, authorize_tool} ->
+              execute_built(config, row, run, authorize_tool, executor_id)
+
+            {:error, reason} ->
+              cancel_unstartable(row.id, reason)
           end
       end
     end
@@ -124,16 +136,18 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # runner subscribes to cancels once it holds the run, and this process
     # stops listening when it lets go. Last, the agent releases what the
     # execution held (after_execution/2), whatever the outcome.
-    defp execute_built(%Config{host: host} = config, row, run, executor_id) do
+    defp execute_built(%Config{host: host} = config, row, run, authorize_tool, executor_id) do
       courier =
         if exports?(host, :run_event, 2), do: Courier.start(host, %{row | status: "running"})
 
       try do
         Clementine.Runner.execute(run,
           lifecycle: Lifecycle,
+          delegation: true,
           executor_id: executor_id,
           events: if(courier, do: Courier, else: Clementine.Events.Null),
-          ctx: %{run: row, courier: courier}
+          ctx: %{run: row, courier: courier},
+          authorize_tool: authorize_tool
         )
       after
         CancelRelay.unsubscribe(row.id)
@@ -165,9 +179,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     defp agent_module(agents, %AgentRun{agent_key: key}), do: Map.get(agents, key)
 
-    # The inert Clementine.Run for one execution. Agents are built at claim
-    # time from code, so a deploy that changes an agent applies to the next
-    # execution of every run.
+    # The inert Clementine.Run for one execution, and the tool policy it
+    # runs under. Agents are built at claim time from code, so a deploy
+    # that changes an agent applies to the next execution of every run.
     defp build(config, %AgentRun{} = row) do
       with {:ok, module} <- fetch_agent(config, row.agent_key),
            {:ok, prompt} <- prompt(row),
@@ -201,7 +215,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             limits: default_limits(agent)
           )
 
-        {:ok, Clementine.Run.new(ref: row.id, rollout: rollout)}
+        {:ok, Clementine.Run.new(ref: row.id, rollout: rollout), authorize_tool(config.host, row)}
       end
     rescue
       # Construction failures (a bad model alias, a malformed agent) happen
@@ -250,6 +264,15 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     defp prompt(%AgentRun{}), do: {:error, :blank_prompt}
+
+    # The host's authorize_tool/3, asked with the run as agent/1 saw it,
+    # its subject and actor resolved. Without it, nil: a {:policy, _} tool
+    # gates like :required.
+    defp authorize_tool(host, %AgentRun{} = run) do
+      if exports?(host, :authorize_tool, 3) do
+        fn request, term -> host.authorize_tool(run, request, term) end
+      end
+    end
 
     # The subject and the actor resolve the same way, at every claim: the
     # one after a resume included, so a reference refused since the run

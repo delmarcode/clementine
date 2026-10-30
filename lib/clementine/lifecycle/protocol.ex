@@ -265,7 +265,9 @@ defmodule Clementine.Lifecycle.Protocol do
   direct cancel and `{:cancelled, facts}` tells the runner the run is
   terminal, not parked. (In the residual race where the run has already
   moved on by re-check time, the flag survives in facts and the next
-  execution's cancellation poll honors it.)
+  execution's cancellation poll honors it.) A run parked on children it
+  started is not cancelled here: its canceller flagged it and cancelled
+  the children (`request_cancel/4`), and it ends after them.
   """
   @spec suspend(Lease.t(), Suspension.Request.t(), keyword()) ::
           {:ok, ResumeToken.t()}
@@ -284,9 +286,14 @@ defmodule Clementine.Lifecycle.Protocol do
       iteration: request.iteration,
       messages: request.messages,
       pending: request.pending,
+      skills: request.skills,
       usage: request.usage,
       cursor: Keyword.get(opts, :cursor)
     }
+
+    # The lowest version that holds it, so code that reads only an older
+    # version can still resume a run that needs nothing newer.
+    checkpoint = %{checkpoint | version: Checkpoint.version_for(checkpoint)}
 
     suspension = %Suspension{reason: request.reason, checkpoint: checkpoint, token: token}
 
@@ -322,34 +329,13 @@ defmodule Clementine.Lifecycle.Protocol do
 
   defp post_suspend_cancel_check(%Lease{} = lease, token, usage) do
     case lease.lifecycle.fetch(lease.run_ref, lease.ctx) do
-      {:ok, %Facts{status: :waiting, epoch: epoch, cancel: %{reason: reason}} = facts}
+      # Waiting on children it started: a flag that reached it was carried
+      # to them by its canceller (request_cancel/4), and it ends after them.
+      {:ok, %Facts{status: :waiting, epoch: epoch, cancel: %{}} = facts}
       when epoch == lease.epoch ->
-        result = Result.cancelled(reason, usage)
-
-        transition = %Transition{
-          op: :cancel_request,
-          run_ref: lease.run_ref,
-          expect: expect(facts),
-          set: %{status: :cancelled, finished_at: :now},
-          result: result
-        }
-
-        case apply_with_retry(lease.lifecycle, transition, lease.ctx) do
-          {:ok, cancelled_facts} ->
-            emit_finished(lease.run_ref, lease.epoch, result,
-              claimed_at: lease.claimed_at,
-              finished_at: cancelled_facts.finished_at
-            )
-
-            {:cancelled, cancelled_facts}
-
-          # Someone else terminalized it first; report what stands.
-          {:error, :stale} ->
-            refetch_terminal_or_token(lease, token)
-
-          {:error, _reason} ->
-            {:ok, token}
-        end
+        if delegating?(facts),
+          do: {:ok, token},
+          else: cancel_parked(lease, token, usage, facts)
 
       {:ok, %Facts{status: :waiting}} ->
         {:ok, token}
@@ -360,6 +346,37 @@ defmodule Clementine.Lifecycle.Protocol do
       {:error, _reason} ->
         # The suspend itself committed; a failed advisory re-read must not
         # unpark the run. The flag, if any, survives for the next execution.
+        {:ok, token}
+    end
+  end
+
+  # The parked run's cancel flag won the write order just before the
+  # suspend: it resolves as a direct cancel.
+  defp cancel_parked(%Lease{} = lease, token, usage, %Facts{cancel: %{reason: reason}} = facts) do
+    result = Result.cancelled(reason, usage)
+
+    transition = %Transition{
+      op: :cancel_request,
+      run_ref: lease.run_ref,
+      expect: expect(facts),
+      set: %{status: :cancelled, finished_at: :now},
+      result: result
+    }
+
+    case apply_with_retry(lease.lifecycle, transition, lease.ctx) do
+      {:ok, cancelled_facts} ->
+        emit_finished(lease.run_ref, lease.epoch, result,
+          claimed_at: lease.claimed_at,
+          finished_at: cancelled_facts.finished_at
+        )
+
+        {:cancelled, cancelled_facts}
+
+      # Someone else terminalized it first; report what stands.
+      {:error, :stale} ->
+        refetch_terminal_or_token(lease, token)
+
+      {:error, _reason} ->
         {:ok, token}
     end
   end
@@ -459,6 +476,12 @@ defmodule Clementine.Lifecycle.Protocol do
   projection firing (`{:ok, :finished}`). Racing movement re-routes between
   the flavors.
 
+  A run `waiting` on children it started (`{:external, {:delegation, ids}}`
+  with `ids` not empty, `Clementine.Delegation`) is not unowned: its
+  children are. It gets the flag too, and the lifecycle cancels its live
+  children with it; the last child's end resumes it, and its next
+  execution honors the flag first, so it ends after its children.
+
   Live loop-kind runs are refused with `{:error, :loop_run}` (LOOP_RFC
   amendment A2), before either flavor: the direct-terminal flavor would
   orphan a loop's children, and the flag this operation sets is honored by
@@ -486,7 +509,7 @@ defmodule Clementine.Lifecycle.Protocol do
         facts.kind == :loop ->
           {:error, :loop_run}
 
-        facts.status == :running ->
+        facts.status == :running or delegating?(facts) ->
           transition = %Transition{
             op: :cancel_request,
             run_ref: run_ref,
@@ -537,6 +560,14 @@ defmodule Clementine.Lifecycle.Protocol do
       end
     end
   end
+
+  defp delegating?(%Facts{
+         status: :waiting,
+         suspension: %Suspension{reason: {:external, {:delegation, [_ | _]}}}
+       }),
+       do: true
+
+  defp delegating?(%Facts{}), do: false
 
   ## Finish
 

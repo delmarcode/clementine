@@ -9,6 +9,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # hands the result to the host's run_finished/2. Every other committed
     # change reaches the host's run_transition/2, after its commit, and a
     # committed cancel flag goes on to the run's runner (CancelRelay).
+    # Writes that carry delegation's cargo go through
+    # Clementine.Runs.Delegations: a park on `delegate` calls starts the
+    # children, and a cancel flag or an end on a run that waits cancels
+    # its live ones.
 
     @behaviour Clementine.Lifecycle
     @behaviour Clementine.Lifecycle.Ecto
@@ -21,7 +25,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     alias Clementine.Lifecycle.Ecto, as: EctoLifecycle
     alias Clementine.Lifecycle.Ecto.Codec
     alias Clementine.Lifecycle.{Facts, Transition}
-    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, Loops}
+    alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, Delegations, Loops}
 
     # Liveness, the trace, and the effects fence are the runtime's
     # bookkeeping.
@@ -50,7 +54,17 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @impl Clementine.Lifecycle
     def apply(transition, ctx) do
       flush_events(transition, ctx)
-      EctoLifecycle.apply_transition(__MODULE__, transition, ctx)
+
+      cond do
+        Delegations.park?(transition) ->
+          Delegations.park(transition, ctx)
+
+        Delegations.flags_wait?(transition) or Delegations.ends_wait?(transition) ->
+          Delegations.write_wait(transition, ctx)
+
+        true ->
+          EctoLifecycle.apply_transition(__MODULE__, transition, ctx)
+      end
     end
 
     # The runner subscribes once it holds the run: a cancel flag committed
@@ -102,9 +116,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       %Config{repo: repo, host: host} = Config.fetch!()
       run = store_output(repo, result, run)
 
-      # A loop's child tells its loop inside this same transaction: the
-      # completion is exactly-once at source, because a terminal is a
-      # dead end (LOOP_RFC L12).
+      # A child tells its parent inside this same transaction: a loop
+      # gets a completion, exactly-once at source because a terminal is a
+      # dead end (LOOP_RFC L12), and a rollout waiting on its delegates
+      # resumes once the last one ends.
       if run.parent_id, do: Loops.append_completion(run, result)
 
       # The adapter brackets this transaction for emissions: this one
@@ -204,6 +219,35 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       case Codec.encode_value(key, value) do
         %{} = map when not is_struct(map) -> map |> Jason.encode!() |> Jason.decode!()
         encoded -> encoded
+      end
+    end
+
+    @doc false
+    # The Result a terminal row records: the output a completed run
+    # stored, the error, the cancel reason, the interrupt reason, and the
+    # usage. Reads of a child's end that did not carry its Result (the
+    # loop sweep's synthesized completion, a delegating parent's resume)
+    # rebuild it here.
+    @spec terminal_result(AgentRun.t()) :: Result.t()
+    def terminal_result(%AgentRun{} = row) do
+      facts = Codec.to_facts(row, @fields)
+      usage = facts.usage || %Clementine.Usage{}
+
+      case facts.status do
+        :completed ->
+          Result.completed(output: row.result && row.result["output"], usage: usage)
+
+        :failed ->
+          Result.failed(facts.error || %Clementine.Error{message: "child failed"}, usage)
+
+        :cancelled ->
+          Result.cancelled(
+            (facts.cancel && facts.cancel.reason) || %{"code" => "reconciled"},
+            usage
+          )
+
+        :interrupted ->
+          Result.interrupted(facts.interrupt || {:app, :reconciled}, usage)
       end
     end
 

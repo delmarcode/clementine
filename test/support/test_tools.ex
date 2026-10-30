@@ -237,10 +237,10 @@ defmodule Clementine.Test.Tools do
   end
 
   defmodule PolicyGated do
-    @moduledoc "Declares the reserved {:policy, _} approval shape"
+    @moduledoc "Declares a {:policy, _} approval, which the tool policy resolves"
     use Clementine.Tool,
       name: "policy_gated",
-      description: "Gated by a reserved policy shape",
+      description: "Gated by a policy",
       approval: {:policy, :prod_only},
       parameters: []
 

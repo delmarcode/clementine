@@ -17,8 +17,11 @@ defmodule Clementine.Suspension do
   `{:until, _}` parks are mid-rollout by definition and always carry one —
   the Ecto codec refuses to store them without it.
 
-  Reason scope: rollouts produce only `{:approval, _}` (gated tools).
-  `{:external, tag}` is for host- and loop-initiated waits; `{:until, t}`
+  Reason scope: rollouts produce `{:approval, _}` (gated tools) and
+  `{:external, {:delegation, child_ids}}` (`delegate` calls waiting on
+  their children, `Clementine.Delegation`), whose ids the runtime fills
+  in as it starts them. `{:external, tag}` is otherwise for host- and
+  loop-initiated waits; `{:until, t}`
   for scheduled waits, whose wake-up is host-scheduled resume — nothing in
   Clementine owns a timer. The reaper's `:suspension_expired` is the
   policy ceiling over all waits, distinct from any wake-up path.
@@ -43,8 +46,9 @@ defmodule Clementine.Suspension do
   defmodule Request do
     @moduledoc """
     The suspension body as the rollout produces it: reason, pending
-    operation, and loop state — everything except the cursor and the
-    token, which require the lease the rollout never sees.
+    operation, and loop state (the skills it had loaded among it) —
+    everything except the cursor and the token, which require the lease
+    the rollout never sees.
     """
 
     @enforce_keys [:reason, :pending]
@@ -52,6 +56,7 @@ defmodule Clementine.Suspension do
               pending: nil,
               messages: [],
               iteration: 0,
+              skills: [],
               usage: %Clementine.Usage{}
 
     @type t :: %__MODULE__{
@@ -59,6 +64,7 @@ defmodule Clementine.Suspension do
             pending: Clementine.Pending.t(),
             messages: [Clementine.LLM.Message.message()],
             iteration: non_neg_integer(),
+            skills: [String.t()],
             usage: Clementine.Usage.t()
           }
   end

@@ -91,6 +91,8 @@ defmodule Clementine.LLM.OpenAI.Messages do
     content
     |> Enum.flat_map(fn
       %{"type" => "output_text", "text" => text} when is_binary(text) -> [Content.text(text)]
+      # A refusal is the turn's text; the client reports stop reason "refusal".
+      %{"type" => "refusal", "refusal" => text} when is_binary(text) -> [Content.text(text)]
       _ -> []
     end)
   end

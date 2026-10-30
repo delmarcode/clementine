@@ -21,9 +21,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       * `use Clementine.Agent` modules, listed in `agents:`.
 
     The optional `host:` module implements `Clementine.Host`: who may
-    resume a run, what commits with a run's end and what hears of it
-    after, what hears of its events and its other transitions, and how a
-    subject and an actor resolve. An agent that converses supplies its
+    resume a run, which calls to a `{:policy, term}` tool run, what
+    commits with a run's end and what hears of it after, what hears of
+    its events and its other transitions, and how a subject and an actor
+    resolve. An agent that converses supplies its
     history with `c:Clementine.Agent.history/1`. Nothing else is
     configurable. Coding agents: the rules are in
     [`usage-rules.md`](usage-rules.md).
@@ -445,8 +446,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     `c:Clementine.Host.authorize_resume/2` decides who may resume; its
     refusal comes back as is. Returns `{:error, :not_found}` and
     `{:error, :not_waiting}` for a run that does not exist or is not
-    waiting, and `{:error, :loop_run}` for a loop, which waits for its
-    inbox rather than a decision. The claim that follows resolves the
+    waiting, `{:error, :loop_run}` for a loop, which waits for its inbox
+    rather than a decision, and `{:error, :delegating}` for a run waiting
+    on the agents it asked (`Clementine.Delegation`), which resumes when
+    they end. The claim that follows resolves the
     run's subject and actor again, so a run whose actor was refused
     meanwhile is cancelled rather than continued.
 
@@ -460,7 +463,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     resume when resume's own transaction commits.
     """
     @spec resume(Ecto.UUID.t(), Clementine.Host.decision()) ::
-            :ok | {:error, :not_found | :not_waiting | :loop_run | term()}
+            :ok | {:error, :not_found | :not_waiting | :loop_run | :delegating | term()}
     def resume(run_id, {verdict, meta} = decision)
         when verdict in [:approved, :denied] and is_map(meta) do
       %Config{repo: repo} = config = Config.fetch!()
@@ -504,10 +507,18 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     defp refuse_loop(%AgentRun{kind: "loop"}), do: {:error, :loop_run}
     defp refuse_loop(%AgentRun{}), do: :ok
 
+    # A run waiting on its delegates resumes when they end, never by a
+    # decision.
     defp waiting_token(row) do
       case Codec.to_facts(row, @fields) do
-        %Facts{status: :waiting, suspension: %Suspension{token: token}} -> {:ok, token}
-        %Facts{} -> {:error, :not_waiting}
+        %Facts{status: :waiting, suspension: %Suspension{reason: {:external, {:delegation, _}}}} ->
+          {:error, :delegating}
+
+        %Facts{status: :waiting, suspension: %Suspension{token: token}} ->
+          {:ok, token}
+
+        %Facts{} ->
+          {:error, :not_waiting}
       end
     end
 
@@ -538,6 +549,16 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     any input left in its inbox kept as evidence. A child of a loop
     cancels like any run; its loop hears the `Cancelled` completion and
     decides.
+
+    A run waiting on the agents it asked (`Clementine.Delegation`) is
+    flagged (`{:ok, :flagged}`), and its live children are cancelled in
+    the same transaction with the reason
+    `%{"code" => "parent_cancelled", "parent_id" => run_id}`: a queued one
+    finishes at once, a running one is flagged. The last child's end
+    resumes the run, which ends `cancelled` before it does anything else,
+    so it ends after its children, and its `run_committed/2` finds none
+    of them active. A child cancelled on its own settles its parent's
+    call as cancelled.
 
     Who may cancel which run is the app's decision: check it before
     calling. A cancel of a run that has ended returns

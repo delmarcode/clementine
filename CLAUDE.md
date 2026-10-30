@@ -201,10 +201,11 @@ decisive, and its samples pass `test/clementine/guides_test.exs`.
   the tests run both agents end to end through the runtime on Postgres. CI's
   `installer` job runs it with a pinned `phx_new`; run it locally after
   changing a template.
-- The generated migration calls `Clementine.Migration.up(version: 3)`;
+- The generated migration calls `Clementine.Migration.up(version: 4)`;
   version 1 builds on version 1 of the column recipe, version 2 adds
-  the actor, the turn flag, and the lane index, and version 3 the loop
-  columns, the child tag, and the `agent_run_inbox` table. Every version is frozen
+  the actor, the turn flag, and the lane index, version 3 the loop
+  columns, the child tag, and the `agent_run_inbox` table, and version 4
+  the `agent_run_trace` table (PR 78). Every version is frozen
   (asserted in `test/clementine/runs/migration_test.exs` and
   `test/clementine/lifecycle/ecto_migration_versions_test.exs`) and
   stamps its number on the table, which the runtime checks as it starts;

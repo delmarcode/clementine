@@ -6,7 +6,9 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
   # provider event tuples. Chunks carry `choices[0].delta`; tool call
   # arguments arrive as string fragments keyed by `index`; the stream closes
   # with a `data: [DONE]` sentinel. SSE comment payloads (OpenRouter
-  # keep-alives) carry no data lines and are ignored.
+  # keep-alives) carry no data lines and are ignored. A refusal streams as
+  # `delta.refusal`: it becomes the turn's text, and the stop reason
+  # "refusal".
 
   defmodule State do
     @moduledoc false
@@ -15,6 +17,7 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
               started_calls: [],
               finish_reason: nil,
               usage: %{},
+              refused: false,
               done: false
   end
 
@@ -132,11 +135,18 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
     end
   end
 
-  defp text_events(%{"content" => text}, state) when is_binary(text) and text != "" do
-    {[{:text_delta, text}], state}
-  end
+  defp text_events(delta, state) do
+    case delta do
+      %{"content" => text} when is_binary(text) and text != "" ->
+        {[{:text_delta, text}], state}
 
-  defp text_events(_delta, state), do: {[], state}
+      %{"refusal" => text} when is_binary(text) and text != "" ->
+        {[{:text_delta, text}], %{state | refused: true}}
+
+      _other ->
+        {[], state}
+    end
+  end
 
   defp tool_call_events(nil, state), do: {[], state}
 
@@ -210,6 +220,7 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
     {events, %{state | done: true}}
   end
 
+  defp stop_reason(%State{refused: true}), do: "refusal"
   defp stop_reason(%State{finish_reason: "stop"}), do: "end_turn"
   defp stop_reason(%State{finish_reason: "tool_calls"}), do: "tool_use"
   defp stop_reason(%State{finish_reason: "length"}), do: "max_tokens"

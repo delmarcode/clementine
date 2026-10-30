@@ -36,14 +36,63 @@ defmodule Clementine.Rollout do
   and deciding to retry is outer-control work (see `Clementine.Verifier` for
   the judge-function shape it uses).
 
+  ## Engine Tools
+
+  Most tool calls act on the world, through `Clementine.ToolRunner`. An
+  engine tool (`Clementine.EngineTool`) acts on the execution itself.
+  `use_skill` settles in place, first in its batch: it loads a
+  `Clementine.Skill`, adding the skill's tools to the ones offered from
+  the next model call on, and the batch's other calls resolve against the
+  toolset it leaves. The system prompt never changes. `delegate` parks:
+  its calls are checked first, and once the batch's other calls have
+  settled (approval-gated ones included, one decision at a time), the
+  run parks on them with a `Clementine.Pending.Delegation`, and the
+  runtime starts the children in the write that parks it
+  (`Clementine.Delegation`). The resume settles each call with its
+  child's answer.
+
+  ## Tool Policy
+
+  A tool declared `approval: {:policy, term}` asks the `:authorize_tool`
+  function about each call before the batch runs anything: `:allow`
+  runs it with the batch, `:require_approval` parks it like
+  `approval: :required`, and `{:deny, reason}` settles it as an error
+  result carrying `reason`, which the model reads. An approved call is
+  asked once more when the approval resumes the run, and a deny wins. A
+  function that raises, exits, throws, answers anything else, or does
+  not answer in time denies the call and logs why, without the run's
+  data. Without the function, `{:policy, _}` gates like `:required`.
+  The check covers every tool the execution offers: the agent's,
+  deferred ones, and those a loaded skill brought. Engine tools carry
+  no approval. The host's `c:Clementine.Host.authorize_tool/3` is the
+  function on the durable runtime.
+
+  The policy and a skill's body are host code, and run in a task of
+  their own (`Clementine.HostCall`), bounded like a tool call; a cancel,
+  a drain, or a lost lease while one runs kills it and unwinds the run.
+
   Formerly `Clementine.Loop`; renamed so `Loop` can name the outer control
   primitive.
   """
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
   alias Clementine.LLM.Message.{Content, ToolResultMessage}
-  alias Clementine.{ApprovalRequest, LLM, Pending, Suspension, Tool, ToolInput, ToolRunner, Trace}
+
+  alias Clementine.{
+    ApprovalRequest,
+    Delegation,
+    EngineTool,
+    LLM,
+    Pending,
+    Skill,
+    Suspension,
+    Tool
+  }
+
+  alias Clementine.{HostCall, ToolInput, ToolResult, ToolRunner, Trace}
   alias Clementine.Trace.Recorder
+
+  require Logger
 
   @default_max_iterations 10
 
@@ -113,6 +162,9 @@ defmodule Clementine.Rollout do
       system: agent.instructions,
       tools: agent.tools ++ deferred,
       deferred: deferred,
+      output_schema: agent.output_schema,
+      skills: agent.skills,
+      delegates: agent.delegates,
       context: rollout.context,
       messages: rollout.messages,
       max_iterations: Keyword.get(limits(rollout), :max_iterations, @default_max_iterations),
@@ -126,18 +178,25 @@ defmodule Clementine.Rollout do
     # accumulated typed usage, and `prefix_len` — where history + input end
     # and generated messages begin, so `Result.Completed` can separate the
     # two. `recorder` is the runner's trace buffer (nil: no trace), and
-    # `fidelity` the agent's `trace:`.
+    # `fidelity` the agent's `trace:`. `tools` are the tool modules
+    # offered now (the agent's, then each loaded skill's), `engine_tools`
+    # the engine's own, `skills` the skills the agent offers,
+    # `loaded_skills` the names of those loaded, in load order, and
+    # `delegates` the agent modules it may ask. `authorize_tool` answers
+    # for `{:policy, term}` tools (nil: they gate like :required).
     defstruct [
       :model,
       :system,
       :tools,
       :deferred,
+      :output_schema,
       :context,
       :max_iterations,
       :emit,
       :recorder,
       :cancel?,
       :mark_effects,
+      :authorize_tool,
       :deadline,
       :input_message,
       :prefix_len,
@@ -147,7 +206,12 @@ defmodule Clementine.Rollout do
       usage: %Clementine.Usage{},
       fence_raised?: false,
       fidelity: :content,
-      paused?: false
+      paused?: false,
+      skills: [],
+      delegates: [],
+      delegation?: false,
+      engine_tools: [],
+      loaded_skills: []
     ]
   end
 
@@ -201,6 +265,20 @@ defmodule Clementine.Rollout do
     `retry` metadata is not `:safe` (`:unknown` is `:unsafe`). Batches of
     only `:safe` tools leave the fence down: nothing external can happen,
     so the run stays requeue-eligible.
+  - `:delegation` - `true` when the lifecycle starts the children of a
+    delegation park (`Clementine.Runs`); without it the agent's
+    `delegates:` are not offered.
+  - `:authorize_tool` - a two-arity function the rollout asks about each
+    call to a tool declared `approval: {:policy, term}`, with the call as
+    a `Clementine.ApprovalRequest` (the arguments that would run) and
+    `term`. It answers `:allow`, `:require_approval`, or
+    `{:deny, reason}` with `reason` a string (see "Tool Policy" above).
+    It runs in a task before the batch's fence, one call at a time, and
+    a signal that arrives meanwhile unwinds the run before anything
+    runs. A call still waiting when the batch parks is asked again on
+    each resume, and an approved one once more when its approval
+    resumes the run; a call an approver denied is not. Omitted means
+    `{:policy, _}` gates like `:required`.
   - `:deadline` - the execution deadline minted at claim, checked at
     iteration boundaries and applied as a cap on the provider stream's
     receive timeout and on per-tool timeouts.
@@ -237,6 +315,10 @@ defmodule Clementine.Rollout do
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
       deferred: Keyword.get(config, :deferred, []),
+      output_schema: Keyword.get(config, :output_schema),
+      skills: Keyword.get(config, :skills, []),
+      delegates: Keyword.get(config, :delegates, []),
+      delegation?: Keyword.get(opts, :delegation, false),
       context: Keyword.get(config, :context, %{}),
       max_iterations: Keyword.get(config, :max_iterations, @default_max_iterations),
       emit: Keyword.get(opts, :emit),
@@ -244,6 +326,7 @@ defmodule Clementine.Rollout do
       fidelity: Keyword.fetch!(config, :trace),
       cancel?: Keyword.get(opts, :cancel?, fn -> :none end),
       mark_effects: Keyword.get(opts, :mark_effects, fn -> :ok end),
+      authorize_tool: Keyword.get(opts, :authorize_tool),
       deadline: Keyword.get(opts, :deadline),
       input_message: input_message,
       prefix_len: length(rollout.messages) + 1,
@@ -257,17 +340,14 @@ defmodule Clementine.Rollout do
     )
 
     try do
-      resume = Keyword.get(opts, :resume)
-      record_execution(exec, resume != nil)
-
-      case restore(exec, resume, rollout) do
+      case prepare(exec, Keyword.get(opts, :resume), rollout) do
         {:ok, %Execution{} = exec} ->
           boundary(exec)
 
         {:resolve, %Execution{} = exec, pending, payload} ->
           resolve_pending(exec, pending, payload)
 
-        {:error, %Clementine.Error{} = error} ->
+        {:error, %Execution{} = exec, %Clementine.Error{} = error} ->
           fail(exec, error)
       end
     rescue
@@ -281,6 +361,104 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # Checks what the agent offers (its output schema, its skills, its
+  # delegates),
+  # restores a resumed run's state, and records the execution entry. The
+  # entry names the toolset the execution begins with, so it follows the
+  # restore that rebuilds it; an execution that fails here records one
+  # too, with the agent's own tools.
+  defp prepare(%Execution{} = exec, resume, rollout) do
+    resumed? = resume != nil
+
+    with {:ok, %Execution{} = exec} <- normalize_output_schema(exec),
+         {:ok, %Execution{} = exec} <- prepare_skills(exec),
+         {:ok, %Execution{} = exec} <- prepare_delegates(exec) do
+      case restore(exec, resume, rollout) do
+        {:ok, %Execution{} = restored} = ok ->
+          record_execution(restored, exec.tools, resumed?)
+          ok
+
+        {:resolve, %Execution{} = restored, _pending, _payload} = resolve ->
+          record_execution(restored, exec.tools, true)
+          resolve
+
+        {:error, %Clementine.Error{} = error} ->
+          record_execution(exec, exec.tools, resumed?)
+          {:error, exec, error}
+      end
+    else
+      {:error, %Execution{} = exec, %Clementine.Error{}} = error ->
+        record_execution(exec, exec.tools, resumed?)
+        error
+    end
+  end
+
+  # Agent.new/1 normalizes an output_schema, but an agent/1 may set the
+  # struct's field directly: normalize it here too (a normalized schema
+  # comes back unchanged), so the execution's trace entry fingerprints the
+  # schema the run uses, and fail the run on one that is not a schema
+  # before anything executes.
+  defp normalize_output_schema(%Execution{output_schema: nil} = exec), do: {:ok, exec}
+
+  defp normalize_output_schema(%Execution{output_schema: schema} = exec) do
+    case Clementine.OutputSchema.normalize(schema) do
+      {:ok, schema} -> {:ok, %{exec | output_schema: schema}}
+      {:error, %Clementine.Error{} = error} -> {:error, exec, error}
+    end
+  end
+
+  # Agent.new/1 checks skills, but an agent/1 may set the field directly
+  # (a raw skill module, a tool whose name another takes): every run is
+  # checked here, against the tools it offers of its own, deferred ones
+  # included, and one that fails runs nothing. A run with skills is
+  # offered use_skill.
+  defp prepare_skills(%Execution{skills: []} = exec), do: {:ok, exec}
+
+  defp prepare_skills(%Execution{} = exec) do
+    case Skill.prepare(exec.skills, exec.tools, exec.deferred) do
+      {:ok, skills} ->
+        {:ok, %{exec | skills: skills, engine_tools: [Skill.use_skill_tool(skills)]}}
+
+      {:error, message} ->
+        {:error, %{exec | skills: []},
+         %Clementine.Error{
+           kind: :rollout,
+           code: :invalid_skills,
+           message: message,
+           retryable?: false
+         }}
+    end
+  end
+
+  # Agent.new/1 checks what a build may of delegates, but reads no
+  # delegate's key, and an agent/1 may set the field directly: every run
+  # checks them here (agent modules, their keys distinct, no tool it
+  # offers named delegate), and one that fails runs nothing. A run with
+  # delegates is offered delegate, when its runner's lifecycle starts the
+  # children (`delegation: true`); elsewhere it is offered none.
+  defp prepare_delegates(%Execution{delegates: []} = exec), do: {:ok, exec}
+
+  defp prepare_delegates(%Execution{delegation?: false} = exec),
+    do: {:ok, %{exec | delegates: []}}
+
+  defp prepare_delegates(%Execution{} = exec) do
+    offered = exec.tools ++ Enum.flat_map(exec.skills, & &1.tools)
+
+    case Delegation.prepare(exec.delegates, offered) do
+      {:ok, tool} ->
+        {:ok, %{exec | engine_tools: exec.engine_tools ++ [tool]}}
+
+      {:error, message} ->
+        {:error, %{exec | delegates: []},
+         %Clementine.Error{
+           kind: :rollout,
+           code: :invalid_delegates,
+           message: message,
+           retryable?: false
+         }}
+    end
+  end
+
   # Fresh start: history, then the materialized input message.
   defp restore(%Execution{} = exec, nil, rollout) do
     {:ok, %{exec | messages: rollout.messages ++ [exec.input_message]}}
@@ -291,7 +469,8 @@ defmodule Clementine.Rollout do
   # operation is the act the suspension interrupted; the payload resolves
   # it before the loop may gather again.
   defp restore(%Execution{} = exec, {checkpoint, payload}, _rollout) do
-    with {:ok, %Clementine.Checkpoint{} = checkpoint} <- decode_checkpoint(checkpoint) do
+    with {:ok, %Clementine.Checkpoint{} = checkpoint} <- decode_checkpoint(checkpoint),
+         {:ok, %Execution{} = exec} <- restore_skills(exec, checkpoint) do
       exec = %{
         exec
         | messages: checkpoint.messages,
@@ -300,16 +479,19 @@ defmodule Clementine.Rollout do
           usage: checkpoint.usage
       }
 
-      # Shapes beyond ToolApproval are deliberately unspecified until their
-      # reasons activate; a checkpoint carrying one is exactly "content no
-      # longer understood" and takes the doctrine's incompatible path — a
-      # decoded envelope already fails inside decode, so this arm guards
-      # host-built structs.
+      # Shapes beyond ToolApproval and Delegation are unspecified until
+      # their reasons activate; a checkpoint carrying one is exactly
+      # "content no longer understood" and takes the doctrine's
+      # incompatible path — a decoded envelope already fails inside
+      # decode, so this arm guards host-built structs.
       case checkpoint.pending do
         nil ->
           {:ok, exec}
 
         %Pending.ToolApproval{} = pending ->
+          {:resolve, exec, pending, payload}
+
+        %Pending.Delegation{} = pending ->
           {:resolve, exec, pending, payload}
 
         other ->
@@ -335,17 +517,40 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # The skills loaded before the park are loaded again, from the agent's
+  # current skills: the resume offers the tools the checkpointed messages
+  # were written against. A skill the agent no longer offers is a
+  # checkpoint this rollout cannot honor, as a gated tool it no longer
+  # carries is.
+  defp restore_skills(%Execution{} = exec, %Clementine.Checkpoint{skills: names} = checkpoint) do
+    Enum.reduce_while(names, {:ok, exec}, fn name, {:ok, exec} ->
+      case Enum.find(exec.skills, &(&1.name == name)) do
+        %Skill{} = skill ->
+          {:cont, {:ok, put_skill(exec, skill)}}
+
+        nil ->
+          {:halt,
+           {:error,
+            incompatible_checkpoint(
+              "the checkpoint loaded skill #{inspect(name)}, which the agent no " <>
+                "longer offers",
+              checkpoint
+            )}}
+      end
+    end)
+  end
+
   defp pending_shape(%struct{}), do: inspect(struct)
   defp pending_shape(other), do: inspect(other)
 
   defp decode_checkpoint(%Clementine.Checkpoint{version: version} = checkpoint) do
-    if version == Clementine.Checkpoint.version() do
+    if version in Clementine.Checkpoint.versions() do
       {:ok, checkpoint}
     else
       {:error,
        incompatible_checkpoint(
          "unknown checkpoint version #{inspect(version)} " <>
-           "(current: #{Clementine.Checkpoint.version()})",
+           "(this engine reads #{inspect(Clementine.Checkpoint.versions())})",
          checkpoint
        )}
     end
@@ -361,7 +566,9 @@ defmodule Clementine.Rollout do
   # this execution; denial synthesizes an error tool result carrying the
   # approver's message and lets the model react. Either way the batch
   # settles through the same path as a fresh act, so a batch holding
-  # further gated calls parks again, one decision at a time.
+  # further gated calls parks again, one decision at a time. An approved
+  # call to a {:policy, term} tool is put to the tool policy once more
+  # (resolve_approved/5); a denied one is not.
   defp resolve_pending(%Execution{} = exec, %Pending.ToolApproval{} = pending, payload) do
     with :continue <- check_signals(),
          :continue <- check_deadline(exec),
@@ -369,11 +576,7 @@ defmodule Clementine.Rollout do
          {:ok, pending_use, batch} <- pending_batch(exec, pending) do
       case payload do
         {:approved, _meta} ->
-          case execute_now(exec, [pending_use], pending.completed_results, payload) do
-            {:ok, %Execution{} = exec, completed} -> settle_batch(exec, batch, completed)
-            {:error, %Clementine.Error{} = error} -> fail(exec, error)
-            unwound -> conclude(exec, unwound)
-          end
+          resolve_approved(exec, pending, pending_use, batch, payload)
 
         {:denied, meta} ->
           denial = %Clementine.ToolResult{content: denial_message(meta), is_error: true}
@@ -384,7 +587,11 @@ defmodule Clementine.Rollout do
             is_error: true
           })
 
-          record_tool_call(exec, pending_use, denial, 0, payload)
+          record_tool_call(exec, pending_use, denial, 0,
+            approval: payload,
+            policy: pending.policy
+          )
+
           settle_batch(exec, batch, Map.put(pending.completed_results, pending_use.id, denial))
 
         other ->
@@ -395,6 +602,141 @@ defmodule Clementine.Rollout do
       unwound -> conclude(exec, unwound)
     end
   end
+
+  # Resolving a pending delegation settles each waiting `delegate` call
+  # with its child's outcome from the payload — or, for a call whose
+  # child could not start, the refusal the park left in the checkpoint —
+  # after the boundary's own checks, as an approval's resolve does. The
+  # batch then settles through the same path as a fresh act: every other
+  # call settled before the park, so it feeds back to the model.
+  defp resolve_pending(%Execution{} = exec, %Pending.Delegation{} = pending, payload) do
+    with :continue <- check_signals(),
+         :continue <- check_deadline(exec),
+         :continue <- check_cancel(exec),
+         {:ok, batch} <- delegation_batch(exec, pending),
+         {:ok, outcomes} <- delegated(pending, payload) do
+      completed =
+        batch
+        |> Enum.filter(&Map.has_key?(pending.children, &1.id))
+        |> Enum.reduce(pending.completed_results, fn call, completed ->
+          child = Map.fetch!(pending.children, call.id)
+          Map.put(completed, call.id, settle_child(exec, call, child, outcomes, completed))
+        end)
+
+      settle_batch(exec, batch, completed)
+    else
+      {:error, %Clementine.Error{} = error} -> fail(exec, error)
+      unwound -> conclude(exec, unwound)
+    end
+  end
+
+  # A child that ran settles from its outcome, and the trace records the
+  # child (its id, agent, and how it ended) before the call; a call whose
+  # child could not start settles with the refusal the park recorded.
+  defp settle_child(%Execution{} = exec, call, child, outcomes, completed) do
+    result =
+      case Map.fetch(outcomes, call.id) do
+        {:ok, outcome} ->
+          record(exec, :delegate, Trace.delegate(exec.iteration, call.id, child, outcome))
+          %ToolResult{content: outcome["content"], is_error: outcome["is_error"]}
+
+        :error ->
+          Map.fetch!(completed, call.id)
+      end
+
+    emit_event(exec, :tool_result, %{
+      tool_use_id: call.id,
+      result: result.content,
+      is_error: result.is_error
+    })
+
+    record_tool_call(exec, call, result, 0)
+    result
+  end
+
+  # The approved call runs with exactly the arguments approved, unless the
+  # tool policy, asked once more, now denies it: then it settles as the
+  # deny, and its trace entry carries the approval beside it.
+  defp resolve_approved(%Execution{} = exec, pending, pending_use, batch, payload) do
+    with {:ok, decision} <- reauthorize(exec, pending_use, pending),
+         :continue <- after_host_code(exec, [pending_use]) do
+      case decision do
+        {:deny, verdict} ->
+          completed =
+            settle_denied(exec, pending_use, verdict, pending.completed_results,
+              approval: payload
+            )
+
+          settle_batch(exec, batch, completed)
+
+        {:run, verdict} ->
+          verdicts = if verdict, do: %{pending_use.id => verdict}, else: %{}
+
+          case execute_now(exec, [pending_use], pending.completed_results, payload, verdicts) do
+            {:ok, %Execution{} = exec, completed} -> settle_batch(exec, batch, completed)
+            {:error, %Clementine.Error{} = error} -> fail(exec, error)
+            unwound -> conclude(exec, unwound)
+          end
+      end
+    else
+      {:unwind, unwound} -> conclude(exec, unwound)
+      {:error, %Clementine.Error{} = error} -> fail(exec, error)
+      unwound -> conclude(exec, unwound)
+    end
+  end
+
+  # The checkpoint's last message must be the assistant turn whose calls
+  # the delegation waits on, as for an approval: the batch is read back
+  # from it.
+  defp delegation_batch(%Execution{} = exec, %Pending.Delegation{} = pending) do
+    batch =
+      case List.last(exec.messages) do
+        %AssistantMessage{} = message ->
+          repair_tool_uses(exec, AssistantMessage.get_tool_uses(message), false)
+
+        _other ->
+          []
+      end
+
+    ids = MapSet.new(batch, & &1.id)
+
+    case Enum.reject(Map.keys(pending.children), &MapSet.member?(ids, &1)) do
+      [] ->
+        {:ok, batch}
+
+      missing ->
+        {:error,
+         incompatible_checkpoint(
+           "pending delegate calls #{Enum.join(missing, ", ")} are not in the " <>
+             "checkpoint's last assistant message",
+           pending
+         )}
+    end
+  end
+
+  # The payload names an outcome for each child that ran; a child with
+  # none must be one the park refused, its refusal already settled.
+  defp delegated(%Pending.Delegation{} = pending, {:delegated, outcomes} = payload)
+       when is_map(outcomes) do
+    refused = pending.completed_results
+
+    Enum.reduce_while(pending.children, {:ok, %{}}, fn {id, _child}, {:ok, acc} ->
+      case Map.get(outcomes, id) do
+        %{"content" => content, "is_error" => is_error} = outcome
+        when is_binary(content) and is_boolean(is_error) ->
+          {:cont, {:ok, Map.put(acc, id, outcome)}}
+
+        nil when is_map_key(refused, id) ->
+          {:cont, {:ok, acc}}
+
+        _missing_or_malformed ->
+          {:halt, {:error, invalid_resume_payload(payload, pending)}}
+      end
+    end)
+  end
+
+  defp delegated(%Pending.Delegation{} = pending, payload),
+    do: {:error, invalid_resume_payload(payload, pending)}
 
   # The checkpoint's last message must be the assistant turn that issued
   # the pending call — the batch is read back from it, so sibling
@@ -456,6 +798,19 @@ defmodule Clementine.Rollout do
         "resume payload #{inspect(payload)} cannot resolve the pending " <>
           "approval of tool #{pending.tool_name}; approval resumes take " <>
           "{:approved, meta} | {:denied, meta}",
+      retryable?: false,
+      raw: payload
+    }
+  end
+
+  defp invalid_resume_payload(payload, %Pending.Delegation{} = pending) do
+    %Clementine.Error{
+      kind: :rollout,
+      code: :invalid_resume_payload,
+      message:
+        "resume payload #{inspect(payload, limit: 5)} cannot resolve the pending " <>
+          "delegation of #{map_size(pending.children)} call(s); a delegation resumes with " <>
+          "{:delegated, %{tool_use_id => outcome}}, an outcome for each child that ran",
       retryable?: false,
       raw: payload
     }
@@ -578,11 +933,13 @@ defmodule Clementine.Rollout do
   defp stream_response(%Execution{} = exec) do
     alias Clementine.LLM.StreamParser.Accumulator
 
+    tools = offered_tools(exec)
+
     metadata = %{
       model: exec.model,
       iteration: exec.iteration,
       message_count: length(exec.messages),
-      tool_count: length(exec.tools),
+      tool_count: length(tools),
       streaming: true
     }
 
@@ -593,7 +950,7 @@ defmodule Clementine.Rollout do
     )
 
     started = System.monotonic_time()
-    stream = LLM.stream(exec.model, exec.system, exec.messages, exec.tools, stream_opts(exec))
+    stream = LLM.stream(exec.model, exec.system, exec.messages, tools, stream_opts(exec))
 
     {acc, signal} =
       try do
@@ -708,16 +1065,22 @@ defmodule Clementine.Rollout do
         boundary(%{exec | paused?: true})
 
       true ->
-        conclude(
-          exec,
-          {:ok,
-           Clementine.Result.completed(
-             input_message: exec.input_message,
-             messages: Enum.drop(exec.messages, exec.prefix_len),
-             output: exec.messages |> List.last() |> AssistantMessage.get_text(),
-             usage: exec.usage
-           )}
-        )
+        case final_output(exec, List.last(exec.messages), response) do
+          {:ok, output} ->
+            conclude(
+              exec,
+              {:ok,
+               Clementine.Result.completed(
+                 input_message: exec.input_message,
+                 messages: Enum.drop(exec.messages, exec.prefix_len),
+                 output: output,
+                 usage: exec.usage
+               )}
+            )
+
+          {:error, %Clementine.Error{} = error} ->
+            fail(exec, error)
+        end
     end
   end
 
@@ -729,6 +1092,17 @@ defmodule Clementine.Rollout do
   defp append_turn(%Execution{messages: messages}, content) do
     messages ++ [AssistantMessage.new(content)]
   end
+
+  # The output is the final turn's text, the paused turn's included. An
+  # agent with an output_schema answers in JSON: the output is the decoded
+  # map of what the turn wrote last, after any search or thinking, and an
+  # answer that does not decode or match fails the run
+  # (Clementine.OutputSchema).
+  defp final_output(%Execution{output_schema: nil}, %AssistantMessage{} = turn, _response),
+    do: {:ok, AssistantMessage.get_text(turn)}
+
+  defp final_output(%Execution{output_schema: schema}, %AssistantMessage{} = turn, response),
+    do: Clementine.OutputSchema.decode(schema, turn.content, response.stop_reason)
 
   # A signal that arrived during the gather is already in the mailbox:
   # honor it before the fence write and before any tool starts — a
@@ -749,15 +1123,28 @@ defmodule Clementine.Rollout do
   defp repair_tool_uses(%Execution{} = exec, tool_uses, report?) do
     Enum.map(tool_uses, fn tool_use ->
       with %{} = input <- tool_use.input,
-           tool when not is_nil(tool) <- Tool.find_by_name(exec.tools, tool_use.name),
+           parameters when is_list(parameters) <- parameters(exec, tool_use.name),
            {repaired, [_ | _] = fields} <-
-             ToolInput.repair(input, tool.__parameters__(), tool: tool_use.name) do
+             ToolInput.repair(input, parameters, tool: tool_use.name) do
         if report?, do: report_repair(exec, tool_use, fields)
         %{tool_use | input: repaired}
       else
         _ -> tool_use
       end
     end)
+  end
+
+  defp parameters(%Execution{} = exec, name) do
+    case engine_tool(exec, name) do
+      %EngineTool{parameters: parameters} ->
+        parameters
+
+      nil ->
+        case Tool.find_by_name(exec.tools, name) do
+          nil -> nil
+          tool -> tool.__parameters__()
+        end
+    end
   end
 
   defp report_repair(%Execution{} = exec, tool_use, fields) do
@@ -769,60 +1156,358 @@ defmodule Clementine.Rollout do
   end
 
   # Settles one tool batch toward its ToolResultMessage, possibly across
-  # suspensions: uncovered ungated calls execute now; then the first
+  # suspensions: uncovered engine calls go first, since they change the
+  # execution the rest resolve against — a call that settles now (a
+  # skill load) settles in place, and a call that parks (a delegate) is
+  # checked and held; the tool policy then answers for the calls whose
+  # tools declare `{:policy, term}`, and a call it denies settles now,
+  # running nothing; uncovered ungated calls execute now; then the first
   # uncovered approval-gated call parks the run — everything settled so
   # far rides in the checkpoint, so nothing is discarded and nothing
-  # unsafe re-executes on resume — and a fully covered batch feeds back
-  # to the model. Resume re-enters here with the decided call already
-  # settled, so a batch holding several gated calls parks once per
-  # decision.
+  # unsafe re-executes on resume. With no gated call left, held delegate
+  # calls park the run once, for all their children. A fully covered
+  # batch feeds back to the model. Resume re-enters here with the
+  # decided call already settled, so a batch holding several gated calls
+  # parks once per decision, and its delegate calls after the last.
   defp settle_batch(%Execution{} = exec, tool_uses, completed) do
     uncovered = Enum.reject(tool_uses, &Map.has_key?(completed, &1.id))
-    {gated, ungated} = Enum.split_with(uncovered, &approval_gated?(exec.tools, &1))
+    {engine, world} = Enum.split_with(uncovered, &engine_tool(exec, &1.name))
 
-    case execute_now(exec, ungated, completed) do
-      {:ok, %Execution{} = exec, completed} ->
-        case gated do
-          [] ->
-            finish_batch(exec, tool_uses, completed)
+    with {:ok, %Execution{} = exec, completed, held} <-
+           settle_engine_calls(exec, engine, completed),
+         :continue <- after_host_code(exec, engine) do
+      settle_world(exec, tool_uses, repair_after_loads(exec, engine, world), completed, held)
+    else
+      {:error, %Clementine.Error{} = error} -> fail(exec, error)
+      unwound -> conclude(exec, unwound)
+    end
+  end
 
-          [next | _later] ->
-            conclude(exec, {:suspend, suspension_request(exec, next, completed)})
+  # Engine calls and the tool policy run host code (a skill's body, the
+  # host's authorize_tool) through Clementine.HostCall, which unwinds on
+  # a signal that lands while the code runs. One that lands just after is
+  # honored here, before the fence write and before any tool starts, as
+  # one that arrived during the gather is. Host code may also run out the
+  # execution's deadline (HostCall's bound is the time left): that is
+  # honored here too, so an expired execution neither starts tools nor
+  # parks, which would hand the run a fresh budget on its resume. `calls`
+  # are those whose settling ran host code; none means nothing ran.
+  defp after_host_code(_exec, [] = _calls), do: :continue
+
+  defp after_host_code(exec, _calls) do
+    with :continue <- check_signals(), do: check_deadline(exec)
+  end
+
+  defp settle_world(%Execution{} = exec, tool_uses, world, completed, held) do
+    # Each verdict is an answer the policy gave, so host code ran.
+    with {:ok, {gated, ungated, completed, verdicts}} <- gate_calls(exec, world, completed),
+         :continue <- after_host_code(exec, Map.keys(verdicts)) do
+      case execute_now(exec, ungated, completed, nil, verdicts) do
+        {:ok, %Execution{} = exec, completed} ->
+          cond do
+            gated != [] ->
+              conclude(exec, {:suspend, suspension_request(exec, hd(gated), completed, verdicts)})
+
+            held != %{} ->
+              park_for_children(exec, held, completed)
+
+            true ->
+              finish_batch(exec, tool_uses, completed)
+          end
+
+        {:error, %Clementine.Error{} = error} ->
+          fail(exec, error)
+
+        unwound ->
+          conclude(exec, unwound)
+      end
+    else
+      {:error, %Clementine.Error{} = error} -> fail(exec, error)
+      unwound -> conclude(exec, unwound)
+    end
+  end
+
+  # Splits a batch's world calls into those that park for a decision and
+  # those that run now, settling the ones the tool policy denies, one call
+  # at a time, in batch order. `verdicts` holds the policy's answer for
+  # each call it was asked about, for the trace entry the call gets when
+  # it settles. A signal while the policy answers stops the split; the
+  # answers given so far are on the trace already.
+  defp gate_calls(%Execution{} = exec, world, completed) do
+    world
+    |> Enum.reduce_while({[], [], completed, %{}}, fn call, acc ->
+      case gate(exec, call) do
+        {:unwind, unwound} -> {:halt, {:unwind, unwound}}
+        verdict -> {:cont, gate_call(call, verdict, acc, exec)}
+      end
+    end)
+    |> case do
+      {:unwind, unwound} ->
+        unwound
+
+      {gated, ungated, completed, verdicts} ->
+        {:ok, {Enum.reverse(gated), Enum.reverse(ungated), completed, verdicts}}
+    end
+  end
+
+  defp gate_call(call, verdict, {gated, ungated, completed, verdicts}, exec) do
+    case verdict do
+      :run ->
+        {gated, [call | ungated], completed, verdicts}
+
+      :park ->
+        {[call | gated], ungated, completed, verdicts}
+
+      :allow ->
+        {gated, [call | ungated], completed, Map.put(verdicts, call.id, :allow)}
+
+      :require_approval ->
+        {[call | gated], ungated, completed, Map.put(verdicts, call.id, :require_approval)}
+
+      denied ->
+        completed = settle_denied(exec, call, denied, completed)
+        {gated, ungated, completed, Map.put(verdicts, call.id, denied)}
+    end
+  end
+
+  # :required parks every call for a decision. {:policy, term} asks the
+  # tool policy, and without one parks like :required: a tool that
+  # declares any approval requirement never executes unchecked. An
+  # unresolvable tool name never executes anything — it settles as an
+  # "Unknown tool" error result — so it is never gated.
+  defp gate(%Execution{} = exec, call) do
+    case Tool.find_by_name(exec.tools, call.name) do
+      nil ->
+        :run
+
+      tool ->
+        case Tool.approval(tool) do
+          :never -> :run
+          :required -> :park
+          {:policy, _term} when exec.authorize_tool == nil -> :park
+          {:policy, term} -> authorize(exec, call, term)
+        end
+    end
+  end
+
+  @policy_failed "Denied: the tool's policy check failed."
+
+  # The host's answer for one call, asked with exactly the arguments that
+  # would run, in a task bounded like a tool call (Clementine.HostCall).
+  # Every answer is on the trace as it is given (a :policy entry), so a
+  # run that parks or unwinds after it keeps it. Anything but an answer
+  # the policy may give, a raise, or no answer in time denies the call
+  # (fails closed) and is logged without the run's data; the model reads
+  # only that the check failed.
+  defp authorize(%Execution{authorize_tool: authorize_tool} = exec, call, term) do
+    request = %ApprovalRequest{tool_use_id: call.id, tool_name: call.name, args: call.input}
+    timeout = host_timeout(exec)
+
+    case HostCall.run(fn -> authorize_tool.(request, term) end, timeout) do
+      {:signal, signal} ->
+        {:unwind, unwind(signal)}
+
+      outcome ->
+        verdict = verdict(call, outcome, timeout)
+        record(exec, :policy, Trace.policy(exec.iteration, call, verdict))
+        verdict
+    end
+  end
+
+  defp verdict(_call, {:ok, :allow}, _timeout), do: :allow
+  defp verdict(_call, {:ok, :require_approval}, _timeout), do: :require_approval
+
+  defp verdict(_call, {:ok, {:deny, reason}}, _timeout) when is_binary(reason),
+    do: {:deny, reason}
+
+  defp verdict(call, {:ok, other}, _timeout) do
+    policy_failed(
+      call,
+      "answered #{HostCall.shape(other)}, which is not :allow, :require_approval, or " <>
+        "{:deny, reason} with a string reason"
+    )
+  end
+
+  defp verdict(call, {:failed, kind, reason, stacktrace}, _timeout),
+    do: policy_failed(call, HostCall.describe(kind, reason, stacktrace))
+
+  defp verdict(call, :timeout, timeout),
+    do: policy_failed(call, "did not answer within #{timeout} ms")
+
+  defp policy_failed(call, why) do
+    Logger.error(
+      "authorize_tool for tool #{inspect(call.name)} (call #{call.id}) #{why}\n" <>
+        "The call is denied."
+    )
+
+    {:failed, @policy_failed}
+  end
+
+  # An approval satisfies :require_approval, but not a policy that has
+  # turned the call down since it parked: an approved call to a
+  # {:policy, term} tool is asked about once more, and a deny (or a
+  # failure) wins over the approval. :allow or :require_approval runs it,
+  # the approval already given. Without a policy, or for a tool that no
+  # longer declares one, the approval decides, and the trace keeps the
+  # verdict that parked it.
+  defp reauthorize(%Execution{authorize_tool: nil}, _call, pending),
+    do: {:ok, {:run, pending.policy}}
+
+  defp reauthorize(%Execution{} = exec, call, pending) do
+    case Tool.approval(Tool.find_by_name(exec.tools, call.name)) do
+      {:policy, term} ->
+        case authorize(exec, call, term) do
+          {:unwind, _unwound} = unwind -> unwind
+          verdict when verdict in [:allow, :require_approval] -> {:ok, {:run, verdict}}
+          denied -> {:ok, {:deny, denied}}
         end
 
-      {:error, %Clementine.Error{} = error} ->
-        fail(exec, error)
-
-      unwound ->
-        conclude(exec, unwound)
+      _declared ->
+        {:ok, {:run, pending.policy}}
     end
   end
 
-  # {:policy, _} is reserved and unresolved in this engine version, so it
-  # gates exactly like :required: a tool that declares any approval
-  # requirement never executes without a decision. An unresolvable tool
-  # name never executes anything — it settles as an "Unknown tool" error
-  # result — so it cannot be gated either.
-  defp approval_gated?(tools, tool_use) do
-    case Tool.find_by_name(tools, tool_use.name) do
-      nil -> false
-      tool -> Tool.approval(tool) != :never
+  # Host code runs no longer than a tool call may: the tool timeout or
+  # the run's remaining time, whichever is less.
+  defp host_timeout(%Execution{deadline: nil}), do: ToolRunner.default_timeout()
+
+  defp host_timeout(%Execution{deadline: deadline}),
+    do: min(ToolRunner.default_timeout(), remaining_ms(deadline))
+
+  # A denied call runs nothing: it settles as the error result the model
+  # reads, reported and traced like any settled call.
+  defp settle_denied(%Execution{} = exec, call, verdict, completed, gate \\ []) do
+    result = %ToolResult{content: elem(verdict, 1), is_error: true}
+
+    emit_event(exec, :tool_result, %{
+      tool_use_id: call.id,
+      result: result.content,
+      is_error: true
+    })
+
+    record_tool_call(exec, call, result, 0, Keyword.put(gate, :policy, verdict))
+    Map.put(completed, call.id, result)
+  end
+
+  # The batch was repaired as it arrived, against the tools offered then;
+  # a call to a tool a skill load in this batch just added was not, so the
+  # rest of the batch is repaired again against the toolset the loads left.
+  # A call already repaired has nothing left to repair.
+  defp repair_after_loads(_exec, [] = _engine_calls, world), do: world
+  defp repair_after_loads(exec, _engine_calls, world), do: repair_tool_uses(exec, world, true)
+
+  defp engine_tool(%Execution{engine_tools: tools}, name) do
+    Enum.find(tools, &(&1.name == name))
+  end
+
+  # Engine calls go in batch order, each against the execution the one
+  # before left. A call that settles now is traced and reported like any
+  # tool call; a call that parks comes back held, to settle on the
+  # resume. They touch nothing outside the execution: no fence, no gate,
+  # no runner.
+  defp settle_engine_calls(%Execution{} = exec, calls, completed) do
+    Enum.reduce_while(calls, {:ok, exec, completed, %{}}, fn call, {:ok, exec, completed, held} ->
+      started = System.monotonic_time()
+
+      case engine_call(exec, engine_tool(exec, call.name), call) do
+        {exec, %ToolResult{} = result} ->
+          emit_event(exec, :tool_result, %{
+            tool_use_id: call.id,
+            result: result.content,
+            is_error: result.is_error
+          })
+
+          record_tool_call(exec, call, result, to_ms(System.monotonic_time() - started))
+          {:cont, {:ok, exec, Map.put(completed, call.id, result), held}}
+
+        {exec, {:park, child}} ->
+          {:cont, {:ok, exec, completed, Map.put(held, call.id, child)}}
+
+        {:unwind, unwound} ->
+          {:halt, unwound}
+      end
+    end)
+  end
+
+  defp engine_call(%Execution{} = exec, %EngineTool{kind: :use_skill}, call),
+    do: use_skill(exec, call)
+
+  # A delegate call the engine can refuse from what it holds (an agent
+  # not offered, a turn agent, no prompt) settles now as an error; any
+  # other is held for the park, where the runtime starts its child.
+  defp engine_call(%Execution{} = exec, %EngineTool{kind: :delegate}, call) do
+    case Delegation.call(exec.delegates, call.input) do
+      {:ok, child} -> {exec, {:park, child}}
+      {:error, message} -> {exec, %ToolResult{content: message, is_error: true}}
     end
   end
+
+  # Only a first load changes the execution: the skill's tools are
+  # offered from the next model call on, and the checkpoint of a later
+  # park names it. The load runs the skill's body, host code, in a task
+  # bounded like a tool call (Clementine.HostCall): a body that does not
+  # finish in time is an error the model reads, and a signal while it
+  # runs unwinds the run with nothing loaded.
+  defp use_skill(%Execution{} = exec, call) do
+    %Execution{skills: skills, loaded_skills: loaded, context: context} = exec
+    load = fn -> Skill.load(skills, loaded, call.input, context) end
+
+    case HostCall.run(load, host_timeout(exec)) do
+      {:ok, {:loaded, %Skill{} = skill, body, content}} ->
+        record(exec, :skill_load, Trace.skill_load(exec.iteration, call.id, skill, body))
+        {put_skill(exec, skill), %ToolResult{content: content, is_error: false}}
+
+      {:ok, {:unchanged, content}} ->
+        {exec, %ToolResult{content: content, is_error: false}}
+
+      {:ok, {:error, content}} ->
+        {exec, %ToolResult{content: content, is_error: true}}
+
+      :timeout ->
+        {exec, unloaded(call, "its body did not finish in time")}
+
+      {:failed, _kind, _reason, _stacktrace} ->
+        {exec, unloaded(call, "loading it failed")}
+
+      {:signal, signal} ->
+        {:unwind, unwind(signal)}
+    end
+  end
+
+  defp unloaded(call, why) do
+    name = if is_map(call.input), do: call.input["name"]
+
+    %ToolResult{
+      content: "The skill #{inspect(name)} could not be loaded: #{why}.",
+      is_error: true
+    }
+  end
+
+  defp put_skill(%Execution{} = exec, %Skill{} = skill) do
+    %{
+      exec
+      | tools: exec.tools ++ Enum.reject(skill.tools, &(&1 in exec.tools)),
+        loaded_skills: exec.loaded_skills ++ [skill.name]
+    }
+  end
+
+  # The tools the model is offered: the modules, then the engine's own.
+  defp offered_tools(%Execution{} = exec), do: exec.tools ++ exec.engine_tools
 
   # Runs the calls that may execute in this pass — fence first, keyed to
   # exactly these calls: only code that runs now can cause an effect, so
   # a parked gated call contributes nothing to the fence decision — and
   # settles their normalized results into the batch map.
-  # `approval` is the decision a resumed call ran under, for its trace
-  # entry; nil for calls that needed none.
-  defp execute_now(exec, calls, completed, approval \\ nil)
+  # `approval` is the decision a resumed call ran under, and `verdicts`
+  # the tool policy's answer for each call it was asked about, for their
+  # trace entries.
+  defp execute_now(%Execution{} = exec, [], completed, _approval, _verdicts),
+    do: {:ok, exec, completed}
 
-  defp execute_now(%Execution{} = exec, [], completed, _approval), do: {:ok, exec, completed}
-
-  defp execute_now(%Execution{} = exec, calls, completed, approval) do
+  defp execute_now(%Execution{} = exec, calls, completed, approval, verdicts) do
     tool_calls = Enum.map(calls, fn t -> %{id: t.id, name: t.name, input: t.input} end)
     context = Map.put(exec.context, :_clementine_iteration, exec.iteration)
+    gates = Map.new(calls, &{&1.id, [approval: approval, policy: verdicts[&1.id]]})
 
     with {:continue, %Execution{} = exec} <- raise_fence(exec, calls) do
       uses = Map.new(calls, &{&1.id, &1})
@@ -833,7 +1518,15 @@ defmodule Clementine.Rollout do
             Enum.reduce(results, completed, fn {id, result, duration_ms}, completed ->
               emit_tool_result(exec, {id, result})
               completed = settle_result({id, result}, completed)
-              record_tool_call(exec, Map.fetch!(uses, id), completed[id], duration_ms, approval)
+
+              record_tool_call(
+                exec,
+                Map.fetch!(uses, id),
+                completed[id],
+                duration_ms,
+                Map.fetch!(gates, id)
+              )
+
               completed
             end)
 
@@ -841,11 +1534,11 @@ defmodule Clementine.Rollout do
 
         # The model never sees these, but they ran: the trace keeps them.
         {:cancelled, reason, settled} ->
-          record_abandoned(exec, uses, settled, approval)
+          record_abandoned(exec, uses, settled, gates)
           {:cancelled, reason}
 
         {:drained, settled} ->
-          record_abandoned(exec, uses, settled, approval)
+          record_abandoned(exec, uses, settled, gates)
           :drained
 
         :lost_lease ->
@@ -857,14 +1550,21 @@ defmodule Clementine.Rollout do
   # A cancel or a drain cut the batch short: every call is still on the
   # record, the ones killed before they answered marked so, since what
   # they did is unknown.
-  defp record_abandoned(exec, uses, settled, approval) do
+  defp record_abandoned(exec, uses, settled, gates) do
     Enum.each(settled, fn
       {id, :killed, duration_ms} ->
-        record_tool_call(exec, Map.fetch!(uses, id), :killed, duration_ms, approval)
+        record_tool_call(exec, Map.fetch!(uses, id), :killed, duration_ms, Map.fetch!(gates, id))
 
       {id, result, duration_ms} ->
         %{^id => tool_result} = settle_result({id, result}, %{})
-        record_tool_call(exec, Map.fetch!(uses, id), tool_result, duration_ms, approval)
+
+        record_tool_call(
+          exec,
+          Map.fetch!(uses, id),
+          tool_result,
+          duration_ms,
+          Map.fetch!(gates, id)
+        )
     end)
   end
 
@@ -880,7 +1580,9 @@ defmodule Clementine.Rollout do
     })
   end
 
-  defp record_tool_call(exec, tool_use, result, duration_ms, approval) do
+  # `gate` is how the call came to run or not: `approval:`, the decision
+  # it waited on, and `policy:`, the tool policy's verdict on it.
+  defp record_tool_call(exec, tool_use, result, duration_ms, gate \\ []) do
     {content, is_error, killed} =
       case result do
         %Clementine.ToolResult{content: content, is_error: is_error} -> {content, is_error, false}
@@ -899,7 +1601,8 @@ defmodule Clementine.Rollout do
         is_error: is_error,
         killed: killed,
         duration_ms: duration_ms,
-        approval: approval
+        approval: Keyword.get(gate, :approval),
+        policy: Keyword.get(gate, :policy)
       })
     )
   end
@@ -919,7 +1622,7 @@ defmodule Clementine.Rollout do
   # The suspension body: everything the rollout knows and nothing it does
   # not — the cursor and the token need the lease, which the rollout
   # never sees (RFC §Checkpoints And Suspension, assembly split).
-  defp suspension_request(%Execution{} = exec, tool_use, completed) do
+  defp suspension_request(%Execution{} = exec, tool_use, completed, verdicts) do
     %Suspension.Request{
       reason:
         {:approval,
@@ -932,10 +1635,38 @@ defmodule Clementine.Rollout do
         tool_use_id: tool_use.id,
         tool_name: tool_use.name,
         args: tool_use.input,
-        completed_results: completed
+        completed_results: completed,
+        policy: verdicts[tool_use.id]
       },
       messages: exec.messages,
       iteration: exec.iteration,
+      skills: exec.loaded_skills,
+      usage: exec.usage
+    }
+  end
+
+  # The children start in the write that parks the run, so a drain, a
+  # cancel pushed meanwhile, or a cancel flag already set is honored
+  # first: nothing starts for a run that is going away.
+  defp park_for_children(%Execution{} = exec, held, completed) do
+    with :continue <- check_signals(),
+         :continue <- check_cancel(exec) do
+      conclude(exec, {:suspend, delegation_request(exec, held, completed)})
+    else
+      unwound -> conclude(exec, unwound)
+    end
+  end
+
+  # The delegation's suspension body. The reason names no child yet: the
+  # runtime that starts them fills in their ids, in the pending children
+  # and in the reason, in the write that parks the run.
+  defp delegation_request(%Execution{} = exec, held, completed) do
+    %Suspension.Request{
+      reason: {:external, {:delegation, []}},
+      pending: %Pending.Delegation{children: held, completed_results: completed},
+      messages: exec.messages,
+      iteration: exec.iteration,
+      skills: exec.loaded_skills,
       usage: exec.usage
     }
   end
@@ -970,15 +1701,21 @@ defmodule Clementine.Rollout do
     end)
   end
 
-  defp stream_opts(%Execution{deadline: nil, deferred: deferred}), do: deferred_opts(deferred)
+  defp stream_opts(%Execution{deadline: nil} = exec), do: request_opts(exec)
 
-  defp stream_opts(%Execution{deadline: deadline, deferred: deferred}) do
+  defp stream_opts(%Execution{deadline: deadline} = exec) do
     [receive_timeout: min(@provider_receive_timeout, remaining_ms(deadline))] ++
-      deferred_opts(deferred)
+      request_opts(exec)
   end
+
+  defp request_opts(%Execution{} = exec),
+    do: deferred_opts(exec.deferred) ++ output_schema_opts(exec.output_schema)
 
   defp deferred_opts([]), do: []
   defp deferred_opts(deferred), do: [deferred: deferred]
+
+  defp output_schema_opts(nil), do: []
+  defp output_schema_opts(schema), do: [output_schema: schema]
 
   defp batch_opts(%Execution{deadline: nil}), do: []
 
@@ -1065,16 +1802,26 @@ defmodule Clementine.Rollout do
     )
   end
 
-  # What this execution offers the model, once, before anything runs.
-  defp record_execution(%Execution{recorder: nil}, _resumed?), do: :ok
+  # What this execution offers the model, once, before the model runs.
+  # `agent_tools` are the agent's own, which the fingerprint covers.
+  defp record_execution(%Execution{recorder: nil}, _agent_tools, _resumed?), do: :ok
 
-  defp record_execution(%Execution{} = exec, resumed?) do
+  defp record_execution(%Execution{} = exec, agent_tools, resumed?) do
     record(
       exec,
       :execution,
-      Trace.execution(exec.model, exec.system, exec.tools, resumed?, deferred: exec.deferred)
+      Trace.execution(exec.model, exec.system, agent_tools, resumed?,
+        deferred: exec.deferred,
+        output_schema: exec.output_schema,
+        skills: exec.skills,
+        delegates: delegate_entries(exec),
+        offered: offered_tools(exec)
+      )
     )
   end
+
+  defp delegate_entries(%Execution{delegates: []}), do: []
+  defp delegate_entries(%Execution{delegates: delegates}), do: Delegation.entries(delegates)
 
   defp record(%Execution{recorder: nil}, _kind, _payload), do: :ok
 

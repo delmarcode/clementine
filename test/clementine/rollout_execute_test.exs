@@ -456,7 +456,7 @@ defmodule Clementine.RolloutExecuteTest do
     end
 
     test "matrix row 8: a checkpoint struct from another version is incompatible" do
-      checkpoint = %Checkpoint{version: 2, rollout_id: "r1"}
+      checkpoint = %Checkpoint{version: 3, rollout_id: "r1"}
 
       assert {:error, %Error{code: :incompatible_checkpoint, retryable?: false}} =
                Rollout.execute(rollout(), resume: {checkpoint, :elapsed})
@@ -718,7 +718,7 @@ defmodule Clementine.RolloutExecuteTest do
       refute_received {:mark, :fence}
     end
 
-    test "a {:policy, _} declaration gates exactly like :required" do
+    test "without authorize_tool:, a {:policy, _} declaration gates exactly like :required" do
       expect_stream(tool_events("tu_1", "policy_gated", %{}))
 
       assert {:suspend, %Suspension.Request{pending: pending}} =

@@ -166,6 +166,11 @@ Clementine.Runs.latest({"conversation", id}, turn: true)            # the thread
 Clementine.Runs.list(actor: {"user", id}, limit: 50)                # an account's runs
 ```
 
+A completed run stores its output in `result["output"]`: the answer's
+text, or, for an agent with `output_schema:`, the decoded answer
+(`%{"verdict" => "pass", ...}`), the same map `run_finished/2` sees in
+`Result.Completed`'s `output`.
+
 - `start/3` inserts the run and its Oban job in one transaction, and
   copies the agent's `turn` to the row. A start in a busy lane returns
   `{:error, :active_run_exists}`; a turn without a subject id,
@@ -178,10 +183,13 @@ Clementine.Runs.list(actor: {"user", id}, limit: 50)                # an account
   `kind: :loop`.
 - `resume/2` takes a waiting run's decision, `{:approved, meta}` or
   `{:denied, meta}`. A tool declared `approval: :required` parks its run
-  in `waiting` before it executes (see [Approvals](approvals.md)). The
+  in `waiting` before it executes, and one declared `{:policy, term}`
+  does when the host's `authorize_tool/3` says so (see
+  [Approvals](approvals.md)). The
   resume and the run's new job commit in one transaction, so a sweep can
   never find the resumed run without a job, and the claim that follows
-  resolves the subject and actor again.
+  resolves the subject and actor again. A run waiting on the agents it
+  asked takes no decision: `{:error, :delegating}`.
 - `cancel/1` finishes a queued or waiting run at once and flags a running
   one. The flag goes on to the process running it, on whichever node, so
   the model call in flight is aborted and the run ends `cancelled`
@@ -189,6 +197,79 @@ Clementine.Runs.list(actor: {"user", id}, limit: 50)                # an account
   it notifies every node through Oban's notifier, so a notifier that
   cannot listen (Postgres behind a transaction pooler) leaves the run to
   find the flag at its next step.
+
+## Asking other agents
+
+An agent that needs another agent's answer before it goes on lists the
+agents it may ask with `delegates:` (`Clementine.Delegation`):
+
+<!-- guide-sample: parse-only -->
+```elixir
+defmodule MyApp.Agents.Planner do
+  use Clementine.Agent,
+    key: "planner",
+    model: :claude_sonnet,
+    instructions: "Plan the launch. Ask the researcher for facts you lack.",
+    delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
+end
+```
+
+The model sees a `delegate` tool taking `agent`, an enum of the
+delegates' keys, and `prompt`, the child's whole brief. The tool lists
+each delegate with its `description:`, so give each one a sentence on
+when to ask it (`use Clementine.Agent, key: "researcher", description:
+"Finds and cites facts.", ...`). Only `Clementine.Runs` offers
+`delegate`; on `Clementine.run/3`, `stream/3`, and `AgentServer` the
+agent's delegates are left out.
+
+- **The call.** Each call starts a run of that agent: a child whose
+  `parent_id` is the parent's, tagged `{:delegate, tool_use_id}`, with the
+  parent's subject and actor and `metadata: %{"delegated_by" => "planner"}`.
+  The children of one batch start in the transaction that parks the
+  parent, so they exist exactly when it waits on them. A batch that also
+  holds an approval-gated call waits for the decision first, then parks
+  once for its children.
+- **The resume.** A child's end reaches its parent inside the child's
+  terminal transaction. The last one resumes the parent, on a new job,
+  and each `delegate` call settles with its child's output: text as is,
+  anything else (a map from `output_schema:`) JSON-encoded. A child that
+  failed, was cancelled, or was interrupted settles as an error the model
+  reads. A parent resumed and then drained before any effect requeues
+  and resumes again with the same answers.
+- **Lanes and cycles.** A child is a task on the parent's subject. A
+  turn agent is never a delegate: the call is refused at once. A
+  delegate with an active task on the subject, the parent itself or a
+  sibling of the same batch included, is refused when the parent parks,
+  and so is an agent above the parent in its chain of asks, subject or
+  not. Each refusal is an error result the model reads; if no child of
+  a batch could start, the parent resumes once its execution is over.
+- **Cancel.** `cancel/1` of a waiting parent flags it (`{:ok, :flagged}`)
+  and cancels its live children in the same transaction: a queued child
+  ends, a running one gets its flag. The parent ends `cancelled` after
+  the last of them, so a thread's erasure works as for any thread:
+  cancel the loop, and purge from its `run_committed/2`, which runs once
+  the turn and the turn's delegates have all ended. `cancel/1` of one
+  child settles that call as cancelled once its siblings have ended.
+- **The reaper** leaves a waiting parent alone, and a child it interrupts
+  (its node died, or it was never claimed) resumes the parent like any
+  end. A parent still waiting on children that have all ended (an end
+  that never reached it) is resumed by a sweep once its park and its
+  last child's end are a sweep interval old. `max_wait:` on
+  the policy bounds a parent's wait as it bounds an approval's, and its
+  end cancels the children.
+- **Purge** follows `parent_id`, so `purge/1` of the subject takes the
+  children and their traces.
+
+`delegate` blocks the run that asks until every child ends. Fan-out
+that a product drives (start several, decide on each answer, keep
+answering the user meanwhile) belongs in a loop.
+
+**Deploying it.** Ship this version of Clementine one deploy before any
+agent offers `delegates:`. Nodes on older code drop a child's end when
+its parent is a rollout, and cannot read a delegation's checkpoint: a
+child they ran during a rolling deploy would leave its parent waiting
+until a new node's reaper resumes it, and a parent they claimed would
+fail as `:incompatible_checkpoint`.
 
 ## The trace
 
@@ -207,7 +288,8 @@ Clementine.Runs.trace(run.id)
 #=>                "usage" => %{"input_tokens" => 1204, "output_tokens" => 38}, "content" => […]}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 3, kind: :tool_call,
 #=>     payload: %{"name" => "lookup", "args" => %{"query" => "…"}, "result" => "…",
-#=>                "is_error" => false, "duration_ms" => 40, "approval" => nil, …}},
+#=>                "is_error" => false, "duration_ms" => 40, "approval" => nil,
+#=>                "policy" => nil, …}},
 #=>   …
 #=> ]
 
@@ -215,19 +297,33 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 ```
 
 - An `:execution` entry opens each execution: when the run starts, and
-  again, `"resumed" => true`, when it resumes after an approval, under
-  the next epoch. `"tools"` names every tool offered, and `"deferred"`
-  the ones among them the model loads through tool search. Its
-  `"agent_fingerprint"` is a sha256 over the system prompt, the tool
-  schemas, the model id, and which tools are deferred, so runs that
-  offered the model the same thing group together.
+  again, `"resumed" => true`, when it resumes after an approval or a
+  delegation, under the next epoch. `"tools"` names every tool offered,
+  `"deferred"` the ones among them the model loads through tool search,
+  `"skills"` the skills it may load, and `"delegates"` the agents it may
+  ask. Its `"agent_fingerprint"` is a sha256 over the system prompt, the
+  tool schemas, the model id, which tools are deferred, the output
+  schema, the skills offered (names, descriptions, and their tools'
+  schemas), and the delegates' keys, so runs that offered the model the
+  same thing group together.
 - A `:model_call` entry records each call to the model, a call cut off
   by a cancel included, with the usage it had reported. A `:tool_call`
   entry records each tool call started, with the arguments it ran with
   and the decision it waited on (`"approval" => %{"verdict" => "approved",
-  "by" => ...}`). A call a cancel or a drain cut off is there too: with
+  "by" => ...}`); a call to a `{:policy, term}` tool also carries the
+  tool policy's verdict (`"policy" => %{"verdict" => "allow" |
+  "require_approval" | "deny", "reason" => ..., "failed" => ...}`), and a
+  call it denied ran nothing. A `:policy` entry records each answer the
+  policy gave, as it gave it, so a run that ends while it waits still
+  shows the policy asked for approval. A call a cancel or a drain cut off is there too: with
   its result if it had one, and `"killed" => true` if it was killed
-  before it answered, so what it did is unknown.
+  before it answered, so what it did is unknown. A `:skill_load` entry
+  records each skill the model loaded (`Clementine.Skill`), with the
+  tools it brought and a sha256 of the body the model read, just before
+  the `use_skill` call that loaded it. A `:delegate` entry records each
+  child a `delegate` call started, with its agent, its run id (`trace/1`
+  of it is the child's own trace), and how it ended, just before the
+  call's `:tool_call` entry, when the parent resumes.
 - The runner writes new entries at every iteration boundary, fenced on
   the epoch like the heartbeat, and the rest with the run's end or park,
   in the same transaction: `run_finished/2` already sees the whole trace.
@@ -247,7 +343,7 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 
 ## The host module
 
-Seven questions belong to the app, and one optional module answers them.
+Eight questions belong to the app, and one optional module answers them.
 Every callback is optional:
 
 ```elixir
@@ -263,6 +359,20 @@ defmodule MyApp.Agents.Host do
   end
 
   def authorize_resume(_run, _decision), do: {:error, :forbidden}
+
+  # Whether a call to a tool declared approval: {:policy, term} runs,
+  # waits for approval, or is refused with a reason the model reads.
+  # Before the call's batch runs anything; a raise denies the call.
+  @impl true
+  def authorize_tool(run, %Clementine.ApprovalRequest{args: args}, :refund) do
+    cond do
+      not MyApp.Accounts.may_refund?(run.actor) -> {:deny, "You may not issue refunds."}
+      args["amount_cents"] > 50_00 -> :require_approval
+      true -> :allow
+    end
+  end
+
+  def authorize_tool(_run, _request, _term), do: {:deny, "No policy covers this tool."}
 
   # Tokens and tool activity while a run executes, for a UI. In a process
   # of its own, in order, outside any transaction.

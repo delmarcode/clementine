@@ -42,7 +42,11 @@ defmodule Clementine.LLM.ModelRegistry do
   `:openrouter`, `:bedrock`, `:vertex`, and `:openai_compatible` models
   are served by the shared `Clementine.LLM.ChatCompletions` client; only
   those entries may carry `:base_url`/`:api_key` overrides (see that
-  module for provider endpoint and credential configuration).
+  module for provider endpoint and credential configuration), and
+  `structured_output: :instructions`, which sends an agent's
+  `output_schema:` to the server not as `response_format` but not at
+  all: the agent's instructions describe the answer, and the engine
+  checks it. The default, `:native`, sends `response_format`.
   """
 
   alias Clementine.LLM.Reasoning
@@ -66,6 +70,7 @@ defmodule Clementine.LLM.ModelRegistry do
           reasoning: reasoning_config(),
           base_url: String.t() | nil,
           api_key: api_key() | nil,
+          structured_output: :native | :instructions,
           alias: atom() | nil
         }
 
@@ -78,7 +83,8 @@ defmodule Clementine.LLM.ModelRegistry do
       default: nil
     ],
     base_url: [type: :string],
-    api_key: [type: {:custom, __MODULE__, :validate_api_key, []}]
+    api_key: [type: {:custom, __MODULE__, :validate_api_key, []}],
+    structured_output: [type: {:in, [:native, :instructions]}, default: :native]
   ]
 
   @doc false
@@ -149,6 +155,7 @@ defmodule Clementine.LLM.ModelRegistry do
           reasoning: nil,
           base_url: nil,
           api_key: nil,
+          structured_output: :native,
           alias: nil
         }
     end
@@ -172,6 +179,7 @@ defmodule Clementine.LLM.ModelRegistry do
           reasoning: Keyword.get(validated, :reasoning),
           base_url: Keyword.get(validated, :base_url),
           api_key: Keyword.get(validated, :api_key),
+          structured_output: Keyword.fetch!(validated, :structured_output),
           alias: model_alias
         }
     end
@@ -226,6 +234,13 @@ defmodule Clementine.LLM.ModelRegistry do
                   "providers #{inspect(@chat_completions_providers)}"
         end
       end)
+
+      # Anthropic and OpenAI constrain the answer and still call tools.
+      if Keyword.get(validated, :structured_output) == :instructions do
+        raise ArgumentError,
+              "#{context}: structured_output: :instructions is only supported for chat " <>
+                "completions providers #{inspect(@chat_completions_providers)}"
+      end
     end
   end
 

@@ -42,11 +42,15 @@ defmodule Clementine.MixProject do
         Core: [
           Clementine,
           Clementine.Agent,
+          Clementine.Skill,
+          Clementine.Delegation,
+          Clementine.EngineTool,
           Clementine.AgentServer,
           Clementine.Rollout,
           Clementine.Run,
           Clementine.Runner,
           Clementine.Result,
+          Clementine.OutputSchema,
           Clementine.Error,
           Clementine.Usage,
           Clementine.Verifier
@@ -73,6 +77,7 @@ defmodule Clementine.MixProject do
           Clementine.ResumeToken,
           Clementine.Pending,
           Clementine.Pending.ToolApproval,
+          Clementine.Pending.Delegation,
           Clementine.ApprovalRequest
         ],
         Reaper: [

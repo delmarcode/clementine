@@ -66,6 +66,36 @@ defmodule Clementine.Agent do
   edits the replayed history, which restarts the prompt cache and may
   void earlier thinking on models that verify it.
 
+  ## Structured output
+
+  An agent whose answer code reads (a grader's verdict, a planner's next
+  steps, a loop's decision) gives the answer's JSON schema as
+  `output_schema:`:
+
+      use Clementine.Agent,
+        key: "grader",
+        model: :claude_sonnet,
+        instructions: "Grade the essay against the rubric.",
+        tools: [MyApp.Tools.FetchRubric],
+        output_schema: %{
+          "type" => "object",
+          "properties" => %{
+            "verdict" => %{"type" => "string", "enum" => ["pass", "fail"]},
+            "reasons" => %{"type" => "array", "items" => %{"type" => "string"}}
+          },
+          "required" => ["verdict", "reasons"],
+          "additionalProperties" => false
+        }
+
+  A completed run's `Clementine.Result.Completed` `output` is then the
+  decoded answer, a map with string keys, rather than text: what
+  `c:Clementine.Host.run_finished/2` receives, what `run.result["output"]`
+  stores, and what a loop's `{:completed, tag, result}` carries. The run
+  still calls its tools as it likes; only the answer that ends it is
+  constrained, through the provider's own structured output. An answer
+  that does not decode or match fails the run with a `Clementine.Error`
+  of code `:invalid_output`. See `Clementine.OutputSchema`.
+
   ## Turns and tasks
 
   A run is a **turn** or a **task**. A turn is a run on a thread: its
@@ -116,6 +146,63 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent, key: "chat", turn: true, trace: :facts, ...
 
+  ## Skills
+
+  An agent may offer skills (`Clementine.Skill`): instructions for one
+  kind of task and the tools it needs, which the model loads when a task
+  calls for them, rather than carrying every procedure in the system
+  prompt and every tool from the start.
+
+      use Clementine.Agent,
+        key: "support",
+        model: :claude_sonnet,
+        instructions: "Help customers with their orders.",
+        tools: [MyApp.Tools.Search],
+        skills: [MyApp.Skills.Refunds, MyApp.Skills.Shipping]
+
+  `skills:` takes modules that `use Clementine.Skill` and skills built with
+  `Clementine.Skill.new/1`, so an `c:agent/1` may offer skills the app
+  keeps as rows. With any, the model sees a `use_skill` tool listing each
+  skill's name and description; loading one returns its body and adds its
+  tools. A run that parks resumes with the skills it had loaded, so an
+  `c:agent/1` must offer them again at the resume's claim, as it must its
+  tools. Every tool the model can be offered, the agent's own (`tools:`
+  and `deferred:`) and each skill's, has a name of its own, and none is
+  named `use_skill`. A skill's tools load in full when the skill loads,
+  never through tool search, so none of them may also be deferred. `new/1`
+  raises otherwise, and a run whose `c:agent/1` sets `skills` without it
+  fails as `:invalid_skills` before anything runs.
+
+  ## Delegates
+
+  An agent may ask other agents (`Clementine.Delegation`): the model calls
+  a `delegate` tool, each call starts a run of the agent it names on the
+  parent's subject, with the parent's actor, and the parent waits, parked,
+  until every one has ended. Each call's result is its child's answer.
+
+      use Clementine.Agent,
+        key: "planner",
+        model: :claude_sonnet,
+        instructions: "Plan the work. Ask the researcher for facts.",
+        delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
+
+  `delegates:` takes agent modules the child spec lists; the model sees
+  their keys as the `agent` enum, each with its `description:` when it
+  has one, so give a delegate one that says when to ask it:
+
+      use Clementine.Agent,
+        key: "researcher",
+        description: "Finds and cites facts. Ask it for anything you would look up.",
+        model: :claude_sonnet,
+        instructions: "..."
+
+  `description:` goes to `use` in either form, beside `key:`, with the
+  agent's fields or with an `c:agent/1` of your own. A delegate runs
+  tasks: a turn agent is refused at the call. An `c:agent/1` may offer
+  different delegates by subject or actor, and no tool the agent offers
+  is named `delegate`. Only `Clementine.Runs` starts a delegate's run, so
+  only there is `delegate` offered.
+
   Note: this module shadows Elixir's built-in `Agent` under a bare `alias`;
   prefer `alias Clementine.Agent, as: AgentDef` where the collision bites.
   The in-memory agent *process* lives at `Clementine.AgentServer`.
@@ -127,6 +214,9 @@ defmodule Clementine.Agent do
             instructions: nil,
             tools: [],
             deferred: [],
+            output_schema: nil,
+            skills: [],
+            delegates: [],
             defaults: [],
             policy: %{},
             tool_context: %{},
@@ -138,6 +228,9 @@ defmodule Clementine.Agent do
           instructions: String.t() | nil,
           tools: [module()],
           deferred: [module()],
+          output_schema: Clementine.OutputSchema.t() | nil,
+          skills: [Clementine.Skill.t()],
+          delegates: [module()],
           defaults: keyword(),
           policy: map(),
           tool_context: map(),
@@ -155,6 +248,14 @@ defmodule Clementine.Agent do
   `Clementine.Runs.start/3` copies it to the row's `turn` column.
   """
   @callback turn() :: boolean()
+
+  @doc """
+  What the agent does, in a sentence (`description:` on `use`), or `nil`.
+  A delegating agent's model reads it beside the agent's key in its
+  `delegate` tool (`Clementine.Delegation`), so it says when to ask this
+  agent; the agent's own model never sees it.
+  """
+  @callback description() :: String.t() | nil
 
   @doc """
   The agent for one execution of `run`: model, instructions, tools, and
@@ -214,7 +315,7 @@ defmodule Clementine.Agent do
   """
   @callback after_execution(run :: Clementine.Runs.AgentRun.t(), context :: map()) :: any()
 
-  @optional_callbacks history: 1, after_execution: 2
+  @optional_callbacks history: 1, after_execution: 2, description: 0
 
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do
@@ -223,6 +324,7 @@ defmodule Clementine.Agent do
 
       {key, fields} = Keyword.pop(opts, :key)
       {turn, fields} = Keyword.pop(fields, :turn, false)
+      {description, fields} = Keyword.pop(fields, :description)
 
       unless is_binary(key) and key != "" do
         raise ArgumentError,
@@ -234,14 +336,24 @@ defmodule Clementine.Agent do
               "use Clementine.Agent takes turn: true or false, got: #{inspect(turn)}"
       end
 
+      unless is_nil(description) or (is_binary(description) and description != "") do
+        raise ArgumentError,
+              "use Clementine.Agent takes description: as a non-empty string, got: " <>
+                inspect(description)
+      end
+
       @clementine_agent_key key
       @clementine_agent_turn turn
+      @clementine_agent_description description
 
       @impl Clementine.Agent
       def key, do: @clementine_agent_key
 
       @impl Clementine.Agent
       def turn, do: @clementine_agent_turn
+
+      @impl Clementine.Agent
+      def description, do: @clementine_agent_description
 
       # A turn reads its thread as history, so a turn agent writes
       # history/1 itself (__before_compile__ checks); a task defaults to
@@ -287,6 +399,13 @@ defmodule Clementine.Agent do
   - `:deferred` - tool modules the model loads on demand through the
     provider's tool search, rather than seeing up front (see "Deferred
     tools" above); a tool is in `:tools` or `:deferred`, not both
+  - `:output_schema` - the JSON schema of the final answer, its root an
+    object; with it, a completed run's `output` is the decoded map (see
+    "Structured output" above). Atom keys become strings
+  - `:skills` - skills the model may load (see "Skills" above): modules
+    that `use Clementine.Skill`, or `Clementine.Skill` structs
+  - `:delegates` - agents the model may ask (see "Delegates" above):
+    modules that `use Clementine.Agent`
   - `:defaults` - default rollout limits (`max_iterations:`, `max_duration:`)
   - `:policy` - host-app policy/config passthrough (opaque to Clementine)
   - `:tool_context` - keys every tool of the execution sees (`working_dir:`,
@@ -303,11 +422,43 @@ defmodule Clementine.Agent do
 
     case Enum.filter(agent.deferred, &(&1 in agent.tools)) do
       [] ->
-        agent
+        agent |> normalize_output_schema() |> put_skills!() |> check_delegates!()
 
       both ->
         raise ArgumentError,
               "a tool is in tools: or deferred:, not both; found in both: #{inspect(both)}"
+    end
+  end
+
+  # Delegates are agent modules, kept as given, and checked as far as a
+  # build may (Clementine.Delegation.check/2): their keys are read when a
+  # run prepares, never here, since `use` builds an agent at compile time,
+  # and two agents may name each other.
+  defp check_delegates!(%__MODULE__{delegates: []} = agent), do: agent
+
+  defp check_delegates!(%__MODULE__{} = agent) do
+    tools = agent.tools ++ agent.deferred ++ Enum.flat_map(agent.skills, & &1.tools)
+
+    case Clementine.Delegation.check(agent.delegates, tools) do
+      :ok -> agent
+      {:error, message} -> raise ArgumentError, message
+    end
+  end
+
+  defp normalize_output_schema(%__MODULE__{output_schema: nil} = agent), do: agent
+
+  defp normalize_output_schema(%__MODULE__{output_schema: schema} = agent),
+    do: %{agent | output_schema: Clementine.OutputSchema.normalize!(schema)}
+
+  # Skills arrive as modules or structs and are kept as structs, checked
+  # against every tool the agent may offer (Clementine.Skill.prepare/2).
+  # The rollout checks again, since an agent/1 may set the field directly.
+  defp put_skills!(%__MODULE__{skills: []} = agent), do: agent
+
+  defp put_skills!(%__MODULE__{} = agent) do
+    case Clementine.Skill.prepare(agent.skills, agent.tools ++ agent.deferred, agent.deferred) do
+      {:ok, skills} -> %{agent | skills: skills}
+      {:error, message} -> raise ArgumentError, message
     end
   end
 end

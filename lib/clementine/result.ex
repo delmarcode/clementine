@@ -13,13 +13,19 @@ defmodule Clementine.Result do
   alias Clementine.{Error, InterruptReason, Usage}
 
   defmodule Completed do
-    @moduledoc "The rollout produced a final answer."
+    @moduledoc """
+    The rollout produced a final answer.
+
+    `output` is the answer's text, or, for an agent with an
+    `output_schema:`, the answer decoded: a map with string keys that
+    matched the schema (`Clementine.OutputSchema`).
+    """
     defstruct input_message: nil, messages: [], output: nil, usage: %Clementine.Usage{}
 
     @type t :: %__MODULE__{
             input_message: Clementine.LLM.Message.message() | nil,
             messages: [Clementine.LLM.Message.message()],
-            output: String.t() | nil,
+            output: String.t() | map() | nil,
             usage: Clementine.Usage.t()
           }
   end

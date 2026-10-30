@@ -82,6 +82,7 @@ alias, not mid-run.
 | `reasoning` | no | all | Provider-neutral reasoning config; see the table below. Validated at boot for the entry's provider. |
 | `base_url` | no | chat-completions providers only | Endpoint override, OpenAI-SDK style: the client appends `/chat/completions`. Required (per-model or app-wide) for `:openai_compatible`. Rejected on `:anthropic`/`:openai` entries. |
 | `api_key` | no | chat-completions providers only | Per-model credential override. A literal string, `{:system, "ENV_VAR"}`, or `{module, function, args}` resolved per request (for short-lived tokens). Rejected on `:anthropic`/`:openai` entries. |
+| `structured_output` | no | chat-completions providers only | `:native` (default) sends an agent's `output_schema:` as `response_format`; `:instructions` sends none, for a server whose grammar would keep the model from calling tools (see "Structured output" below). `:instructions` is rejected on `:anthropic`/`:openai` entries. |
 
 "Chat-completions providers" means `:openrouter`, `:bedrock`, `:vertex`,
 and `:openai_compatible` — the four served by the shared
@@ -251,6 +252,53 @@ gpt_5_high: [provider: :openai, id: "gpt-5", reasoning: :high],
 # One-off override without touching the catalog (LLM layer only):
 Clementine.LLM.call(:gpt_5_low, system, messages, tools, reasoning: :high)
 ```
+
+## Structured output
+
+An agent's `output_schema:` goes to the provider as its own structured
+output, which constrains the model's text answer to the schema (tool
+calls are unaffected):
+
+| Provider | Request field |
+|---|---|
+| `:anthropic` | `output_config.format`: `{"type": "json_schema", "schema": ...}`, beside any reasoning `effort` |
+| `:openai` | `text.format`: `{"type": "json_schema", "name": "output", "schema": ..., "strict": true}` |
+| Chat Completions (`:openrouter`, `:bedrock`, `:vertex`, `:openai_compatible`) | `response_format`: `{"type": "json_schema", "json_schema": {"name": "output", "schema": ..., "strict": true}}` |
+
+A model or server without structured outputs refuses the request, or,
+on some OpenAI-compatible servers, ignores the field; the engine checks
+the answer either way (`Clementine.OutputSchema`), so describe the
+answer's shape in the instructions too when an agent runs there.
+
+**A grammar can take an agent's tools away.** Anthropic and OpenAI
+constrain only the text answer, and the model still calls tools. A
+Chat Completions server may instead enforce `response_format` with a
+grammar over the whole completion (vLLM, SGLang, Ollama, and llama.cpp
+can), and then the model has no way to emit a tool call: the agent
+answers at once, without its tools, and nothing fails. For such a
+model, set `structured_output: :instructions` on its entry:
+
+```elixir
+qwen_local: [
+  provider: :openai_compatible,
+  id: "qwen3-32b",
+  base_url: "http://localhost:8000/v1",
+  structured_output: :instructions
+]
+```
+
+No `response_format` goes out; the agent's instructions must describe
+the answer, and the engine checks it as always (one markdown fence
+around the JSON is tolerated). Try an agent with tools and an
+`output_schema:` against a new server before relying on `:native`.
+
+A refusal and a cut-off answer explain themselves on every provider:
+the refusal text is the turn's text with stop reason `"refusal"` (an
+OpenAI refusal content part or `response.refusal.delta`, a Chat
+Completions `refusal`), and an answer that ran out of output tokens
+stops with `"max_tokens"` (OpenAI's `response.incomplete` with
+`max_output_tokens`, Chat Completions' `length`). A schema agent's
+`:invalid_output` error says which.
 
 ## Adding a model, start to finish
 

@@ -169,6 +169,47 @@ so history that stores and replays a turn's messages keeps the tools it
 found. Providers without tool search get deferred tools as ordinary
 tools.
 
+## Structured output
+
+When code reads the answer (a grader's verdict, a classifier's label, a
+planner's next steps), give the agent the answer's JSON schema as
+`output_schema:`, and `result.output` is the decoded map instead of
+text:
+
+<!-- guide-sample: parse-only -->
+```elixir
+agent =
+  Clementine.Agent.new(
+    model: :claude_sonnet,
+    instructions: "Classify the support ticket.",
+    tools: [MyApp.Tools.LookupCustomer],
+    output_schema: %{
+      "type" => "object",
+      "properties" => %{
+        "queue" => %{"type" => "string", "enum" => ["billing", "bugs", "other"]},
+        "urgent" => %{"type" => "boolean"}
+      },
+      "required" => ["queue", "urgent"],
+      "additionalProperties" => false
+    }
+  )
+
+{:ok, %Clementine.Result.Completed{output: %{"queue" => queue, "urgent" => urgent}}} =
+  Clementine.run(agent, ticket_text)
+```
+
+The run calls its tools as it likes; only the answer that ends it is
+constrained. The schema goes to the provider as its own structured
+output (Anthropic's `output_config.format`, OpenAI's `text.format`),
+which constrains the model to it, so write it in the subset providers
+accept: an object at the root, `"additionalProperties": false` on every
+object, and, for OpenAI, every property listed in `required` (type an
+optional one `["string", "null"]`). The engine decodes the answer and
+checks it against the schema too. An answer that does not decode or
+match, as when the model refuses or runs out of tokens, fails the run
+with a `Clementine.Error` of code `:invalid_output`; whether to try
+again is outer control (below).
+
 ## Streaming
 
 `Clementine.stream/3` returns a lazy enumerable of `Clementine.Event`
@@ -212,6 +253,52 @@ deadline enforced at iteration boundaries (and, in production, minted
 fresh at every claim). Exceeding either returns
 `{:error, %Clementine.Result.Failed{}}` with error code `:max_iterations`
 or `:deadline_exceeded`. Unset keys fall back to the agent's `defaults:`.
+
+## Skills
+
+An agent that handles several kinds of task need not carry every
+procedure in its system prompt and every tool from the first call. Give
+each kind of task a skill: instructions, and the tools they need.
+
+```elixir
+defmodule MyApp.Skills.Forecasts do
+  use Clementine.Skill,
+    name: "forecasts",
+    description: "Answer questions about the weather to come. Use for anything past today.",
+    tools: [MyApp.Tools.Weather]
+
+  @impl true
+  def body(_context) do
+    """
+    Look the city up before you answer, and give the forecast day by day.
+    Say how sure the forecast is.
+    """
+  end
+end
+```
+
+<!-- guide-sample: parse-only -->
+```elixir
+agent =
+  Clementine.Agent.new(
+    model: :claude_sonnet,
+    instructions: "You are a weather assistant.",
+    skills: [MyApp.Skills.Forecasts]
+  )
+```
+
+The model sees a `use_skill` tool whose description lists each skill's
+name and description. When it loads one, the body comes back as that
+call's result, and the skill's tools are offered from its next call on.
+The system prompt never changes. Loading a skill twice changes nothing,
+and a name the agent does not offer is an error the model reads.
+`body/1` receives the context the run's tools see, so it may differ by
+subject or actor; skills an app keeps as data are built with
+`Clementine.Skill.new/1`, with the body as a string.
+
+A skill's tools are ordinary tools: a gated one parks the run like any
+other, and the resume offers the loaded skills' tools again. The trace
+records each load (`:skill_load`).
 
 ## Conversation history
 
@@ -275,6 +362,8 @@ moment agent work must survive browser disconnects, deploys, worker
 restarts, or approval pauses, the same `Runner.execute/2` runs against a
 durable `Clementine.Lifecycle` backed by your own database table — with
 claims, lease fencing, heartbeats, a reaper, checkpointed suspension, and
-exactly-one-terminal-writer semantics.
+exactly-one-terminal-writer semantics. An agent that asks other agents
+and waits for their answers (`delegates:`, `Clementine.Delegation`)
+needs it too.
 
 Continue with [Durable Execution](durable-execution.md).

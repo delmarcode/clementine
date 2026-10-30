@@ -2,7 +2,19 @@ defmodule Clementine.LLM.OpenAI do
   @moduledoc """
   OpenAI Responses API client.
 
-  Supports synchronous and streaming requests, including tool calls.
+  Supports synchronous and streaming requests, including tool calls. A
+  refusal is the turn's text, with stop reason `"refusal"`; a response
+  cut off at `max_output_tokens` stops with `"max_tokens"`; one that ends
+  `response.failed` is an error.
+
+  A JSON schema in the `:output_schema` request option goes as the
+  Responses API's Structured Outputs, `text.format` with
+  `"type": "json_schema"` and `"strict": true`, which constrains the
+  model's text answer to it; function calls are unaffected. Strict mode
+  takes OpenAI's supported subset: every object needs
+  `"additionalProperties": false` and lists all of its properties in
+  `required` (an optional one is typed `["string", "null"]`), and the
+  API refuses a schema outside it.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
@@ -206,7 +218,10 @@ defmodule Clementine.LLM.OpenAI do
       "max_output_tokens" => max_output_tokens
     }
 
-    body = maybe_put_reasoning(body, Keyword.get(opts, :reasoning, resolved.reasoning))
+    body =
+      body
+      |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
+      |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
 
     body =
       if is_binary(system) and system != "" do
@@ -228,6 +243,19 @@ defmodule Clementine.LLM.OpenAI do
 
   defp maybe_put_reasoning(body, reasoning) do
     Map.merge(body, Reasoning.to_provider_config!(:openai, reasoning))
+  end
+
+  defp maybe_put_output_schema(body, nil), do: body
+
+  defp maybe_put_output_schema(body, schema) do
+    Map.put(body, "text", %{
+      "format" => %{
+        "type" => "json_schema",
+        "name" => "output",
+        "schema" => schema,
+        "strict" => true
+      }
+    })
   end
 
   defp build_headers do
@@ -275,10 +303,10 @@ defmodule Clementine.LLM.OpenAI do
     content = Messages.decode_output_items(output)
 
     stop_reason =
-      if Enum.any?(content, &match?(%Content.ToolUse{}, &1)) do
-        "tool_use"
-      else
-        "end_turn"
+      cond do
+        Enum.any?(content, &match?(%Content.ToolUse{}, &1)) -> "tool_use"
+        refused?(output) -> "refusal"
+        true -> OpenAIStreamParser.incomplete_reason(body)
       end
 
     %Response{
@@ -294,5 +322,15 @@ defmodule Clementine.LLM.OpenAI do
       stop_reason: nil,
       usage: Map.get(body, "usage", %{}) || %{}
     }
+  end
+
+  defp refused?(output) do
+    Enum.any?(output, fn
+      %{"type" => "message", "content" => parts} when is_list(parts) ->
+        Enum.any?(parts, &match?(%{"type" => "refusal"}, &1))
+
+      _item ->
+        false
+    end)
   end
 end

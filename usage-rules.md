@@ -61,8 +61,10 @@ lifecycle, or a reaper into the app.
   caller's transaction the run and its job commit with it.
 - `resume/2` takes `{:approved, meta}` or `{:denied, meta}` for a waiting
   run; a denial's `meta[:message]` reaches the model. It returns
-  `{:error, :not_found | :not_waiting}`, or the host's refusal. The claim
-  that follows resolves the subject and actor again.
+  `{:error, :not_found | :not_waiting}`, `{:error, :delegating}` for a run
+  waiting on the agents it asked (it resumes when they end), or the
+  host's refusal. The claim that follows resolves the subject and actor
+  again.
 - `cancel/1` returns `{:ok, :finished}` for a queued or waiting run and
   `{:ok, :flagged}` for a running one. The flag reaches the run's process
   on whichever node runs it, which aborts the model call in flight and
@@ -87,9 +89,13 @@ lifecycle, or a reaper into the app.
 - `trace/1` returns the run's trace, oldest first: a
   `Clementine.Trace.Entry` for each execution (`:execution`: the model,
   the tools offered, the agent's fingerprint, the system prompt), each
-  model call (`:model_call`: usage, timing, what it said), and each tool
-  call (`:tool_call`: name, arguments, result, timing, and the approval
-  it waited on). It commits with the run's end, so `run_finished/2` can
+  model call (`:model_call`: usage, timing, what it said), each tool
+  call (`:tool_call`: name, arguments, result, timing, the approval it
+  waited on, and the tool policy's verdict), each answer of the tool
+  policy (`:policy`), each skill loaded (`:skill_load`: its name, the
+  tools it brought, and a hash of the body it read), and each child a
+  `delegate` call started (`:delegate`: its agent, its run id, how it
+  ended). It commits with the run's end, so `run_finished/2` can
   read it. Read tool names in order from it rather than storing your
   own: `for %{kind: :tool_call, payload: %{"name" => name}} <- trace,
   do: name`. Like `get/1` it checks nothing: check the subject or actor
@@ -146,6 +152,101 @@ end
   usage, and none of the text the app already holds. A task agent keeps
   the default, `trace: :content`, because its trace is the only record of
   what it read and said.
+
+## Skills: `skills:`
+
+A procedure the agent needs only for some tasks, with the tools it
+needs, is a skill, not more system prompt and not more `tools:`:
+
+```elixir
+defmodule MyApp.Skills.Refunds do
+  use Clementine.Skill,
+    name: "refunds",
+    description: "Review or issue a refund. Use when the customer asks for money back.",
+    tools: [MyApp.Tools.LookupOrder, MyApp.Tools.IssueRefund]
+
+  @impl true
+  def body(_context), do: MyApp.Skills.read!("refunds.md")
+end
+```
+
+`use Clementine.Agent, ..., skills: [MyApp.Skills.Refunds]`, or in
+`agent/1`, `skills: Enum.map(rows, &Clementine.Skill.new(name: &1.name,
+description: &1.description, body: &1.body, tools: ...))`.
+
+- The model sees a `use_skill` tool listing each skill's name and
+  description. A load returns the body and offers the skill's tools from
+  the next model call on; the system prompt never changes. Write the
+  description so the model knows when to load the skill from it alone.
+- `body/1` runs at load, in a task bounded like a tool call (a cancel
+  stops it), with the tools' context (`subject`, `actor`, `metadata`,
+  ...). Keep it quick; a raise, an exit, a throw, or no answer in time
+  is an error the model reads, and the skill stays unloaded.
+- `agent/1` decides which skills a run may load, with its subject and
+  actor resolved: tenancy and authority go there, never in the body.
+- A skill's tools are ordinary tools: `approval:` parks the run (or asks
+  `authorize_tool/3`, for `{:policy, term}`), and the resume offers the
+  loaded skills' tools again. Keep offering a skill
+  while runs that loaded it may be parked: a resume whose agent dropped
+  it fails as `:incompatible_checkpoint`.
+- Every tool the agent may offer, its own (`tools:` and `deferred:`) and
+  each skill's, has a name of its own, and none is named `use_skill`. A
+  skill's tools load in full when it loads, so none is also `deferred:`.
+  The build fails otherwise,
+  and a run whose `agent/1` sets `skills` past `Agent.new/1` fails as
+  `:invalid_skills` before anything runs. Two skills may share a tool
+  module.
+
+## Asking other agents: `delegates:`
+
+A run that needs another agent's answer before it can go on asks it
+with `delegate`, not a tool that calls `Runs.start/3`, and not a loop of
+its own:
+
+```elixir
+use Clementine.Agent,
+  key: "planner",
+  model: :claude_sonnet,
+  instructions: "Plan the launch. Ask the researcher for facts you lack.",
+  delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
+```
+
+- The model sees a `delegate` tool taking `agent` (an enum of the
+  delegates' keys, each listed with its `description:`) and `prompt`.
+  Give every delegate `use Clementine.Agent, ..., description: "..."`,
+  a sentence on when to ask it. Each call starts a run of that agent, a
+  child with the parent's subject and actor, `parent_id` the parent's,
+  tag `{:delegate, tool_use_id}`, and metadata
+  `%{"delegated_by" => parent_key}`. The child sees only the prompt.
+- The parent parks `waiting` and resumes on a new job when the last
+  child ends; each call's result is its child's output (text as is,
+  anything else JSON-encoded) or, for a child that failed, was cancelled,
+  or was interrupted, an error the model reads. The children of one
+  batch start in the transaction that parks the parent, after the
+  batch's other calls and any approval they need.
+- A delegate runs tasks: a turn agent is refused at the call. A child
+  needs its lane on the subject, so a delegate with an active task there
+  (or a second call to one agent in a batch) is refused when the parent
+  parks. An agent already above the parent in its chain of asks (the
+  parent included) is refused too, subject or not: no cycles.
+- List the delegates in the child spec's `agents:` too. `agent/1` may
+  offer different ones by subject or actor; no tool is named `delegate`.
+  Only `Clementine.Runs` offers `delegate`: `Clementine.run/3`,
+  `stream/3`, and `AgentServer` leave the agent's delegates out.
+- `cancel/1` of a waiting parent returns `{:ok, :flagged}`: it cancels
+  the live children, and the parent ends `cancelled` after the last of
+  them, so purging the subject from the parent's `run_committed/2` (or
+  the thread loop's) finds nothing active. Cancelling one child settles
+  its call as cancelled. A child the reaper interrupts resumes the
+  parent, and the reaper resumes a parent whose children all ended
+  without its hearing. `resume/2` refuses a waiting parent with
+  `{:error, :delegating}`.
+- Deploy Clementine's delegation support one deploy before any agent
+  offers `delegates:`: older nodes drop a child's end for a rollout
+  parent and cannot read its checkpoint.
+- Fan-out a product controls (start N, decide on each answer, keep
+  answering the user meanwhile) is a loop's job, not `delegate`:
+  `delegate` blocks the run that asks until every child ends.
 
 ## A thread: `Clementine.Thread` and `Runs.send/3`
 
@@ -327,6 +428,48 @@ def authorize_resume(run, {_verdict, %{by: user_id}}) do
 end
 ```
 
+`authorize_tool/3` is the tool policy: it decides each call to a tool
+declared `approval: {:policy, term}`, before the call's batch runs
+anything. It gets the run with `run.subject` and `run.actor` resolved,
+the call as a `Clementine.ApprovalRequest` (`tool_name`, and the `args`
+that would run), and the tool's `term`, and answers `:allow` (run it),
+`:require_approval` (park the run for `resume/2`, as `:required`
+does), or `{:deny, reason}` (the call runs nothing and the model reads
+`reason`, a string).
+
+```elixir
+@impl true
+def authorize_tool(run, %Clementine.ApprovalRequest{args: args}, :refund) do
+  cond do
+    not MyApp.Accounts.may_refund?(run.actor) -> {:deny, "You may not issue refunds."}
+    args["amount_cents"] > 50_00 -> :require_approval
+    true -> :allow
+  end
+end
+
+def authorize_tool(_run, _request, _term), do: {:deny, "No policy covers this tool."}
+```
+
+- It fails closed: a raise, an exit, a throw, no answer in time, or any
+  other answer denies the call and logs why, with the exception's type
+  and frames or the answer's shape, never the run's data. End with a
+  catch-all clause. Without the callback, a `{:policy, term}` tool gates
+  every call like `:required`.
+- An approval does not outrank it: an approved call is asked once more
+  when the run resumes, and a deny wins. A call the approver denied is
+  not asked again.
+- It covers every tool the run offers, deferred ones and a loaded
+  skill's included. `use_skill` and `delegate` carry no approval: offer
+  skills and delegates by actor in `agent/1`. A delegated child is asked
+  about with its own run, which carries the parent's subject and actor.
+- It runs in a task, bounded like a tool call, one call at a time
+  before the batch's tools: keep it fast and read-only. A call still
+  waiting when its batch parks is asked again on each resume, so N calls
+  that each need approval ask N(N+3)/2 times in all.
+- The trace keeps each answer as a `:policy` entry when it is given, and
+  the call's `:tool_call` entry records the verdict it settled under, in
+  `"policy"`, beside `"approval"`.
+
 `resolve_subject/2` turns the stored `{type, id}` into what the agent works
 on, at every claim. Agents read it as `run.subject` and tools as
 `context.subject`; `{:error, reason}` cancels the run, and so does a
@@ -392,8 +535,9 @@ use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "..."
   model sees `tools:` up front and loads the deferred tools it needs by
   searching their names, descriptions, and argument names, so write
   those to be found. Any other provider gets them as ordinary tools.
-- Once found, a deferred tool is an ordinary tool: `approval:`,
-  `retry:`, and the tool context apply, and a gated one parks the run.
+- Once found, a deferred tool is an ordinary tool: `approval:` (with
+  `authorize_tool/3` for `{:policy, term}`), `retry:`, and the tool
+  context apply, and a gated one parks the run.
 - A tool is in `tools:` or `deferred:`, never both; the build fails.
 - The search is part of the turn: `result.messages` carries it as
   `Content.ServerToolUse` and `Content.ServerToolResult`, which
@@ -405,6 +549,39 @@ use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "..."
   tool), so the thread keeps working, but the edit restarts the prompt
   cache and may void earlier thinking on models that verify it.
 
+## Structured output: `output_schema:`
+
+An agent whose answer code reads gives the answer's JSON schema:
+
+```elixir
+use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
+  output_schema: %{"type" => "object", "properties" => %{"verdict" => %{"type" => "string"}},
+                   "required" => ["verdict"], "additionalProperties" => false}
+```
+
+- A completed run's `output` is the decoded answer, a map with string
+  keys: what `run_finished/2` receives, what `run.result["output"]`
+  stores, and what a loop's `{:completed, tag, result}` carries. Match
+  on it; never parse text. Without `output_schema:`, `output` is text.
+- The run uses its tools freely; only the final answer is constrained,
+  through the provider's own structured output. The answer is the text
+  the final turn writes last: prose before a tool search in that turn
+  is not part of it.
+- The root is an object; the build fails otherwise. Put
+  `"additionalProperties": false` on every object, and for OpenAI list
+  every property in `required` (type an optional one
+  `["string", "null"]`). The provider refuses a schema outside its
+  subset, and the run fails with its error.
+- On a Chat Completions server that enforces `response_format` with a
+  grammar over the whole completion (vLLM, SGLang, Ollama, llama.cpp),
+  the model cannot call tools. Set `structured_output: :instructions` on
+  that model's catalog entry and describe the answer in the agent's
+  instructions; see `docs/MODELS.md`.
+- An answer that does not decode or match fails the run:
+  `Result.Failed` with a `Clementine.Error` of code `:invalid_output`,
+  whose `raw["output"]` is the text the model wrote. There is no retry
+  inside the run; retry from a loop or your own code.
+
 ## Never
 
 - Never send mail, call a service, broadcast, or write files in
@@ -415,8 +592,9 @@ use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "..."
 - Never do slow work in any callback. `run_finished/2` holds the run's
   transaction open, `run_committed/2` and `run_transition/2` run in the
   run's worker, the reaper's sweep, or the caller of `resume/2` or
-  `cancel/1`, and `run_event/2` runs once per token. Slow work is an Oban
-  job inserted in `run_finished/2`.
+  `cancel/1`, `run_event/2` runs once per token, and `authorize_tool/3`
+  before each call it decides. Slow work is an Oban job inserted in
+  `run_finished/2`.
 - Never write the database from `run_event/2`. Store the conversation
   from the run's result in `run_finished/2`.
 - Never write `agent_runs`, `agent_run_inbox`, or `agent_run_trace`, or

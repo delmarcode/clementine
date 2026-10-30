@@ -77,6 +77,14 @@ defmodule Clementine.Runner do
   - `:heartbeat` - `false` to run without a heartbeat process (the
     ephemeral, single-process path — lease loss is impossible there), or a
     keyword list (`interval:`) tuning it; defaults to on
+  - `:delegation` - `true` when the lifecycle starts the children a
+    `delegate` park names (`Clementine.Delegation`), as `Clementine.Runs`
+    does; without it the rollout offers no `delegate` tool, whatever the
+    agent's `delegates:`. Defaults to `false`
+  - `:authorize_tool` - the tool policy, a two-arity function the
+    rollout asks about each call to a tool declared
+    `approval: {:policy, term}` (see `Clementine.Rollout.execute/2`);
+    omitted, such a tool gates like `approval: :required`
   - `:rollout_execute` - the rollout engine, defaulting to
     `&Clementine.Rollout.execute/2`. A seam for deterministic tests of
     runner branches the real engine cannot yet produce on demand; not host
@@ -117,8 +125,10 @@ defmodule Clementine.Runner do
             resume: lease.resume,
             emit: stamper,
             trace: recorder,
+            delegation: Keyword.get(opts, :delegation, false),
             cancel?: fn -> Protocol.cancellation(lease) end,
             mark_effects: fn -> Protocol.mark_effects(lease) end,
+            authorize_tool: Keyword.get(opts, :authorize_tool),
             deadline: lease.deadline
           )
         rescue

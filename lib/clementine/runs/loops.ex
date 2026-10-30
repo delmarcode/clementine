@@ -49,7 +49,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     alias Clementine.Reconciler.LoopEvidence
     alias Clementine.Result
     alias Clementine.Runs
-    alias Clementine.Runs.{AgentRun, Config, Lifecycle, StepWorker, TimerWorker}
+    alias Clementine.Runs.{AgentRun, Config, Delegations, Lifecycle, StepWorker, TimerWorker}
 
     @inbox "agent_run_inbox"
 
@@ -1126,14 +1126,16 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     ## The child glue
 
     @doc false
-    # Inside a child's terminal transaction: the parent's
+    # Inside a child's terminal transaction, with the parent's row
+    # locked, by the parent's kind. A loop gets its
     # {:completed, tag, result} input, under the replay-stable dedup key
     # "completed:<tag_key>:<child_id>", exactly-once at source because
     # terminals are dead ends (matrix row L12). The tag key comes from the
     # parent's envelope, which recorded the child under it; a child the
     # envelope no longer lists dead-letters as :unknown_tag at the drain.
     # No wake here: the parent may be mid-step, and wake_parent/1 takes
-    # it after the commit.
+    # it after the commit. A rollout waiting on its delegates resumes
+    # when this was the last of them (Clementine.Runs.Delegations).
     @spec append_completion(AgentRun.t(), Result.t()) :: :ok
     def append_completion(%AgentRun{parent_id: parent_id} = child, result)
         when is_binary(parent_id) do
@@ -1146,9 +1148,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           dedup_key = InboxCodec.completion_dedup_key(tag_key, child.id)
           deliver_locked(config, parent, "completed", payload, dedup_key, wake?: false)
 
-        _missing_or_not_a_loop ->
+        %AgentRun{kind: "rollout"} = parent ->
+          Delegations.child_ended(parent, child)
+
+        nil ->
           Logger.warning(
-            "loop #{parent_id} is gone; dropping the completion of child #{child.id} " <>
+            "run #{parent_id} is gone; dropping the end of child #{child.id} " <>
               "(#{child.tag_kind} #{child.tag_id})"
           )
       end
@@ -1260,27 +1265,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # output a completed run stored, the error, the cancel reason, the
     # interrupt reason, and the usage. The synthesized completion folds as
     # the lost one would have, so the controller decides the same way.
-    defp synthesized_result(%AgentRun{} = child) do
-      facts = facts(child)
-      usage = facts.usage || %Clementine.Usage{}
-
-      case facts.status do
-        :completed ->
-          Result.completed(output: child.result && child.result["output"], usage: usage)
-
-        :failed ->
-          Result.failed(facts.error || %Clementine.Error{message: "child failed"}, usage)
-
-        :cancelled ->
-          Result.cancelled(
-            (facts.cancel && facts.cancel.reason) || %{"code" => "reconciled"},
-            usage
-          )
-
-        :interrupted ->
-          Result.interrupted(facts.interrupt || {:app, :reconciled}, usage)
-      end
-    end
+    defp synthesized_result(%AgentRun{} = child), do: Lifecycle.terminal_result(child)
 
     ## The paging gauge
 

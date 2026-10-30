@@ -47,6 +47,22 @@ defmodule Clementine.LLM.ChatCompletionsStreamParserTest do
            ]
   end
 
+  test "a refusal streams as the turn's text and stops with refusal" do
+    events =
+      parse_all([
+        delta_chunk(%{"role" => "assistant", "content" => nil, "refusal" => "I can't "}),
+        delta_chunk(%{"refusal" => "help with that."}, finish_reason: "stop"),
+        "data: [DONE]\n\n"
+      ])
+
+    assert events == [
+             {:text_delta, "I can't "},
+             {:text_delta, "help with that."},
+             {:message_delta, %{"stop_reason" => "refusal"}, %{}},
+             {:message_stop}
+           ]
+  end
+
   test "buffers events split across data boundaries" do
     payload =
       delta_chunk(%{"content" => "Hello"}) <>

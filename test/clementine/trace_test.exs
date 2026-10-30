@@ -647,9 +647,20 @@ defmodule Clementine.TraceTest do
 
   describe "entry kinds" do
     test "a stored kind reads back as its atom, and one a later version wrote stays text" do
-      assert Entry.kinds() == [:execution, :model_call, :tool_call]
+      assert Entry.kinds() == [
+               :execution,
+               :model_call,
+               :tool_call,
+               :policy,
+               :skill_load,
+               :delegate
+             ]
+
       assert Entry.decode_kind("tool_call") == :tool_call
-      assert Entry.decode_kind("skill_load") == "skill_load"
+      assert Entry.decode_kind("policy") == :policy
+      assert Entry.decode_kind("skill_load") == :skill_load
+      assert Entry.decode_kind("delegate") == :delegate
+      assert Entry.decode_kind("handoff") == "handoff"
     end
   end
 
@@ -669,6 +680,41 @@ defmodule Clementine.TraceTest do
 
       assert base == Trace.fingerprint(:claude_sonnet, "Trace me.", both, deferred: [])
       refute base == Trace.fingerprint(:claude_sonnet, "Trace me.", both, deferred: [GatedDeploy])
+    end
+
+    test "moves with the output schema, and not for an agent without one" do
+      base = Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
+      schema = %{"type" => "object", "required" => ["verdict"]}
+
+      with_schema =
+        Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho], output_schema: schema)
+
+      assert base ==
+               Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho], output_schema: nil)
+
+      refute base == with_schema
+
+      refute with_schema ==
+               Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho],
+                 output_schema: %{schema | "required" => ["score"]}
+               )
+    end
+
+    test "of a run whose agent/1 set its schema with atom keys is the normalized schema's",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_stream(text_events(~s({"verdict": "pass"})))
+
+      agent = %{agent([]) | output_schema: %{type: :object, required: [:verdict]}}
+      run = Run.new(ref: ref, rollout: Rollout.new(agent: agent, input: "go"))
+
+      assert {:finished, %Facts{status: :completed}} = execute(run, store)
+      assert [execution, _call] = MemoryLifecycle.trace(store, ref)
+
+      assert execution.payload["agent_fingerprint"] ==
+               Trace.fingerprint(:claude_sonnet, "Trace me.", [],
+                 output_schema: %{"type" => "object", "required" => ["verdict"]}
+               )
     end
   end
 
