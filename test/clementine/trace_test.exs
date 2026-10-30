@@ -313,6 +313,42 @@ defmodule Clementine.TraceTest do
              } = ran
     end
 
+    test "a drain mid-batch keeps the tool calls that finished", %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+      runner = self()
+
+      # The drain lands while the batch runs: after the safe call has
+      # answered, while the unsafe one still works.
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        spawn(fn ->
+          Process.sleep(200)
+          send(runner, {:clementine, :drain})
+        end)
+
+        [
+          {:tool_use_start, "tu_1", "safe_echo"},
+          {:input_json_delta, "tu_1", Jason.encode!(%{"message" => "read"})},
+          {:content_block_stop, 0},
+          {:tool_use_start, "tu_2", "unsafe_slow"},
+          {:input_json_delta, "tu_2", Jason.encode!(%{"delay_ms" => 5_000})},
+          {:content_block_stop, 1},
+          {:message_delta, %{"stop_reason" => "tool_use"},
+           %{"input_tokens" => 5, "output_tokens" => 2}}
+        ]
+      end)
+
+      run = build_run(ref, tools: [SafeEcho, UnsafeSlow])
+
+      # The unsafe call raised the effect fence, so the drain ends the run
+      # interrupted, with the call that finished on the record.
+      assert {:finished, %Facts{status: :interrupted}} = execute(run, store)
+
+      assert [_execution, _call, %Entry{kind: :tool_call, payload: kept}] =
+               MemoryLifecycle.trace(store, ref)
+
+      assert %{"tool_use_id" => "tu_1", "result" => "Echo: read"} = kept
+    end
+
     test "a drained run's trace commits with its requeue", %{store: store, ref: ref} do
       MemoryLifecycle.seed_queued(store, ref)
 

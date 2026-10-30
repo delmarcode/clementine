@@ -107,8 +107,12 @@ defmodule Clementine.ToolRunner do
     it, or timed out), as `{id, result, duration_ms}` in call order, so
     the run's trace records what ran. A killed call has none.
   - `{:clementine, :lease_lost, _}` / `{:clementine, :drain}` — a
-    superseded or draining executor must unwind *now*: every task is
-    killed and `:lost_lease` / `:drained` returns immediately.
+    superseded or draining executor must unwind *now*: every task still
+    running is killed and `:lost_lease` / `{:drained, settled}` returns
+    immediately. A drained run is still its executor's to end, so
+    `settled` keeps the calls that reached a result before the drain, as
+    for a cancel; a superseded executor writes nothing, so a lost lease
+    keeps none.
 
   With no signal, returns `{:ok, results}`: `execute/4`'s `{id, result}`
   pairs, in call order, each with the milliseconds from its spawn to its
@@ -120,7 +124,7 @@ defmodule Clementine.ToolRunner do
           {:ok, [{String.t(), term(), non_neg_integer()}]}
           | {:cancelled, reason :: term(), [{String.t(), term(), non_neg_integer()}]}
           | :lost_lease
-          | :drained
+          | {:drained, [{String.t(), term(), non_neg_integer()}]}
   def run_batch(tools, tool_calls, context, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     task_supervisor = Keyword.get(opts, :task_supervisor, Clementine.TaskSupervisor)
@@ -179,8 +183,8 @@ defmodule Clementine.ToolRunner do
         :lost_lease
 
       {:clementine, :drain} ->
-        kill_awaiting(state, fn _entry -> true end)
-        :drained
+        state = kill_awaiting(state, fn _entry -> true end)
+        {:drained, settled(state.entries)}
 
       {:clementine, :cancel, reason} ->
         state

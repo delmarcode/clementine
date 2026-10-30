@@ -442,11 +442,17 @@ defmodule Clementine.ToolRunnerTest do
 
       calls = [
         %{id: "call_1", name: "unsafe_slow", input: %{"delay_ms" => 5_000}},
-        %{id: "call_2", name: "slow", input: %{"delay_ms" => 5_000}}
+        %{id: "call_2", name: "slow", input: %{"delay_ms" => 5_000}},
+        %{id: "call_3", name: "echo", input: %{"message" => "done first"}}
       ]
 
       started = System.monotonic_time(:millisecond)
-      assert :drained = ToolRunner.run_batch(@batch_tools, calls, %{})
+
+      # The call that finished before the drain comes back for the record;
+      # the killed ones have no result.
+      assert {:drained, [{"call_3", {:ok, %ToolResult{content: "Echo: done first"}}, _ms}]} =
+               ToolRunner.run_batch(@batch_tools, calls, %{})
+
       assert System.monotonic_time(:millisecond) - started < 2_000
       refute_received {:unsafe_done, _}
     end

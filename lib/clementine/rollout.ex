@@ -822,17 +822,24 @@ defmodule Clementine.Rollout do
 
         # The model never sees these, but they ran: the trace keeps them.
         {:cancelled, reason, settled} ->
-          Enum.each(settled, fn {id, result, duration_ms} ->
-            %{^id => tool_result} = settle_result({id, result}, %{})
-            record_tool_call(exec, Map.fetch!(uses, id), tool_result, duration_ms, approval)
-          end)
-
+          record_abandoned(exec, uses, settled, approval)
           {:cancelled, reason}
 
-        unwound ->
-          unwound
+        {:drained, settled} ->
+          record_abandoned(exec, uses, settled, approval)
+          :drained
+
+        :lost_lease ->
+          :lost_lease
       end
     end
+  end
+
+  defp record_abandoned(exec, uses, settled, approval) do
+    Enum.each(settled, fn {id, result, duration_ms} ->
+      %{^id => tool_result} = settle_result({id, result}, %{})
+      record_tool_call(exec, Map.fetch!(uses, id), tool_result, duration_ms, approval)
+    end)
   end
 
   # A settled result keeps exactly the content and error flag the model
