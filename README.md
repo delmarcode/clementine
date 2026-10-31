@@ -258,9 +258,16 @@ The thread:
 - keeps no transcript: the turn agent's `history/1` reads the thread
   from your tables.
 
-`Runs.child(loop.id, {:turn, message.id})` finds a message's turn once
-it has started. `Clementine.Thread.waiting(loop.id)` lists the ids of
-the messages still queued.
+To follow a message:
+
+<!-- guide-sample: parse-only -->
+```elixir
+Clementine.Runs.child(loop.id, {:turn, message.id})
+#=> {:ok, %Clementine.Runs.AgentRun{}} once its turn has started, {:error, :no_child} before
+
+Clementine.Thread.waiting(loop.id)
+#=> {:ok, ids}, the ids of the messages still queued, in the order the thread will answer them
+```
 
 In process there is no thread: pass the history yourself, as
 `Clementine.run(agent, prompt, messages: history)`.
