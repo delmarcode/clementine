@@ -105,7 +105,9 @@ lifecycle, or a reaper into the app.
   the prices of the moment; `children: true` adds every run below it
   (delegates, a loop's turns), and `subject_cost(subject)` totals a
   subject. Prices are your config, the `pricing:` key in
-  `docs/MODELS.md`; without them a cost is `nil`, never zero.
+  `docs/MODELS.md`; without them a cost is `nil`, never zero. A cost
+  goes with its trace on `purge/1`: copy `cost(run.id)` into your own
+  table from `run_finished/2` if spend must outlive it.
 - The queries: `active?(agent, subject)` is a task's lane (does the agent
   have an active run on the subject); `active(subject)` is the thread's
   active turn, of whichever agent, or `nil`; `latest(subject, opts)` is

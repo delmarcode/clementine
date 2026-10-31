@@ -465,10 +465,19 @@ the currency, here $0.001284.
   `Clementine.Runs.cost(run_id, children: true)` adds every run below it
   (its delegates, a loop's turns and theirs);
   `Clementine.Runs.subject_cost(subject)` totals every run on a subject.
-  Each is `nil` when any call in it ran unpriced.
+  Each is `nil` when any call in it ran unpriced, and when a run's
+  `usage` holds a call its trace does not: the heartbeat counts a call
+  as it ends, and the trace writes it at the next iteration boundary, so
+  a run whose node died in between, or a live run until its boundary,
+  has no cost to state rather than a short one.
+- The cost lives in the trace and goes with it: after
+  `Clementine.Runs.purge/1`, a run's and its subject's cost is `nil`. To
+  keep spend past a purge, copy `Clementine.Runs.cost(run.id)` into your
+  own table from `run_finished/2`, which sees the run's whole trace.
 - `[:clementine, :llm, :stop]` carries a priced call's `cost_micros`,
-  with `currency` in its metadata, and `Clementine.Telemetry.metrics/0`
-  sums it.
+  with `currency` in its metadata, and so does `[:clementine, :llm,
+  :exception]` for a call a provider error ended, at what it had
+  reported; `Clementine.Telemetry.metrics/0` sums both.
 - `Clementine.Cost.of(usage, alias)` prices any usage at today's prices:
   an in-process run's `result.usage`, or a trace entry's usage to reprice
   it.
@@ -478,7 +487,11 @@ token counts is not modeled, and the cost is the plain rate: Anthropic's
 US-only inference (`inference_geo`) and fast mode, a model with higher
 prices above a prompt length (Claude Haiku 5.5 over 100,000 tokens),
 regional pricing on Bedrock and Vertex (price the alias at its region's
-rates), and per-use server tool fees such as web search.
+rates), per-use server tool fees such as web search, and OpenRouter's
+routing: it serves one model id from whichever of its upstream providers
+it picks, at that provider's price, and reports what it charged in the
+response's `usage.cost`, which Clementine does not read. Price an
+OpenRouter alias at the rate you expect to pay.
 
 ## Adding a model, start to finish
 

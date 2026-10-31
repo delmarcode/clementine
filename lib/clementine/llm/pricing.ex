@@ -18,7 +18,8 @@ defmodule Clementine.LLM.Pricing do
   (Illustrative numbers, not anyone's current prices.)
 
   Every rate is in the named `currency` per million tokens, as a provider's
-  price card states it, to six decimal places at most. A priced alias names
+  price card states it, to six decimal places at most (a finer rate fails
+  at boot rather than rounding away). A priced alias names
   all four: `input` (uncached input), `output` (reasoning included),
   `cache_read`, and `cache_write`. `cache_write` is one rate, or a rate per
   cache TTL where the provider charges more to keep a cache entry longer;
@@ -228,7 +229,21 @@ defmodule Clementine.LLM.Pricing do
   end
 
   defp rate(_key, value) when is_integer(value) and value >= 0, do: {:ok, value * @micro}
-  defp rate(_key, value) when is_float(value) and value >= 0, do: {:ok, round(value * @micro)}
+  # A rate finer than a micro-unit per million tokens would round away,
+  # silently: 0.0000003 would be free. The tolerance absorbs the float's
+  # own representation error, which grows with the rate.
+  defp rate(key, value) when is_float(value) and value >= 0 do
+    scaled = value * @micro
+    micros = round(scaled)
+
+    if abs(scaled - micros) <= max(1.0e-6, abs(scaled) * 1.0e-12) do
+      {:ok, micros}
+    else
+      {:error,
+       "#{label(key)} #{inspect(value)} is finer than six decimal places per million " <>
+         "tokens, the unit costs are counted in"}
+    end
+  end
 
   defp rate(key, value) do
     {:error,

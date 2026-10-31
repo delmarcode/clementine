@@ -25,8 +25,10 @@ defmodule Clementine.Cost do
     (`Clementine.Trace`). Changing a price never reprices history.
   - `Clementine.Runs.cost/2` sums a run's frozen costs (`children: true`
     adds every run it started, down the tree), and
-    `Clementine.Runs.subject_cost/1` every run on a subject.
-  - `[:clementine, :llm, :stop]` carries a priced call's `cost_micros`
+    `Clementine.Runs.subject_cost/1` every run on a subject: `nil` while a
+    run's trace is behind its usage, and once a purge has taken it.
+  - `[:clementine, :llm, :stop]` carries a priced call's `cost_micros`,
+    and `[:clementine, :llm, :exception]` a call's a provider error ended
     (`Clementine.Telemetry`).
   - `of/2` prices any usage at today's prices: an in-process run's
     `result.usage`, or a trace entry's usage to reprice it.

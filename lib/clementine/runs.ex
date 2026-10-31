@@ -66,7 +66,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     import Kernel, except: [inspect: 1]
 
     import Ecto.Query,
-      only: [from: 2, recursive_ctes: 2, union_all: 2, with_cte: 3]
+      only: [from: 2, recursive_ctes: 2, subquery: 1, union_all: 2, with_cte: 3]
 
     alias Clementine.Emissions
     alias Clementine.Lifecycle.Ecto.Codec
@@ -861,43 +861,51 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     nothing.
 
     `nil` when no cost can be stated: a call ran on a model without
-    prices, or calls were priced in different currencies. A run that
-    called no model costs `Clementine.Cost.zero/0`, zero where the catalog
-    has prices. `nil` for a run that does not exist.
+    prices, calls were priced in different currencies, or the run's
+    `usage` holds tokens its trace does not. That last is a run whose
+    executor died after a model call and before the iteration boundary
+    that writes the call to the trace (the heartbeat had already counted
+    it), and a live run between such a call and its boundary: its cost
+    is `nil` until the boundary, and otherwise covers its calls through
+    the last one. A run that called no model costs
+    `Clementine.Cost.zero/0`, zero where the catalog has prices. `nil`
+    for a run that does not exist, a purged one included.
 
     A run's cost is its own calls', as its `usage` is: a parent that asked
     other agents (`delegates:`), and a loop, are charged for their own
     calls only, so the costs of a subject's runs add up without counting
     a child twice. With `children: true` it is the run's and every run's
     below it, down the `parent_id` tree: a parent's delegates, a loop's
-    turns and theirs.
+    turns, and theirs; `nil` if any of them is.
 
-    A run reaped after its node died is priced up to its last iteration
-    boundary, as its trace is.
+    The cost lives in the trace, which goes with the run (`purge/1`). A
+    host that keeps spend past a purge copies `cost/1` into its own table
+    from `c:Clementine.Host.run_finished/2`, which already sees the run's
+    whole trace.
     """
     @spec cost(Ecto.UUID.t(), keyword()) :: Clementine.Cost.t() | nil
     def cost(run_id, opts \\ []) do
+      opts = Keyword.validate!(opts, children: false)
       %Config{repo: repo} = Config.fetch!()
 
-      with {:ok, id} <- cast_id(run_id),
-           true <- repo.exists?(from(r in AgentRun, where: r.id == ^id)) do
-        runs =
-          if Keyword.get(opts, :children, false),
-            do: run_tree(id),
-            else: from(r in AgentRun, where: r.id == ^id, select: r.id)
+      case {cast_id(run_id), opts[:children]} do
+        {{:ok, id}, true} ->
+          trace_cost(repo, run_tree(id))
 
-        trace_cost(repo, runs)
-      else
-        _missing -> nil
+        {{:ok, id}, _own} ->
+          trace_cost(repo, from(r in AgentRun, where: r.id == ^id, select: r.id))
+
+        {{:error, :not_found}, _children} ->
+          nil
       end
     end
 
     @doc """
     What every run on `subject` cost, as `cost/2` prices each: the
     subject's tasks and turns, the delegates they asked (a delegate runs
-    on its parent's subject), and its loops. `nil` when no cost can be
-    stated; zero, where the catalog has prices, for a subject with no
-    model calls.
+    on its parent's subject), and its loops. `nil` when any run's cost is,
+    and for a subject with no runs, a purged one included; zero, where the
+    catalog has prices, for runs that called no model.
     """
     @spec subject_cost(subject()) :: Clementine.Cost.t() | nil
     def subject_cost(subject) do
@@ -923,39 +931,106 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       |> with_cte("run_tree", as: ^union_all(root, ^below))
     end
 
-    # The sum of the costs frozen on the model calls of `runs`, a query of
-    # run ids, aggregated in the database: only the cost leaves it, never
-    # a payload.
+    # The total of the costs frozen on the model calls of `runs`, a query
+    # of run ids: one query, aggregated in the database, so only the totals
+    # leave it, never a payload.
     defp trace_cost(repo, runs) do
       totals =
         repo.one(
-          from(t in "agent_run_trace",
-            where: t.run_id in subquery(runs) and t.kind == "model_call",
+          from(p in subquery(per_run_cost(runs)),
             select: %{
-              calls: count(t.id),
-              unpriced:
-                fragment(
-                  "count(*) FILTER (WHERE jsonb_typeof(?->'cost') IS DISTINCT FROM 'object')",
-                  t.payload
-                ),
-              currencies: fragment("count(DISTINCT ?->'cost'->>'currency')", t.payload),
-              currency: fragment("min(?->'cost'->>'currency')", t.payload),
-              micros:
-                fragment("coalesce(sum((?->'cost'->>'micros')::bigint), 0)::bigint", t.payload)
+              runs: count(),
+              calls: fragment("coalesce(sum(?), 0)::bigint", p.calls),
+              unpriced: fragment("coalesce(sum(?), 0)::bigint", p.unpriced),
+              behind: fragment("count(*) FILTER (WHERE ?)", p.behind),
+              low: min(p.low),
+              high: max(p.high),
+              micros: fragment("coalesce(sum(?), 0)::bigint", p.micros)
             }
           )
         )
 
       case totals do
-        %{calls: 0} ->
+        %{runs: 0} ->
+          nil
+
+        %{calls: 0, behind: 0} ->
           Clementine.Cost.zero()
 
-        %{unpriced: 0, currencies: 1, currency: currency, micros: micros} ->
+        %{unpriced: 0, behind: 0, low: currency, high: currency, micros: micros} ->
           %Clementine.Cost{currency: currency, micros: micros}
 
-        _unpriced_or_mixed ->
+        _unpriced_mixed_or_behind ->
           nil
       end
+    end
+
+    # Each run's model calls beside its `usage` column. The column can hold
+    # a call the trace does not: the heartbeat counts a call as it ends,
+    # and the trace writes it at the next iteration boundary, or never if
+    # the executor dies first. A trace whose total is short of the column
+    # is behind. The heartbeat counts one execution, so for a run whose
+    # last execution may not have written its end (running, or interrupted
+    # by the reaper, not while waiting or queued), the column is held
+    # against that execution's calls too: earlier executions' calls would
+    # otherwise hide a missing one. Every execution that ends through its
+    # runner writes its whole trace with that end, so its run is never
+    # behind. A loop calls no model, and its column counts its children's
+    # usage, so only a rollout is ever behind.
+    defp per_run_cost(runs) do
+      from(r in AgentRun,
+        left_join: t in "agent_run_trace",
+        on: t.run_id == r.id and t.kind == "model_call",
+        where: r.id in subquery(runs),
+        group_by: r.id,
+        select: %{
+          calls: count(t.id),
+          unpriced:
+            fragment(
+              "count(?) FILTER (WHERE jsonb_typeof(?->'cost') IS DISTINCT FROM 'object')",
+              t.id,
+              t.payload
+            ),
+          low: fragment("min(?->'cost'->>'currency')", t.payload),
+          high: fragment("max(?->'cost'->>'currency')", t.payload),
+          micros: fragment("coalesce(sum((?->'cost'->>'micros')::bigint), 0)", t.payload),
+          behind:
+            fragment(
+              """
+              ? = 'rollout'
+              AND (coalesce((?->>'input_tokens')::bigint, 0)
+                 > coalesce(sum((?->'usage'->>'input_tokens')::bigint), 0)
+               OR coalesce((?->>'output_tokens')::bigint, 0)
+                 > coalesce(sum((?->'usage'->>'output_tokens')::bigint), 0)
+               OR ((? = 'running'
+                    OR (? = 'interrupted' AND coalesce(?->>'code', '')
+                        NOT IN ('suspension_expired', 'claim_timeout', 'drain')))
+                   AND (coalesce((?->>'input_tokens')::bigint, 0)
+                          > coalesce(sum((?->'usage'->>'input_tokens')::bigint)
+                                       FILTER (WHERE ? = ?), 0)
+                        OR coalesce((?->>'output_tokens')::bigint, 0)
+                          > coalesce(sum((?->'usage'->>'output_tokens')::bigint)
+                                       FILTER (WHERE ? = ?), 0))))
+              """,
+              r.kind,
+              r.usage,
+              t.payload,
+              r.usage,
+              t.payload,
+              r.status,
+              r.status,
+              r.interrupt,
+              r.usage,
+              t.payload,
+              t.epoch,
+              r.lease_epoch,
+              r.usage,
+              t.payload,
+              t.epoch,
+              r.lease_epoch
+            )
+        }
+      )
     end
 
     defp cast_id(run_id) do

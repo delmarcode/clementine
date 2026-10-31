@@ -297,8 +297,15 @@ defmodule Clementine.Telemetry do
 
   Emitted when the LLM call fails.
 
-  - Measurements: `%{duration: native_time}`
-  - Metadata: `%{model: model_ref, iteration: integer, kind: atom, reason: term, streaming: boolean}`
+  - Measurements: `%{duration: native_time}`. A provider error in the
+    stream also carries what the call reported before it, as stop does:
+    the four token counts and, priced, `cost_micros`. A raise carries
+    `duration` alone.
+  - Metadata: `%{model: model_ref, iteration: integer, kind: atom, reason: term, currency: String.t() | nil, streaming: boolean}`
+    — `currency` is `nil` but on a priced provider error
+
+  Spend is the `cost_micros` of `:stop` and `:exception` together; the
+  trace prices both.
 
   ## Tool Events
 
@@ -476,8 +483,10 @@ defmodule Clementine.Telemetry do
       summary("clementine.llm.stop.cache_read_tokens"),
       summary("clementine.llm.stop.cache_write_tokens"),
       counter("clementine.llm.stop.input_tokens"),
-      # Spend: an unpriced call carries no cost_micros, and reporters skip it.
+      # Spend, a call that ended in a provider error included: an unpriced
+      # call carries no cost_micros, and reporters skip it.
       sum("clementine.llm.stop.cost_micros", tags: [:currency]),
+      sum("clementine.llm.exception.cost_micros", tags: [:currency]),
       counter("clementine.llm.exception.duration",
         event_name: [:clementine, :llm, :exception],
         measurement: fn _measurements -> 1 end

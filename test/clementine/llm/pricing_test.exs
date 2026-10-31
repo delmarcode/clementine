@@ -74,6 +74,27 @@ defmodule Clementine.LLM.PricingTest do
       assert {:error, _} = Pricing.validate(%{input: 1})
     end
 
+    test "rejects a rate finer than six decimal places, which would round away" do
+      assert {:error, message} = Pricing.validate(Keyword.put(@card, :input, 0.0000003))
+      assert message =~ "input 3.0e-7 is finer than six decimal places"
+
+      assert {:error, message} =
+               Pricing.validate(Keyword.put(@card, :cache_write, one_hour: 1.0000005))
+
+      assert message =~ "cache_write :one_hour 1.0000005 is finer"
+
+      # Six places, and large rates whose floats are not exact, are fine.
+      assert {:ok, %Pricing{cache_read: 18_750, input: 0}} =
+               Pricing.validate(
+                 @card
+                 |> Keyword.put(:cache_read, 0.01875)
+                 |> Keyword.put(:input, 0.0)
+               )
+
+      assert {:ok, %Pricing{input: 123_456_789_012}} =
+               Pricing.validate(Keyword.put(@card, :input, 123_456.789012))
+    end
+
     test "rejects a per-TTL cache_write naming a TTL no provider has" do
       assert {:error, message} =
                Pricing.validate(Keyword.put(@card, :cache_write, five_minutes: 3.75, forever: 9))
@@ -127,6 +148,20 @@ defmodule Clementine.LLM.PricingTest do
       assert %{pricing: %Pricing{currency: "USD"}} = ModelRegistry.resolve!(:claude)
       assert %{pricing: nil} = ModelRegistry.resolve!(:plain)
       assert %{pricing: nil} = ModelRegistry.resolve!({:openai, "gpt-5"})
+    end
+
+    test "a sub-micro rate fails, naming the alias and the key" do
+      error =
+        boot_error(
+          claude: [
+            provider: :anthropic,
+            id: "claude-sonnet-5",
+            pricing: Keyword.put(@one_rate, :output, 0.0000003)
+          ]
+        )
+
+      assert error.message =~ "Invalid model config for :claude"
+      assert error.message =~ "output 3.0e-7 is finer than six decimal places"
     end
 
     test "a partial price list fails, naming the alias" do
