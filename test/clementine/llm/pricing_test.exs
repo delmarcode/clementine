@@ -193,6 +193,32 @@ defmodule Clementine.LLM.PricingTest do
       assert error.message =~ "names no rate for :one_hour"
     end
 
+    test "GPT-5.6 through OpenRouter or Bedrock writes for thirty minutes; caching off, none" do
+      card = [
+        currency: "USD",
+        input: 2.0,
+        output: 8.0,
+        cache_read: 0.2,
+        cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0]
+      ]
+
+      put_models(
+        routed: [provider: :openrouter, id: "openai/gpt-5.6", pricing: card],
+        hosted: [provider: :bedrock, id: "openai.gpt-5.6", pricing: card]
+      )
+
+      assert :ok = ModelRegistry.validate_config!()
+      assert %Pricing{cache_write: 2_500_000} = Pricing.of(:routed)
+      assert %Pricing{cache_write: 2_500_000} = Pricing.of(:hosted)
+
+      error =
+        boot_error(
+          hosted: [provider: :bedrock, id: "openai.gpt-5.6", cache: false, pricing: card]
+        )
+
+      assert error.message =~ "give one cache_write rate"
+    end
+
     test "a per-TTL cache_write on an alias whose writes carry no TTL fails" do
       error =
         boot_error(

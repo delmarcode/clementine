@@ -462,7 +462,8 @@ deepseek: [
   | `:anthropic` | `:five_minutes` (the default), `:one_hour` |
   | `:openai`, GPT-5.6 and later | `:thirty_minutes` (the default), `:twelve_hours`. OpenAI's caching guide offers twelve hours; its API reference says thirty minutes is currently the only value. |
   | `:openrouter`, `:openai_compatible`, when cache markers go out | `:five_minutes` (the default), `:one_hour` |
-  | Every other alias: `:bedrock`, `:vertex`, older OpenAI ids, the rest of OpenRouter, caching off | none: give one rate |
+  | `:openrouter` `openai/` and `:bedrock` `openai.` ids, GPT-5.6 and later | `:thirty_minutes`, which their writes are billed at; Clementine sends them no TTL |
+  | Every other alias: `:vertex`, the rest of `:bedrock` and `:openrouter`, older OpenAI ids, caching off | none: give one rate |
 
   A per-TTL `cache_write` without the rate for the alias's TTL, or on an
   alias whose writes carry no TTL, fails boot.
