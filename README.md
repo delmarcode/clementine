@@ -297,9 +297,12 @@ Two declarations matter once runs are durable:
 
 The built-in tools, `Clementine.Tools.ReadFile`, `WriteFile`, `ListDir`,
 `Search`, and `Bash`, refuse unless the context grants their capability
-(`capabilities: %{read: true, write: false, shell: false}`), and stay
-inside its `working_dir`. On the durable runtime that directory comes
-only from the agent's `tool_context:`. An agent with many tools lists
+(`capabilities: %{read: true, write: false, shell: false}`). The four
+file tools stay inside the context's `working_dir`. `Bash` only starts
+there: it runs the model's command in an unrestricted shell, so grant
+`shell` only where a sandbox confines the process. On the durable
+runtime `working_dir` comes only from the agent's `tool_context:`. An
+agent with many tools lists
 the ones it rarely needs as `deferred:`, and on Anthropic models the
 model searches for them. [docs/TOOL_AUTHORING.md](docs/TOOL_AUTHORING.md)
 has the full contract.

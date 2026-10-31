@@ -247,7 +247,7 @@ The second argument to `run/2` is a context map. Available keys:
 | Key | Type | Description |
 |---|---|---|
 | `:working_dir` | string | Working directory for the agent (resolve relative paths against this). In-process it defaults to the current directory; on the durable runtime it has no default, and the built-in tools refuse without one |
-| `:workspace_root` | string | Optional stricter root for built-in filesystem and shell tools |
+| `:workspace_root` | string | Optional stricter root for the built-in filesystem tools, and the directory `Bash` starts in (its shell is not confined to it) |
 | `:capabilities` | map | Explicit built-in tool capabilities, e.g. `%{read: true, write: false, shell: false}` |
 | `:agent_pid` | pid | PID of the agent GenServer |
 
