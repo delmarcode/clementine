@@ -53,36 +53,28 @@ the code disagree, the code wins.
 
 ```
 lib/
-├── clementine.ex                  # Facade: run/3, stream/3, the {Clementine, ...} child spec,
-│                                  #   AgentServer delegates (run_async, await, fork, ...)
+├── clementine.ex                  # Facade: run/3, stream/3, child_spec/1, AgentServer delegates
 ├── clementine/
 │   ├── agent.ex                   # Agent struct; `use Clementine.Agent` (key, turn, agent/1, history/1)
 │   ├── rollout.ex                 # Rollout spec and the engine, execute/2
 │   ├── run.ex, runner.ex          # One durable attempt; claim → execute → suspend or finish, once
 │   ├── result.ex, error.ex, usage.ex
-│   ├── lifecycle.ex, lifecycle/   # The storage contract; Facts, Transition, Ephemeral (in process);
-│   │                              #   Protocol and the Ecto adapter (internal)
-│   ├── lease.ex, heartbeat.ex     # Lease fencing and liveness
-│   ├── reconciler.ex, interrupt_reason.ex   # The reaper's judgment
-│   ├── checkpoint.ex, suspension.ex, resume_token.ex, pending.ex, approval_request.ex
-│   │                              # Parking a run and resuming it
-│   ├── runs.ex                    # The durable runtime's API: start, start_loop, send, resume,
-│   │                              #   cancel, purge, get, list, child, trace, ...
-│   ├── runs/                      # Its internals: Worker, StepWorker, TimerWorker, Lifecycle (over
-│   │                              #   agent_runs), Loops, Delegations, Reaper, drain, cancel relay
+│   ├── lifecycle.ex, lifecycle/   # Storage contract; Facts, Transition, Ephemeral; Protocol and
+│   │                              #   the Ecto adapter (internal)
+│   ├── lease.ex, heartbeat.ex, reconciler.ex, interrupt_reason.ex   # Fencing, liveness, reaping
+│   ├── checkpoint.ex, suspension.ex, resume_token.ex, pending.ex, ...  # Parking and resuming
+│   ├── runs.ex                    # The runtime's API: start, start_loop, send, resume, cancel, trace, ...
+│   ├── runs/                      # Its internals: Worker, StepWorker, TimerWorker, Lifecycle, Loops,
+│   │                              #   Delegations, Reaper, drain, cancel relay
 │   ├── host.ex                    # The optional host module's callbacks
 │   ├── migration.ex               # agent_runs, agent_run_inbox, agent_run_trace DDL, versions 1–4
-│   ├── loop.ex, thread.ex         # The loop behaviour; the thread controller
-│   ├── loop/                      # The pure loop core (step, envelope, codec; internal) and Report
-│   ├── skill.ex, delegation.ex, engine_tool.ex   # skills:, delegates:, and their engine tools
-│   │                                             #   (use_skill, delegate)
+│   ├── loop.ex, thread.ex, loop/  # The loop behaviour, the thread controller, the pure loop core
+│   ├── skill.ex, delegation.ex, engine_tool.ex   # skills:, delegates:, use_skill and delegate
 │   ├── output_schema.ex           # output_schema: decoding and checking
 │   ├── trace.ex, trace/           # A run's trace and its recorder
-│   ├── event.ex, events.ex, events/, run_view.ex   # (epoch, seq)-stamped events, sinks, the
-│   │                                               #   live-view fold
+│   ├── event.ex, events.ex, events/, run_view.ex   # Stamped events, sinks, the live-view fold
 │   ├── telemetry.ex, telemetry/
-│   ├── tool.ex, tool_runner.ex, tool_context.ex, tool_input.ex, tool_result.ex
-│   │                              # Tool macro, supervised batches, context helpers, input repair
+│   ├── tool.ex, tool_runner.ex, tool_*.ex   # Tool macro, supervised batches, context, input repair
 │   ├── tools/                     # Built-in tools: ReadFile, WriteFile, ListDir, Search, Bash
 │   ├── llm/                       # Provider clients, stream parsers, model registry, router
 │   ├── host_call.ex               # Host code run mid-execution, bounded like a tool call
@@ -112,9 +104,6 @@ and every caller reaches it through `Clementine.Runner.execute/2`:
 - Locally, interactively: `Clementine.AgentServer` holds a history and
   runs each turn in process. It is for IEx and local tools, never the
   owner of a production conversation.
-
-Judging a result and retrying happens above a run: in process with a
-`Clementine.Verifier`-shaped function, durably with a loop.
 
 ## How production uses it
 
@@ -217,18 +206,13 @@ changes once runs exist.
 ## Configuration
 
 `config/` configures this repo's own development and tests; a host app
-configures `:clementine` itself. What the library reads:
-
-- `:models`, the catalog of model aliases. There are no built-in
-  aliases: an alias resolves only if config names it. `docs/MODELS.md`
-  has every key, a recipe per provider, and the reasoning table.
-- Provider credentials and endpoints: `anthropic_api_key`,
-  `openai_api_key`, `openrouter_api_key`, `bedrock_region`, ...
-  (a literal, or `{:system, "ENV_VAR"}`).
-- `:retry`: attempts and backoff for provider calls.
-- `:default_model` and `:max_iterations`: read only by
-  `Clementine.AgentServer`. An agent names its own model and limits.
-- `:llm_client`: `config/test.exs` points it at the mock.
+configures `:clementine` itself. The library reads `:models` (the
+catalog of aliases; there are no built-in ones, so an alias resolves
+only if config names it, and `docs/MODELS.md` has every key), provider
+credentials and endpoints (`anthropic_api_key: {:system, "..."}`, ...),
+`:retry` for provider calls, and `:llm_client` (the mock, in tests).
+`:default_model` and `:max_iterations` are read only by
+`Clementine.AgentServer`; an agent names its own model and limits.
 
 ## Common tasks
 
