@@ -6,7 +6,11 @@ defmodule Clementine.LLM.OpenAIStreamParser do
   # turn's text, and the stop reason "refusal". A response that ends
   # `response.incomplete` stops with "max_tokens" when it ran out of
   # output tokens (its other reasons pass through as they are), and one
-  # that ends `response.failed` is an error, not an empty answer.
+  # that ends `response.failed` is an error, not an empty answer. Usage
+  # leaves in the keys `Clementine.Usage` reads
+  # (`Clementine.LLM.ProviderUsage.openai/1`).
+
+  alias Clementine.LLM.ProviderUsage
 
   defmodule State do
     @moduledoc false
@@ -188,7 +192,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
 
   defp convert_event("response.completed", %{"response" => response}, state) do
     {fallback_tool_events, state} = ensure_completed_tool_events(response, state)
-    usage = Map.get(response, "usage", %{}) || %{}
+    usage = ProviderUsage.openai(Map.get(response, "usage"))
 
     events =
       fallback_tool_events ++
@@ -203,7 +207,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
   # Cut off: what streamed is the turn, and nothing more arrives. A call
   # still open has no complete arguments, so none is replayed.
   defp convert_event("response.incomplete", %{"response" => response}, state) do
-    usage = Map.get(response, "usage", %{}) || %{}
+    usage = ProviderUsage.openai(Map.get(response, "usage"))
 
     {[{:message_delta, %{"stop_reason" => stop_reason(response, state)}, usage}, {:message_stop}],
      state}

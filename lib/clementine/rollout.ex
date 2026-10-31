@@ -1707,14 +1707,19 @@ defmodule Clementine.Rollout do
       request_opts(exec)
   end
 
-  defp request_opts(%Execution{} = exec),
-    do: deferred_opts(exec.deferred) ++ output_schema_opts(exec.output_schema)
+  defp request_opts(%Execution{} = exec) do
+    deferred_opts(exec.deferred) ++
+      output_schema_opts(exec.output_schema) ++ cache_key_opts(LLM.Cache.key(exec.context))
+  end
 
   defp deferred_opts([]), do: []
   defp deferred_opts(deferred), do: [deferred: deferred]
 
   defp output_schema_opts(nil), do: []
   defp output_schema_opts(schema), do: [output_schema: schema]
+
+  defp cache_key_opts(nil), do: []
+  defp cache_key_opts(key), do: [cache_key: key]
 
   defp batch_opts(%Execution{deadline: nil}), do: []
 

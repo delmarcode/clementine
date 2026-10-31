@@ -35,14 +35,23 @@ defmodule Clementine.LLM.ChatCompletionsStreamParserTest do
     events =
       parse_all([
         delta_chunk(%{"role" => "assistant", "content" => "Hel"}),
-        delta_chunk(%{"content" => "lo"}, finish_reason: "stop", usage: %{"total_tokens" => 7}),
+        delta_chunk(%{"content" => "lo"},
+          finish_reason: "stop",
+          usage: %{"prompt_tokens" => 5, "completion_tokens" => 2, "total_tokens" => 7}
+        ),
         "data: [DONE]\n\n"
       ])
 
     assert events == [
              {:text_delta, "Hel"},
              {:text_delta, "lo"},
-             {:message_delta, %{"stop_reason" => "end_turn"}, %{"total_tokens" => 7}},
+             {:message_delta, %{"stop_reason" => "end_turn"},
+              %{
+                "input_tokens" => 5,
+                "output_tokens" => 2,
+                "cache_read_tokens" => 0,
+                "cache_write_tokens" => 0
+              }},
              {:message_stop}
            ]
   end

@@ -15,11 +15,18 @@ defmodule Clementine.LLM.OpenAI do
   `"additionalProperties": false` and lists all of its properties in
   `required` (an optional one is typed `["string", "null"]`), and the
   API refuses a schema outside it.
+
+  Prompt caching is automatic. A request carries the lane's
+  `prompt_cache_key` (`Clementine.LLM.Cache.key/1`), and on GPT-5.6 and
+  later `prompt_cache_options` with the alias's TTL, or, with `cache:
+  false`, explicit mode with no breakpoints, which turns caching off.
+  Usage reads `input_tokens_details.cached_tokens` and
+  `cache_write_tokens`.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
 
-  alias Clementine.LLM.ModelRegistry
+  alias Clementine.LLM.{Cache, ModelRegistry, ProviderUsage}
   alias Clementine.LLM.Message.Content
   alias Clementine.LLM.Reasoning
   alias Clementine.LLM.ProviderStream
@@ -222,6 +229,7 @@ defmodule Clementine.LLM.OpenAI do
       body
       |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
       |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
+      |> put_cache(resolved, Keyword.get(opts, :cache_key))
 
     body =
       if is_binary(system) and system != "" do
@@ -244,6 +252,25 @@ defmodule Clementine.LLM.OpenAI do
   defp maybe_put_reasoning(body, reasoning) do
     Map.merge(body, Reasoning.to_provider_config!(:openai, reasoning))
   end
+
+  # Caching is automatic. The key keeps a lane's requests on one cache
+  # (routing on models before GPT-5.6, cache accounting after), and
+  # GPT-5.6 and later take the write's lifetime in prompt_cache_options;
+  # with caching off there, explicit mode and no breakpoints turn it off.
+  defp put_cache(body, %{cache: %{enabled: true} = cache}, key) do
+    body
+    |> put_if("prompt_cache_key", key)
+    |> put_if("prompt_cache_options", cache.ttl && %{"ttl" => Cache.wire_ttl(cache.ttl)})
+  end
+
+  defp put_cache(body, %{cache: %{enabled: false}, id: id}, _key) do
+    if Cache.prompt_cache_options?(id),
+      do: Map.put(body, "prompt_cache_options", %{"mode" => "explicit"}),
+      else: body
+  end
+
+  defp put_if(body, _key, nil), do: body
+  defp put_if(body, key, value), do: Map.put(body, key, value)
 
   defp maybe_put_output_schema(body, nil), do: body
 
@@ -312,7 +339,7 @@ defmodule Clementine.LLM.OpenAI do
     %Response{
       content: content,
       stop_reason: stop_reason,
-      usage: Map.get(body, "usage", %{}) || %{}
+      usage: ProviderUsage.openai(Map.get(body, "usage"))
     }
   end
 
@@ -320,7 +347,7 @@ defmodule Clementine.LLM.OpenAI do
     %Response{
       content: [],
       stop_reason: nil,
-      usage: Map.get(body, "usage", %{}) || %{}
+      usage: ProviderUsage.openai(Map.get(body, "usage"))
     }
   end
 

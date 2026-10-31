@@ -53,11 +53,21 @@ defmodule Clementine.LLM.ChatCompletions do
 
   A refusal (`delta.refusal`, or `message.refusal` on `call/5`) arrives
   as the turn's text with stop reason `"refusal"`.
+
+  Prompt caching: an alias with markers (OpenRouter's `anthropic/`
+  models by default, any `:openrouter` or `:openai_compatible` alias with
+  `cache: [markers: true]`) sends a `cache_control` content part on the
+  system prompt and the top-level `cache_control` for the conversation's
+  tail. OpenRouter also gets the lane's `prompt_cache_key`, which it uses
+  for sticky routing. Other servers cache prefixes on their own. A stream
+  asks for usage with `stream_options.include_usage`, and usage reads
+  `prompt_tokens_details.cached_tokens` and `cache_write_tokens` wherever
+  the server reports them.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
 
-  alias Clementine.LLM.ModelRegistry
+  alias Clementine.LLM.{Cache, ModelRegistry, ProviderUsage}
   alias Clementine.LLM.ChatCompletions.{Messages, Tools}
   alias Clementine.LLM.ChatCompletionsStreamParser
   alias Clementine.LLM.ProviderStream
@@ -112,10 +122,12 @@ defmodule Clementine.LLM.ChatCompletions do
   def stream(model, system, messages, tools, opts \\ []) do
     resolved = resolve_model(model)
 
+    # Usage arrives in the stream's last chunk only when asked for.
     body =
       resolved
       |> build_body(system, messages, tools, opts)
       |> Map.put("stream", true)
+      |> Map.put("stream_options", %{"include_usage" => true})
 
     headers = build_headers(resolved)
     url = request_url(resolved)
@@ -256,7 +268,7 @@ defmodule Clementine.LLM.ChatCompletions do
 
     body = %{
       "model" => resolved.id,
-      "messages" => encode_messages(system, messages),
+      "messages" => encode_messages(system, messages, resolved.cache),
       "max_tokens" => max_tokens
     }
 
@@ -264,6 +276,7 @@ defmodule Clementine.LLM.ChatCompletions do
       body
       |> maybe_put_reasoning(resolved.provider, Keyword.get(opts, :reasoning, resolved.reasoning))
       |> maybe_put_output_schema(resolved.structured_output, Keyword.get(opts, :output_schema))
+      |> put_cache(resolved, Keyword.get(opts, :cache_key))
 
     if is_list(tools) and tools != [] do
       body
@@ -274,14 +287,39 @@ defmodule Clementine.LLM.ChatCompletions do
     end
   end
 
-  defp encode_messages(system, messages) do
+  defp encode_messages(system, messages, cache) do
     encoded = Messages.encode_all(messages)
 
     if is_binary(system) and system != "" do
-      [%{"role" => "system", "content" => system} | encoded]
+      [%{"role" => "system", "content" => system_content(system, cache)} | encoded]
     else
       encoded
     end
+  end
+
+  # With markers, the system prompt ends in a cache_control breakpoint,
+  # the stable prefix every run of the agent shares, as Anthropic's
+  # Messages API takes it (OpenRouter passes it through).
+  defp system_content(system, %{enabled: true, markers: true} = cache) do
+    [%{"type" => "text", "text" => system, "cache_control" => Cache.cache_control(cache)}]
+  end
+
+  defp system_content(system, _cache), do: system
+
+  # Markers end with the top-level automatic breakpoint, which follows
+  # the conversation's tail (OpenRouter documents it for Claude on every
+  # provider that serves it). OpenRouter routes a lane's requests to one
+  # provider by prompt_cache_key; no other Chat Completions provider is
+  # sent one, since a strict server may refuse a field it does not know.
+  defp put_cache(body, %{cache: %{enabled: false}}, _key), do: body
+
+  defp put_cache(body, %{cache: cache, provider: provider}, key) do
+    body =
+      if cache.markers,
+        do: Map.put(body, "cache_control", Cache.cache_control(cache)),
+        else: body
+
+    if provider == :openrouter and key, do: Map.put(body, "prompt_cache_key", key), else: body
   end
 
   defp maybe_put_reasoning(body, _provider, nil), do: body
@@ -417,7 +455,7 @@ defmodule Clementine.LLM.ChatCompletions do
     %Response{
       content: content,
       stop_reason: stop_reason,
-      usage: Map.get(body, "usage", %{}) || %{}
+      usage: ProviderUsage.chat_completions(Map.get(body, "usage"))
     }
   end
 
@@ -425,7 +463,7 @@ defmodule Clementine.LLM.ChatCompletions do
     %Response{
       content: [],
       stop_reason: nil,
-      usage: Map.get(body, "usage", %{}) || %{}
+      usage: ProviderUsage.chat_completions(Map.get(body, "usage"))
     }
   end
 
