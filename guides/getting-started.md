@@ -10,10 +10,10 @@ The vocabulary is small and load-bearing:
 
 - **`Clementine.Agent`** — a reusable capability definition: model,
   instructions, tools, defaults. Inert.
-- **`Clementine.Rollout`** — one inner execution spec: agent + input +
-  history + limits. The inner loop is Gather → Act (call the model, execute
-  tool calls, feed results back), repeated until a terminal answer or
-  limit. Inert.
+- **`Clementine.Rollout`** — one execution spec: agent + input +
+  history + limits. Executing it is the model–tool cycle (call the model,
+  execute its tool calls, feed the results back), repeated until a
+  terminal answer or a limit. Inert.
 - **`Clementine.Run`** — one durable attempt to execute a rollout.
 - **`Clementine.Runner`** — the interpreter that animates a run against a
   `Clementine.Lifecycle` (the host storage contract).
@@ -318,9 +318,9 @@ history = [first.input_message | first.messages]
 
 ## Verification is outer control
 
-There is no verifier inside the inner loop. Judging a completed result and
-retrying with feedback happens one floor up, in ordinary code — where it
-can also fan out, compare candidates, or escalate to a human:
+There is no verifier inside the model–tool cycle. Judging a completed
+result and retrying with feedback happens one floor up, in ordinary code —
+where it can also fan out, compare candidates, or escalate to a human:
 
 ```elixir
 defmodule MyApp.JudgedRun do

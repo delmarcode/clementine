@@ -4,7 +4,7 @@ defmodule Clementine do
 
   Clementine models agent work as inert definitions animated by explicit
   execution machinery: an `Clementine.Agent` is a capability definition, a
-  `Clementine.Rollout` is one Gather → Act execution spec, a
+  `Clementine.Rollout` is one execution spec (the model–tool cycle), a
   `Clementine.Run` is one durable attempt, and a `Clementine.Runner` turns
   the crank against the host's `Clementine.Lifecycle`.
 
@@ -64,9 +64,9 @@ defmodule Clementine do
 
   ### Verifiers
 
-  Verification is an outer-control concern, not part of the inner loop:
-  judge a completed result and retry with feedback one floor above the
-  rollout. See `Clementine.Verifier` for the judge-function shape.
+  Verification is an outer-control concern, not part of the model–tool
+  cycle: judge a completed result and retry with feedback one floor above
+  the rollout. See `Clementine.Verifier` for the judge-function shape.
 
       {:ok, result} = Clementine.run(agent, "Refactor the parser")
       :ok = Clementine.Verifier.run_all([MyApp.Verifiers.TestsPassing], result, context)
@@ -83,9 +83,7 @@ defmodule Clementine do
       # config/config.exs
       config :clementine,
         anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
-        openai_api_key: {:system, "OPENAI_API_KEY"},
-        default_model: :claude_sonnet,
-        max_iterations: 10
+        openai_api_key: {:system, "OPENAI_API_KEY"}
 
       config :clementine, :models,
         claude_sonnet: [
@@ -110,6 +108,12 @@ defmodule Clementine do
   Completions dialect (OpenRouter, AWS Bedrock, GCP Vertex, Tinker,
   self-hosted vLLM) route through `Clementine.LLM.ChatCompletions` —
   see that module for provider endpoint and credential configuration.
+
+  There are no built-in model aliases: an agent names one the catalog
+  defines, or a `{provider, id}` tuple. `:retry` tunes provider retries.
+  `:default_model` and `:max_iterations` matter only to
+  `Clementine.AgentServer`, for a process that names neither; an agent
+  names its own model and limits.
   """
 
   alias Clementine.{AgentServer, Events, Result, Rollout, Run, Runner}
