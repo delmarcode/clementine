@@ -37,9 +37,10 @@ defmodule Clementine.Telemetry do
   an alias there reads `alias` now.
   Each is fixed in code, so a metric may tag by it. Run events carry
   `agent_key` where the writer knows it: an execution's own writes (the
-  claim, heartbeats, a park, its end, a drain's requeue, a lost lease)
-  and the runtime reaper's; a resume and a direct cancel of a run no
-  execution holds carry `nil`.
+  claim, heartbeats, a park, its end, a drain's requeue, a lost lease),
+  a loop step's on the runtime (the controller's key), and the runtime
+  reaper's; a resume and a direct cancel of a run no execution holds
+  carry `nil`.
 
   ## Rollout Events
 
@@ -401,7 +402,7 @@ defmodule Clementine.Telemetry do
 
   | Series | Kind | From | Labels |
   |--------|------|------|--------|
-  | `clementine_llm_calls_total` | counter | `:llm :stop` | + `stop_reason` (`"aborted"` for a call a runner signal cut off) |
+  | `clementine_llm_calls_total` | counter | `:llm :stop` | + `stop_reason`: `"aborted"` for a call a runner signal cut off, `"other"` for one outside the providers' known reasons |
   | `clementine_llm_input_tokens_total`, `_output_tokens_total`, `_cache_read_tokens_total`, `_cache_write_tokens_total` | sum | `:llm :stop` | |
   | `clementine_llm_cost_micros_total` | sum | `:llm :stop` | + `currency` |
   | `clementine_llm_duration_milliseconds` | distribution | `:llm :stop` | |
@@ -481,6 +482,12 @@ defmodule Clementine.Telemetry do
 
   @tokens [:input_tokens, :output_tokens, :cache_read_tokens, :cache_write_tokens]
 
+  # The stop reasons the provider clients normalize to. A reason outside
+  # them (an OpenAI-compatible server's own finish_reason) is labeled
+  # "other": a label may not take whatever a server sends.
+  @stop_reasons ~w(end_turn tool_use max_tokens stop_sequence pause_turn refusal
+                   model_context_window_exceeded content_filter incomplete)
+
   @doc """
   The metrics every Clementine app exports, as `Telemetry.Metrics`
   structs: counters, sums, and distributions, never summaries, so a
@@ -505,7 +512,9 @@ defmodule Clementine.Telemetry do
       counter([:clementine, :llm, :calls, :total],
         event_name: @llm_stop,
         measurement: &one/1,
-        description: "Model calls that completed, or that a runner signal cut off (aborted).",
+        description:
+          "Model calls that completed, by stop reason: aborted for one a runner signal cut " <>
+            "off, other for a reason outside the known set.",
         tags: @identity ++ [:stop_reason],
         tag_values: &llm_stop_tag_values/1
       )
@@ -810,8 +819,12 @@ defmodule Clementine.Telemetry do
   # stop_reason is nil when a runner signal (lease loss, drain, cancel
   # push) cut the stream off: labeled "aborted" rather than "".
   defp llm_stop_tag_values(metadata) do
-    metadata |> identity() |> Map.update(:stop_reason, "aborted", &(&1 || "aborted"))
+    metadata |> identity() |> Map.put(:stop_reason, stop_reason(metadata[:stop_reason]))
   end
+
+  defp stop_reason(nil), do: "aborted"
+  defp stop_reason(reason) when reason in @stop_reasons, do: reason
+  defp stop_reason(_other), do: "other"
 
   # `{:app, term}` interrupt codes collapse to `:app`: the tuple's payload
   # is host vocabulary with unbounded cardinality, which a label must not

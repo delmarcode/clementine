@@ -88,7 +88,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
              module: controller(config, row),
              args: row.input || %{},
              policy: row.loop_policy || %{},
-             envelope: row.envelope
+             envelope: row.envelope,
+             agent_key: row.agent_key
            }}
 
         %AgentRun{} ->

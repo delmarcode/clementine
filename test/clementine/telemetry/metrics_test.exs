@@ -312,6 +312,13 @@ defmodule Clementine.Telemetry.MetricsTest do
              series(exports, "clementine_run_reaped_total")
            )
 
+    # A loop's step names its controller's key.
+    assert [{%{agent_key: "thread"}, _} | _] =
+             Enum.filter(
+               sum_by(series(exports, "clementine_run_claims_total")),
+               &match?({%{agent_key: "thread"}, _}, &1)
+             )
+
     # A resume has no execution to name its agent.
     assert {%{agent_key: nil}, 1} in sum_by(series(exports, "clementine_run_resumed_total"))
   end
@@ -376,6 +383,21 @@ defmodule Clementine.Telemetry.MetricsTest do
       assert Map.has_key?(labels, name), "#{name} is gone"
       assert tags -- labels[name] == [], "#{name} lost a label: #{inspect(tags)}"
     end
+  end
+
+  test "a stop reason outside the providers' known ones is labeled other" do
+    calls =
+      Enum.find(
+        Clementine.Telemetry.metrics(),
+        &(Enum.join(&1.name, "_") == "clementine_llm_calls_total")
+      )
+
+    label = &calls.tag_values.(%{stop_reason: &1}).stop_reason
+
+    assert label.("end_turn") == "end_turn"
+    assert label.("max_tokens") == "max_tokens"
+    assert label.(nil) == "aborted"
+    assert label.("some_server_finish_reason_#{System.unique_integer()}") == "other"
   end
 
   test "the reaped counter collapses an app's own codes to a bounded label" do
