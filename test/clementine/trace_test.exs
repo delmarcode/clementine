@@ -141,10 +141,13 @@ defmodule Clementine.TraceTest do
       assert fingerprint == Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
       assert fingerprint =~ ~r/\A[0-9a-f]{64}\z/
 
+      # The alias that priced the call; it has no prices here, so no cost.
       assert %{
                "iteration" => 1,
                "stop_reason" => "tool_use",
                "usage" => %{"input_tokens" => 5, "output_tokens" => 2},
+               "alias" => "claude_sonnet",
+               "cost" => nil,
                "content" => [
                  %{
                    "type" => "tool_use",
@@ -844,6 +847,24 @@ defmodule Clementine.TraceTest do
       assert payload["args"] == %{"nested" => %{"atom" => "value"}}
       assert payload["result"] == "nul�byte"
       assert payload["approval"] == %{"verdict" => "approved", "by" => "{:user, 7}"}
+    end
+
+    test "a model call on a direct reference has no alias, so nothing prices it" do
+      payload =
+        Trace.payload(
+          :model_call,
+          Trace.model_call(
+            {:anthropic, "claude-sonnet-5"},
+            1,
+            12,
+            "end_turn",
+            %Clementine.Usage{input_tokens: 100, output_tokens: 10},
+            nil
+          ),
+          :facts
+        )
+
+      assert %{"alias" => nil, "cost" => nil, "usage" => %{"input_tokens" => 100}} = payload
     end
   end
 end

@@ -921,6 +921,7 @@ defmodule Clementine.Rollout do
       exec,
       :model_call,
       Trace.model_call(
+        exec.model,
         exec.iteration,
         to_ms(duration),
         stop_reason,
@@ -983,10 +984,15 @@ defmodule Clementine.Rollout do
         {:signal, signal, Accumulator.to_response(acc), duration}
 
       Accumulator.error?(acc) ->
+        # What the stream reported before the error burned too, and the
+        # trace prices it, so the event carries it as stop does.
+        {measurements, currency} =
+          call_measurements(duration, Clementine.Usage.new(acc.usage), metadata.model)
+
         :telemetry.execute(
           [:clementine, :llm, :exception],
-          %{duration: duration},
-          Map.merge(metadata, %{kind: :error, reason: acc.error})
+          measurements,
+          Map.merge(metadata, %{kind: :error, reason: acc.error, currency: currency})
         )
 
         {:error, acc.error, acc.usage, duration}
@@ -1006,24 +1012,42 @@ defmodule Clementine.Rollout do
   end
 
   defp emit_llm_stop(metadata, duration, %Clementine.Usage{} = usage, stop_reason) do
+    {measurements, currency} = call_measurements(duration, usage, metadata.model)
+
     :telemetry.execute(
       [:clementine, :llm, :stop],
-      %{
-        duration: duration,
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_write_tokens: usage.cache_write_tokens
-      },
-      Map.put(metadata, :stop_reason, stop_reason)
+      measurements,
+      Map.merge(metadata, %{stop_reason: stop_reason, currency: currency})
     )
+  end
+
+  # A call's measurements, and the currency of its cost. A priced call
+  # adds `cost_micros`; an unpriced one leaves it out rather than
+  # reporting zero, and reporters skip an event whose measurement is
+  # missing.
+  defp call_measurements(duration, %Clementine.Usage{} = usage, model) do
+    measurements = %{
+      duration: duration,
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      cache_read_tokens: usage.cache_read_tokens,
+      cache_write_tokens: usage.cache_write_tokens
+    }
+
+    case Clementine.Cost.of(usage, model) do
+      %Clementine.Cost{micros: micros, currency: currency} ->
+        {Map.put(measurements, :cost_micros, micros), currency}
+
+      nil ->
+        {measurements, nil}
+    end
   end
 
   defp emit_llm_raise(metadata, started, kind, reason, stacktrace) do
     :telemetry.execute(
       [:clementine, :llm, :exception],
       %{duration: System.monotonic_time() - started},
-      Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: stacktrace})
+      Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: stacktrace, currency: nil})
     )
   end
 

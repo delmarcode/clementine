@@ -89,7 +89,7 @@ lifecycle, or a reaper into the app.
 - `trace/1` returns the run's trace, oldest first: a
   `Clementine.Trace.Entry` for each execution (`:execution`: the model,
   the tools offered, the agent's fingerprint, the system prompt), each
-  model call (`:model_call`: usage, timing, what it said), each tool
+  model call (`:model_call`: usage, its cost, timing, what it said), each tool
   call (`:tool_call`: name, arguments, result, timing, the approval it
   waited on, and the tool policy's verdict), each answer of the tool
   policy (`:policy`), each skill loaded (`:skill_load`: its name, the
@@ -100,6 +100,14 @@ lifecycle, or a reaper into the app.
   own: `for %{kind: :tool_call, payload: %{"name" => name}} <- trace,
   do: name`. Like `get/1` it checks nothing: check the subject or actor
   before showing it.
+- `cost(run_id)` is what a run's model calls cost, a `Clementine.Cost`
+  (integer `micros` of the catalog's currency), frozen on each call at
+  the prices of the moment; `children: true` adds every run below it
+  (delegates, a loop's turns), and `subject_cost(subject)` totals a
+  subject. Prices are your config, the `pricing:` key in
+  `docs/MODELS.md`; without them a cost is `nil`, never zero. A cost
+  goes with its trace on `purge/1`: copy `cost(run.id)` into your own
+  table from `run_finished/2` if spend must outlive it.
 - The queries: `active?(agent, subject)` is a task's lane (does the agent
   have an active run on the subject); `active(subject)` is the thread's
   active turn, of whichever agent, or `nil`; `latest(subject, opts)` is

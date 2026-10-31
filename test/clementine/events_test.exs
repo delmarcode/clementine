@@ -171,6 +171,27 @@ defmodule Clementine.EventsTest do
              }
     end
 
+    test "a resumed execution counts from its checkpoint's usage, as its rollout does" do
+      checkpoint = %Clementine.Checkpoint{
+        rollout_id: "rollout_1",
+        usage: %Usage{input_tokens: 2_000, output_tokens: 50, cache_read_tokens: 1_500}
+      }
+
+      stamper =
+        Events.stamper(CollectingSink, %{lease(2) | resume: {checkpoint, {:approved, %{}}}})
+
+      Stamper.emit(stamper, :usage_delta, %{input_tokens: 250, output_tokens: 50})
+
+      assert Stamper.usage(stamper) == %Usage{
+               input_tokens: 2_250,
+               output_tokens: 100,
+               cache_read_tokens: 1_500
+             }
+
+      # Seeding counts no event: the stream's numbering starts at 1.
+      assert Stamper.cursor(stamper) == {2, 1}
+    end
+
     test "is readable from another process — the heartbeat's sampling path" do
       stamper = Events.stamper(CollectingSink, lease())
       Stamper.emit(stamper, :usage_delta, %{input_tokens: 11, output_tokens: 2})

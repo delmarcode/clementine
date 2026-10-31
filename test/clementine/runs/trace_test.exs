@@ -180,6 +180,29 @@ defmodule Clementine.Runs.TraceTest do
     assert [{1, 1, :execution}, {1, 2, :model_call}] = kinds(Runs.trace(run.id))
   end
 
+  test "a resumed run cancelled in its second execution keeps its first's usage on the row" do
+    {:ok, run} = Runs.start(Approval, "Tell the team")
+    id = run.id
+    expect_turn(tool_events("tu_1", "send_note", %{"text" => "hi"}))
+    assert :ok = perform_job(Worker, %{"run_id" => id})
+    assert :ok = Runs.resume(id, {:approved, %{by: "alice"}})
+
+    expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+      assert {:ok, :flagged} = Runs.cancel(id)
+
+      [
+        {:message_start, %{"usage" => %{"input_tokens" => 42, "output_tokens" => 1}}},
+        {:signal, {:clementine, :cancel, %{"code" => "cancelled"}}}
+      ]
+    end)
+
+    assert :ok = perform_job(Worker, %{"run_id" => id})
+
+    # The first execution's 10 in and 5 out, then the cut-off call's.
+    assert %AgentRun{status: "cancelled", usage: %{"input_tokens" => 52, "output_tokens" => 6}} =
+             Runs.get(id)
+  end
+
   test "a cancelled run keeps the usage its stream reported, on the row and in the trace" do
     {:ok, run} = Runs.start(Echo, "Tell me a long story")
     id = run.id

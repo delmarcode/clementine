@@ -135,6 +135,28 @@ defmodule Clementine.Telemetry.LoggerTest do
       assert log =~ "input_tokens=850"
       assert log =~ "output_tokens=120"
       assert log =~ "stop_reason=tool_use"
+      refute log =~ "cost_micros="
+    end
+
+    test "llm stop logs a priced call's cost" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :llm, :stop],
+            %{duration: 0, input_tokens: 850, output_tokens: 120, cost_micros: 4_350},
+            %{
+              model: :claude_sonnet,
+              iteration: 1,
+              stop_reason: "end_turn",
+              currency: "USD",
+              streaming: true
+            }
+          )
+        end)
+
+      assert log =~ "cost_micros=4350 currency=USD"
     end
 
     test "tool stop logs tool summary with duration and status" do

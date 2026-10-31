@@ -52,9 +52,12 @@ defmodule Clementine.LLM.ModelRegistry do
   sends no cache hints, and `[ttl: ..., markers: ...]` changes the
   default's lifetime or markers (`Clementine.LLM.Cache`). Caching is on
   without it.
+
+  `:pricing` is the alias's prices, which `Clementine.Cost` charges its
+  usage at (`Clementine.LLM.Pricing`); an alias without it costs `nil`.
   """
 
-  alias Clementine.LLM.{Cache, Reasoning}
+  alias Clementine.LLM.{Cache, Pricing, Reasoning}
 
   @providers [:anthropic, :bedrock, :openai, :openai_compatible, :openrouter, :vertex]
 
@@ -77,6 +80,7 @@ defmodule Clementine.LLM.ModelRegistry do
           api_key: api_key() | nil,
           structured_output: :native | :instructions,
           cache: Cache.t(),
+          pricing: Pricing.t() | nil,
           alias: atom() | nil
         }
 
@@ -91,7 +95,8 @@ defmodule Clementine.LLM.ModelRegistry do
     base_url: [type: :string],
     api_key: [type: {:custom, __MODULE__, :validate_api_key, []}],
     structured_output: [type: {:in, [:native, :instructions]}, default: :native],
-    cache: [type: {:custom, Cache, :validate_config, []}, default: true]
+    cache: [type: {:custom, Cache, :validate_config, []}, default: true],
+    pricing: [type: {:custom, Pricing, :validate, []}, default: nil]
   ]
 
   @doc false
@@ -134,7 +139,7 @@ defmodule Clementine.LLM.ModelRegistry do
               "Invalid :clementine, :models entry: expected {alias_atom, keyword_config}, got #{inspect(other)}"
     end)
 
-    :ok
+    ensure_pricing!(models)
   end
 
   @doc """
@@ -166,6 +171,7 @@ defmodule Clementine.LLM.ModelRegistry do
           api_key: nil,
           structured_output: :native,
           cache: cache,
+          pricing: nil,
           alias: nil
         }
     end
@@ -191,6 +197,7 @@ defmodule Clementine.LLM.ModelRegistry do
           api_key: Keyword.get(validated, :api_key),
           structured_output: Keyword.fetch!(validated, :structured_output),
           cache: Keyword.fetch!(validated, :cache),
+          pricing: Keyword.fetch!(validated, :pricing),
           alias: model_alias
         }
     end
@@ -257,6 +264,33 @@ defmodule Clementine.LLM.ModelRegistry do
               "#{context}: structured_output: :instructions is only supported for chat " <>
                 "completions providers #{inspect(@chat_completions_providers)}"
       end
+    end
+  end
+
+  # What prices need from the rest of the catalog, read off each resolved
+  # alias: a per-TTL cache_write names the rate for the TTL the alias
+  # writes with, and every priced alias names one currency, so costs
+  # across the catalog add up.
+  defp ensure_pricing!(models) do
+    resolved = Enum.map(models, fn {model_alias, _config} -> resolve!(model_alias) end)
+
+    Enum.each(resolved, fn model ->
+      with {:error, message} <- Pricing.validate_for_model(model) do
+        raise ArgumentError, "#{model_config_context(model.alias)}: :pricing #{message}"
+      end
+    end)
+
+    case Enum.uniq(for %{pricing: %Pricing{currency: currency}} <- resolved, do: currency) do
+      [] ->
+        :ok
+
+      [_one] ->
+        :ok
+
+      currencies ->
+        raise ArgumentError,
+              "Invalid :clementine, :models configuration: every priced alias names one " <>
+                "currency, so their costs add up; got #{inspect(currencies)}"
     end
   end
 

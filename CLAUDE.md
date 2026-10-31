@@ -58,7 +58,7 @@ lib/
 │   ├── agent.ex                   # Agent struct; `use Clementine.Agent` (key, turn, agent/1, history/1)
 │   ├── rollout.ex                 # Rollout spec and the engine, execute/2
 │   ├── run.ex, runner.ex          # One durable attempt; claim → execute → suspend or finish, once
-│   ├── result.ex, error.ex, usage.ex
+│   ├── result.ex, error.ex, usage.ex, cost.ex
 │   ├── lifecycle.ex, lifecycle/   # Storage contract; Facts, Transition, Ephemeral; Protocol and
 │   │                              #   the Ecto adapter (internal)
 │   ├── lease.ex, heartbeat.ex, reconciler.ex, interrupt_reason.ex   # Fencing, liveness, reaping
@@ -76,7 +76,7 @@ lib/
 │   ├── telemetry.ex, telemetry/
 │   ├── tool.ex, tool_runner.ex, tool_*.ex   # Tool macro, supervised batches, context, input repair
 │   ├── tools/                     # Built-in tools: ReadFile, WriteFile, ListDir, Search, Bash
-│   ├── llm/                       # Provider clients, stream parsers, model registry, router
+│   ├── llm/                       # Provider clients, stream parsers, model registry, pricing, router
 │   ├── host_call.ex               # Host code run mid-execution, bounded like a tool call
 │   ├── agent_server.ex            # GenServer for local interactive use; each turn an in-process run
 │   ├── verifier.ex

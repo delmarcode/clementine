@@ -44,6 +44,13 @@ defmodule Clementine.Trace do
     - `"usage"` — `Clementine.Usage.to_map/1`'s map (`"input_tokens"`,
       `"output_tokens"`, `"cache_read_tokens"`, `"cache_write_tokens"`),
       what the stream reported, so far as it got
+    - `"alias"` — the catalog alias the call ran on, whose prices priced
+      it; `nil` for a direct `{provider, id}` reference. Two aliases may
+      share a provider id at different prices, so the id is not enough.
+    - `"cost"` — what the call cost, frozen when it ended at the prices
+      the alias had then: `Clementine.Cost.to_map/1`'s map
+      (`"currency"`, `"micros"`), or `nil` for an alias without prices
+      (`Clementine.Runs.cost/2` sums them)
     - `"content"` — the assistant's blocks, as
       `Clementine.LLM.Message.Content.to_map/1` maps them
   - `:tool_call`, once per tool call started, a call a cancel or a drain
@@ -183,9 +190,10 @@ defmodule Clementine.Trace do
   end
 
   @doc false
-  # The `:model_call` payload. `content` is the response's blocks, or nil
-  # for a call that produced none.
+  # The `:model_call` payload of a call to `model`. `content` is the
+  # response's blocks, or nil for a call that produced none.
   @spec model_call(
+          Clementine.LLM.ModelRegistry.model_ref(),
           pos_integer(),
           non_neg_integer(),
           String.t() | nil,
@@ -193,12 +201,14 @@ defmodule Clementine.Trace do
           list() | nil
         ) ::
           map()
-  def model_call(iteration, duration_ms, stop_reason, %Clementine.Usage{} = usage, content) do
+  def model_call(model, iteration, duration_ms, stop_reason, %Clementine.Usage{} = usage, content) do
     %{
       "iteration" => iteration,
       "duration_ms" => duration_ms,
       "stop_reason" => stop_reason,
       "usage" => Clementine.Usage.to_map(usage),
+      "alias" => alias_name(model),
+      "cost" => usage |> Clementine.Cost.of(model) |> Clementine.Cost.to_map(),
       "content" => content && Enum.map(content, &content_map/1)
     }
   end
@@ -363,6 +373,9 @@ defmodule Clementine.Trace do
       "tools" => Enum.map(skill.tools, & &1.__schema__())
     }
   end
+
+  defp alias_name(model) when is_atom(model) and not is_nil(model), do: Atom.to_string(model)
+  defp alias_name(_tuple), do: nil
 
   # The provider's id for a model reference; a reference the catalog does
   # not hold (a test's) is recorded as written rather than failing the run.

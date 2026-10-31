@@ -285,6 +285,92 @@ defmodule Clementine.TelemetryTest do
                        }, %{stop_reason: "end_turn"}}
     end
 
+    test "stop carries a priced call's cost; an unpriced call leaves it out, never zero",
+         %{store: store, ref: ref} do
+      previous = Application.get_env(:clementine, :models)
+      on_exit(fn -> Application.put_env(:clementine, :models, previous) end)
+
+      # Illustrative rates: 3.00 in, 15.00 out, 0.30 read, 3.75 write per
+      # million tokens.
+      Application.put_env(
+        :clementine,
+        :models,
+        Keyword.put(previous, :claude_sonnet,
+          provider: :anthropic,
+          id: "claude-sonnet-5",
+          pricing: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
+        )
+      )
+
+      attach(@llm_events)
+      MemoryLifecycle.seed_queued(store, ref)
+
+      usage = %{
+        "input_tokens" => 900,
+        "output_tokens" => 3,
+        "cache_read_tokens" => 800,
+        "cache_write_tokens" => 60
+      }
+
+      expect_stream([
+        {:text_delta, "done"},
+        {:message_delta, %{"stop_reason" => "end_turn"}, usage}
+      ])
+
+      assert {:finished, %Facts{status: :completed}} = execute(build_run(ref), store)
+
+      # 40 × 3.00 + 800 × 0.30 + 60 × 3.75 + 3 × 15.00 = 630 micro-dollars.
+      assert_received {:telemetry, [:clementine, :llm, :stop],
+                       %{input_tokens: 900, cost_micros: 630},
+                       %{model: :claude_sonnet, currency: "USD"}}
+
+      Application.put_env(:clementine, :models, previous)
+      unpriced = make_ref()
+      MemoryLifecycle.seed_queued(store, unpriced)
+
+      expect_stream([
+        {:text_delta, "done"},
+        {:message_delta, %{"stop_reason" => "end_turn"}, usage}
+      ])
+
+      assert {:finished, %Facts{status: :completed}} = execute(build_run(unpriced), store)
+
+      assert_received {:telemetry, [:clementine, :llm, :stop], measurements, %{currency: nil}}
+
+      refute Map.has_key?(measurements, :cost_micros)
+    end
+
+    test "a provider error after the stream's start carries what it burned, priced",
+         %{store: store, ref: ref} do
+      previous = Application.get_env(:clementine, :models)
+      on_exit(fn -> Application.put_env(:clementine, :models, previous) end)
+
+      Application.put_env(
+        :clementine,
+        :models,
+        Keyword.put(previous, :claude_sonnet,
+          provider: :anthropic,
+          id: "claude-sonnet-5",
+          pricing: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
+        )
+      )
+
+      attach(@llm_events)
+      MemoryLifecycle.seed_queued(store, ref)
+
+      expect_stream([
+        {:message_start, %{"usage" => %{"input_tokens" => 1_000, "output_tokens" => 1}}},
+        {:error, :overloaded}
+      ])
+
+      assert {:finished, %Facts{status: :failed}} = execute(build_run(ref), store)
+
+      # 1,000 × 3.00 + 1 × 15.00 = 3,015 micro-dollars.
+      assert_received {:telemetry, [:clementine, :llm, :exception],
+                       %{input_tokens: 1_000, output_tokens: 1, cost_micros: 3_015},
+                       %{kind: :error, reason: :overloaded, currency: "USD"}}
+    end
+
     test "a provider error in the stream emits exception", %{store: store, ref: ref} do
       attach(@llm_events)
       MemoryLifecycle.seed_queued(store, ref)
@@ -568,6 +654,14 @@ defmodule Clementine.TelemetryTest do
                metric.__struct__ == Telemetry.Metrics.Counter and
                  metric.event_name == [:clementine, :llm, :stop] and
                  metric.measurement == :input_tokens
+             end)
+    end
+
+    test "spend sums each priced call's cost by currency" do
+      assert Enum.any?(Clementine.Telemetry.metrics(), fn metric ->
+               metric.__struct__ == Telemetry.Metrics.Sum and
+                 metric.event_name == [:clementine, :llm, :stop] and
+                 metric.measurement == :cost_micros and metric.tags == [:currency]
              end)
     end
 

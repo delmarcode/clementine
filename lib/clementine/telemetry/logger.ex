@@ -114,7 +114,7 @@ defmodule Clementine.Telemetry.Logger do
     Logger.log(config.level, fn ->
       streaming = if metadata.streaming, do: " streaming=true", else: ""
 
-      "[Clementine] LLM call completed iteration=#{metadata.iteration} duration=#{duration_ms(measurements)}ms input_tokens=#{measurements.input_tokens} output_tokens=#{measurements.output_tokens} stop_reason=#{metadata.stop_reason}#{streaming}"
+      "[Clementine] LLM call completed iteration=#{metadata.iteration} duration=#{duration_ms(measurements)}ms input_tokens=#{measurements.input_tokens} output_tokens=#{measurements.output_tokens}#{cost(measurements, metadata)} stop_reason=#{metadata.stop_reason}#{streaming}"
     end)
   end
 
@@ -290,6 +290,11 @@ defmodule Clementine.Telemetry.Logger do
   defp loop_summary(metadata) do
     "loop=#{inspect(metadata.loop_ref)} epoch=#{metadata.epoch}"
   end
+
+  defp cost(%{cost_micros: micros}, %{currency: currency}),
+    do: " cost_micros=#{micros} currency=#{currency}"
+
+  defp cost(_measurements, _metadata), do: ""
 
   defp duration_ms(%{duration: duration}) do
     System.convert_time_unit(duration, :native, :millisecond)
