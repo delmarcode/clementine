@@ -114,9 +114,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # A3a: a crashed step requeues unconditionally, with its step job in
     # the same transaction, as a resume does. A loop's epoch counts its
     # lifetime claims, and the commit is replayable by construction.
-    defp apply_loop_verdict({:requeue, reason}, repo, _row, facts) do
+    defp apply_loop_verdict({:requeue, reason}, repo, row, facts) do
       case Emissions.after_commit(fn ->
-             repo.transaction(fn -> requeue_loop(repo, facts, reason) end)
+             repo.transaction(fn -> requeue_loop(repo, facts, reason, row.agent_key) end)
            end) do
         {:ok, :ok} -> :ok
         {:error, :stale} -> :ok
@@ -144,8 +144,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     # The one terminal verdict a loop keeps: a live-wedged step runner past
     # its deadline and the grace.
-    defp apply_loop_verdict({:interrupt, reason}, _repo, _row, facts) do
-      case Protocol.interrupt(Lifecycle, facts, reason) do
+    defp apply_loop_verdict({:interrupt, reason}, _repo, row, facts) do
+      case Protocol.interrupt(Lifecycle, facts, reason, nil, agent_key: row.agent_key) do
         {:ok, _facts} -> :ok
         {:error, :stale} -> :ok
         {:error, other} -> log_sweep_error(facts.ref, other, nil)
@@ -160,8 +160,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       e -> log_sweep_error(facts.ref, Exception.message(e), nil)
     end
 
-    defp requeue_loop(repo, facts, reason) do
-      case Protocol.requeue(Lifecycle, facts, reason) do
+    defp requeue_loop(repo, facts, reason, agent_key) do
+      case Protocol.requeue(Lifecycle, facts, reason, nil, agent_key: agent_key) do
         {:ok, _facts} -> Loops.enqueue_step(facts.ref, nil)
         {:error, reason} -> repo.rollback(reason)
       end
@@ -187,7 +187,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
         case judge(facts, jobs[row.oban_job_id], now, policy) do
           :healthy -> reconcile_delegation(facts, now, policy, acc)
-          verdict -> apply_verdict(verdict, repo, facts, acc)
+          verdict -> apply_verdict(verdict, repo, facts, row.agent_key, acc)
         end
       end)
     end
@@ -270,8 +270,10 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     defp claim_clock(facts, _job, _now), do: facts
 
-    defp apply_verdict({:interrupt, reason}, _repo, facts, acc) do
-      case Protocol.interrupt(Lifecycle, facts, reason) do
+    # The row's agent key rides the run event the verdict writes, so the
+    # reap and requeue metrics split by agent.
+    defp apply_verdict({:interrupt, reason}, _repo, facts, agent_key, acc) do
+      case Protocol.interrupt(Lifecycle, facts, reason, nil, agent_key: agent_key) do
         {:ok, _facts} -> %{acc | interrupted: acc.interrupted + 1}
         # A racing finish, or another reaper, won: the guard working.
         {:error, :stale} -> acc
@@ -279,11 +281,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp apply_verdict({:requeue, reason}, repo, facts, acc) do
+    defp apply_verdict({:requeue, reason}, repo, facts, agent_key, acc) do
       # The host hears of the requeue once its transaction commits, and
       # never if it rolls back.
       case Emissions.after_commit(fn ->
-             repo.transaction(fn -> requeue(repo, facts, reason) end)
+             repo.transaction(fn -> requeue(repo, facts, reason, agent_key) end)
            end) do
         {:ok, :ok} -> %{acc | requeued: acc.requeued + 1}
         {:error, reason} when reason in [:stale, :effects_present] -> acc
@@ -291,13 +293,13 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp apply_verdict(_healthy, _repo, _facts, acc), do: acc
+    defp apply_verdict(_healthy, _repo, _facts, _agent_key, acc), do: acc
 
     # The requeue and its new job commit together, for the reason
     # Clementine.Runs.resume/2 gives: apart, another node's sweep could
     # interrupt the queued run before its job exists.
-    defp requeue(repo, facts, reason) do
-      case Protocol.requeue(Lifecycle, facts, reason) do
+    defp requeue(repo, facts, reason, agent_key) do
+      case Protocol.requeue(Lifecycle, facts, reason, nil, agent_key: agent_key) do
         {:ok, _facts} -> Worker.re_enqueue!(facts.ref)
         {:error, reason} -> repo.rollback(reason)
       end

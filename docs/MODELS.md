@@ -503,7 +503,9 @@ the currency, here $0.001284.
 - `[:clementine, :llm, :stop]` carries a priced call's `cost_micros`,
   with `currency` in its metadata, and so does `[:clementine, :llm,
   :exception]` for a call a provider error ended, at what it had
-  reported; `Clementine.Telemetry.metrics/0` sums both.
+  reported; `Clementine.Telemetry.metrics/0` sums them by agent, provider,
+  model, alias, and currency, as `clementine_llm_cost_micros_total` and
+  `clementine_llm_exception_cost_micros_total`.
 - `Clementine.Cost.of(usage, alias)` prices any usage at today's prices:
   an in-process run's `result.usage`, or a trace entry's usage to reprice
   it.

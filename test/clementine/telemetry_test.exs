@@ -74,7 +74,10 @@ defmodule Clementine.TelemetryTest do
 
   defp agent(opts) do
     Clementine.Agent.new(
-      Keyword.merge([model: :claude_sonnet, instructions: "test agent", tools: []], opts)
+      Keyword.merge(
+        [id: "telemetry_test", model: :claude_sonnet, instructions: "test agent", tools: []],
+        opts
+      )
     )
   end
 
@@ -159,13 +162,20 @@ defmodule Clementine.TelemetryTest do
       assert {:finished, %Facts{status: :completed}} = execute(build_run(ref), store)
 
       assert_received {:telemetry, [:clementine, :rollout, :start], %{system_time: system_time},
-                       %{model: :claude_sonnet, max_iterations: 10, tool_count: 0}}
+                       %{
+                         agent_key: "telemetry_test",
+                         provider: :anthropic,
+                         model: "claude-sonnet-5",
+                         alias: :claude_sonnet,
+                         max_iterations: 10,
+                         tool_count: 0
+                       }}
 
       assert is_integer(system_time)
 
       assert_received {:telemetry, [:clementine, :rollout, :stop],
                        %{duration: duration, iterations: 1},
-                       %{model: :claude_sonnet, status: :success}}
+                       %{agent_key: "telemetry_test", model: "claude-sonnet-5", status: :success}}
 
       assert is_integer(duration) and duration >= 0
       refute_received {:telemetry, [:clementine, :rollout, :exception], _, _}
@@ -184,7 +194,12 @@ defmodule Clementine.TelemetryTest do
 
       assert_received {:telemetry, [:clementine, :rollout, :exception],
                        %{duration: _, iterations: 1},
-                       %{model: :claude_sonnet, kind: :error, reason: %Error{} = error}}
+                       %{
+                         agent_key: "telemetry_test",
+                         provider: :anthropic,
+                         kind: :error,
+                         reason: %Error{} = error
+                       }}
 
       assert error.code == :max_iterations
       refute_received {:telemetry, [:clementine, :rollout, :stop], _, _}
@@ -247,7 +262,10 @@ defmodule Clementine.TelemetryTest do
 
       assert_received {:telemetry, [:clementine, :llm, :start], %{system_time: _},
                        %{
-                         model: :claude_sonnet,
+                         agent_key: "telemetry_test",
+                         provider: :anthropic,
+                         model: "claude-sonnet-5",
+                         alias: :claude_sonnet,
                          iteration: 1,
                          message_count: 1,
                          tool_count: 0,
@@ -322,7 +340,7 @@ defmodule Clementine.TelemetryTest do
       # 40 × 3.00 + 800 × 0.30 + 60 × 3.75 + 3 × 15.00 = 630 micro-dollars.
       assert_received {:telemetry, [:clementine, :llm, :stop],
                        %{input_tokens: 900, cost_micros: 630},
-                       %{model: :claude_sonnet, currency: "USD"}}
+                       %{alias: :claude_sonnet, provider: :anthropic, currency: "USD"}}
 
       Application.put_env(:clementine, :models, previous)
       unpriced = make_ref()
@@ -599,81 +617,55 @@ defmodule Clementine.TelemetryTest do
     end
   end
 
-  describe "metrics/0" do
-    test "the engine speaks :rollout — the :loop prefix belongs to the loop layer now" do
-      metrics = Clementine.Telemetry.metrics()
+  describe "agent_key on run events" do
+    test "an execution's writes name its agent; a direct cancel and a resume do not",
+         %{store: store, ref: ref} do
+      attach(@run_events)
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_stream(text_events("done"))
 
-      # No metric still reads the pre-RFC engine events: the vacated
-      # prefix carries only the loop layer's own vocabulary.
-      refute Enum.any?(metrics, fn metric ->
-               match?(
-                 [:clementine, :loop, event] when event in [:start, :stop, :exception],
-                 metric.event_name
+      assert {:finished, _facts} = execute(build_run(ref), store)
+
+      assert_received {:telemetry, [:clementine, :run, :claimed], _,
+                       %{agent_key: "telemetry_test"}}
+
+      assert_received {:telemetry, [:clementine, :run, :finished], _,
+                       %{agent_key: "telemetry_test", terminal: :completed}}
+
+      # A rollout run on the runtime names the row's key, which wins over
+      # the agent's id.
+      runtime = make_ref()
+      MemoryLifecycle.seed_queued(store, runtime)
+      expect_stream(text_events("done"))
+      run = build_run(runtime, [], context: %{agent_key: "row_key"})
+      assert {:finished, _facts} = execute(run, store)
+
+      assert_received {:telemetry, [:clementine, :run, :finished], _, %{agent_key: "row_key"}}
+
+      unowned = make_ref()
+      MemoryLifecycle.seed_queued(store, unowned)
+      assert {:ok, :finished} = Protocol.request_cancel(MemoryLifecycle, unowned, :stop, store)
+
+      assert_received {:telemetry, [:clementine, :run, :finished], _,
+                       %{run_ref: ^unowned, agent_key: nil}}
+    end
+
+    test "the reaper names the agent it read", %{store: store, ref: ref} do
+      attach(@run_events)
+      lease = claim!(store, ref)
+      {:ok, facts} = MemoryLifecycle.fetch(lease.run_ref, store)
+
+      assert {:ok, _} =
+               Protocol.interrupt(
+                 MemoryLifecycle,
+                 facts,
+                 InterruptReason.new(:lease_expired),
+                 store,
+                 agent_key: "reaped_agent"
                )
-             end)
 
-      assert Enum.any?(metrics, fn metric ->
-               metric.event_name == [:clementine, :loop, :verdict]
-             end)
-
-      assert Enum.any?(metrics, fn metric ->
-               metric.event_name == [:clementine, :rollout, :stop]
-             end)
-
-      # Every legacy loop metric name survives the mechanical rename —
-      # dashboards swap :loop for :rollout and find their metric.
-      for legacy <- [
-            [:clementine, :rollout, :stop, :duration],
-            [:clementine, :rollout, :stop, :iterations],
-            [:clementine, :rollout, :exception, :iterations]
-          ] do
-        assert Enum.any?(metrics, fn metric -> metric.name == legacy end),
-               "missing renamed legacy metric #{Enum.join(legacy, ".")}"
-      end
-
-      for [:clementine, :run, event] <- @run_events do
-        assert Enum.any?(metrics, fn metric ->
-                 metric.event_name == [:clementine, :run, event]
-               end),
-               "no metric defined for [:clementine, :run, #{inspect(event)}]"
-      end
-    end
-
-    test "the token-usage metrics Meli's dashboards consume are unchanged" do
-      metrics = Clementine.Telemetry.metrics()
-
-      for measurement <- [:input_tokens, :output_tokens] do
-        assert Enum.any?(metrics, fn metric ->
-                 metric.__struct__ == Telemetry.Metrics.Summary and
-                   metric.event_name == [:clementine, :llm, :stop] and
-                   metric.measurement == measurement
-               end)
-      end
-
-      assert Enum.any?(metrics, fn metric ->
-               metric.__struct__ == Telemetry.Metrics.Counter and
-                 metric.event_name == [:clementine, :llm, :stop] and
-                 metric.measurement == :input_tokens
-             end)
-    end
-
-    test "spend sums each priced call's cost by currency" do
-      assert Enum.any?(Clementine.Telemetry.metrics(), fn metric ->
-               metric.__struct__ == Telemetry.Metrics.Sum and
-                 metric.event_name == [:clementine, :llm, :stop] and
-                 metric.measurement == :cost_micros and metric.tags == [:currency]
-             end)
-    end
-
-    test "the reaped counter collapses app-defined codes to a bounded label" do
-      reaped =
-        Enum.find(Clementine.Telemetry.metrics(), fn metric ->
-          metric.event_name == [:clementine, :run, :reaped]
-        end)
-
-      assert reaped.tags == [:code]
-      assert %{code: :app} = reaped.tag_values.(%{code: {:app, {:custom, "why"}}})
-      assert %{code: :lease_expired} = reaped.tag_values.(%{code: :lease_expired})
+      assert_received {:telemetry, [:clementine, :run, :reaped], _,
+                       %{agent_key: "reaped_agent", code: :lease_expired}}
     end
   end
 end

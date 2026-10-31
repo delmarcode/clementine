@@ -43,6 +43,8 @@ defmodule Clementine.ToolRunner do
     results are collected. With a low `:max_concurrency`, queued tasks
     do not start their timeout until they are actually spawned.
   - `:max_concurrency` - Maximum parallel tool executions (default: `length(tool_calls)`)
+  - `:metadata` - a map merged into every `[:clementine, :tool, ...]`
+    event's metadata: the rollout's agent key, provider, model, and alias
 
   ## Returns
 
@@ -54,6 +56,7 @@ defmodule Clementine.ToolRunner do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     max_concurrency = Keyword.get(opts, :max_concurrency, length(tool_calls))
     task_supervisor = Keyword.get(opts, :task_supervisor, Clementine.TaskSupervisor)
+    metadata = Keyword.get(opts, :metadata, %{})
 
     # Ensure max_concurrency is at least 1 (async_stream_nolink requires > 0)
     max_concurrency = max(max_concurrency, 1)
@@ -61,7 +64,7 @@ defmodule Clementine.ToolRunner do
     task_supervisor
     |> Task.Supervisor.async_stream_nolink(
       tool_calls,
-      fn call -> execute_single(tools, call, context) end,
+      fn call -> execute_single(tools, call, context, metadata) end,
       max_concurrency: max_concurrency,
       timeout: timeout,
       on_timeout: :kill_task,
@@ -73,10 +76,10 @@ defmodule Clementine.ToolRunner do
         {call.id, result}
 
       {{:exit, :timeout}, call} ->
-        {call.id, timeout_result(call, context, timeout)}
+        {call.id, timeout_result(call, context, metadata, timeout)}
 
       {{:exit, reason}, call} ->
-        {call.id, exit_result(call, context, reason)}
+        {call.id, exit_result(call, context, metadata, reason)}
     end)
   end
 
@@ -123,7 +126,7 @@ defmodule Clementine.ToolRunner do
   pairs, in call order, each with the milliseconds from its spawn to its
   result as a third element (`{id, result, duration_ms}`). All calls run
   concurrently (no `:max_concurrency`); each task's timeout counts from
-  spawn.
+  spawn. Takes `execute/4`'s `:timeout` and `:metadata`.
   """
   @spec run_batch([module()], [map()], map(), keyword()) ::
           {:ok, [{String.t(), term(), non_neg_integer()}]}
@@ -133,12 +136,13 @@ defmodule Clementine.ToolRunner do
   def run_batch(tools, tool_calls, context, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     task_supervisor = Keyword.get(opts, :task_supervisor, Clementine.TaskSupervisor)
+    metadata = Keyword.get(opts, :metadata, %{})
 
     entries =
       Enum.map(tool_calls, fn call ->
         task =
           Task.Supervisor.async_nolink(task_supervisor, fn ->
-            execute_single(tools, call, context)
+            execute_single(tools, call, context, metadata)
           end)
 
         %{
@@ -156,6 +160,7 @@ defmodule Clementine.ToolRunner do
       entries: entries,
       awaiting: Map.new(Enum.with_index(entries), fn {e, i} -> {e.task.ref, i} end),
       context: context,
+      metadata: metadata,
       timeout: timeout,
       cancelled: nil
     })
@@ -176,13 +181,18 @@ defmodule Clementine.ToolRunner do
 
       {:DOWN, ref, :process, _pid, reason} when is_map_key(awaiting, ref) ->
         %{call: call} = entry(state, ref)
-        state |> settle(ref, exit_result(call, state.context, reason)) |> await_batch()
+
+        state
+        |> settle(ref, exit_result(call, state.context, state.metadata, reason))
+        |> await_batch()
 
       {__MODULE__, :timeout, ref} when is_map_key(awaiting, ref) ->
         %{call: call} = entry(state, ref)
 
         state
-        |> shut_down(ref, fn -> timeout_result(call, state.context, state.timeout) end)
+        |> shut_down(ref, fn ->
+          timeout_result(call, state.context, state.metadata, state.timeout)
+        end)
         |> await_batch()
 
       {:clementine, :lease_lost, _lease} ->
@@ -214,9 +224,14 @@ defmodule Clementine.ToolRunner do
     %{call: call, task: task} = entry(state, ref)
 
     case Task.shutdown(task, :brutal_kill) do
-      {:ok, reply} -> settle(state, ref, reply)
-      {:exit, reason} -> settle(state, ref, exit_result(call, state.context, reason))
-      nil -> settle(state, ref, killed.())
+      {:ok, reply} ->
+        settle(state, ref, reply)
+
+      {:exit, reason} ->
+        settle(state, ref, exit_result(call, state.context, state.metadata, reason))
+
+      nil ->
+        settle(state, ref, killed.())
     end
   end
 
@@ -264,33 +279,33 @@ defmodule Clementine.ToolRunner do
     end
   end
 
-  defp timeout_result(call, context, timeout) do
+  defp timeout_result(call, context, metadata, timeout) do
     :telemetry.execute(
       [:clementine, :tool, :exception],
       %{duration: System.convert_time_unit(timeout, :millisecond, :native)},
-      %{
+      Map.merge(metadata, %{
         tool: call.name,
         tool_call_id: call.id,
         iteration: Map.get(context, :_clementine_iteration, 0),
         kind: :exit,
         reason: :timeout
-      }
+      })
     )
 
     {:error, "Tool timed out after #{timeout}ms"}
   end
 
-  defp exit_result(call, context, reason) do
+  defp exit_result(call, context, metadata, reason) do
     :telemetry.execute(
       [:clementine, :tool, :exception],
       %{duration: 0},
-      %{
+      Map.merge(metadata, %{
         tool: call.name,
         tool_call_id: call.id,
         iteration: Map.get(context, :_clementine_iteration, 0),
         kind: :exit,
         reason: reason
-      }
+      })
     )
 
     {:error, "Tool crashed: #{inspect(reason)}"}
@@ -300,9 +315,10 @@ defmodule Clementine.ToolRunner do
   Executes a single tool call synchronously.
 
   This is useful when you want to run tools one at a time
-  or when you're already in a supervised context.
+  or when you're already in a supervised context. `metadata` is merged
+  into its telemetry events' metadata, as `execute/4`'s `:metadata`.
   """
-  def execute_single(tools, %{name: name, input: input} = call, context) do
+  def execute_single(tools, %{name: name, input: input} = call, context, metadata \\ %{}) do
     case Tool.find_by_name(tools, name) do
       nil ->
         {:error, "Unknown tool: #{name}"}
@@ -316,13 +332,14 @@ defmodule Clementine.ToolRunner do
         tool_call_id = Map.get(call, :id)
         iteration = Map.get(context, :_clementine_iteration, 0)
 
-        telemetry_meta = %{
-          tool: name,
-          tool_call_id: tool_call_id,
-          iteration: iteration,
-          tool_module: tool,
-          args: args
-        }
+        telemetry_meta =
+          Map.merge(metadata, %{
+            tool: name,
+            tool_call_id: tool_call_id,
+            iteration: iteration,
+            tool_module: tool,
+            args: args
+          })
 
         :telemetry.execute(
           [:clementine, :tool, :start],

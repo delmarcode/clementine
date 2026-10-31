@@ -29,11 +29,30 @@ that rolled back.
 
 ## Wiring the metrics and the poller
 
-`Clementine.Telemetry.metrics/0` already includes the loop metrics
-(counters tagged by `kind`/`outcome`/`reason`/`verdict`/`trigger`, step
-duration and batch summaries, inbox gauge summaries). The one piece that
-needs a schedule is the inbox gauge — depth and age are states, not
-events, so a poller emits them from one aggregate query per period:
+`Clementine.Telemetry.metrics/0` is the list every app exports: counters,
+sums, and distributions a Prometheus reporter takes as they are. It
+holds the loop metrics (counters labeled `kind`/`outcome`/`reason`/
+`verdict`/`trigger`, step duration and inputs, the inbox distributions)
+beside the engine's, which are labeled by agent, provider, model, and
+alias, and the runs', labeled by agent (`Clementine.Telemetry`, "What is
+exported", lists every series). A PromEx app passes it to one plugin:
+
+<!-- guide-sample: parse-only -->
+```elixir
+defmodule MyApp.PromEx.Plugins.Clementine do
+  use PromEx.Plugin
+
+  @impl true
+  def event_metrics(_opts) do
+    [Event.build(:clementine_event_metrics, Clementine.Telemetry.metrics())]
+  end
+end
+```
+
+The one piece that needs a schedule is the inbox gauge — depth and age
+are states, not events, so a poller emits them from one aggregate query
+per period. This supervisor runs the poller and, for an app without
+PromEx, a reporter that takes the list directly:
 
 ```elixir
 defmodule MyApp.Telemetry do
@@ -69,15 +88,16 @@ defmodule MyApp.Telemetry do
 end
 ```
 
-Alert suggestions, in the shipped metric names:
+Alert suggestions, in the shipped series names:
 
-- `clementine.loop.inbox.oldest_age_ms` max over 5m above your reply
-  SLO — a loop is stuck or starved; the doctor names which one.
-- `clementine.loop.dead_letter.count` rate by `reason` — any sustained
-  `:poison` is a handler bug; any `:unknown_tag` after a deploy is tag
+- `clementine_loop_inbox_oldest_age_milliseconds` (its upper buckets)
+  over 5m above your reply SLO — a loop is stuck or starved; the doctor
+  names which one.
+- `clementine_loop_dead_letters_total` rate by `reason` — any sustained
+  `poison` is a handler bug; any `unknown_tag` after a deploy is tag
   vocabulary drift (matrix row L17).
-- `clementine.loop.verdict.count` where `verdict` is
-  `:reconcile_children` or `:wake_pending` — nonzero on a transactional
+- `clementine_loop_verdicts_total` where `verdict` is
+  `reconcile_children` or `wake_pending` — nonzero on a transactional
   substrate is a glue bug surfacing safely. Fix the glue; the sweep is
   meanwhile keeping users whole.
 
