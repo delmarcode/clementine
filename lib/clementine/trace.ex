@@ -13,7 +13,11 @@ defmodule Clementine.Trace do
 
   - `:execution`, once per execution: when a run starts, and again when it
     resumes after an approval or a delegation.
-    - `"model"` — the model's resolved id
+    - `"provider"` — the provider the model resolved to (`"anthropic"`,
+      `"openai"`, ...)
+    - `"model"` — the provider's id for the model
+    - `"alias"` — the catalog alias the agent named; `nil` for a direct
+      `{provider, id}` reference
     - `"agent_fingerprint"` — a sha256 over the model id, the
       instructions, the agent's tool schemas, and, when the agent has
       them, which tools are deferred, the output schema, the skills it
@@ -38,6 +42,7 @@ defmodule Clementine.Trace do
     - `"resumed"` — `true` for an execution that resumed from a checkpoint
   - `:model_call`, once per call to the model.
     - `"iteration"`, `"duration_ms"`
+    - `"provider"`, `"model"` — as in `:execution`, resolved for the call
     - `"stop_reason"` — the provider's, or `nil` when the call did not
       finish (a cancel, a drain, a lost lease, or a provider error ended
       the execution in the middle of it)
@@ -55,8 +60,11 @@ defmodule Clementine.Trace do
       `Clementine.LLM.Message.Content.to_map/1` maps them
   - `:tool_call`, once per tool call started, a call a cancel or a drain
     cut off included (the model never sees its result; the trace keeps it).
-    - `"iteration"`, `"tool_use_id"`, `"name"`, `"args"` (the arguments
-      the tool ran with), `"is_error"`, `"duration_ms"`
+    - `"iteration"`, `"tool_use_id"`, `"args"` (the arguments the tool ran
+      with), `"is_error"`, `"duration_ms"`
+    - `"name"` — the tool's; `nil` when the model asked for a tool the
+      agent does not offer (the call ran nothing, and its `"result"`, the
+      error the model read, names what it asked for)
     - `"result"` — the text the model saw, or would have; `nil` for a
       killed call
     - `"killed"` — `true` for a call killed before it answered (a drain,
@@ -123,6 +131,27 @@ defmodule Clementine.Trace do
   `:facts`; a task agent whose trajectory nothing else holds keeps
   `:content`. The fingerprint is the same under either.
 
+  ## How it is stored
+
+  On the durable runtime the trace is `agent_run_trace`
+  (`Clementine.Migration`, version 5), and each entry's facts have
+  columns of their own, so a warehouse or a dashboard reads them without
+  the content:
+
+  - `:execution`: `provider`, `model`, `alias`, `agent_fingerprint`.
+  - `:model_call`: `provider`, `model`, `alias`, the four counts of
+    `"usage"` (`input_tokens`, `output_tokens`, `cache_read_tokens`,
+    `cache_write_tokens`), `"cost"` as `cost_micros` and `currency`,
+    `duration_ms`, `stop_reason`.
+  - `:tool_call`: `tool_name` (`"name"`), `is_error`, `killed`,
+    `duration_ms`, and the verdicts of `"approval"` and `"policy"` as
+    `approval_verdict` and `policy_verdict`.
+
+  The columns hold only ids, names fixed in code, numbers, and enums,
+  never text a person, a model, or a tool produced. Every other key stays
+  in `payload`, which a fact is never copied into: `Clementine.Runs.trace/1`
+  puts the columns back, so an entry reads as listed above.
+
   ## When it is written
 
   The engine records each entry as it happens. At every iteration
@@ -135,6 +164,7 @@ defmodule Clementine.Trace do
   """
 
   alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.ModelRegistry
   alias Clementine.Trace.Entry
 
   @type fidelity :: :content | :facts
@@ -145,6 +175,43 @@ defmodule Clementine.Trace do
     model_call: ["content"],
     tool_call: ["result"]
   }
+
+  # The columns of agent_run_trace that hold an entry's facts
+  # (Clementine.Migration, version 5), in table order.
+  @columns [
+    :provider,
+    :model,
+    :alias,
+    :agent_fingerprint,
+    :input_tokens,
+    :output_tokens,
+    :cache_read_tokens,
+    :cache_write_tokens,
+    :cost_micros,
+    :currency,
+    :duration_ms,
+    :stop_reason,
+    :tool_name,
+    :is_error,
+    :killed,
+    :approval_verdict,
+    :policy_verdict
+  ]
+
+  @usage_columns [:input_tokens, :output_tokens, :cache_read_tokens, :cache_write_tokens]
+
+  @typedoc """
+  The model an execution or a call runs on, resolved once
+  (`resolve_model/1`): the catalog's resolution, or a reference the
+  catalog does not hold, as written.
+  """
+  @type model :: %{
+          required(:provider) => ModelRegistry.provider() | nil,
+          required(:id) => String.t(),
+          required(:alias) => atom() | nil,
+          required(:pricing) => Clementine.LLM.Pricing.t() | nil,
+          optional(atom()) => term()
+        }
 
   @doc "The fidelities an agent may declare."
   @spec fidelities() :: [fidelity()]
@@ -160,26 +227,41 @@ defmodule Clementine.Trace do
   end
 
   @doc false
-  # The `:execution` payload for an execution offering `model`,
-  # `instructions`, and `tools`, the agent's own. `offer` is what else it
-  # offers the model (see `fingerprint/4`), and `offered:`, every tool the
-  # execution begins with when that is more than `tools` (the tools of
-  # skills restored from a checkpoint, and engine tools), which only the
-  # entry's `"tools"` reads.
-  @spec execution(
-          Clementine.LLM.ModelRegistry.model_ref(),
-          String.t() | nil,
-          [module()],
-          boolean(),
-          keyword()
-        ) ::
-          map()
+  # The model `ref` names, resolved once for an execution or a call, so
+  # its trace entry, its cost, and its telemetry name the same provider,
+  # id, alias, and prices: the catalog's resolution
+  # (`ModelRegistry.resolve!/1`), or, for a reference the catalog does not
+  # hold (a test's, on a mock client), the reference as written, with no
+  # provider and no prices, rather than failing the run over its record.
+  @spec resolve_model(ModelRegistry.model_ref()) :: model()
+  def resolve_model(ref) do
+    ModelRegistry.resolve!(ref)
+  rescue
+    ArgumentError ->
+      %{
+        provider: nil,
+        id: if(is_atom(ref), do: Atom.to_string(ref), else: inspect(ref)),
+        alias: if(is_atom(ref), do: ref),
+        pricing: nil
+      }
+  end
+
+  @doc false
+  # The `:execution` payload for an execution offering `model` (resolved,
+  # `resolve_model/1`), `instructions`, and `tools`, the agent's own.
+  # `offer` is what else it offers the model (see `fingerprint/4`), and
+  # `offered:`, every tool the execution begins with when that is more
+  # than `tools` (the tools of skills restored from a checkpoint, and
+  # engine tools), which only the entry's `"tools"` reads.
+  @spec execution(model(), String.t() | nil, [module()], boolean(), keyword()) :: map()
   def execution(model, instructions, tools, resumed?, offer \\ []) do
     {offered, offer} = Keyword.pop(offer, :offered, tools)
 
     %{
-      "model" => model_id(model),
-      "agent_fingerprint" => fingerprint(model, instructions, tools, offer),
+      "provider" => model.provider,
+      "model" => model.id,
+      "alias" => model.alias,
+      "agent_fingerprint" => fingerprint_of(model, instructions, tools, offer),
       "instructions" => instructions,
       "tools" => Enum.map(offered, &Clementine.Tool.to_schema(&1).name),
       "deferred" => Enum.map(Keyword.get(offer, :deferred, []), & &1.__name__()),
@@ -190,25 +272,30 @@ defmodule Clementine.Trace do
   end
 
   @doc false
-  # The `:model_call` payload of a call to `model`. `content` is the
-  # response's blocks, or nil for a call that produced none.
+  # The `:model_call` payload of a call to `model` (resolved for the call,
+  # `resolve_model/1`) that burned `usage` and cost `cost` at the model's
+  # prices then. `content` is the response's blocks, or nil for a call
+  # that produced none.
   @spec model_call(
-          Clementine.LLM.ModelRegistry.model_ref(),
+          model(),
           pos_integer(),
           non_neg_integer(),
           String.t() | nil,
           Clementine.Usage.t(),
+          Clementine.Cost.t() | nil,
           list() | nil
         ) ::
           map()
-  def model_call(model, iteration, duration_ms, stop_reason, %Clementine.Usage{} = usage, content) do
+  def model_call(model, iteration, duration_ms, stop_reason, usage, cost, content) do
     %{
       "iteration" => iteration,
       "duration_ms" => duration_ms,
       "stop_reason" => stop_reason,
       "usage" => Clementine.Usage.to_map(usage),
-      "alias" => alias_name(model),
-      "cost" => usage |> Clementine.Cost.of(model) |> Clementine.Cost.to_map(),
+      "provider" => model.provider,
+      "model" => model.id,
+      "alias" => model.alias,
+      "cost" => Clementine.Cost.to_map(cost),
       "content" => content && Enum.map(content, &content_map/1)
     }
   end
@@ -277,6 +364,144 @@ defmodule Clementine.Trace do
   end
 
   @doc false
+  # The columns of `agent_run_trace` that hold an entry's facts.
+  @spec columns() :: [atom()]
+  def columns, do: @columns
+
+  @doc false
+  # How an entry of `kind` with `payload` (as `payload/3` gives it) is
+  # stored: its facts as a value for every column in `columns/0` (nil
+  # where the kind has none), and the rest of its payload. A fact goes in
+  # its column only, so `from_row/3` is the way back. A kind this version
+  # does not record has no columns.
+  @spec to_row(Entry.kind() | String.t(), map()) :: {map(), map()}
+  def to_row(:execution, payload) do
+    {facts, rest} = Map.split(payload, ["provider", "model", "alias", "agent_fingerprint"])
+
+    {row(
+       provider: facts["provider"],
+       model: facts["model"],
+       alias: facts["alias"],
+       agent_fingerprint: facts["agent_fingerprint"]
+     ), rest}
+  end
+
+  def to_row(:model_call, payload) do
+    {facts, rest} =
+      Map.split(payload, [
+        "provider",
+        "model",
+        "alias",
+        "usage",
+        "cost",
+        "duration_ms",
+        "stop_reason"
+      ])
+
+    usage = facts["usage"] || %{}
+    cost = facts["cost"] || %{}
+
+    {row(
+       [
+         provider: facts["provider"],
+         model: facts["model"],
+         alias: facts["alias"],
+         cost_micros: cost["micros"],
+         currency: cost["currency"],
+         duration_ms: facts["duration_ms"],
+         stop_reason: facts["stop_reason"]
+       ] ++ for(column <- @usage_columns, do: {column, usage[Atom.to_string(column)]})
+     ), rest}
+  end
+
+  def to_row(:tool_call, payload) do
+    {facts, rest} = Map.split(payload, ["name", "is_error", "killed", "duration_ms"])
+    {approval, rest} = Map.pop(rest, "approval")
+    {policy, rest} = Map.pop(rest, "policy")
+
+    # An approval's `by` and a policy's reason and failure stay in the
+    # payload; only the verdicts are enums.
+    rest =
+      rest
+      |> put_present("approval", approval && Map.delete(approval, "verdict"))
+      |> put_present("policy", policy && Map.delete(policy, "verdict"))
+
+    {row(
+       tool_name: facts["name"],
+       is_error: facts["is_error"],
+       killed: facts["killed"],
+       duration_ms: facts["duration_ms"],
+       approval_verdict: approval && approval["verdict"],
+       policy_verdict: policy && policy["verdict"]
+     ), rest}
+  end
+
+  def to_row(_kind, payload), do: {row([]), payload}
+
+  @doc false
+  # The payload of an entry of `kind` stored as `columns` (a map with a
+  # key for each of `columns/0`) and `payload`: the inverse of `to_row/2`.
+  # A key the stored payload holds itself wins over its column.
+  @spec from_row(Entry.kind() | String.t(), map(), map()) :: map()
+  def from_row(:execution, columns, payload) do
+    Map.merge(
+      %{
+        "provider" => columns.provider,
+        "model" => columns.model,
+        "alias" => columns.alias,
+        "agent_fingerprint" => columns.agent_fingerprint
+      },
+      payload
+    )
+  end
+
+  def from_row(:model_call, columns, payload) do
+    cost =
+      if columns.cost_micros,
+        do: %{"currency" => columns.currency, "micros" => columns.cost_micros}
+
+    Map.merge(
+      %{
+        "provider" => columns.provider,
+        "model" => columns.model,
+        "alias" => columns.alias,
+        "usage" => Map.new(@usage_columns, &{Atom.to_string(&1), Map.fetch!(columns, &1)}),
+        "cost" => cost,
+        "duration_ms" => columns.duration_ms,
+        "stop_reason" => columns.stop_reason
+      },
+      payload
+    )
+  end
+
+  def from_row(:tool_call, columns, payload) do
+    {approval, payload} = Map.pop(payload, "approval")
+    {policy, payload} = Map.pop(payload, "policy")
+
+    Map.merge(
+      %{
+        "name" => columns.tool_name,
+        "is_error" => columns.is_error,
+        "killed" => columns.killed,
+        "duration_ms" => columns.duration_ms,
+        "approval" => with_verdict(approval, columns.approval_verdict),
+        "policy" => with_verdict(policy, columns.policy_verdict)
+      },
+      payload
+    )
+  end
+
+  def from_row(_kind, _columns, payload), do: payload
+
+  defp row(facts), do: Map.merge(Map.new(@columns, &{&1, nil}), Map.new(facts))
+
+  defp put_present(map, _key, nil), do: map
+  defp put_present(map, key, value), do: Map.put(map, key, value)
+
+  defp with_verdict(rest, nil), do: rest
+  defp with_verdict(rest, verdict), do: Map.put(rest || %{}, "verdict", verdict)
+
+  @doc false
   # What an entry of `kind` stores at `fidelity`: content keys dropped
   # under :facts, and every value in the form a jsonb round trip returns,
   # so what is recorded is what a read gives back, and a write never
@@ -316,8 +541,12 @@ defmodule Clementine.Trace do
         ) ::
           String.t()
   def fingerprint(model, instructions, tools, offer \\ []) do
+    model |> resolve_model() |> fingerprint_of(instructions, tools, offer)
+  end
+
+  defp fingerprint_of(model, instructions, tools, offer) do
     %{
-      "model" => model_id(model),
+      "model" => model.id,
       "instructions" => instructions,
       "tools" => Enum.map(tools, & &1.__schema__())
     }
@@ -372,17 +601,6 @@ defmodule Clementine.Trace do
       "description" => skill.description,
       "tools" => Enum.map(skill.tools, & &1.__schema__())
     }
-  end
-
-  defp alias_name(model) when is_atom(model) and not is_nil(model), do: Atom.to_string(model)
-  defp alias_name(_tuple), do: nil
-
-  # The provider's id for a model reference; a reference the catalog does
-  # not hold (a test's) is recorded as written rather than failing the run.
-  defp model_id(model) do
-    Clementine.LLM.ModelRegistry.resolve!(model).id
-  rescue
-    ArgumentError -> if is_atom(model), do: Atom.to_string(model), else: inspect(model)
   end
 
   defp content_map(%_{} = block) do

@@ -67,7 +67,7 @@ lib/
 │   ├── runs/                      # Its internals: Worker, StepWorker, TimerWorker, Lifecycle, Loops,
 │   │                              #   Delegations, Reaper, drain, cancel relay
 │   ├── host.ex                    # The optional host module's callbacks
-│   ├── migration.ex               # agent_runs, agent_run_inbox, agent_run_trace DDL, versions 1–4
+│   ├── migration.ex               # agent_runs, agent_run_inbox, agent_run_trace DDL, versions 1–5
 │   ├── loop.ex, thread.ex, loop/  # The loop behaviour, the thread controller, the pure loop core
 │   ├── skill.ex, delegation.ex, engine_tool.ex   # skills:, delegates:, use_skill and delegate
 │   ├── output_schema.ex           # output_schema: decoding and checking
@@ -114,7 +114,7 @@ The durable runtime is in the library. A host writes glue, and
   supervision tree. It starts `Clementine.Runs.Supervisor` (drain
   notifier, cancel relay, inline loop steps, reaper) and refuses to start
   against a table behind the code's migration version.
-- One migration calling `Clementine.Migration.up(version: 4)`.
+- One migration calling `Clementine.Migration.up(version: 5)`.
 - Agent modules (`use Clementine.Agent, key: ...`) and loop controllers
   (`use Clementine.Loop, key: ...`), each listed in `agents:`.
 - An optional `Clementine.Host` module: `resolve_subject/2`,
@@ -135,12 +135,15 @@ its own run table and worker assembles the pieces itself
 `Clementine.Migration` holds every version's DDL, frozen: 1 builds
 `agent_runs` on version 1 of the column recipe; 2 adds the actor, the
 turn flag, and the lane index; 3 the loop columns, the child tag, and
-`agent_run_inbox`; 4 `agent_run_trace`. Each stamps its number on the
-table. A table change is a new version, never an edit to an old one,
-and the installer template moves to it in the same commit
-(`test/clementine/runs/migration_test.exs` and
+`agent_run_inbox`; 4 `agent_run_trace`; 5 the trace's fact columns.
+Each stamps its number on the table. A table change is a new version,
+never an edit to an old one, and the installer template moves to it in
+the same commit (`test/clementine/runs/migration_test.exs` and
 `test/clementine/lifecycle/ecto_migration_versions_test.exs` hold the
-frozen DDL).
+frozen DDL). Every column is a fact or content
+(`Clementine.Migration.content_columns/0`), which a warehouse copy
+leaves out; a new column is classified in the same commit, and the
+migration test fails until it is.
 
 ## Tools and agents
 

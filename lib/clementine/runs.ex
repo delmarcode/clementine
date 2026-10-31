@@ -17,7 +17,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
              agents: [MyApp.Agents.Weather],
              host: MyApp.Agents.Host}
 
-      * one migration calling `Clementine.Migration.up(version: 4)`;
+      * one migration calling `Clementine.Migration.up(version: 5)`;
       * `use Clementine.Agent` modules, listed in `agents:`.
 
     The optional `host:` module implements `Clementine.Host`: who may
@@ -829,23 +829,28 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             from(t in "agent_run_trace",
               where: t.run_id == type(^id, Ecto.UUID),
               order_by: t.id,
-              select: %{
-                epoch: t.epoch,
-                seq: t.seq,
-                kind: t.kind,
-                payload: t.payload,
-                at: type(t.inserted_at, :utc_datetime_usec)
+              select: {
+                %{
+                  epoch: t.epoch,
+                  seq: t.seq,
+                  kind: t.kind,
+                  payload: t.payload,
+                  at: type(t.inserted_at, :utc_datetime_usec)
+                },
+                map(t, ^Clementine.Trace.columns())
               }
             )
           )
-          |> Enum.map(fn row ->
+          |> Enum.map(fn {row, columns} ->
+            kind = Clementine.Trace.Entry.decode_kind(row.kind)
+
             %Clementine.Trace.Entry{
               run_id: id,
               epoch: row.epoch,
               seq: row.seq,
               at: row.at,
-              kind: Clementine.Trace.Entry.decode_kind(row.kind),
-              payload: row.payload
+              kind: kind,
+              payload: Clementine.Trace.from_row(kind, columns, row.payload)
             }
           end)
 
@@ -932,8 +937,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     end
 
     # The total of the costs frozen on the model calls of `runs`, a query
-    # of run ids: one query, aggregated in the database, so only the totals
-    # leave it, never a payload.
+    # of run ids: one query over the trace's cost and token columns,
+    # aggregated in the database, so only the totals leave it.
     defp trace_cost(repo, runs) do
       totals =
         repo.one(
@@ -983,29 +988,22 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         group_by: r.id,
         select: %{
           calls: count(t.id),
-          unpriced:
-            fragment(
-              "count(?) FILTER (WHERE jsonb_typeof(?->'cost') IS DISTINCT FROM 'object')",
-              t.id,
-              t.payload
-            ),
-          low: fragment("min(?->'cost'->>'currency')", t.payload),
-          high: fragment("max(?->'cost'->>'currency')", t.payload),
-          micros: fragment("coalesce(sum((?->'cost'->>'micros')::bigint), 0)", t.payload),
+          unpriced: fragment("count(?) FILTER (WHERE ? IS NULL)", t.id, t.cost_micros),
+          low: min(t.currency),
+          high: max(t.currency),
+          micros: fragment("coalesce(sum(?), 0)::bigint", t.cost_micros),
           behind:
             fragment(
               """
               ? = 'rollout'
-              AND (coalesce((?->>'input_tokens')::bigint, 0)
-                     > coalesce(sum((?->'usage'->>'input_tokens')::bigint), 0)
-                   OR coalesce((?->>'output_tokens')::bigint, 0)
-                     > coalesce(sum((?->'usage'->>'output_tokens')::bigint), 0))
+              AND (coalesce((?->>'input_tokens')::bigint, 0) > coalesce(sum(?), 0)
+                   OR coalesce((?->>'output_tokens')::bigint, 0) > coalesce(sum(?), 0))
               """,
               r.kind,
               r.usage,
-              t.payload,
+              t.input_tokens,
               r.usage,
-              t.payload
+              t.output_tokens
             )
         }
       )

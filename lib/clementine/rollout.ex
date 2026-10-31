@@ -899,41 +899,52 @@ defmodule Clementine.Rollout do
     emit_event(exec, :iteration_start, %{n: exec.iteration})
 
     case stream_response(exec) do
-      {:ok, response, duration} ->
+      {:ok, response, call} ->
         exec = record_usage(exec, response)
-        record_model_call(exec, duration, response.stop_reason, response.usage, response.content)
+        record_model_call(exec, call, response.stop_reason, response.content)
         act(exec, response)
 
-      {:signal, signal, partial, duration} ->
+      {:signal, signal, partial, call} ->
         exec = record_usage(exec, partial)
-        record_model_call(exec, duration, nil, partial.usage, partial.content)
+        record_model_call(exec, call, nil, partial.content)
         conclude(exec, unwind(signal))
 
-      {:error, reason, usage, duration} ->
+      {:error, reason, usage, call} ->
         exec = record_usage(exec, %{usage: usage})
-        record_model_call(exec, duration, nil, usage, nil)
+        record_model_call(exec, call, nil, nil)
         fail(exec, Clementine.Error.normalize(reason))
     end
   end
 
-  defp record_model_call(exec, duration, stop_reason, usage, content) do
+  defp record_model_call(exec, call, stop_reason, content) do
     record(
       exec,
       :model_call,
       Trace.model_call(
-        exec.model,
+        call.model,
         exec.iteration,
-        to_ms(duration),
+        to_ms(call.duration),
         stop_reason,
-        Clementine.Usage.new(usage),
+        call.usage,
+        call.cost,
         content
       )
     )
   end
 
+  # One model call as it is recorded: the model it ran on, resolved once
+  # for the call, how long it took, what it burned, and what that cost at
+  # the model's prices then. Its trace entry and its telemetry event both
+  # read this, so they name the same model and the same cost.
+  defp metered(model, duration, usage) do
+    usage = Clementine.Usage.new(usage)
+    %{model: model, duration: duration, usage: usage, cost: Clementine.Cost.of(usage, model)}
+  end
+
   defp stream_response(%Execution{} = exec) do
     alias Clementine.LLM.StreamParser.Accumulator
 
+    model = Trace.resolve_model(exec.model)
     tools = offered_tools(exec)
 
     metadata = %{
@@ -980,14 +991,15 @@ defmodule Clementine.Rollout do
         # Aborted by a runner signal: no provider stop_reason exists, and
         # the partial usage is what actually burned: the accumulator keeps
         # the input count the stream's start reported.
-        emit_llm_stop(metadata, duration, Clementine.Usage.new(acc.usage), nil)
-        {:signal, signal, Accumulator.to_response(acc), duration}
+        call = metered(model, duration, acc.usage)
+        emit_llm_stop(metadata, call, nil)
+        {:signal, signal, Accumulator.to_response(acc), call}
 
       Accumulator.error?(acc) ->
         # What the stream reported before the error burned too, and the
         # trace prices it, so the event carries it as stop does.
-        {measurements, currency} =
-          call_measurements(duration, Clementine.Usage.new(acc.usage), metadata.model)
+        call = metered(model, duration, acc.usage)
+        {measurements, currency} = call_measurements(call)
 
         :telemetry.execute(
           [:clementine, :llm, :exception],
@@ -995,24 +1007,18 @@ defmodule Clementine.Rollout do
           Map.merge(metadata, %{kind: :error, reason: acc.error, currency: currency})
         )
 
-        {:error, acc.error, acc.usage, duration}
+        {:error, acc.error, acc.usage, call}
 
       true ->
         response = Accumulator.to_response(acc)
-
-        emit_llm_stop(
-          metadata,
-          duration,
-          Clementine.Usage.new(response.usage),
-          response.stop_reason
-        )
-
-        {:ok, response, duration}
+        call = metered(model, duration, response.usage)
+        emit_llm_stop(metadata, call, response.stop_reason)
+        {:ok, response, call}
     end
   end
 
-  defp emit_llm_stop(metadata, duration, %Clementine.Usage{} = usage, stop_reason) do
-    {measurements, currency} = call_measurements(duration, usage, metadata.model)
+  defp emit_llm_stop(metadata, call, stop_reason) do
+    {measurements, currency} = call_measurements(call)
 
     :telemetry.execute(
       [:clementine, :llm, :stop],
@@ -1025,7 +1031,7 @@ defmodule Clementine.Rollout do
   # adds `cost_micros`; an unpriced one leaves it out rather than
   # reporting zero, and reporters skip an event whose measurement is
   # missing.
-  defp call_measurements(duration, %Clementine.Usage{} = usage, model) do
+  defp call_measurements(%{duration: duration, usage: usage, cost: cost}) do
     measurements = %{
       duration: duration,
       input_tokens: usage.input_tokens,
@@ -1034,7 +1040,7 @@ defmodule Clementine.Rollout do
       cache_write_tokens: usage.cache_write_tokens
     }
 
-    case Clementine.Cost.of(usage, model) do
+    case cost do
       %Clementine.Cost{micros: micros, currency: currency} ->
         {Map.put(measurements, :cost_micros, micros), currency}
 
@@ -1517,6 +1523,10 @@ defmodule Clementine.Rollout do
   # The tools the model is offered: the modules, then the engine's own.
   defp offered_tools(%Execution{} = exec), do: exec.tools ++ exec.engine_tools
 
+  defp offered_name(%Execution{} = exec, name) do
+    if Tool.find_by_name(exec.tools, name) || engine_tool(exec, name), do: name
+  end
+
   # Runs the calls that may execute in this pass — fence first, keyed to
   # exactly these calls: only code that runs now can cause an effect, so
   # a parked gated call contributes nothing to the fence decision — and
@@ -1604,7 +1614,10 @@ defmodule Clementine.Rollout do
   end
 
   # `gate` is how the call came to run or not: `approval:`, the decision
-  # it waited on, and `policy:`, the tool policy's verdict on it.
+  # it waited on, and `policy:`, the tool policy's verdict on it. A name
+  # the agent does not offer is the model's text, not a tool's name: the
+  # entry names no tool, and the result the model read says what it asked
+  # for.
   defp record_tool_call(exec, tool_use, result, duration_ms, gate \\ []) do
     {content, is_error, killed} =
       case result do
@@ -1618,7 +1631,7 @@ defmodule Clementine.Rollout do
       Trace.tool_call(%{
         iteration: exec.iteration,
         tool_use_id: tool_use.id,
-        name: tool_use.name,
+        name: offered_name(exec, tool_use.name),
         args: tool_use.input,
         result: content,
         is_error: is_error,
@@ -1838,7 +1851,7 @@ defmodule Clementine.Rollout do
     record(
       exec,
       :execution,
-      Trace.execution(exec.model, exec.system, agent_tools, resumed?,
+      Trace.execution(Trace.resolve_model(exec.model), exec.system, agent_tools, resumed?,
         deferred: exec.deferred,
         output_schema: exec.output_schema,
         skills: exec.skills,

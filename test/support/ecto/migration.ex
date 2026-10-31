@@ -131,3 +131,17 @@ defmodule Clementine.Test.Ecto.UpgradeAgentRunsToVersion4 do
   def up, do: Clementine.Migration.up(from: 3, version: 4)
   def down, do: Clementine.Migration.down(to: 3, version: 4)
 end
+
+defmodule Clementine.Test.Ecto.UpgradeAgentRunsToVersion5 do
+  @moduledoc """
+  The migration a host on version 4 writes to adopt version 5: the
+  trace's fact columns. The runs suite runs on the upgraded table;
+  `Clementine.MigrationTest` proves it builds the same tables as
+  `up(version: 5)` from scratch.
+  """
+
+  use Ecto.Migration
+
+  def up, do: Clementine.Migration.up(from: 4, version: 5)
+  def down, do: Clementine.Migration.down(to: 4, version: 5)
+end

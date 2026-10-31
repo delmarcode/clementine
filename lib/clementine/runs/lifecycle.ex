@@ -85,12 +85,13 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     defp flush_events(_transition, _ctx), do: :ok
 
     # A write's trace entries go to agent_run_trace in its transaction, so
-    # they commit with the write and the projection below sees them.
-    # inserted_at is the storage clock's, as the column's default. An
-    # entry is (run, epoch, seq), unique in the table: entries a write
-    # carries again after an earlier one committed unheard (a dropped
-    # connection at COMMIT, then the end carrying them as pending) are
-    # already there and insert nothing.
+    # they commit with the write and the projection below sees them, each
+    # entry's facts in their columns and the rest in payload
+    # (Clementine.Trace.to_row/2). inserted_at is the storage clock's, as
+    # the column's default. An entry is (run, epoch, seq), unique in the
+    # table: entries a write carries again after an earlier one committed
+    # unheard (a dropped connection at COMMIT, then the end carrying them
+    # as pending) are already there and insert nothing.
     @impl Clementine.Lifecycle.Ecto
     def record_trace(entries, %AgentRun{id: run_id}, _ctx) do
       %Config{repo: repo} = Config.fetch!()
@@ -98,13 +99,15 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
       rows =
         Enum.map(entries, fn entry ->
-          %{
+          {columns, payload} = Clementine.Trace.to_row(entry.kind, entry.payload)
+
+          Map.merge(columns, %{
             run_id: id,
             epoch: entry.epoch,
             seq: entry.seq,
             kind: to_string(entry.kind),
-            payload: entry.payload
-          }
+            payload: payload
+          })
         end)
 
       {_count, _} = repo.insert_all(@trace, rows, on_conflict: :nothing)
