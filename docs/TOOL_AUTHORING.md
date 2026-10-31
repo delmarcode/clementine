@@ -28,13 +28,12 @@ end
 Register it with an agent:
 
 ```elixir
-defmodule MyApp.Agent do
-  use Clementine.Agent,
-    name: "my_agent",
+agent =
+  Clementine.Agent.new(
     model: :claude_sonnet,
-    tools: [MyApp.Tools.Ping],
-    system: "You can check network connectivity."
-end
+    instructions: "You can check network connectivity.",
+    tools: [MyApp.Tools.Ping]
+  )
 ```
 
 ## Result Contract
