@@ -1,9 +1,18 @@
 # Streaming Agent Application Design Doc
 
-This is an application-level UI design sketch. For production hosts that need
-durable run state, deploy-safe execution, and reconnect semantics, use
-Clementine's durable runtime ([`guides/runtime.md`](../guides/runtime.md)) as
-the architectural boundary between Clementine and the host application.
+> **A design record.** This is an application-level UI sketch from February
+> 2026, before the durable runtime. Its UI blocks, SSE and channel events, and
+> frontend reducer are a sketch of a product, not part of Clementine. Its
+> Clementine code is out of date: `Clementine.Loop.run_stream/3` and its
+> callback events no longer exist (`Clementine.Loop` is now a standing
+> controller), and its background agents live in a GenServer job server, which
+> dies with its node. On the current library a chat answer or a background job
+> is a run (`Clementine.Runs.start/3`, or a turn of a `Clementine.Thread`).
+> Tokens reach the UI through the host's `run_event/2`, changes along the way
+> (claimed, parked, resumed) through `run_transition/2`, and the run's end
+> through `run_committed/2`; see
+> [The Durable Runtime](../guides/runtime.md) and
+> [Observing Runs](../guides/observation.md).
 
 A Phoenix + Next.js application with real-time streaming, tool visualization, and interactive UI blocks—powered by Clementine.
 

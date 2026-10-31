@@ -1,5 +1,27 @@
 # RFC: Clementine Durable Execution Model
 
+> **A design record.** This RFC records the design of Clementine's
+> durable-execution layer as adopted in July 2026 (v2.2, built under
+> SKUNK-124 and proven on Meli), with the tool policy amended in October
+> 2026 (OPS-156). Its mechanism still holds: the two-function lifecycle
+> and its compare-and-swap writes, epochs and fencing, checkpoints and
+> suspension, the effect fence, the reaper, and the failure matrix, whose
+> rows are named tests. How an app uses it does not. The library now
+> ships the durable runtime this RFC asks each host to assemble:
+> `{Clementine, ...}` and `Clementine.Runs` own the `agent_runs` table
+> (built by `Clementine.Migration`, now at version 4, with a lane index
+> in place of the single-active-run index), its worker, the reaper, and
+> the drain, and the app writes agent modules and an optional
+> `Clementine.Host`. The protocol core, the Ecto adapter, and the
+> conformance suite described here now serve that runtime and are hidden
+> from the API docs; an app that keeps its own run table still builds on
+> them, as [Durable Execution](../guides/durable-execution.md) shows. The outer
+> `Loop` this RFC reserves shipped as `Clementine.Loop`
+> ([LOOP_RFC.md](LOOP_RFC.md)). For the library as it is, read the
+> [README](../README.md), [Getting Started](../guides/getting-started.md)
+> and the other guides, and [usage-rules.md](../usage-rules.md). Where
+> this text and the code disagree, the code wins.
+
 Status: draft v2.2 (CAS revision)  
 Scope: greenfield Clementine API design  
 Origin: Meli integration learnings, especially Oban-backed turn execution  

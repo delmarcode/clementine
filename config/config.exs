@@ -5,7 +5,6 @@ config :clementine,
   anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
   openai_api_key: {:system, "OPENAI_API_KEY"},
   max_iterations: 10,
-  timeout: :timer.minutes(5),
   retry: [
     max_attempts: 3,
     base_delay: 1000,

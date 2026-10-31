@@ -1,6 +1,6 @@
 defmodule Clementine.Rollout do
   @moduledoc """
-  One inner agent execution: the Gather → Act loop, and the inert spec that
+  One agent execution: the model–tool cycle, and the inert spec that
   describes it.
 
   A rollout is Clementine's inner unit of agent work: call the model, execute
@@ -32,9 +32,9 @@ defmodule Clementine.Rollout do
   - Max iterations reached
   - An unrecoverable error occurs
 
-  Verification is deliberately not part of the inner loop: judging a result
-  and deciding to retry is outer-control work (see `Clementine.Verifier` for
-  the judge-function shape it uses).
+  Verification is deliberately not part of the model–tool cycle: judging a
+  result and deciding to retry is outer-control work (see
+  `Clementine.Verifier` for the judge-function shape it uses).
 
   ## Engine Tools
 
@@ -229,7 +229,7 @@ defmodule Clementine.Rollout do
           | :lost_lease
 
   @doc """
-  Animates a rollout spec: the Gather → Act loop with the runner's execution
+  Animates a rollout spec: the model–tool cycle with the runner's execution
   apparatus threaded through. This is the engine a `Clementine.Runner`
   drives — the one engine; scripts reach it through `Clementine.run/3` and
   `Clementine.stream/3`, interactive processes through
