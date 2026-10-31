@@ -921,6 +921,7 @@ defmodule Clementine.Rollout do
       exec,
       :model_call,
       Trace.model_call(
+        exec.model,
         exec.iteration,
         to_ms(duration),
         stop_reason,
@@ -1005,17 +1006,31 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # A priced call adds its cost; an unpriced one leaves `cost_micros` out
+  # rather than reporting zero, and reporters skip an event whose
+  # measurement is missing.
   defp emit_llm_stop(metadata, duration, %Clementine.Usage{} = usage, stop_reason) do
+    measurements = %{
+      duration: duration,
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      cache_read_tokens: usage.cache_read_tokens,
+      cache_write_tokens: usage.cache_write_tokens
+    }
+
+    {measurements, currency} =
+      case Clementine.Cost.of(usage, metadata.model) do
+        %Clementine.Cost{micros: micros, currency: currency} ->
+          {Map.put(measurements, :cost_micros, micros), currency}
+
+        nil ->
+          {measurements, nil}
+      end
+
     :telemetry.execute(
       [:clementine, :llm, :stop],
-      %{
-        duration: duration,
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_write_tokens: usage.cache_write_tokens
-      },
-      Map.put(metadata, :stop_reason, stop_reason)
+      measurements,
+      Map.merge(metadata, %{stop_reason: stop_reason, currency: currency})
     )
   end
 

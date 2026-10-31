@@ -83,6 +83,7 @@ alias, not mid-run.
 | `base_url` | no | chat-completions providers only | Endpoint override, OpenAI-SDK style: the client appends `/chat/completions`. Required (per-model or app-wide) for `:openai_compatible`. Rejected on `:anthropic`/`:openai` entries. |
 | `api_key` | no | chat-completions providers only | Per-model credential override. A literal string, `{:system, "ENV_VAR"}`, or `{module, function, args}` resolved per request (for short-lived tokens). Rejected on `:anthropic`/`:openai` entries. |
 | `structured_output` | no | chat-completions providers only | `:native` (default) sends an agent's `output_schema:` as `response_format`; `:instructions` sends none, for a server whose grammar would keep the model from calling tools (see "Structured output" below). `:instructions` is rejected on `:anthropic`/`:openai` entries. |
+| `pricing` | no | all | The alias's prices, which every call on it is charged at (see "Pricing" below). Without it a call's cost is `nil`, never zero. |
 
 "Chat-completions providers" means `:openrouter`, `:bedrock`, `:vertex`,
 and `:openai_compatible` — the four served by the shared
@@ -300,6 +301,98 @@ stops with `"max_tokens"` (OpenAI's `response.incomplete` with
 `max_output_tokens`, Chat Completions' `length`). A schema agent's
 `:invalid_output` error says which.
 
+## Pricing
+
+Clementine turns usage into money only at prices you configure. It
+ships no price table, so it never ships a stale one: copy your rates from
+each provider's price page. Give an alias `pricing:` and every call on it
+has a cost; leave it out and the cost is `nil`, never zero.
+
+```elixir
+# Illustrative numbers, not anyone's current prices.
+claude_sonnet: [
+  provider: :anthropic,
+  id: "claude-sonnet-5",
+  pricing: [
+    currency: "USD",
+    input: 3.00,
+    output: 15.00,
+    cache_read: 0.30,
+    cache_write: [five_minutes: 3.75, one_hour: 6.00]
+  ]
+],
+deepseek: [
+  provider: :openrouter,
+  id: "deepseek/deepseek-v3.2",
+  pricing: [currency: "USD", input: 0.28, output: 0.42, cache_read: 0.028, cache_write: 0.28]
+]
+```
+
+| Key | Meaning |
+|---|---|
+| `currency` | An ISO 4217 code, `"USD"`. Every priced alias names the same one, so costs across the catalog add up. |
+| `input` | Uncached input. |
+| `output` | Output, reasoning included. |
+| `cache_read` | Input read from the provider's prompt cache. |
+| `cache_write` | Input written to it: one rate, or a rate per cache TTL. |
+
+- **The unit.** Every rate is in `currency` per million tokens, as price
+  pages state it, to six decimal places at most; integers and floats both
+  work.
+- **All four rates, or none.** A missing one fails boot, naming the
+  alias: a call charged for only some of its tokens is an undercount
+  nobody would see. Write `0` for what the provider does not charge (a
+  server you host), and the input rate where it bills a cache write as
+  plain input.
+- **Cache writes by TTL.** Where a provider charges more to keep a cache
+  entry longer, give `cache_write` a rate per TTL, as the price page
+  lists them, and the TTL the alias writes with (its `cache:` key, or the
+  provider's default) picks one:
+
+  | Provider | TTLs |
+  |---|---|
+  | `:anthropic` | `:five_minutes` (the default), `:one_hour` |
+  | `:openai`, GPT-5.6 and later | `:thirty_minutes` (the default), `:twelve_hours`. OpenAI's caching guide offers twelve hours; its API reference says thirty minutes is currently the only value. |
+  | `:openrouter`, `:openai_compatible`, when cache markers go out | `:five_minutes` (the default), `:one_hour` |
+  | Every other alias: `:bedrock`, `:vertex`, older OpenAI ids, the rest of OpenRouter, caching off | none: give one rate |
+
+  A per-TTL `cache_write` without the rate for the alias's TTL, or on an
+  alias whose writes carry no TTL, fails boot.
+
+**How a call is priced.** `input_tokens` counts every input token, cached
+or not, and the cache reads and writes are parts of it
+(`Clementine.Usage`). A call costs its uncached input (`input_tokens`
+less both cache counts) at `input`, its cache reads at `cache_read`, its
+cache writes at `cache_write`, and its output at `output`, summed exactly
+and rounded once, half up, to the micro-unit. A cost is a
+`%Clementine.Cost{currency: "USD", micros: 1_284}`: integer millionths of
+the currency, here $0.001284.
+
+**Where costs show.**
+
+- Each trace `:model_call` entry records the alias it ran on (`"alias"`)
+  and its cost (`"cost"`), frozen when the call ended, at the prices the
+  alias had then. A price you change applies to calls from then on and
+  never reprices history.
+- `Clementine.Runs.cost(run_id)` sums a run's own calls;
+  `Clementine.Runs.cost(run_id, children: true)` adds every run below it
+  (its delegates, a loop's turns and theirs);
+  `Clementine.Runs.subject_cost(subject)` totals every run on a subject.
+  Each is `nil` when any call in it ran unpriced.
+- `[:clementine, :llm, :stop]` carries a priced call's `cost_micros`,
+  with `currency` in its metadata, and `Clementine.Telemetry.metrics/0`
+  sums it.
+- `Clementine.Cost.of(usage, alias)` prices any usage at today's prices:
+  an in-process run's `result.usage`, or a trace entry's usage to reprice
+  it.
+
+**What four rates do not cover.** A price that depends on more than the
+token counts is not modeled, and the cost is the plain rate: Anthropic's
+US-only inference (`inference_geo`) and fast mode, a model with higher
+prices above a prompt length (Claude Haiku 5.5 over 100,000 tokens),
+regional pricing on Bedrock and Vertex (price the alias at its region's
+rates), and per-use server tool fees such as web search.
+
 ## Adding a model, start to finish
 
 1. Find the lane. First-party Anthropic/OpenAI → `:anthropic`/`:openai`.
@@ -309,7 +402,7 @@ stops with `"max_tokens"` (OpenAI's `response.incomplete` with
 2. Make sure the lane's app config exists (API key; region/project for
    Bedrock/Vertex) — see the recipes above.
 3. Add the catalog entry: `provider`, the provider's exact `id`, and
-   optionally `defaults`/`reasoning`/`base_url`/`api_key`.
+   optionally `defaults`/`reasoning`/`base_url`/`api_key`/`pricing`.
 4. Boot the app (or run `mix test`) — an invalid entry fails at startup,
    naming the alias.
 5. Smoke it: `Clementine.run(Clementine.Agent.new(model: :my_alias), "Hi")`.

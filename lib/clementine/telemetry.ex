@@ -285,9 +285,13 @@ defmodule Clementine.Telemetry do
   `stop_reason` is `nil` and the token counts are the partial usage that
   actually burned.
 
-  - Measurements: `%{duration: native_time, input_tokens: integer, output_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer}`
-    (`Clementine.Usage`'s fields: the cache counts are parts of `input_tokens`)
-  - Metadata: `%{model: model_ref, iteration: integer, stop_reason: String.t() | nil, streaming: boolean}`
+  - Measurements: `%{duration: native_time, input_tokens: integer, output_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer, cost_micros: integer}`
+    (`Clementine.Usage`'s fields: the cache counts are parts of `input_tokens`).
+    `cost_micros` is what the call cost in micro-units of `currency`
+    (`Clementine.Cost`), at the prices `model` has now; a call on a model
+    without prices leaves it out, never reports zero.
+  - Metadata: `%{model: model_ref, iteration: integer, stop_reason: String.t() | nil, currency: String.t() | nil, streaming: boolean}`
+    — `currency` is `nil` for an unpriced call
 
   ### `[:clementine, :llm, :exception]`
 
@@ -472,6 +476,8 @@ defmodule Clementine.Telemetry do
       summary("clementine.llm.stop.cache_read_tokens"),
       summary("clementine.llm.stop.cache_write_tokens"),
       counter("clementine.llm.stop.input_tokens"),
+      # Spend: an unpriced call carries no cost_micros, and reporters skip it.
+      sum("clementine.llm.stop.cost_micros", tags: [:currency]),
       counter("clementine.llm.exception.duration",
         event_name: [:clementine, :llm, :exception],
         measurement: fn _measurements -> 1 end

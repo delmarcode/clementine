@@ -64,7 +64,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # inspect/1 is the loop doctor, by the RFC's name; Kernel's is
     # qualified where this module needs it.
     import Kernel, except: [inspect: 1]
-    import Ecto.Query, only: [from: 2]
+
+    import Ecto.Query,
+      only: [from: 2, recursive_ctes: 2, union_all: 2, with_cte: 3]
 
     alias Clementine.Emissions
     alias Clementine.Lifecycle.Ecto.Codec
@@ -849,6 +851,110 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
         {:error, :not_found} ->
           []
+      end
+    end
+
+    @doc """
+    What the run `id` cost (`Clementine.Cost`): the sum of the costs its
+    trace froze on each model call, each priced by its call's model at
+    the prices configured when it ran, so a price changed since reprices
+    nothing.
+
+    `nil` when no cost can be stated: a call ran on a model without
+    prices, or calls were priced in different currencies. A run that
+    called no model costs `Clementine.Cost.zero/0`, zero where the catalog
+    has prices. `nil` for a run that does not exist.
+
+    A run's cost is its own calls', as its `usage` is: a parent that asked
+    other agents (`delegates:`), and a loop, are charged for their own
+    calls only, so the costs of a subject's runs add up without counting
+    a child twice. With `children: true` it is the run's and every run's
+    below it, down the `parent_id` tree: a parent's delegates, a loop's
+    turns and theirs.
+
+    A run reaped after its node died is priced up to its last iteration
+    boundary, as its trace is.
+    """
+    @spec cost(Ecto.UUID.t(), keyword()) :: Clementine.Cost.t() | nil
+    def cost(run_id, opts \\ []) do
+      %Config{repo: repo} = Config.fetch!()
+
+      with {:ok, id} <- cast_id(run_id),
+           true <- repo.exists?(from(r in AgentRun, where: r.id == ^id)) do
+        runs =
+          if Keyword.get(opts, :children, false),
+            do: run_tree(id),
+            else: from(r in AgentRun, where: r.id == ^id, select: r.id)
+
+        trace_cost(repo, runs)
+      else
+        _missing -> nil
+      end
+    end
+
+    @doc """
+    What every run on `subject` cost, as `cost/2` prices each: the
+    subject's tasks and turns, the delegates they asked (a delegate runs
+    on its parent's subject), and its loops. `nil` when no cost can be
+    stated; zero, where the catalog has prices, for a subject with no
+    model calls.
+    """
+    @spec subject_cost(subject()) :: Clementine.Cost.t() | nil
+    def subject_cost(subject) do
+      %Config{repo: repo} = Config.fetch!()
+
+      trace_cost(repo, where_reference(from(r in AgentRun, select: r.id), :subject, subject))
+    end
+
+    # The run `id` and every run below it, by parent_id
+    # (agent_runs_parent_index).
+    defp run_tree(id) do
+      root = from(r in AgentRun, where: r.id == ^id, select: %{id: r.id})
+
+      below =
+        from(r in AgentRun,
+          join: t in "run_tree",
+          on: r.parent_id == t.id,
+          select: %{id: r.id}
+        )
+
+      from(t in "run_tree", select: t.id)
+      |> recursive_ctes(true)
+      |> with_cte("run_tree", as: ^union_all(root, ^below))
+    end
+
+    # The sum of the costs frozen on the model calls of `runs`, a query of
+    # run ids, aggregated in the database: only the cost leaves it, never
+    # a payload.
+    defp trace_cost(repo, runs) do
+      totals =
+        repo.one(
+          from(t in "agent_run_trace",
+            where: t.run_id in subquery(runs) and t.kind == "model_call",
+            select: %{
+              calls: count(t.id),
+              unpriced:
+                fragment(
+                  "count(*) FILTER (WHERE jsonb_typeof(?->'cost') IS DISTINCT FROM 'object')",
+                  t.payload
+                ),
+              currencies: fragment("count(DISTINCT ?->'cost'->>'currency')", t.payload),
+              currency: fragment("min(?->'cost'->>'currency')", t.payload),
+              micros:
+                fragment("coalesce(sum((?->'cost'->>'micros')::bigint), 0)::bigint", t.payload)
+            }
+          )
+        )
+
+      case totals do
+        %{calls: 0} ->
+          Clementine.Cost.zero()
+
+        %{unpriced: 0, currencies: 1, currency: currency, micros: micros} ->
+          %Clementine.Cost{currency: currency, micros: micros}
+
+        _unpriced_or_mixed ->
+          nil
       end
     end
 

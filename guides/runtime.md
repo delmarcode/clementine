@@ -287,6 +287,7 @@ Clementine.Runs.trace(run.id)
 #=>     payload: %{"iteration" => 1, "stop_reason" => "tool_use", "duration_ms" => 812,
 #=>                "usage" => %{"input_tokens" => 1204, "output_tokens" => 38,
 #=>                             "cache_read_tokens" => 1100, "cache_write_tokens" => 96},
+#=>                "alias" => "claude_sonnet", "cost" => %{"currency" => "USD", "micros" => 1284},
 #=>                "content" => […]}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 3, kind: :tool_call,
 #=>     payload: %{"name" => "lookup", "args" => %{"query" => "…"}, "result" => "…",
@@ -309,7 +310,10 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   schemas), and the delegates' keys, so runs that offered the model the
   same thing group together.
 - A `:model_call` entry records each call to the model, a call cut off
-  by a cancel included, with the usage it had reported. A `:tool_call`
+  by a cancel included, with the usage it had reported, the alias it ran
+  on, and its cost at that alias's prices then (`nil` without prices;
+  `Clementine.Runs.cost/2` sums a run's, and `docs/MODELS.md` has the
+  `pricing:` key). A `:tool_call`
   entry records each tool call started, with the arguments it ran with
   and the decision it waited on (`"approval" => %{"verdict" => "approved",
   "by" => ...}`); a call to a `{:policy, term}` tool also carries the
