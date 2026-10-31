@@ -279,7 +279,15 @@ defmodule Clementine.Runs.TraceTest do
       assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
 
       assert [_, _, unknown, _, _, approved, _] = Runs.trace(turn.id)
-      assert %{"name" => nil, "is_error" => true, "args" => %{"x" => @canary}} = unknown.payload
+
+      # The name the model asked for reads back as it always did, from the
+      # payload, and its tool_name column stays null.
+      assert %{
+               "name" => "zzz_" <> @canary,
+               "unknown" => true,
+               "is_error" => true,
+               "args" => %{"x" => @canary}
+             } = unknown.payload
 
       assert %{"name" => "send_note", "approval" => %{"by" => "Kq7canary-approver"}} =
                approved.payload
@@ -338,11 +346,15 @@ defmodule Clementine.Runs.TraceTest do
                } = model_call
 
         assert is_integer(duration)
-        assert Map.keys(model_call.payload) |> Enum.sort() == ["content", "iteration"]
+        assert Map.keys(model_call.payload) == ["content"]
       end
+
+      assert [1, 2] = [call.iteration, final.iteration]
 
       assert %{
                kind: "tool_call",
+               iteration: 1,
+               tool_use_id: "tu_1",
                tool_name: "lookup",
                is_error: false,
                killed: false,
@@ -354,8 +366,7 @@ defmodule Clementine.Runs.TraceTest do
 
       assert is_integer(duration)
 
-      assert Map.keys(tool.payload) |> Enum.sort() ==
-               ["args", "iteration", "result", "tool_use_id"]
+      assert Map.keys(tool.payload) |> Enum.sort() == ["args", "result"]
     end
   end
 

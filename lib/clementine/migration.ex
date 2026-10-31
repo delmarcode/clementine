@@ -64,9 +64,14 @@ if Code.ensure_loaded?(Ecto.Migration) do
         kind: :fact,
         payload: {:content, "the system prompt, the model's text, tools' arguments and results"},
         inserted_at: :fact,
+        # A counter the engine keeps.
+        iteration: :fact,
+        # The provider's id for a tool call; a delegate child's tag_id.
+        tool_use_id: :fact,
         provider: :fact,
         model: :fact,
         alias: :fact,
+        # A hash, though over content: see "What a warehouse may keep".
         agent_fingerprint: :fact,
         input_tokens: :fact,
         output_tokens: :fact,
@@ -76,11 +81,20 @@ if Code.ensure_loaded?(Ecto.Migration) do
         currency: :fact,
         duration_ms: :fact,
         stop_reason: :fact,
+        # Only a name the agent offers; the model's own stays in payload.
         tool_name: :fact,
         is_error: :fact,
         killed: :fact,
         approval_verdict: :fact,
-        policy_verdict: :fact
+        policy_verdict: :fact,
+        # A boolean; the failure's text stays in payload.
+        policy_failed: :fact,
+        # A skill the agent offered and the model loaded, by the name the
+        # app gave it.
+        skill_name: :fact,
+        # An agent key the delegate call started, one of the agent's
+        # delegates.
+        delegate_key: :fact
       ]
     ]
 
@@ -153,10 +167,29 @@ if Code.ensure_loaded?(Ecto.Migration) do
     model, alias, tokens, cost, duration, and stop reason, and each tool
     call's name, outcome, and duration, are in `agent_run_trace`'s columns
     (version 5), and a run that was interrupted says why in
-    `agent_runs.interrupt`, a closed code with Clementine's own text. The
-    ids an app chooses for a subject, an actor, or a child's tag are facts
-    while the app keeps them ids. A version that adds a column says here
-    which it is.
+    `agent_runs.interrupt`, a closed code with Clementine's own text. A
+    version that adds a column says here which it is.
+
+    Three kinds of fact column hold what the app chooses, and stay facts
+    only while the app keeps them so:
+
+    - **The ids an app gives a subject, an actor, or a child's tag**
+      (`subject_id`, `actor_id`, `tag_id`) are facts while they are ids.
+      An id that is the app's text is content, for the reason
+      `dedup_key` is: an email's Message-ID names the sender's mail host.
+      `Clementine.Thread` tags each turn with the id its message was sent
+      with, and its example sends `message.id` as both that id and the
+      `dedup_key`, so an app whose message ids are Message-IDs puts them
+      in `tag_id` too. Such an app leaves those columns out as well.
+    - **The names an app gives skills** (`skill_name`) are facts while
+      they are names, as a tool's or an agent's key is.
+    - **`agent_fingerprint`** is a sha256 over content: the instructions,
+      the tool schemas, and the rest of what an execution offered the
+      model (`Clementine.Trace`). It reads as no text, but an app whose
+      instructions differ by person (a user's name or account in the
+      system prompt) makes it a per-person value, which anyone with a
+      guess at those instructions can confirm by hashing the guess. Such
+      an app leaves it out too.
 
     ## Version 5
 
@@ -166,34 +199,70 @@ if Code.ensure_loaded?(Ecto.Migration) do
     the rest:
 
         agent_run_trace
-          provider            text     execution, model_call  the provider: anthropic, openai, ...
-          model               text     execution, model_call  the provider's model id
-          alias               text     execution, model_call  the catalog alias; null for a
-                                                              {provider, id} reference
-          agent_fingerprint   text     execution
-          input_tokens        integer  model_call             Clementine.Usage's four counts
-          output_tokens       integer  model_call
-          cache_read_tokens   integer  model_call
-          cache_write_tokens  integer  model_call
-          cost_micros         bigint   model_call             frozen when the call ended;
-          currency            text     model_call             both null for an unpriced call
-          duration_ms         integer  model_call, tool_call
-          stop_reason         text     model_call             the provider's; null for a call
-                                                              that did not finish
-          tool_name           text     tool_call              null for a name the agent did not
-                                                              offer
+          iteration           integer  every kind but execution  the pass of the model–tool cycle
+          tool_use_id         text     tool_call, policy,        the provider's id for the call;
+                                       skill_load, delegate      a delegate child's tag_id
+          provider            text     execution, model_call     the provider: anthropic, openai, ...
+          model               text     execution, model_call     the provider's model id; null for
+                                                                 an alias the catalog lacks
+          alias               text     execution, model_call     the catalog alias; null for a
+                                                                 {provider, id} reference
+          agent_fingerprint   text     execution                 Clementine.Trace's sha256
+          input_tokens        bigint   model_call                Clementine.Usage's four counts
+          output_tokens       bigint   model_call
+          cache_read_tokens   bigint   model_call
+          cache_write_tokens  bigint   model_call
+          cost_micros         bigint   model_call                frozen when the call ended;
+          currency            text     model_call                both null for an unpriced call
+          duration_ms         bigint   model_call, tool_call
+          stop_reason         text     model_call                the provider's; null for a call
+                                                                 that did not finish
+          tool_name           text     tool_call, policy         null for a name the agent did
+                                                                 not offer
           is_error            boolean  tool_call
           killed              boolean  tool_call
-          approval_verdict    text     tool_call              approved | denied
-          policy_verdict      text     tool_call              allow | require_approval | deny
-          check agent_run_trace_cost_whole ((cost_micros is null) = (currency is null))
+          approval_verdict    text     tool_call                 approved | denied
+          policy_verdict      text     tool_call, policy         allow | require_approval | deny
+          policy_failed       boolean  tool_call, policy         the policy failed, and the call
+                                                                 was denied for it
+          skill_name          text     skill_load                the skill the call loaded
+          delegate_key        text     delegate                  the agent the child ran
+          check agent_run_trace_cost_whole     ((cost_micros is null) = (currency is null))
+          check agent_run_trace_approval_known (approval_verdict in ('approved', 'denied'))
+          check agent_run_trace_policy_known   (policy_verdict in
+                                                ('allow', 'require_approval', 'deny'))
+          check agent_run_trace_policy_whole   ((policy_verdict is null) = (policy_failed is null))
 
     A fact is stored once: `payload` keeps the rest of the entry, and
     `Clementine.Runs.trace/1` puts the columns back into each entry's
-    payload, as `Clementine.Trace` lists it. `agent_runs` gets no model
+    payload, as `Clementine.Trace` lists it. A tool name the agent does not
+    offer is the model's text, so it stays in `payload`. Counts and
+    durations are `bigint`, so no count a provider reports fails the write
+    that records it, and with it the run's end. `agent_runs` gets no model
     column: a run's executions can span a deploy, so the record is per
-    call. `up(from: 4, version: 5)` adds the columns, null on every
-    existing row, and backfills nothing.
+    call.
+
+    No column is `not null` for the kinds it applies to, on purpose. The
+    version gate keeps new code off an old table, not old code off a new
+    one, so during a rolling deploy a node still on version 4 code writes
+    to a version 5 table, with its facts in `payload` and these columns
+    null; a `not null` would fail those writes and leave their runs
+    stuck. And a model reference the catalog does not hold (a test's on a
+    mock client, or an alias since removed) records no provider, and an
+    alias no model. The checks hold a value written to the ones it may
+    take.
+
+    `up(from: 4, version: 5)` adds the columns, null on every existing
+    row, and backfills nothing: `Clementine.Runs.trace/1` reads an older
+    row from its payload, as before, and its cost reads `nil`. The way back
+    loses facts:
+
+    - `down(to: 4, version: 5)` drops the columns, and with them the facts
+      of every entry written under version 5, whose payload no longer
+      holds them: its model, tokens, cost, and tool name are gone.
+    - Code on version 4 started against a version 5 table (a table ahead
+      of the code starts) reads only `payload`, so it reads the entries
+      version 5 wrote without their usage, cost, or tool name.
 
     ## Version 4
 
@@ -597,25 +666,34 @@ if Code.ensure_loaded?(Ecto.Migration) do
       stamp(4)
     end
 
+    # Counts and durations are bigint: a count past integer's range would
+    # fail the write that records it, and with it the run's end. No column
+    # is NOT NULL for its kinds (the moduledoc says why); the checks hold a
+    # value written to the ones it may take.
     defp step_up(5) do
       alter table(@trace) do
+        add(:iteration, :integer)
+        add(:tool_use_id, :text)
         add(:provider, :text)
         add(:model, :text)
         add(:alias, :text)
         add(:agent_fingerprint, :text)
-        add(:input_tokens, :integer)
-        add(:output_tokens, :integer)
-        add(:cache_read_tokens, :integer)
-        add(:cache_write_tokens, :integer)
+        add(:input_tokens, :bigint)
+        add(:output_tokens, :bigint)
+        add(:cache_read_tokens, :bigint)
+        add(:cache_write_tokens, :bigint)
         add(:cost_micros, :bigint)
         add(:currency, :text)
-        add(:duration_ms, :integer)
+        add(:duration_ms, :bigint)
         add(:stop_reason, :text)
         add(:tool_name, :text)
         add(:is_error, :boolean)
         add(:killed, :boolean)
         add(:approval_verdict, :text)
         add(:policy_verdict, :text)
+        add(:policy_failed, :boolean)
+        add(:skill_name, :text)
+        add(:delegate_key, :text)
       end
 
       create(
@@ -624,13 +702,37 @@ if Code.ensure_loaded?(Ecto.Migration) do
         )
       )
 
+      create(
+        constraint(@trace, :agent_run_trace_approval_known,
+          check: "approval_verdict IN ('approved', 'denied')"
+        )
+      )
+
+      create(
+        constraint(@trace, :agent_run_trace_policy_known,
+          check: "policy_verdict IN ('allow', 'require_approval', 'deny')"
+        )
+      )
+
+      create(
+        constraint(@trace, :agent_run_trace_policy_whole,
+          check: "(policy_verdict IS NULL) = (policy_failed IS NULL)"
+        )
+      )
+
       stamp(5)
     end
 
     defp step_down(5) do
+      drop(constraint(@trace, :agent_run_trace_policy_whole))
+      drop(constraint(@trace, :agent_run_trace_policy_known))
+      drop(constraint(@trace, :agent_run_trace_approval_known))
       drop(constraint(@trace, :agent_run_trace_cost_whole))
 
       alter table(@trace) do
+        remove(:delegate_key)
+        remove(:skill_name)
+        remove(:policy_failed)
         remove(:policy_verdict)
         remove(:approval_verdict)
         remove(:killed)
@@ -648,6 +750,8 @@ if Code.ensure_loaded?(Ecto.Migration) do
         remove(:alias)
         remove(:model)
         remove(:provider)
+        remove(:tool_use_id)
+        remove(:iteration)
       end
 
       stamp(4)

@@ -62,9 +62,11 @@ defmodule Clementine.Trace do
     cut off included (the model never sees its result; the trace keeps it).
     - `"iteration"`, `"tool_use_id"`, `"args"` (the arguments the tool ran
       with), `"is_error"`, `"duration_ms"`
-    - `"name"` — the tool's; `nil` when the model asked for a tool the
-      agent does not offer (the call ran nothing, and its `"result"`, the
-      error the model read, names what it asked for)
+    - `"name"` — the tool's, or the name the model asked for when the
+      agent offers no tool of that name
+    - `"unknown"` — `true` when the agent offers no tool of that name:
+      the call ran nothing, and its `"result"` is the error the model
+      read. Absent for a tool the agent offers.
     - `"result"` — the text the model saw, or would have; `nil` for a
       killed call
     - `"killed"` — `true` for a call killed before it answered (a drain,
@@ -139,18 +141,31 @@ defmodule Clementine.Trace do
   the content:
 
   - `:execution`: `provider`, `model`, `alias`, `agent_fingerprint`.
-  - `:model_call`: `provider`, `model`, `alias`, the four counts of
-    `"usage"` (`input_tokens`, `output_tokens`, `cache_read_tokens`,
-    `cache_write_tokens`), `"cost"` as `cost_micros` and `currency`,
-    `duration_ms`, `stop_reason`.
-  - `:tool_call`: `tool_name` (`"name"`), `is_error`, `killed`,
-    `duration_ms`, and the verdicts of `"approval"` and `"policy"` as
-    `approval_verdict` and `policy_verdict`.
+  - `:model_call`: `iteration`, `provider`, `model`, `alias`, the four
+    counts of `"usage"` (`input_tokens`, `output_tokens`,
+    `cache_read_tokens`, `cache_write_tokens`), `"cost"` as `cost_micros`
+    and `currency`, `duration_ms`, `stop_reason`.
+  - `:tool_call`: `iteration`, `tool_use_id`, `tool_name` (`"name"`),
+    `is_error`, `killed`, `duration_ms`, and `"approval"`'s verdict and
+    `"policy"`'s verdict and failure as `approval_verdict`,
+    `policy_verdict`, and `policy_failed`. A name the agent does not offer
+    is the model's text: its `tool_name` is null, and `"name"` and
+    `"unknown"` stay in `payload`.
+  - `:policy`: `iteration`, `tool_use_id`, `tool_name` (`"name"`),
+    `policy_verdict` (`"verdict"`), `policy_failed` (`"failed"`).
+  - `:skill_load`: `iteration`, `tool_use_id`, `skill_name` (`"name"`).
+  - `:delegate`: `iteration`, `tool_use_id`, `delegate_key` (`"agent"`).
 
-  The columns hold only ids, names fixed in code, numbers, and enums,
-  never text a person, a model, or a tool produced. Every other key stays
-  in `payload`, which a fact is never copied into: `Clementine.Runs.trace/1`
-  puts the columns back, so an entry reads as listed above.
+  A delegate's child is the run whose `parent_id` is this run and whose
+  `tag_id` is the `delegate` call's `tool_use_id`, and a skill load and the
+  `use_skill` call that made it share a `tool_use_id`, so a warehouse joins
+  them without the content.
+
+  The columns hold only ids, names fixed in code or chosen by the app,
+  numbers, and enums, never text a person, a model, or a tool produced.
+  Every other key stays in `payload`, which a fact is never copied into:
+  `Clementine.Runs.trace/1` puts the columns back, so an entry reads as
+  listed above.
 
   ## When it is written
 
@@ -179,6 +194,8 @@ defmodule Clementine.Trace do
   # The columns of agent_run_trace that hold an entry's facts
   # (Clementine.Migration, version 5), in table order.
   @columns [
+    :iteration,
+    :tool_use_id,
     :provider,
     :model,
     :alias,
@@ -195,10 +212,49 @@ defmodule Clementine.Trace do
     :is_error,
     :killed,
     :approval_verdict,
-    :policy_verdict
+    :policy_verdict,
+    :policy_failed,
+    :skill_name,
+    :delegate_key
   ]
 
   @usage_columns [:input_tokens, :output_tokens, :cache_read_tokens, :cache_write_tokens]
+
+  # The facts each kind keeps at the top of its payload, by column. The
+  # nested ones (a model call's usage and cost, a tool call's verdicts)
+  # and a tool call's name are split_nested/2's.
+  @fact_keys %{
+    execution: [
+      provider: "provider",
+      model: "model",
+      alias: "alias",
+      agent_fingerprint: "agent_fingerprint"
+    ],
+    model_call: [
+      iteration: "iteration",
+      provider: "provider",
+      model: "model",
+      alias: "alias",
+      duration_ms: "duration_ms",
+      stop_reason: "stop_reason"
+    ],
+    tool_call: [
+      iteration: "iteration",
+      tool_use_id: "tool_use_id",
+      is_error: "is_error",
+      killed: "killed",
+      duration_ms: "duration_ms"
+    ],
+    policy: [
+      iteration: "iteration",
+      tool_use_id: "tool_use_id",
+      tool_name: "name",
+      policy_verdict: "verdict",
+      policy_failed: "failed"
+    ],
+    skill_load: [iteration: "iteration", tool_use_id: "tool_use_id", skill_name: "name"],
+    delegate: [iteration: "iteration", tool_use_id: "tool_use_id", delegate_key: "agent"]
+  }
 
   @typedoc """
   The model an execution or a call runs on, resolved once
@@ -207,7 +263,7 @@ defmodule Clementine.Trace do
   """
   @type model :: %{
           required(:provider) => ModelRegistry.provider() | nil,
-          required(:id) => String.t(),
+          required(:id) => String.t() | nil,
           required(:alias) => atom() | nil,
           required(:pricing) => Clementine.LLM.Pricing.t() | nil,
           optional(atom()) => term()
@@ -231,20 +287,20 @@ defmodule Clementine.Trace do
   # its trace entry, its cost, and its telemetry name the same provider,
   # id, alias, and prices: the catalog's resolution
   # (`ModelRegistry.resolve!/1`), or, for a reference the catalog does not
-  # hold (a test's, on a mock client), the reference as written, with no
-  # provider and no prices, rather than failing the run over its record.
+  # hold (a test's on a mock client, or an alias since removed), the
+  # reference as written, with no provider and no prices, rather than
+  # failing the run over its record. An alias is not a provider's id, so
+  # such an alias leaves the id nil; `alias` names it.
   @spec resolve_model(ModelRegistry.model_ref()) :: model()
   def resolve_model(ref) do
     ModelRegistry.resolve!(ref)
   rescue
     ArgumentError ->
-      %{
-        provider: nil,
-        id: if(is_atom(ref), do: Atom.to_string(ref), else: inspect(ref)),
-        alias: if(is_atom(ref), do: ref),
-        pricing: nil
-      }
+      %{provider: nil, id: written_id(ref), alias: if(is_atom(ref), do: ref), pricing: nil}
   end
+
+  defp written_id({_provider, id}) when is_binary(id), do: id
+  defp written_id(_ref), do: nil
 
   @doc false
   # The `:execution` payload for an execution offering `model` (resolved,
@@ -304,7 +360,8 @@ defmodule Clementine.Trace do
   # The `:tool_call` payload. `approval` is nil or `{verdict, meta}`, and
   # `policy` nil or the tool policy's verdict: `:allow`,
   # `:require_approval`, `{:deny, reason}`, or `{:failed, reason}` for a
-  # call denied because the policy failed.
+  # call denied because the policy failed. `unknown: true` marks a name
+  # the agent does not offer.
   @spec tool_call(map()) :: map()
   def tool_call(%{} = call) do
     %{
@@ -319,6 +376,7 @@ defmodule Clementine.Trace do
       "approval" => approval(call[:approval]),
       "policy" => call[:policy] && verdict_map(call[:policy])
     }
+    |> put_present("unknown", if(call[:unknown], do: true))
   end
 
   @doc false
@@ -375,131 +433,98 @@ defmodule Clementine.Trace do
   # its column only, so `from_row/3` is the way back. A kind this version
   # does not record has no columns.
   @spec to_row(Entry.kind() | String.t(), map()) :: {map(), map()}
-  def to_row(:execution, payload) do
-    {facts, rest} = Map.split(payload, ["provider", "model", "alias", "agent_fingerprint"])
+  def to_row(kind, payload) do
+    keys = Map.get(@fact_keys, kind, [])
+    {facts, rest} = Map.split(payload, Keyword.values(keys))
+    {nested, rest} = split_nested(kind, rest)
 
-    {row(
-       provider: facts["provider"],
-       model: facts["model"],
-       alias: facts["alias"],
-       agent_fingerprint: facts["agent_fingerprint"]
-     ), rest}
+    {row(Enum.map(keys, fn {column, key} -> {column, facts[key]} end) ++ nested), rest}
   end
 
-  def to_row(:model_call, payload) do
-    {facts, rest} =
-      Map.split(payload, [
-        "provider",
-        "model",
-        "alias",
-        "usage",
-        "cost",
-        "duration_ms",
-        "stop_reason"
-      ])
+  defp split_nested(:model_call, payload) do
+    {usage, rest} = Map.pop(payload, "usage")
+    {cost, rest} = Map.pop(rest, "cost")
+    usage = usage || %{}
+    cost = cost || %{}
 
-    usage = facts["usage"] || %{}
-    cost = facts["cost"] || %{}
-
-    {row(
-       [
-         provider: facts["provider"],
-         model: facts["model"],
-         alias: facts["alias"],
-         cost_micros: cost["micros"],
-         currency: cost["currency"],
-         duration_ms: facts["duration_ms"],
-         stop_reason: facts["stop_reason"]
-       ] ++ for(column <- @usage_columns, do: {column, usage[Atom.to_string(column)]})
-     ), rest}
+    {[cost_micros: cost["micros"], currency: cost["currency"]] ++
+       for(column <- @usage_columns, do: {column, usage[Atom.to_string(column)]}), rest}
   end
 
-  def to_row(:tool_call, payload) do
-    {facts, rest} = Map.split(payload, ["name", "is_error", "killed", "duration_ms"])
+  # A name the agent does not offer is the model's text: it stays in the
+  # payload, beside "unknown". An approval's `by` and a policy's reason
+  # stay too; only the verdicts and the failure are facts.
+  defp split_nested(:tool_call, payload) do
+    {name, rest} = if payload["unknown"], do: {nil, payload}, else: Map.pop(payload, "name")
     {approval, rest} = Map.pop(rest, "approval")
     {policy, rest} = Map.pop(rest, "policy")
 
-    # An approval's `by` and a policy's reason and failure stay in the
-    # payload; only the verdicts are enums.
     rest =
       rest
       |> put_present("approval", approval && Map.delete(approval, "verdict"))
-      |> put_present("policy", policy && Map.delete(policy, "verdict"))
+      |> put_present("policy", policy && Map.drop(policy, ["verdict", "failed"]))
 
-    {row(
-       tool_name: facts["name"],
-       is_error: facts["is_error"],
-       killed: facts["killed"],
-       duration_ms: facts["duration_ms"],
+    {[
+       tool_name: name,
        approval_verdict: approval && approval["verdict"],
-       policy_verdict: policy && policy["verdict"]
-     ), rest}
+       policy_verdict: policy && policy["verdict"],
+       policy_failed: policy && policy["failed"]
+     ], rest}
   end
 
-  def to_row(_kind, payload), do: {row([]), payload}
+  defp split_nested(_kind, payload), do: {[], payload}
 
   @doc false
   # The payload of an entry of `kind` stored as `columns` (a map with a
   # key for each of `columns/0`) and `payload`: the inverse of `to_row/2`.
   # A key the stored payload holds itself wins over its column.
   @spec from_row(Entry.kind() | String.t(), map(), map()) :: map()
-  def from_row(:execution, columns, payload) do
-    Map.merge(
-      %{
-        "provider" => columns.provider,
-        "model" => columns.model,
-        "alias" => columns.alias,
-        "agent_fingerprint" => columns.agent_fingerprint
-      },
-      payload
-    )
+  def from_row(kind, columns, payload) do
+    {nested, payload} = join_nested(kind, columns, payload)
+
+    @fact_keys
+    |> Map.get(kind, [])
+    |> Map.new(fn {column, key} -> {key, Map.fetch!(columns, column)} end)
+    |> Map.merge(nested)
+    |> Map.merge(payload)
   end
 
-  def from_row(:model_call, columns, payload) do
+  defp join_nested(:model_call, columns, payload) do
     cost =
       if columns.cost_micros,
         do: %{"currency" => columns.currency, "micros" => columns.cost_micros}
 
-    Map.merge(
-      %{
-        "provider" => columns.provider,
-        "model" => columns.model,
-        "alias" => columns.alias,
-        "usage" => Map.new(@usage_columns, &{Atom.to_string(&1), Map.fetch!(columns, &1)}),
-        "cost" => cost,
-        "duration_ms" => columns.duration_ms,
-        "stop_reason" => columns.stop_reason
-      },
-      payload
-    )
+    usage = Map.new(@usage_columns, &{Atom.to_string(&1), Map.fetch!(columns, &1)})
+    {%{"usage" => usage, "cost" => cost}, payload}
   end
 
-  def from_row(:tool_call, columns, payload) do
+  defp join_nested(:tool_call, columns, payload) do
     {approval, payload} = Map.pop(payload, "approval")
     {policy, payload} = Map.pop(payload, "policy")
 
-    Map.merge(
-      %{
-        "name" => columns.tool_name,
-        "is_error" => columns.is_error,
-        "killed" => columns.killed,
-        "duration_ms" => columns.duration_ms,
-        "approval" => with_verdict(approval, columns.approval_verdict),
-        "policy" => with_verdict(policy, columns.policy_verdict)
-      },
-      payload
-    )
+    {%{
+       "name" => columns.tool_name,
+       "approval" => with_facts(approval, %{"verdict" => columns.approval_verdict}),
+       "policy" =>
+         with_facts(policy, %{
+           "verdict" => columns.policy_verdict,
+           "failed" => columns.policy_failed
+         })
+     }, payload}
   end
 
-  def from_row(_kind, _columns, payload), do: payload
+  defp join_nested(_kind, _columns, payload), do: {%{}, payload}
 
   defp row(facts), do: Map.merge(Map.new(@columns, &{&1, nil}), Map.new(facts))
 
   defp put_present(map, _key, nil), do: map
   defp put_present(map, key, value), do: Map.put(map, key, value)
 
-  defp with_verdict(rest, nil), do: rest
-  defp with_verdict(rest, verdict), do: Map.put(rest || %{}, "verdict", verdict)
+  # A nested map's facts go back into what the payload kept of it; an
+  # entry stored with none (no approval, no policy, or a row from before
+  # version 5) reads as stored.
+  defp with_facts(rest, %{"verdict" => nil}), do: rest
+  defp with_facts(rest, facts), do: Map.merge(rest || %{}, facts)
 
   @doc false
   # What an entry of `kind` stores at `fidelity`: content keys dropped
@@ -546,7 +571,7 @@ defmodule Clementine.Trace do
 
   defp fingerprint_of(model, instructions, tools, offer) do
     %{
-      "model" => model.id,
+      "model" => fingerprint_model(model),
       "instructions" => instructions,
       "tools" => Enum.map(tools, & &1.__schema__())
     }
@@ -556,6 +581,15 @@ defmodule Clementine.Trace do
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)
   end
+
+  # The model enters as the provider's id, or, for an alias the catalog
+  # does not hold, as the alias's name, so such an agent fingerprints as
+  # it always did, and two such aliases apart.
+  defp fingerprint_model(%{id: nil, alias: model_alias})
+       when is_atom(model_alias) and not is_nil(model_alias),
+       do: Atom.to_string(model_alias)
+
+  defp fingerprint_model(%{id: id}), do: id
 
   defp offered(offer) do
     Enum.reduce(offer, %{}, fn

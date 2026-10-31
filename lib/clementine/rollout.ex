@@ -1523,8 +1523,8 @@ defmodule Clementine.Rollout do
   # The tools the model is offered: the modules, then the engine's own.
   defp offered_tools(%Execution{} = exec), do: exec.tools ++ exec.engine_tools
 
-  defp offered_name(%Execution{} = exec, name) do
-    if Tool.find_by_name(exec.tools, name) || engine_tool(exec, name), do: name
+  defp offered?(%Execution{} = exec, name) do
+    Tool.find_by_name(exec.tools, name) != nil or engine_tool(exec, name) != nil
   end
 
   # Runs the calls that may execute in this pass — fence first, keyed to
@@ -1616,8 +1616,7 @@ defmodule Clementine.Rollout do
   # `gate` is how the call came to run or not: `approval:`, the decision
   # it waited on, and `policy:`, the tool policy's verdict on it. A name
   # the agent does not offer is the model's text, not a tool's name: the
-  # entry names no tool, and the result the model read says what it asked
-  # for.
+  # entry marks it unknown, which keeps it out of the tool_name column.
   defp record_tool_call(exec, tool_use, result, duration_ms, gate \\ []) do
     {content, is_error, killed} =
       case result do
@@ -1631,7 +1630,8 @@ defmodule Clementine.Rollout do
       Trace.tool_call(%{
         iteration: exec.iteration,
         tool_use_id: tool_use.id,
-        name: offered_name(exec, tool_use.name),
+        name: tool_use.name,
+        unknown: not offered?(exec, tool_use.name),
         args: tool_use.input,
         result: content,
         is_error: is_error,
