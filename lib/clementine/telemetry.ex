@@ -285,7 +285,8 @@ defmodule Clementine.Telemetry do
   `stop_reason` is `nil` and the token counts are the partial usage that
   actually burned.
 
-  - Measurements: `%{duration: native_time, input_tokens: integer, output_tokens: integer}`
+  - Measurements: `%{duration: native_time, input_tokens: integer, output_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer}`
+    (`Clementine.Usage`'s fields: the cache counts are parts of `input_tokens`)
   - Metadata: `%{model: model_ref, iteration: integer, stop_reason: String.t() | nil, streaming: boolean}`
 
   ### `[:clementine, :llm, :exception]`
@@ -294,6 +295,16 @@ defmodule Clementine.Telemetry do
 
   - Measurements: `%{duration: native_time}`
   - Metadata: `%{model: model_ref, iteration: integer, kind: atom, reason: term, streaming: boolean}`
+
+  ### `[:clementine, :llm, :usage_clamped]`
+
+  Emitted when a provider reports an input total smaller than its own
+  cache reads plus writes. The usage recorded raises the total to their
+  sum; this event says a provider's convention differs from the one its
+  client assumes, which would otherwise undercount quietly.
+
+  - Measurements: `%{input_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer}` (as reported)
+  - Metadata: `%{provider: atom, model: String.t() | nil}`
 
   ## Tool Events
 
@@ -468,10 +479,17 @@ defmodule Clementine.Telemetry do
       summary("clementine.llm.stop.duration", unit: {:native, :millisecond}),
       summary("clementine.llm.stop.input_tokens"),
       summary("clementine.llm.stop.output_tokens"),
+      summary("clementine.llm.stop.cache_read_tokens"),
+      summary("clementine.llm.stop.cache_write_tokens"),
       counter("clementine.llm.stop.input_tokens"),
       counter("clementine.llm.exception.duration",
         event_name: [:clementine, :llm, :exception],
         measurement: fn _measurements -> 1 end
+      ),
+      counter("clementine.llm.usage_clamped.count",
+        event_name: [:clementine, :llm, :usage_clamped],
+        measurement: fn _measurements -> 1 end,
+        tags: [:provider]
       ),
 
       # Tools

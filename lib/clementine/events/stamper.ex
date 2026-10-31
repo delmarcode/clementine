@@ -24,6 +24,8 @@ defmodule Clementine.Events.Stamper do
   @seq_ix 1
   @input_tokens_ix 2
   @output_tokens_ix 3
+  @cache_read_tokens_ix 4
+  @cache_write_tokens_ix 5
 
   @enforce_keys [:sink, :lease, :counters]
   defstruct [:sink, :lease, :counters]
@@ -36,7 +38,7 @@ defmodule Clementine.Events.Stamper do
 
   @spec new(module(), Lease.t()) :: t()
   def new(sink, %Lease{} = lease) when is_atom(sink) do
-    %__MODULE__{sink: sink, lease: lease, counters: :atomics.new(3, signed: false)}
+    %__MODULE__{sink: sink, lease: lease, counters: :atomics.new(5, signed: false)}
   end
 
   @doc """
@@ -68,7 +70,7 @@ defmodule Clementine.Events.Stamper do
 
   @doc """
   The usage accumulated from `usage_delta` events so far, as sampled by
-  the heartbeat. Reads may tear between the two fields; the sample is an
+  the heartbeat. Reads may tear between the fields; the sample is an
   approximation that trails live truth by design, and the terminal result
   carries the exact numbers.
   """
@@ -76,7 +78,9 @@ defmodule Clementine.Events.Stamper do
   def usage(%__MODULE__{counters: counters}) do
     %Usage{
       input_tokens: :atomics.get(counters, @input_tokens_ix),
-      output_tokens: :atomics.get(counters, @output_tokens_ix)
+      output_tokens: :atomics.get(counters, @output_tokens_ix),
+      cache_read_tokens: :atomics.get(counters, @cache_read_tokens_ix),
+      cache_write_tokens: :atomics.get(counters, @cache_write_tokens_ix)
     }
   end
 
@@ -113,9 +117,17 @@ defmodule Clementine.Events.Stamper do
   defp validate_payload!(_type, _payload), do: :ok
 
   defp accumulate_usage(%__MODULE__{counters: counters}, :usage_delta, payload) do
-    %Usage{input_tokens: input, output_tokens: output} = Usage.new(payload)
-    if input > 0, do: :atomics.add(counters, @input_tokens_ix, input)
-    if output > 0, do: :atomics.add(counters, @output_tokens_ix, output)
+    usage = Usage.new(payload)
+
+    for {ix, n} <- [
+          {@input_tokens_ix, usage.input_tokens},
+          {@output_tokens_ix, usage.output_tokens},
+          {@cache_read_tokens_ix, usage.cache_read_tokens},
+          {@cache_write_tokens_ix, usage.cache_write_tokens}
+        ],
+        n > 0,
+        do: :atomics.add(counters, ix, n)
+
     :ok
   end
 

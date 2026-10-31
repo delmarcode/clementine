@@ -47,9 +47,14 @@ defmodule Clementine.LLM.ModelRegistry do
   `output_schema:` to the server not as `response_format` but not at
   all: the agent's instructions describe the answer, and the engine
   checks it. The default, `:native`, sends `response_format`.
+
+  `:cache` sets how the alias uses the provider's prompt cache: `false`
+  sends no cache hints, and `[ttl: ..., markers: ...]` changes the
+  default's lifetime or markers (`Clementine.LLM.Cache`). Caching is on
+  without it.
   """
 
-  alias Clementine.LLM.Reasoning
+  alias Clementine.LLM.{Cache, Reasoning}
 
   @providers [:anthropic, :bedrock, :openai, :openai_compatible, :openrouter, :vertex]
 
@@ -71,6 +76,7 @@ defmodule Clementine.LLM.ModelRegistry do
           base_url: String.t() | nil,
           api_key: api_key() | nil,
           structured_output: :native | :instructions,
+          cache: Cache.t(),
           alias: atom() | nil
         }
 
@@ -84,7 +90,8 @@ defmodule Clementine.LLM.ModelRegistry do
     ],
     base_url: [type: :string],
     api_key: [type: {:custom, __MODULE__, :validate_api_key, []}],
-    structured_output: [type: {:in, [:native, :instructions]}, default: :native]
+    structured_output: [type: {:in, [:native, :instructions]}, default: :native],
+    cache: [type: {:custom, Cache, :validate_config, []}, default: true]
   ]
 
   @doc false
@@ -148,6 +155,8 @@ defmodule Clementine.LLM.ModelRegistry do
               "Invalid model tuple #{inspect({provider, id})}: model id must be a non-empty string"
 
       true ->
+        {:ok, cache} = Cache.resolve(provider, id, true)
+
         %{
           provider: provider,
           id: id,
@@ -156,6 +165,7 @@ defmodule Clementine.LLM.ModelRegistry do
           base_url: nil,
           api_key: nil,
           structured_output: :native,
+          cache: cache,
           alias: nil
         }
     end
@@ -180,6 +190,7 @@ defmodule Clementine.LLM.ModelRegistry do
           base_url: Keyword.get(validated, :base_url),
           api_key: Keyword.get(validated, :api_key),
           structured_output: Keyword.fetch!(validated, :structured_output),
+          cache: Keyword.fetch!(validated, :cache),
           alias: model_alias
         }
     end
@@ -217,11 +228,16 @@ defmodule Clementine.LLM.ModelRegistry do
     ensure_endpoint_keys_supported!(validated, provider, context)
 
     case Reasoning.validate_model_config(provider, reasoning) do
-      {:ok, _reasoning} ->
-        Keyword.put(validated, :id, id)
+      {:ok, _reasoning} -> :ok
+      {:error, message} -> raise ArgumentError, "#{context}: :reasoning #{message}"
+    end
+
+    case Cache.resolve(provider, id, Keyword.fetch!(validated, :cache)) do
+      {:ok, cache} ->
+        validated |> Keyword.put(:id, id) |> Keyword.put(:cache, cache)
 
       {:error, message} ->
-        raise ArgumentError, "#{context}: :reasoning #{message}"
+        raise ArgumentError, "#{context}: :cache #{message}"
     end
   end
 

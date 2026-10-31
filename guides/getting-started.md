@@ -89,6 +89,15 @@ other terminal comes back as `{:error, result}` carrying the matching
 `Clementine.Error` (including whether it is retryable), a `Cancelled`, or
 an `Interrupted`. All variants carry `usage`; tokens burn on failures too.
 
+Prompt caching is on by default: each step of a run reads the prompt
+the step before it sent from the provider's cache instead of paying for
+it again. `usage.input_tokens` counts every input token, and
+`cache_read_tokens` and `cache_write_tokens` are the parts of it the
+provider read from its cache and wrote to it. A catalog entry's `cache:`
+key turns caching off or changes how long a write lives; the table of
+what each provider does is in
+[`docs/MODELS.md`](../docs/MODELS.md#prompt-caching).
+
 ## Tools
 
 Tools are modules. The `Clementine.Tool` macro generates the JSON Schema

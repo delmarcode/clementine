@@ -194,6 +194,54 @@ defmodule Clementine.TraceTest do
       assert kinds(MemoryLifecycle.trace(store, ref)) ==
                [{1, 1, :execution}, {1, 2, :model_call}]
     end
+
+    test "each model call keeps its cache counts, and the run's usage sums them",
+         %{store: store, ref: ref} do
+      MemoryLifecycle.seed_queued(store, ref)
+
+      first = %{
+        "input_tokens" => 1000,
+        "output_tokens" => 20,
+        "cache_read_tokens" => 0,
+        "cache_write_tokens" => 950
+      }
+
+      second = %{
+        "input_tokens" => 1100,
+        "output_tokens" => 5,
+        "cache_read_tokens" => 950,
+        "cache_write_tokens" => 120
+      }
+
+      expect(Clementine.LLM.MockClient, :stream, 2, fn
+        _model, _system, [_input], _tools, _opts ->
+          [
+            {:tool_use_start, "tu_1", "safe_echo"},
+            {:input_json_delta, "tu_1", ~s({"message":"hi"})},
+            {:content_block_stop, 0},
+            {:message_delta, %{"stop_reason" => "tool_use"}, first}
+          ]
+
+        _model, _system, _messages, _tools, _opts ->
+          [{:text_delta, "Done."}, {:message_delta, %{"stop_reason" => "end_turn"}, second}]
+      end)
+
+      assert {:finished, %Facts{status: :completed, usage: usage}} =
+               execute(build_run(ref, tools: [SafeEcho]), store)
+
+      assert usage == %Clementine.Usage{
+               input_tokens: 2100,
+               output_tokens: 25,
+               cache_read_tokens: 950,
+               cache_write_tokens: 1070
+             }
+
+      calls =
+        for %Entry{kind: :model_call, payload: payload} <- MemoryLifecycle.trace(store, ref),
+            do: payload["usage"]
+
+      assert calls == [first, second]
+    end
   end
 
   describe "a run that ends otherwise" do

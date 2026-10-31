@@ -55,13 +55,27 @@ defmodule Clementine.LLM.Anthropic do
   `"additionalProperties": false`, and constraints such as `minimum` or
   `maxLength` are refused. A model without structured outputs refuses
   the request.
+
+  ## Prompt caching
+
+  Every request carries two cache breakpoints unless the alias sets
+  `cache: false` (`Clementine.LLM.Cache`): `cache_control` on the system
+  prompt, which ends the prefix every run of the agent shares (the
+  tools, then the system prompt), and the top-level `cache_control` the
+  API moves to the last cacheable block, so each call of the model–tool
+  cycle reads the prefix the call before it wrote. Without a system
+  prompt the first one goes on the last tool loaded up front: a deferred
+  tool cannot carry one. Both use the alias's TTL, five minutes unless it
+  says `ttl: :one_hour`. A prefix shorter than the model's minimum is not
+  cached, and costs nothing extra. Usage counts the cache reads and writes
+  the API reports as parts of `input_tokens`.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
 
   alias Clementine.LLM.ModelRegistry
   alias Clementine.LLM.Anthropic.{Messages, Tools}
-  alias Clementine.LLM.ProviderStream
+  alias Clementine.LLM.{Cache, ProviderStream, ProviderUsage}
   alias Clementine.LLM.Reasoning
   alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
@@ -288,19 +302,63 @@ defmodule Clementine.LLM.Anthropic do
       "messages" => Messages.encode_all(messages, tool_search: loadable(encoded_tools))
     }
 
-    body =
-      body
-      |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
-      |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
+    body
+    |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
+    |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
+    |> put_prompt(system, encoded_tools, resolved.cache)
+  end
 
-    body =
-      if system != nil and system != "" do
-        Map.put(body, "system", system)
+  # The system prompt and tools, with the cache breakpoints when caching
+  # is on: one at the end of the stable prefix (the system prompt, or the
+  # last tool loaded up front when there is none), which every run of the
+  # agent shares, and the top-level automatic one, which the API moves to
+  # the last cacheable block, so each call reads what the one before it
+  # wrote. Two of the four breakpoints a request may carry.
+  defp put_prompt(body, system, encoded_tools, %{enabled: true} = cache) do
+    cache_control = Cache.cache_control(cache)
+
+    {system, encoded_tools} =
+      if present?(system) do
+        {[%{"type" => "text", "text" => system, "cache_control" => cache_control}], encoded_tools}
       else
-        body
+        {system, mark_last_loaded_tool(encoded_tools, cache_control)}
       end
 
-    if encoded_tools, do: Map.put(body, "tools", encoded_tools), else: body
+    body
+    |> put_present("system", system)
+    |> put_present("tools", encoded_tools)
+    |> Map.put("cache_control", cache_control)
+  end
+
+  defp put_prompt(body, system, encoded_tools, %{enabled: false}) do
+    body
+    |> put_present("system", system)
+    |> put_present("tools", encoded_tools)
+  end
+
+  # A deferred tool cannot carry cache_control (the API refuses it), and
+  # deferred tools are not part of the cached prefix anyway; the search
+  # tool is left as the API defines it.
+  defp mark_last_loaded_tool(nil, _cache_control), do: nil
+
+  defp mark_last_loaded_tool(encoded_tools, cache_control) do
+    index =
+      encoded_tools
+      |> Enum.with_index()
+      |> Enum.reverse()
+      |> Enum.find_value(fn {tool, index} ->
+        if not Map.has_key?(tool, "defer_loading") and not Tools.search_tool?(tool), do: index
+      end)
+
+    if index,
+      do: List.update_at(encoded_tools, index, &Map.put(&1, "cache_control", cache_control)),
+      else: encoded_tools
+  end
+
+  defp present?(value), do: value not in [nil, "", []]
+
+  defp put_present(body, key, value) do
+    if present?(value), do: Map.put(body, key, value), else: body
   end
 
   # What this request's tool search can load, read off its own tools: their
@@ -373,7 +431,7 @@ defmodule Clementine.LLM.Anthropic do
     %Response{
       content: Enum.flat_map(content, &parse_content_block/1),
       stop_reason: stop_reason,
-      usage: Map.get(body, "usage", %{})
+      usage: ProviderUsage.anthropic(Map.get(body, "usage"))
     }
   end
 

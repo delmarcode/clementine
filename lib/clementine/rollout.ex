@@ -1011,7 +1011,9 @@ defmodule Clementine.Rollout do
       %{
         duration: duration,
         input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens
       },
       Map.put(metadata, :stop_reason, stop_reason)
     )
@@ -1040,10 +1042,7 @@ defmodule Clementine.Rollout do
     delta = Clementine.Usage.new(response.usage)
 
     if Clementine.Usage.total(delta) > 0 do
-      emit_event(exec, :usage_delta, %{
-        input_tokens: delta.input_tokens,
-        output_tokens: delta.output_tokens
-      })
+      emit_event(exec, :usage_delta, Map.from_struct(delta))
     end
 
     %{exec | usage: Clementine.Usage.add(exec.usage, delta)}
@@ -1708,14 +1707,19 @@ defmodule Clementine.Rollout do
       request_opts(exec)
   end
 
-  defp request_opts(%Execution{} = exec),
-    do: deferred_opts(exec.deferred) ++ output_schema_opts(exec.output_schema)
+  defp request_opts(%Execution{} = exec) do
+    deferred_opts(exec.deferred) ++
+      output_schema_opts(exec.output_schema) ++ cache_key_opts(LLM.Cache.key(exec.context))
+  end
 
   defp deferred_opts([]), do: []
   defp deferred_opts(deferred), do: [deferred: deferred]
 
   defp output_schema_opts(nil), do: []
   defp output_schema_opts(schema), do: [output_schema: schema]
+
+  defp cache_key_opts(nil), do: []
+  defp cache_key_opts(key), do: [cache_key: key]
 
   defp batch_opts(%Execution{deadline: nil}), do: []
 

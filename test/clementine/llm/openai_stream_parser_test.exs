@@ -67,7 +67,12 @@ defmodule Clementine.LLM.OpenAIStreamParserTest do
              {:text_delta, "I can't "},
              {:text_delta, "help with that."},
              {:message_delta, %{"stop_reason" => "refusal"},
-              %{"input_tokens" => 5, "output_tokens" => 6}},
+              %{
+                "input_tokens" => 5,
+                "output_tokens" => 6,
+                "cache_read_tokens" => 0,
+                "cache_write_tokens" => 0
+              }},
              {:message_stop}
            ]
   end
@@ -89,7 +94,12 @@ defmodule Clementine.LLM.OpenAIStreamParserTest do
     assert events == [
              {:text_delta, ~s({"verdict": "pa)},
              {:message_delta, %{"stop_reason" => "max_tokens"},
-              %{"input_tokens" => 5, "output_tokens" => 8}},
+              %{
+                "input_tokens" => 5,
+                "output_tokens" => 8,
+                "cache_read_tokens" => 0,
+                "cache_write_tokens" => 0
+              }},
              {:message_stop}
            ]
 

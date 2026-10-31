@@ -8,7 +8,11 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
   # with a `data: [DONE]` sentinel. SSE comment payloads (OpenRouter
   # keep-alives) carry no data lines and are ignored. A refusal streams as
   # `delta.refusal`: it becomes the turn's text, and the stop reason
-  # "refusal".
+  # "refusal". Usage, which the stream reports in its last chunk, leaves
+  # in the keys `Clementine.Usage` reads
+  # (`Clementine.LLM.ProviderUsage.chat_completions/1`).
+
+  alias Clementine.LLM.ProviderUsage
 
   defmodule State do
     @moduledoc false
@@ -18,11 +22,14 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
               finish_reason: nil,
               usage: %{},
               refused: false,
-              done: false
+              done: false,
+              usage_meta: %{}
   end
 
-  def new do
-    %State{}
+  # `usage_meta` names the provider and model for the usage normalizer's
+  # telemetry; the client passes it.
+  def new(usage_meta \\ %{}) do
+    %State{usage_meta: usage_meta}
   end
 
   def parse(%State{buffer: buffer} = state, data) when is_binary(data) do
@@ -213,7 +220,8 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
     events =
       stop_events ++
         [
-          {:message_delta, %{"stop_reason" => stop_reason(state)}, state.usage},
+          {:message_delta, %{"stop_reason" => stop_reason(state)},
+           ProviderUsage.chat_completions(state.usage, state.usage_meta)},
           {:message_stop}
         ]
 

@@ -97,6 +97,21 @@ defmodule Clementine.RunViewTest do
       assert RunView.cursor(view) == {1, 3}
     end
 
+    test "usage deltas carry the cache counts" do
+      view =
+        fold([
+          event(1, 1, :usage_delta, %{input_tokens: 10, output_tokens: 1, cache_write_tokens: 8}),
+          event(1, 2, :usage_delta, %{input_tokens: 12, output_tokens: 2, cache_read_tokens: 8})
+        ])
+
+      assert view.usage == %Usage{
+               input_tokens: 22,
+               output_tokens: 3,
+               cache_read_tokens: 8,
+               cache_write_tokens: 8
+             }
+    end
+
     test "a JSON round-tripped stream (string keys) folds to the same view" do
       atom_keyed = [
         event(1, 1, :iteration_start, %{n: 2}),

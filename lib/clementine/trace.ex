@@ -41,8 +41,9 @@ defmodule Clementine.Trace do
     - `"stop_reason"` — the provider's, or `nil` when the call did not
       finish (a cancel, a drain, a lost lease, or a provider error ended
       the execution in the middle of it)
-    - `"usage"` — `%{"input_tokens" => n, "output_tokens" => n}`, what
-      the stream reported, so far as it got
+    - `"usage"` — `Clementine.Usage.to_map/1`'s map (`"input_tokens"`,
+      `"output_tokens"`, `"cache_read_tokens"`, `"cache_write_tokens"`),
+      what the stream reported, so far as it got
     - `"content"` — the assistant's blocks, as
       `Clementine.LLM.Message.Content.to_map/1` maps them
   - `:tool_call`, once per tool call started, a call a cancel or a drain

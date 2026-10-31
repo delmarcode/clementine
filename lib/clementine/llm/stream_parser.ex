@@ -32,7 +32,13 @@ defmodule Clementine.LLM.StreamParser do
   - `{:message_stop}` - End of message
   - `{:ping}` - Keepalive
   - `{:error, error}` - Error event
+
+  Usage, in `message_start`'s message and in `message_delta`, is in the
+  keys `Clementine.Usage` reads: `input_tokens` counts the cache reads
+  and writes Anthropic reports apart from it.
   """
+
+  alias Clementine.LLM.ProviderUsage
 
   @type event ::
           {:message_start, map()}
@@ -56,7 +62,8 @@ defmodule Clementine.LLM.StreamParser do
     defstruct buffer: "",
               current_block_index: nil,
               current_tool_id: nil,
-              current_tool_kind: nil
+              current_tool_kind: nil,
+              usage: %{}
   end
 
   @doc """
@@ -126,9 +133,20 @@ defmodule Clementine.LLM.StreamParser do
 
   # Enrich raw events with tracked state: attaches the open call's id to
   # input_json_delta, and keeps a server tool's input apart from a client
-  # tool's, since the engine executes only the latter.
+  # tool's, since the engine executes only the latter. Usage leaves
+  # normalized (`Clementine.LLM.ProviderUsage.anthropic/1`): the start and
+  # the end each report counts, the end's cumulative and sometimes only
+  # its output, so each event carries what the stream has reported so far.
   defp enrich_events(events, state) do
     Enum.map_reduce(events, state, fn
+      {:message_start, %{"usage" => usage} = message}, state when is_map(usage) ->
+        state = %{state | usage: merge_usage(state.usage, usage)}
+        {{:message_start, %{message | "usage" => ProviderUsage.anthropic(state.usage)}}, state}
+
+      {:message_delta, delta, usage}, state ->
+        state = %{state | usage: merge_usage(state.usage, usage)}
+        {{:message_delta, delta, ProviderUsage.anthropic(state.usage)}, state}
+
       {:tool_use_start, id, _name} = event, state ->
         {event, %{state | current_tool_id: id, current_tool_kind: :client}}
 
@@ -148,6 +166,13 @@ defmodule Clementine.LLM.StreamParser do
         {event, state}
     end)
   end
+
+  # A count the end sends as null leaves the start's in place.
+  defp merge_usage(seen, usage) when is_map(usage) do
+    Map.merge(seen, Map.reject(usage, fn {_key, value} -> is_nil(value) end))
+  end
+
+  defp merge_usage(seen, _usage), do: seen
 
   # Split SSE data into complete events and remaining buffer
   defp split_events(data) do

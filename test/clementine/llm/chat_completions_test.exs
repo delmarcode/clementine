@@ -103,7 +103,13 @@ defmodule Clementine.LLM.ChatCompletionsTest do
 
       assert [%Content.Text{text: "Hello from OpenRouter"}] = response.content
       assert response.stop_reason == "end_turn"
-      assert response.usage["completion_tokens"] == 4
+
+      assert response.usage == %{
+               "input_tokens" => 12,
+               "output_tokens" => 4,
+               "cache_read_tokens" => 0,
+               "cache_write_tokens" => 0
+             }
     end
 
     test "call/5 sends an output schema as response_format", %{bypass: bypass} do
@@ -344,7 +350,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       assert {:text_delta, "Hel"} in events
       assert {:text_delta, "lo"} in events
 
-      assert {:message_delta, %{"stop_reason" => "end_turn"}, %{"completion_tokens" => 2}} in events
+      assert {:message_delta, %{"stop_reason" => "end_turn"}, %{"output_tokens" => 2}} in events
 
       assert List.last(events) == {:message_stop}
     end
