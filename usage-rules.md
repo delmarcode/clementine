@@ -588,6 +588,21 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   whose `raw["output"]` is the text the model wrote. There is no retry
   inside the run; retry from a loop or your own code.
 
+## Prompt caching
+
+- Caching is on, with no code: every client sends what its provider
+  needs. Never add cache markers or keys yourself.
+- Keep `instructions:` the same from run to run. A date, a user's
+  name, or anything else per run there makes every run write the cache
+  afresh; put it in the input.
+- `usage.input_tokens` is the whole input; `cache_read_tokens` and
+  `cache_write_tokens` are parts of it, never added to it.
+- Change caching per model in the catalog, never per agent: `cache:
+  false` for a model whose prompts are never sent twice, `cache: [ttl:
+  :one_hour]` for an Anthropic model whose runs often wait between steps
+  (approvals, slow replies). `docs/MODELS.md` has what each provider
+  takes.
+
 ## Never
 
 - Never send mail, call a service, broadcast, or write files in
