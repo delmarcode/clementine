@@ -490,6 +490,27 @@ defmodule Clementine.Telemetry.MetricsTest do
     assert calls.tag_values.(%{outcome: :error, stop_reason: "end_turn"}).stop_reason == ""
   end
 
+  test "a label nothing filled exports as an empty string, never nil, on every metric" do
+    # An alias the catalog lacks resolves to no provider and no model id,
+    # and a direct tool batch names no agent.
+    metadata = %{agent_key: nil, provider: nil, model: nil, alias: :not_in_catalog}
+
+    for metric <- Clementine.Telemetry.metrics(), metric.tags != [] do
+      labels = metric.tag_values.(metadata)
+      assert Map.keys(labels) |> Enum.sort() == Enum.sort(metric.tags)
+      refute Enum.any?(Map.values(labels), &is_nil/1), "#{inspect(metric.name)} kept a nil"
+    end
+
+    tokens =
+      Enum.find(
+        Clementine.Telemetry.metrics(),
+        &(Enum.join(&1.name, "_") == "clementine_llm_input_tokens_total")
+      )
+
+    assert %{agent_key: "", provider: "", model: "", alias: :not_in_catalog, outcome: ""} =
+             tokens.tag_values.(metadata)
+  end
+
   test "the error labels are closed: every provider error's code, else other" do
     by_name = Map.new(Clementine.Telemetry.metrics(), &{Enum.join(&1.name, "_"), &1})
     code = &by_name["clementine_llm_exceptions_total"].tag_values.(%{error_code: &1}).error_code

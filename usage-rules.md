@@ -636,7 +636,10 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   they hold prompts, replies, tool arguments and results, and your
   `metadata`. Exclude them, and keep the facts (`fact_columns/0`): the
   trace's columns hold each model call's provider, model, alias, tokens,
-  and cost, and each tool call's name and outcome.
+  and cost, and each tool call's name and outcome. Keep `subject_id`,
+  `actor_id`, and `tag_id` ids (never an email address or a Message-ID),
+  or exclude them too, and exclude `agent_fingerprint` if your
+  instructions differ by person.
 - Never call `Clementine.Runs.resume/2` or `cancel/1` inside a
   transaction.
 - Never call `Clementine.Lifecycle.*` (the protocol, the Ecto adapter,

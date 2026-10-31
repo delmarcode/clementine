@@ -39,8 +39,10 @@ defmodule Clementine.Telemetry do
     `nil` for a `{provider, id}` reference
 
   A model reference the catalog does not hold (a test's, on a mock
-  client) has `provider: nil` and the reference as written for `model`.
-  Each is fixed in code, so a metric may label by it.
+  client) has `provider: nil`: a `{provider, id}` reference keeps its id
+  as `model`, and an alias has `model: nil` beside its `alias`. Each is
+  fixed in code, so a metric may label by it, and a nil one exports as
+  `""`.
 
   A tool batch run outside a rollout, through
   `Clementine.ToolRunner.execute/4` or `run_batch/4`, names no execution:

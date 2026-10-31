@@ -121,23 +121,28 @@ defmodule Clementine.MigrationTest do
 
   @v5_trace_columns @trace_columns ++
                       [
+                        {"iteration", "integer", "YES", nil},
+                        {"tool_use_id", "text", "YES", nil},
                         {"provider", "text", "YES", nil},
                         {"model", "text", "YES", nil},
                         {"alias", "text", "YES", nil},
                         {"agent_fingerprint", "text", "YES", nil},
-                        {"input_tokens", "integer", "YES", nil},
-                        {"output_tokens", "integer", "YES", nil},
-                        {"cache_read_tokens", "integer", "YES", nil},
-                        {"cache_write_tokens", "integer", "YES", nil},
+                        {"input_tokens", "bigint", "YES", nil},
+                        {"output_tokens", "bigint", "YES", nil},
+                        {"cache_read_tokens", "bigint", "YES", nil},
+                        {"cache_write_tokens", "bigint", "YES", nil},
                         {"cost_micros", "bigint", "YES", nil},
                         {"currency", "text", "YES", nil},
-                        {"duration_ms", "integer", "YES", nil},
+                        {"duration_ms", "bigint", "YES", nil},
                         {"stop_reason", "text", "YES", nil},
                         {"tool_name", "text", "YES", nil},
                         {"is_error", "boolean", "YES", nil},
                         {"killed", "boolean", "YES", nil},
                         {"approval_verdict", "text", "YES", nil},
-                        {"policy_verdict", "text", "YES", nil}
+                        {"policy_verdict", "text", "YES", nil},
+                        {"policy_failed", "boolean", "YES", nil},
+                        {"skill_name", "text", "YES", nil},
+                        {"delegate_key", "text", "YES", nil}
                       ]
 
   @trace_indexes [
@@ -157,8 +162,16 @@ defmodule Clementine.MigrationTest do
   ]
 
   @v5_trace_constraints Enum.sort([
+                          {"agent_run_trace_approval_known",
+                           "CHECK ((approval_verdict = ANY (ARRAY['approved'::text, " <>
+                             "'denied'::text])))"},
                           {"agent_run_trace_cost_whole",
-                           "CHECK (((cost_micros IS NULL) = (currency IS NULL)))"}
+                           "CHECK (((cost_micros IS NULL) = (currency IS NULL)))"},
+                          {"agent_run_trace_policy_known",
+                           "CHECK ((policy_verdict = ANY (ARRAY['allow'::text, " <>
+                             "'require_approval'::text, 'deny'::text])))"},
+                          {"agent_run_trace_policy_whole",
+                           "CHECK (((policy_verdict IS NULL) = (policy_failed IS NULL)))"}
                           | @trace_constraints
                         ])
 
@@ -209,6 +222,21 @@ defmodule Clementine.MigrationTest do
     use Ecto.Migration
     def up, do: Clementine.Migration.up(version: 5)
     def down, do: Clementine.Migration.down(version: 5)
+  end
+
+  # Whatever version is current, whichever tables it builds.
+  defmodule Current do
+    use Ecto.Migration
+    def up, do: Clementine.Migration.up(version: Clementine.Migration.current_version())
+    def down, do: Clementine.Migration.down(version: Clementine.Migration.current_version())
+  end
+
+  # The current version's own down, run forward: every table it built
+  # goes, without this test naming them.
+  defmodule Teardown do
+    use Ecto.Migration
+    def up, do: Clementine.Migration.down(version: Clementine.Migration.current_version())
+    def down, do: :ok
   end
 
   defmodule Version4 do
@@ -268,6 +296,19 @@ defmodule Clementine.MigrationTest do
     migrate!(:up, FromScratch)
 
     assert_version_5!()
+  end
+
+  test "up(version: current) from nothing builds exactly the tables it classifies" do
+    migrate!(:up, Teardown)
+    assert Migration.migrated_version(TestRepo) == :missing
+    before = tables()
+
+    migrate!(:up, Current)
+
+    classified = Migration.content_columns() |> Keyword.keys() |> Enum.map(&Atom.to_string/1)
+
+    assert Enum.sort(tables() -- before) == Enum.sort(classified),
+           "classify every table the current version builds, and only those"
   end
 
   test "up(version: 4) from scratch builds the frozen version 4 schema" do
@@ -402,14 +443,13 @@ defmodule Clementine.MigrationTest do
   end
 
   test "every column of every table is a fact or content, and nothing else" do
-    tables = ["agent_runs", "agent_run_inbox", "agent_run_trace"]
     content = Migration.content_columns()
     facts = Migration.fact_columns()
 
-    assert Keyword.keys(content) == Enum.map(tables, &String.to_atom/1)
+    # Which tables those are is the from-nothing test's to hold.
     assert Keyword.keys(facts) == Keyword.keys(content)
 
-    for table <- tables, key = String.to_atom(table) do
+    for key <- Keyword.keys(content), table = Atom.to_string(key) do
       schema = table |> columns() |> Enum.map(&elem(&1, 0)) |> Enum.sort()
       classified = Enum.map(content[key] ++ facts[key], &Atom.to_string/1)
 
@@ -421,6 +461,13 @@ defmodule Clementine.MigrationTest do
     assert [:input, :result, :metadata, :suspension] -- content[:agent_runs] == []
     assert content[:agent_run_inbox] == [:payload, :dedup_key]
     assert content[:agent_run_trace] == [:payload]
+  end
+
+  test "Clementine.Trace fills every fact column the trace table adds, and only those" do
+    # Version 4's own columns, which every entry fills apart from its facts.
+    base = [:id, :run_id, :epoch, :seq, :kind, :inserted_at]
+
+    assert Clementine.Trace.columns() == Migration.fact_columns()[:agent_run_trace] -- base
   end
 
   test "the docs say what a warehouse may keep and what it leaves out" do
@@ -484,6 +531,14 @@ defmodule Clementine.MigrationTest do
     assert indexes("agent_runs") == @v2_indexes
     assert constraints("agent_runs") == @v2_constraints
     assert Migration.migrated_version(TestRepo) == 2
+  end
+
+  defp tables do
+    TestRepo.query!("""
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+    """).rows
+    |> List.flatten()
   end
 
   # The inbox and the trace reference agent_runs, so they go first.

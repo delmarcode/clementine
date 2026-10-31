@@ -319,8 +319,8 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   without prices; `Clementine.Runs.cost/2` sums a run's, and
   `docs/MODELS.md` has the `pricing:` key). A `:tool_call`
   entry records each tool call started, with the arguments it ran with
-  (its `"name"` is `nil` when the model asked for a tool the agent does
-  not offer) and the decision it waited on (`"approval" => %{"verdict" => "approved",
+  (and `"unknown" => true` beside its `"name"` when the model asked for a
+  tool the agent does not offer) and the decision it waited on (`"approval" => %{"verdict" => "approved",
   "by" => ...}`); a call to a `{:policy, term}` tool also carries the
   tool policy's verdict (`"policy" => %{"verdict" => "allow" |
   "require_approval" | "deny", "reason" => ..., "failed" => ...}`), and a
@@ -369,18 +369,34 @@ warehouse copy keeps only the facts:
   your free-form data.
 - **Keep** the rest, `Clementine.Migration.fact_columns/0`: ids, keys,
   statuses, timestamps, `agent_runs.usage` (a run's tokens), and the
-  trace's fact columns. Each model call's row holds its `provider`,
-  `model`, `alias`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
-  `cache_write_tokens`, `cost_micros`, `currency`, `duration_ms`, and
-  `stop_reason`; each tool call's holds its `tool_name`, `is_error`,
-  `killed`, `duration_ms`, `approval_verdict`, and `policy_verdict`.
+  trace's fact columns. Each model call's row holds its `iteration`,
+  `provider`, `model`, `alias`, `input_tokens`, `output_tokens`,
+  `cache_read_tokens`, `cache_write_tokens`, `cost_micros`, `currency`,
+  `duration_ms`, and `stop_reason`; each tool call's holds its
+  `iteration`, `tool_use_id`, `tool_name`, `is_error`, `killed`,
+  `duration_ms`, `approval_verdict`, `policy_verdict`, and
+  `policy_failed`. A skill load's row holds its `skill_name`, and a
+  delegate's its `delegate_key`, each beside the `tool_use_id` of the call
+  that made it; a delegate's child is the run whose `tag_id` is that id.
 
 The fact columns hold no text a person, a model, or a tool produced: a
 fact is stored once, in its column, and `payload` keeps the rest of the
 entry. `Clementine.Migration`'s docs list every column and what each
 content column holds; a later version that adds a column says which it
-is. The ids you choose for a subject, an actor, or a child's tag are
-facts while you keep them ids.
+is.
+
+Three facts are only as safe as what you put in them; the
+`Clementine.Migration` docs say more:
+
+- `subject_id`, `actor_id`, and `tag_id` are facts while you keep them
+  ids. An email address or an email's Message-ID there is content, as in
+  `dedup_key`. A thread tags each turn with its message's id, so if you
+  send a Message-ID as both the message's `"id"` and its `dedup_key`, it
+  lands in `tag_id` too: leave `tag_id` out as well.
+- `skill_name` is a fact while your skills' names are names.
+- `agent_fingerprint` is a hash over the instructions and the rest of
+  what an execution offered. If your instructions differ by person, it
+  confirms a guess at them: leave it out.
 
 ## The host module
 
