@@ -13,6 +13,7 @@ defmodule Clementine.TraceTest do
 
   alias Clementine.{Result, Rollout, Run, Runner, Trace}
   alias Clementine.Lifecycle.{Facts, Protocol}
+  alias Clementine.LLM.Message.Content
   alias Clementine.Test.{FlakyLifecycle, MemoryLifecycle}
   alias Clementine.Test.Tools.{Add, GatedDeploy, SafeEcho, SafePush, UnsafeSlow}
   alias Clementine.Trace.Entry
@@ -850,21 +851,299 @@ defmodule Clementine.TraceTest do
     end
 
     test "a model call on a direct reference has no alias, so nothing prices it" do
+      model = Trace.resolve_model({:anthropic, "claude-sonnet-5"})
+      usage = %Clementine.Usage{input_tokens: 100, output_tokens: 10}
+      assert Clementine.Cost.of(usage, model) == nil
+
       payload =
         Trace.payload(
           :model_call,
-          Trace.model_call(
-            {:anthropic, "claude-sonnet-5"},
-            1,
-            12,
-            "end_turn",
-            %Clementine.Usage{input_tokens: 100, output_tokens: 10},
-            nil
-          ),
+          Trace.model_call(model, 1, 12, "end_turn", usage, nil, nil),
           :facts
         )
 
-      assert %{"alias" => nil, "cost" => nil, "usage" => %{"input_tokens" => 100}} = payload
+      assert %{
+               "provider" => "anthropic",
+               "model" => "claude-sonnet-5",
+               "alias" => nil,
+               "cost" => nil,
+               "usage" => %{"input_tokens" => 100}
+             } = payload
     end
+
+    test "a reference the catalog does not hold resolves as written, with no provider or prices" do
+      # An alias is not a provider's id: the alias names it, and the id is
+      # nil.
+      assert %{provider: nil, id: nil, alias: :no_such_alias, pricing: nil} =
+               Trace.resolve_model(:no_such_alias)
+
+      assert %{provider: nil, id: "m-1", alias: nil, pricing: nil} =
+               Trace.resolve_model({:no_such_provider, "m-1"})
+
+      assert %{provider: :anthropic, id: "claude-sonnet-5", alias: :claude_sonnet} =
+               Trace.resolve_model(:claude_sonnet)
+
+      # Its execution's fingerprint is the one it always had, hashing the
+      # alias's name, so two such aliases still fingerprint apart.
+      gone = Trace.fingerprint(:no_such_alias, "Trace me.", [SafeEcho])
+      assert gone =~ ~r/\A[0-9a-f]{64}\z/
+      assert gone == Trace.fingerprint(:no_such_alias, "Trace me.", [SafeEcho])
+      refute gone == Trace.fingerprint(:other_missing_alias, "Trace me.", [SafeEcho])
+      refute gone == Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
+
+      assert %{"model" => nil, "alias" => :no_such_alias, "agent_fingerprint" => ^gone} =
+               Trace.execution(
+                 Trace.resolve_model(:no_such_alias),
+                 "Trace me.",
+                 [SafeEcho],
+                 false
+               )
+    end
+  end
+
+  describe "rows" do
+    # Payloads as the engine records them, at both fidelities: every kind,
+    # and every shape a column takes.
+    defp recorded do
+      model = Trace.resolve_model(:claude_sonnet)
+      usage = %Clementine.Usage{input_tokens: 1204, output_tokens: 38, cache_read_tokens: 1100}
+      cost = %Clementine.Cost{currency: "USD", micros: 1284}
+
+      call = %{
+        iteration: 1,
+        tool_use_id: "tu_1",
+        name: "echo",
+        args: %{"text" => "hi"},
+        result: "hi",
+        is_error: false,
+        duration_ms: 3
+      }
+
+      skill =
+        Clementine.Skill.new(name: "refunds", description: "Refunds.", body: "Do.", tools: [Add])
+
+      entries = [
+        execution: Trace.execution(model, "Be brief.", [SafeEcho], false),
+        model_call:
+          Trace.model_call(model, 1, 812, "tool_use", usage, cost, [Content.text("Hi")]),
+        model_call: Trace.model_call(model, 2, 9, nil, %Clementine.Usage{}, nil, nil),
+        tool_call: Trace.tool_call(call),
+        tool_call:
+          Trace.tool_call(%{call | name: "zzz", is_error: true} |> Map.put(:unknown, true)),
+        tool_call: Trace.tool_call(Map.merge(call, %{result: nil, is_error: true, killed: true})),
+        tool_call: Trace.tool_call(Map.put(call, :approval, {:approved, %{by: "alice"}})),
+        tool_call: Trace.tool_call(Map.put(call, :approval, {:denied, %{}})),
+        tool_call: Trace.tool_call(Map.put(call, :policy, {:deny, "Not on Fridays."})),
+        tool_call:
+          Trace.tool_call(
+            Map.merge(call, %{approval: {:approved, %{by: "bob"}}, policy: :require_approval})
+          ),
+        tool_call: Trace.tool_call(Map.put(call, :policy, {:failed, "Policy raised."})),
+        policy: Trace.policy(1, %{id: "tu_1", name: "echo"}, :allow),
+        policy: Trace.policy(1, %{id: "tu_1", name: "echo"}, {:failed, "Policy raised."}),
+        skill_load: Trace.skill_load(2, "tu_2", skill, "Do."),
+        delegate:
+          Trace.delegate(3, "tu_3", %{agent: "writer", run_id: "c-1"}, %{"status" => "completed"})
+      ]
+
+      for fidelity <- [:content, :facts],
+          {kind, payload} <- entries,
+          do: {kind, Trace.payload(kind, payload, fidelity)}
+    end
+
+    test "every fact goes to its column once, and from_row/3 gives back the payload" do
+      for {kind, payload} <- recorded() do
+        {columns, rest} = Trace.to_row(kind, payload)
+
+        assert Map.keys(columns) |> Enum.sort() == Enum.sort(Trace.columns())
+        assert Trace.from_row(kind, columns, rest) == payload
+
+        # No fact is stored twice: a key whose value went to a column is
+        # gone from the rest.
+        for {column, value} <- columns, value != nil do
+          assert get_in(rest, fact_path(kind, column)) == nil,
+                 "#{kind}: #{column} is stored twice"
+        end
+      end
+    end
+
+    test "every fact column is filled by some kind" do
+      filled =
+        for {kind, payload} <- recorded(),
+            {column, value} <- elem(Trace.to_row(kind, payload), 0),
+            value != nil,
+            into: MapSet.new(),
+            do: column
+
+      assert filled == MapSet.new(Trace.columns())
+    end
+
+    test "a name the agent does not offer stays in the payload, never in tool_name" do
+      payload =
+        Trace.payload(
+          :tool_call,
+          Trace.tool_call(%{
+            iteration: 1,
+            tool_use_id: "tu_1",
+            name: "zzz_asked",
+            unknown: true,
+            args: %{},
+            result: "Unknown tool: zzz_asked",
+            is_error: true,
+            duration_ms: 0
+          }),
+          :facts
+        )
+
+      # :facts keeps it: the name is how a reader tells what was asked.
+      assert %{"name" => "zzz_asked", "unknown" => true} = payload
+
+      {columns, rest} = Trace.to_row(:tool_call, payload)
+      assert %{tool_name: nil, tool_use_id: "tu_1", is_error: true} = columns
+      assert %{"name" => "zzz_asked", "unknown" => true} = rest
+      assert Trace.from_row(:tool_call, columns, rest) == payload
+
+      # A tool the agent offers is not marked.
+      refute Map.has_key?(Trace.tool_call(%{payload_call() | unknown: false}), "unknown")
+      refute Map.has_key?(Trace.tool_call(Map.delete(payload_call(), :unknown)), "unknown")
+    end
+
+    test "a model call's numbers and a tool call's outcome read from the columns alone" do
+      model = Trace.resolve_model(:claude_sonnet)
+      usage = %Clementine.Usage{input_tokens: 1204, output_tokens: 38, cache_write_tokens: 96}
+      cost = %Clementine.Cost{currency: "USD", micros: 1284}
+
+      payload = Trace.model_call(model, 2, 812, "end_turn", usage, cost, [])
+      {columns, rest} = Trace.to_row(:model_call, Trace.payload(:model_call, payload, :content))
+
+      assert %{
+               iteration: 2,
+               provider: "anthropic",
+               model: "claude-sonnet-5",
+               alias: "claude_sonnet",
+               input_tokens: 1204,
+               output_tokens: 38,
+               cache_read_tokens: 0,
+               cache_write_tokens: 96,
+               cost_micros: 1284,
+               currency: "USD",
+               duration_ms: 812,
+               stop_reason: "end_turn",
+               tool_name: nil,
+               tool_use_id: nil
+             } = columns
+
+      assert rest == %{"content" => []}
+
+      {columns, rest} =
+        Trace.to_row(
+          :tool_call,
+          Trace.payload(
+            :tool_call,
+            Trace.tool_call(%{
+              iteration: 1,
+              tool_use_id: "tu_1",
+              name: "deploy",
+              args: %{"env" => "prod"},
+              result: "Denied.",
+              is_error: true,
+              duration_ms: 0,
+              approval: {:denied, %{by: "carol"}},
+              policy: {:deny, "Not on Fridays."}
+            }),
+            :content
+          )
+        )
+
+      assert %{
+               iteration: 1,
+               tool_use_id: "tu_1",
+               tool_name: "deploy",
+               is_error: true,
+               killed: false,
+               duration_ms: 0,
+               approval_verdict: "denied",
+               policy_verdict: "deny",
+               policy_failed: false,
+               provider: nil,
+               input_tokens: nil
+             } = columns
+
+      assert rest == %{
+               "approval" => %{"by" => "carol"},
+               "policy" => %{"reason" => "Not on Fridays."},
+               "args" => %{"env" => "prod"},
+               "result" => "Denied."
+             }
+    end
+
+    test "a policy answer, a skill load, and a delegate keep their facts in columns" do
+      skill = Clementine.Skill.new(name: "refunds", description: "Refunds.", body: "Do.")
+
+      assert {%{
+                iteration: 1,
+                tool_use_id: "tu_1",
+                tool_name: "deploy",
+                policy_verdict: "deny",
+                policy_failed: true
+              }, %{"reason" => "Policy raised."}} =
+               Trace.to_row(
+                 :policy,
+                 Trace.policy(1, %{id: "tu_1", name: "deploy"}, {:failed, "Policy raised."})
+               )
+
+      assert {%{iteration: 2, tool_use_id: "tu_2", skill_name: "refunds"}, rest} =
+               Trace.to_row(:skill_load, Trace.skill_load(2, "tu_2", skill, "Do."))
+
+      assert Map.keys(rest) |> Enum.sort() == ["body_sha256", "tools"]
+
+      assert {%{iteration: 3, tool_use_id: "tu_3", delegate_key: "writer"},
+              %{"child_id" => "c-1", "status" => "failed"}} =
+               Trace.to_row(
+                 :delegate,
+                 Trace.delegate(3, "tu_3", %{agent: "writer", run_id: "c-1"}, %{
+                   "status" => "failed"
+                 })
+               )
+    end
+
+    test "a row stored before version 5 reads from its payload as stored" do
+      columns = Map.new(Trace.columns(), &{&1, nil})
+
+      for {kind, payload} <- recorded() do
+        assert Trace.from_row(kind, columns, payload) == payload
+      end
+    end
+
+    defp payload_call do
+      %{
+        iteration: 1,
+        tool_use_id: "tu_1",
+        name: "echo",
+        unknown: false,
+        args: %{},
+        result: "ok",
+        is_error: false,
+        duration_ms: 1
+      }
+    end
+
+    # Where in the rest of a payload a column's fact would sit, were it
+    # stored twice.
+    defp fact_path(:tool_call, :tool_name), do: ["name"]
+    defp fact_path(:tool_call, :approval_verdict), do: [Access.key("approval", %{}), "verdict"]
+    defp fact_path(:tool_call, :policy_verdict), do: [Access.key("policy", %{}), "verdict"]
+    defp fact_path(:tool_call, :policy_failed), do: [Access.key("policy", %{}), "failed"]
+    defp fact_path(_kind, column) when column in [:tool_name, :skill_name], do: ["name"]
+    defp fact_path(_kind, :policy_verdict), do: ["verdict"]
+    defp fact_path(_kind, :policy_failed), do: ["failed"]
+    defp fact_path(_kind, :delegate_key), do: ["agent"]
+
+    defp fact_path(_kind, column)
+         when column in [:input_tokens, :output_tokens, :cache_read_tokens, :cache_write_tokens],
+         do: ["usage"]
+
+    defp fact_path(_kind, column) when column in [:cost_micros, :currency], do: ["cost"]
+    defp fact_path(_kind, column), do: [Atom.to_string(column)]
   end
 end

@@ -1,12 +1,14 @@
 defmodule Clementine.MigrationTest do
   @moduledoc """
   `Clementine.Migration`'s versions are frozen: a host migration that says
-  `version: 4` must build these exact tables under every later
+  `version: 5` must build these exact tables under every later
   Clementine, and the upgrade path (`up(from: 1, version: 2)` on a version
-  1 table, then `up(from: 2, version: 3)`, then `up(from: 3, version: 4)`)
-  must build the same tables as `up(version: 4)` from scratch. If a
+  1 table, then each next version in turn through `up(from: 4, version:
+  5)`) must build the same tables as `up(version: 5)` from scratch. If a
   snapshot here fails, a change reached a version's DDL; it belongs in a
-  new version instead.
+  new version instead. Every column of the current version is a fact or
+  content (`Clementine.Migration.content_columns/0`), and a column a new
+  version adds fails here until it is classified.
 
   The suite's own `agent_runs` came up by the upgrade path
   (`test_helper.exs`). The from-scratch and down paths run here inside
@@ -117,6 +119,32 @@ defmodule Clementine.MigrationTest do
     {"inserted_at", "timestamp with time zone", "NO", "now()"}
   ]
 
+  @v5_trace_columns @trace_columns ++
+                      [
+                        {"iteration", "integer", "YES", nil},
+                        {"tool_use_id", "text", "YES", nil},
+                        {"provider", "text", "YES", nil},
+                        {"model", "text", "YES", nil},
+                        {"alias", "text", "YES", nil},
+                        {"agent_fingerprint", "text", "YES", nil},
+                        {"input_tokens", "bigint", "YES", nil},
+                        {"output_tokens", "bigint", "YES", nil},
+                        {"cache_read_tokens", "bigint", "YES", nil},
+                        {"cache_write_tokens", "bigint", "YES", nil},
+                        {"cost_micros", "bigint", "YES", nil},
+                        {"currency", "text", "YES", nil},
+                        {"duration_ms", "bigint", "YES", nil},
+                        {"stop_reason", "text", "YES", nil},
+                        {"tool_name", "text", "YES", nil},
+                        {"is_error", "boolean", "YES", nil},
+                        {"killed", "boolean", "YES", nil},
+                        {"approval_verdict", "text", "YES", nil},
+                        {"policy_verdict", "text", "YES", nil},
+                        {"policy_failed", "boolean", "YES", nil},
+                        {"skill_name", "text", "YES", nil},
+                        {"delegate_key", "text", "YES", nil}
+                      ]
+
   @trace_indexes [
     {"agent_run_trace_entry_index",
      "CREATE UNIQUE INDEX agent_run_trace_entry_index ON public.agent_run_trace USING btree " <>
@@ -132,6 +160,20 @@ defmodule Clementine.MigrationTest do
     {"agent_run_trace_run_id_fkey",
      "FOREIGN KEY (run_id) REFERENCES agent_runs(id) ON DELETE CASCADE"}
   ]
+
+  @v5_trace_constraints Enum.sort([
+                          {"agent_run_trace_approval_known",
+                           "CHECK ((approval_verdict = ANY (ARRAY['approved'::text, " <>
+                             "'denied'::text])))"},
+                          {"agent_run_trace_cost_whole",
+                           "CHECK (((cost_micros IS NULL) = (currency IS NULL)))"},
+                          {"agent_run_trace_policy_known",
+                           "CHECK ((policy_verdict = ANY (ARRAY['allow'::text, " <>
+                             "'require_approval'::text, 'deny'::text])))"},
+                          {"agent_run_trace_policy_whole",
+                           "CHECK (((policy_verdict IS NULL) = (policy_failed IS NULL)))"}
+                          | @trace_constraints
+                        ])
 
   @v3_indexes Enum.sort([
                 {"agent_runs_child_tag_index", @child_tag_index},
@@ -178,6 +220,27 @@ defmodule Clementine.MigrationTest do
 
   defmodule FromScratch do
     use Ecto.Migration
+    def up, do: Clementine.Migration.up(version: 5)
+    def down, do: Clementine.Migration.down(version: 5)
+  end
+
+  # Whatever version is current, whichever tables it builds.
+  defmodule Current do
+    use Ecto.Migration
+    def up, do: Clementine.Migration.up(version: Clementine.Migration.current_version())
+    def down, do: Clementine.Migration.down(version: Clementine.Migration.current_version())
+  end
+
+  # The current version's own down, run forward: every table it built
+  # goes, without this test naming them.
+  defmodule Teardown do
+    use Ecto.Migration
+    def up, do: Clementine.Migration.down(version: Clementine.Migration.current_version())
+    def down, do: :ok
+  end
+
+  defmodule Version4 do
+    use Ecto.Migration
     def up, do: Clementine.Migration.up(version: 4)
     def down, do: Clementine.Migration.down(version: 4)
   end
@@ -218,13 +281,39 @@ defmodule Clementine.MigrationTest do
     def down, do: Clementine.Migration.down(to: 3, version: 4)
   end
 
-  test "the upgrade path built the frozen version 4 schema" do
-    assert_version_4!()
+  defmodule UpgradeTo5 do
+    use Ecto.Migration
+    def up, do: Clementine.Migration.up(from: 4, version: 5)
+    def down, do: Clementine.Migration.down(to: 4, version: 5)
   end
 
-  test "up(version: 4) from scratch builds the same schema" do
+  test "the upgrade path built the frozen version 5 schema" do
+    assert_version_5!()
+  end
+
+  test "up(version: 5) from scratch builds the same schema" do
     drop_table!()
     migrate!(:up, FromScratch)
+
+    assert_version_5!()
+  end
+
+  test "up(version: current) from nothing builds exactly the tables it classifies" do
+    migrate!(:up, Teardown)
+    assert Migration.migrated_version(TestRepo) == :missing
+    before = tables()
+
+    migrate!(:up, Current)
+
+    classified = Migration.content_columns() |> Keyword.keys() |> Enum.map(&Atom.to_string/1)
+
+    assert Enum.sort(tables() -- before) == Enum.sort(classified),
+           "classify every table the current version builds, and only those"
+  end
+
+  test "up(version: 4) from scratch builds the frozen version 4 schema" do
+    drop_table!()
+    migrate!(:up, Version4)
 
     assert_version_4!()
   end
@@ -262,37 +351,50 @@ defmodule Clementine.MigrationTest do
 
     migrate!(:up, UpgradeTo4)
     assert_version_4!()
+
+    migrate!(:up, UpgradeTo5)
+    assert_version_5!()
   end
 
-  test "down(to: 3, version: 4) restores version 3, and down(version: 4) drops every table" do
+  test "down(to: 4, version: 5) restores version 4, and down(version: 5) drops every table" do
     # The suite's own upgrade migration, as the host would roll it back.
     Ecto.Migrator.down(
       TestRepo,
-      20_261_029_000_001,
-      Clementine.Test.Ecto.UpgradeAgentRunsToVersion4,
+      20_261_031_000_001,
+      Clementine.Test.Ecto.UpgradeAgentRunsToVersion5,
       log: false,
       log_migrator_sql: false,
       migration_lock: false
     )
 
-    assert_version_3!()
-    assert columns("agent_run_trace") == []
-
-    version = migrate!(:up, UpgradeTo4)
     assert_version_4!()
 
-    migrate!(:down, UpgradeTo4, version)
-    assert_version_3!()
+    version = migrate!(:up, UpgradeTo5)
+    assert_version_5!()
+
+    migrate!(:down, UpgradeTo5, version)
+    assert_version_4!()
 
     drop_table!()
     version = migrate!(:up, FromScratch)
-    assert_version_4!()
+    assert_version_5!()
 
     migrate!(:down, FromScratch, version)
     assert columns("agent_runs") == []
     assert columns("agent_run_inbox") == []
     assert columns("agent_run_trace") == []
     assert Migration.migrated_version(TestRepo) == :missing
+  end
+
+  test "down(to: 3, version: 4) restores version 3" do
+    drop_table!()
+    migrate!(:up, Version3)
+    version = migrate!(:up, UpgradeTo4)
+    assert_version_4!()
+
+    migrate!(:down, UpgradeTo4, version)
+    assert_version_3!()
+    assert columns("agent_run_trace") == []
   end
 
   test "down(to: 2, version: 3) restores version 2" do
@@ -307,13 +409,13 @@ defmodule Clementine.MigrationTest do
   end
 
   test "the version stamp reads back, and the check names the migration to write" do
-    assert Migration.migrated_version(TestRepo) == 4
+    assert Migration.migrated_version(TestRepo) == 5
     assert Migration.check!(TestRepo) == :ok
 
-    TestRepo.query!("COMMENT ON TABLE agent_runs IS '3'")
-    assert Migration.migrated_version(TestRepo) == 3
+    TestRepo.query!("COMMENT ON TABLE agent_runs IS '4'")
+    assert Migration.migrated_version(TestRepo) == 4
 
-    assert_raise RuntimeError, ~r/at version 3: .*up\(from: 3, version: 4\)/, fn ->
+    assert_raise RuntimeError, ~r/at version 4: .*up\(from: 4, version: 5\)/, fn ->
       Migration.check!(TestRepo)
     end
 
@@ -321,23 +423,83 @@ defmodule Clementine.MigrationTest do
     assert Migration.migrated_version(TestRepo) == :unstamped
 
     assert_raise RuntimeError,
-                 ~r/no version stamp \(version 1\): .*up\(from: 1, version: 4\)/,
+                 ~r/no version stamp \(version 1\): .*up\(from: 1, version: 5\)/,
                  fn ->
                    Migration.check!(TestRepo)
                  end
 
     # The code rolled back after a migration: the table is ahead, and
     # starts.
-    TestRepo.query!("COMMENT ON TABLE agent_runs IS '5'")
-    assert Migration.migrated_version(TestRepo) == 5
+    TestRepo.query!("COMMENT ON TABLE agent_runs IS '6'")
+    assert Migration.migrated_version(TestRepo) == 6
     assert Migration.check!(TestRepo) == :ok
 
     drop_table!()
     assert Migration.migrated_version(TestRepo) == :missing
 
-    assert_raise RuntimeError, ~r/has none: .*up\(version: 4\)/, fn ->
+    assert_raise RuntimeError, ~r/has none: .*up\(version: 5\)/, fn ->
       Migration.check!(TestRepo)
     end
+  end
+
+  test "every column of every table is a fact or content, and nothing else" do
+    content = Migration.content_columns()
+    facts = Migration.fact_columns()
+
+    # Which tables those are is the from-nothing test's to hold.
+    assert Keyword.keys(facts) == Keyword.keys(content)
+
+    for key <- Keyword.keys(content), table = Atom.to_string(key) do
+      schema = table |> columns() |> Enum.map(&elem(&1, 0)) |> Enum.sort()
+      classified = Enum.map(content[key] ++ facts[key], &Atom.to_string/1)
+
+      assert Enum.sort(classified) == schema, "#{table}: classify every column, and only those"
+      assert MapSet.disjoint?(MapSet.new(content[key]), MapSet.new(facts[key]))
+    end
+
+    # The columns the issue names as content, among the rest.
+    assert [:input, :result, :metadata, :suspension] -- content[:agent_runs] == []
+    assert content[:agent_run_inbox] == [:payload, :dedup_key]
+    assert content[:agent_run_trace] == [:payload]
+  end
+
+  test "Clementine.Trace fills every fact column the trace table adds, and only those" do
+    # Version 4's own columns, which every entry fills apart from its facts.
+    base = [:id, :run_id, :epoch, :seq, :kind, :inserted_at]
+
+    assert Clementine.Trace.columns() == Migration.fact_columns()[:agent_run_trace] -- base
+  end
+
+  test "the docs say what a warehouse may keep and what it leaves out" do
+    {:docs_v1, _, _, _, %{"en" => doc}, _, _} = Code.fetch_docs(Migration)
+    [_before, section] = String.split(doc, "## What a warehouse may keep")
+    [section | _later] = String.split(section, "\n## ")
+
+    for {table, columns} <- Migration.content_columns() ++ Migration.fact_columns(),
+        column <- columns do
+      assert section =~ ~r/\b#{column}\b/, "#{table}.#{column} is missing from the docs"
+    end
+
+    # The runtime guide names every content column too.
+    [_before, guide] = "guides/runtime.md" |> File.read!() |> String.split("## The warehouse")
+    [guide | _later] = String.split(guide, "\n## ")
+
+    for {table, columns} <- Migration.content_columns(), column <- columns do
+      assert guide =~ "`#{column}`", "guides/runtime.md leaves out #{table}.#{column}"
+    end
+  end
+
+  defp assert_version_5! do
+    assert columns("agent_runs") == @v3_columns
+    assert indexes("agent_runs") == @v3_indexes
+    assert constraints("agent_runs") == @v3_constraints
+    assert columns("agent_run_inbox") == @inbox_columns
+    assert indexes("agent_run_inbox") == @inbox_indexes
+    assert constraints("agent_run_inbox") == @inbox_constraints
+    assert columns("agent_run_trace") == @v5_trace_columns
+    assert indexes("agent_run_trace") == @trace_indexes
+    assert constraints("agent_run_trace") == @v5_trace_constraints
+    assert Migration.migrated_version(TestRepo) == 5
   end
 
   defp assert_version_4! do
@@ -371,6 +533,14 @@ defmodule Clementine.MigrationTest do
     assert Migration.migrated_version(TestRepo) == 2
   end
 
+  defp tables do
+    TestRepo.query!("""
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+    """).rows
+    |> List.flatten()
+  end
+
   # The inbox and the trace reference agent_runs, so they go first.
   defp drop_table! do
     TestRepo.query!("DROP TABLE IF EXISTS agent_run_trace")
@@ -383,7 +553,7 @@ defmodule Clementine.MigrationTest do
   # registers a fresh version, later than the suite's own; a down must name
   # the version its up registered, or the migrator finds nothing to undo.
   defp migrate!(direction, module, version \\ nil) do
-    version = version || 20_261_029_000_001 + System.unique_integer([:positive, :monotonic])
+    version = version || 20_261_031_000_001 + System.unique_integer([:positive, :monotonic])
 
     apply(Ecto.Migrator, direction, [
       TestRepo,

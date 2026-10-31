@@ -1,5 +1,124 @@
 if Code.ensure_loaded?(Ecto.Migration) do
   defmodule Clementine.Migration do
+    # Every column of every table at the current version, by what a
+    # warehouse may do with it: a fact it may keep, or content it leaves
+    # out, with what the column holds. The moduledoc's "What a warehouse
+    # may keep", content_columns/0, and fact_columns/0 are built from it,
+    # and test/clementine/runs/migration_test.exs holds it to the schema,
+    # so a version that adds a column classifies it here.
+    @columns [
+      agent_runs: [
+        id: :fact,
+        agent_key: :fact,
+        subject_type: :fact,
+        subject_id: :fact,
+        input: {:content, "the prompt, or a loop's args"},
+        result: {:content, "a completed run's output"},
+        oban_job_id: :fact,
+        metadata: {:content, "the app's, stored as given"},
+        inserted_at: :fact,
+        updated_at: :fact,
+        kind: :fact,
+        status: :fact,
+        lease_epoch: :fact,
+        executor_id: :fact,
+        heartbeat_at: :fact,
+        deadline: :fact,
+        queued_at: :fact,
+        cancel: {:content, "a cancel's reason, whose detail can quote the app's error"},
+        suspension: {:content, "the checkpoint, which holds the conversation"},
+        resume: {:content, "what a resume carried: an approver's meta, delegates' answers"},
+        effects: :fact,
+        usage: :fact,
+        error:
+          {:content, "an error's message and raw term, which can quote a provider or a tool"},
+        interrupt: :fact,
+        finished_at: :fact,
+        actor_type: :fact,
+        actor_id: :fact,
+        turn: :fact,
+        loop_policy: {:content, "the app's policy map, stored as given"},
+        envelope: {:content, "a loop controller's state, a thread's waiting messages included"},
+        state_version: :fact,
+        parent_id: :fact,
+        tag_kind: :fact,
+        tag_id: :fact
+      ],
+      agent_run_inbox: [
+        id: :fact,
+        run_id: :fact,
+        kind: :fact,
+        payload: {:content, "a message sent to a loop, or a child's output"},
+        dedup_key:
+          {:content, "the app's key for a message: an email's Message-ID names its host"},
+        attempts: :fact,
+        inserted_at: :fact,
+        dead_at: :fact,
+        dead_reason: :fact
+      ],
+      agent_run_trace: [
+        id: :fact,
+        run_id: :fact,
+        epoch: :fact,
+        seq: :fact,
+        kind: :fact,
+        payload: {:content, "the system prompt, the model's text, tools' arguments and results"},
+        inserted_at: :fact,
+        # A counter the engine keeps.
+        iteration: :fact,
+        # The provider's id for a tool call; a delegate child's tag_id.
+        tool_use_id: :fact,
+        provider: :fact,
+        model: :fact,
+        alias: :fact,
+        # A hash, though over content: see "What a warehouse may keep".
+        agent_fingerprint: :fact,
+        input_tokens: :fact,
+        output_tokens: :fact,
+        cache_read_tokens: :fact,
+        cache_write_tokens: :fact,
+        cost_micros: :fact,
+        currency: :fact,
+        duration_ms: :fact,
+        stop_reason: :fact,
+        # Only a name the agent offers; the model's own stays in payload.
+        tool_name: :fact,
+        is_error: :fact,
+        killed: :fact,
+        approval_verdict: :fact,
+        policy_verdict: :fact,
+        # A boolean; the failure's text stays in payload.
+        policy_failed: :fact,
+        # A skill the agent offered and the model loaded, by the name the
+        # app gave it.
+        skill_name: :fact,
+        # An agent key the delegate call started, one of the agent's
+        # delegates.
+        delegate_key: :fact
+      ]
+    ]
+
+    @content_columns for {table, columns} <- @columns,
+                         do: {table, for({column, {:content, _}} <- columns, do: column)}
+
+    @fact_columns for {table, columns} <- @columns,
+                      do: {table, for({column, :fact} <- columns, do: column)}
+
+    @content_doc Enum.map_join(@columns, "\n", fn {table, columns} ->
+                   content = for {column, {:content, holds}} <- columns, do: {"#{column}", holds}
+                   width = content |> Enum.map(&String.length(elem(&1, 0))) |> Enum.max()
+
+                   rows =
+                     for {column, holds} <- content,
+                         do: "      #{String.pad_trailing(column, width)}  #{holds}"
+
+                   Enum.join(["    #{table}" | rows], "\n")
+                 end)
+
+    @fact_doc Enum.map_join(@fact_columns, "\n", fn {table, columns} ->
+                "  - `#{table}`: " <> Enum.map_join(columns, ", ", &"`#{&1}`")
+              end)
+
     @moduledoc """
     The `agent_runs` table the durable runtime (`Clementine.Runs`) runs on,
     as numbered versions, the way `Oban.Migration` ships `oban_jobs`. The
@@ -8,14 +127,14 @@ if Code.ensure_loaded?(Ecto.Migration) do
         defmodule MyApp.Repo.Migrations.AddClementine do
           use Ecto.Migration
 
-          def up, do: Clementine.Migration.up(version: 4)
-          def down, do: Clementine.Migration.down(version: 4)
+          def up, do: Clementine.Migration.up(version: 5)
+          def down, do: Clementine.Migration.down(version: 5)
         end
 
     Each version's DDL is frozen here: a migration that says `version: 1`
     builds the same table under every later Clementine. A host on an
     earlier version adopts a later one in a new migration with
-    `up(from: 3, version: 4)`.
+    `up(from: 4, version: 5)`.
 
     ## The version stamp
 
@@ -27,6 +146,123 @@ if Code.ensure_loaded?(Ecto.Migration) do
     table with no stamp was built before stamps, or by hand to match
     version 1; the check takes it for version 1. A table ahead of the code
     (the code rolled back after a migration) starts.
+
+    ## What a warehouse may keep
+
+    Every column of these tables holds facts or content. Facts are ids,
+    names fixed in code, numbers, enums, and timestamps: what a dashboard
+    or a warehouse compares across runs, agents, models, and apps.
+    Content is text a person, a model, or a tool produced, or the app's
+    free-form data, and it stays in the app's database. A warehouse copy
+    of the tables (Datastream, say, which copies whole columns) leaves out
+    the content columns, `content_columns/0`:
+
+    #{@content_doc}
+
+    and may keep every other column, `fact_columns/0`:
+
+    #{@fact_doc}
+
+    A run's tokens are in `agent_runs.usage`; each model call's provider,
+    model, alias, tokens, cost, duration, and stop reason, and each tool
+    call's name, outcome, and duration, are in `agent_run_trace`'s columns
+    (version 5), and a run that was interrupted says why in
+    `agent_runs.interrupt`, a closed code with Clementine's own text. A
+    version that adds a column says here which it is.
+
+    Three kinds of fact column hold what the app chooses, and stay facts
+    only while the app keeps them so:
+
+    - **The ids an app gives a subject, an actor, or a child's tag**
+      (`subject_id`, `actor_id`, `tag_id`) are facts while they are ids.
+      An id that is the app's text is content, for the reason
+      `dedup_key` is: an email's Message-ID names the sender's mail host.
+      `Clementine.Thread` tags each turn with the id its message was sent
+      with, and its example sends `message.id` as both that id and the
+      `dedup_key`, so an app whose message ids are Message-IDs puts them
+      in `tag_id` too. Such an app leaves those columns out as well.
+    - **The names an app gives skills** (`skill_name`) are facts while
+      they are names, as a tool's or an agent's key is.
+    - **`agent_fingerprint`** is a sha256 over content: the instructions,
+      the tool schemas, and the rest of what an execution offered the
+      model (`Clementine.Trace`). It reads as no text, but an app whose
+      instructions differ by person (a user's name or account in the
+      system prompt) makes it a per-person value, which anyone with a
+      guess at those instructions can confirm by hashing the guess. Such
+      an app leaves it out too.
+
+    ## Version 5
+
+    The trace's facts in columns of their own, beside its content, so a
+    warehouse or a dashboard reads every call's numbers without the
+    conversation. Each is filled for the kinds it applies to, and null for
+    the rest:
+
+        agent_run_trace
+          iteration           integer  every kind but execution  the pass of the model–tool cycle
+          tool_use_id         text     tool_call, policy,        the provider's id for the call;
+                                       skill_load, delegate      a delegate child's tag_id
+          provider            text     execution, model_call     the provider: anthropic, openai, ...
+          model               text     execution, model_call     the provider's model id; null for
+                                                                 an alias the catalog lacks
+          alias               text     execution, model_call     the catalog alias; null for a
+                                                                 {provider, id} reference
+          agent_fingerprint   text     execution                 Clementine.Trace's sha256
+          input_tokens        bigint   model_call                Clementine.Usage's four counts
+          output_tokens       bigint   model_call
+          cache_read_tokens   bigint   model_call
+          cache_write_tokens  bigint   model_call
+          cost_micros         bigint   model_call                frozen when the call ended;
+          currency            text     model_call                both null for an unpriced call
+          duration_ms         bigint   model_call, tool_call
+          stop_reason         text     model_call                the provider's; null for a call
+                                                                 that did not finish
+          tool_name           text     tool_call, policy         null for a name the agent did
+                                                                 not offer
+          is_error            boolean  tool_call
+          killed              boolean  tool_call
+          approval_verdict    text     tool_call                 approved | denied
+          policy_verdict      text     tool_call, policy         allow | require_approval | deny
+          policy_failed       boolean  tool_call, policy         the policy failed, and the call
+                                                                 was denied for it
+          skill_name          text     skill_load                the skill the call loaded
+          delegate_key        text     delegate                  the agent the child ran
+          check agent_run_trace_cost_whole     ((cost_micros is null) = (currency is null))
+          check agent_run_trace_approval_known (approval_verdict in ('approved', 'denied'))
+          check agent_run_trace_policy_known   (policy_verdict in
+                                                ('allow', 'require_approval', 'deny'))
+          check agent_run_trace_policy_whole   ((policy_verdict is null) = (policy_failed is null))
+
+    A fact is stored once: `payload` keeps the rest of the entry, and
+    `Clementine.Runs.trace/1` puts the columns back into each entry's
+    payload, as `Clementine.Trace` lists it. A tool name the agent does not
+    offer is the model's text, so it stays in `payload`. Counts and
+    durations are `bigint`, so no count a provider reports fails the write
+    that records it, and with it the run's end. `agent_runs` gets no model
+    column: a run's executions can span a deploy, so the record is per
+    call.
+
+    No column is `not null` for the kinds it applies to, on purpose. The
+    version gate keeps new code off an old table, not old code off a new
+    one, so during a rolling deploy a node still on version 4 code writes
+    to a version 5 table, with its facts in `payload` and these columns
+    null; a `not null` would fail those writes and leave their runs
+    stuck. And a model reference the catalog does not hold (a test's on a
+    mock client, or an alias since removed) records no provider, and an
+    alias no model. The checks hold a value written to the ones it may
+    take.
+
+    `up(from: 4, version: 5)` adds the columns, null on every existing
+    row, and backfills nothing: `Clementine.Runs.trace/1` reads an older
+    row from its payload, as before, and its cost reads `nil`. The way back
+    loses facts:
+
+    - `down(to: 4, version: 5)` drops the columns, and with them the facts
+      of every entry written under version 5, whose payload no longer
+      holds them: its model, tokens, cost, and tool name are gone.
+    - Code on version 4 started against a version 5 table (a table ahead
+      of the code starts) reads only `payload`, so it reads the entries
+      version 5 wrote without their usage, cost, or tool name.
 
     ## Version 4
 
@@ -158,11 +394,28 @@ if Code.ensure_loaded?(Ecto.Migration) do
     @table :agent_runs
     @inbox :agent_run_inbox
     @trace :agent_run_trace
-    @current_version 4
+    @current_version 5
 
     @doc "The newest version `up/1` can apply."
     @spec current_version() :: pos_integer()
     def current_version, do: @current_version
+
+    @doc """
+    The columns, in every table at `current_version/0`, that can carry
+    content: text a person, a model, or a tool produced, or the app's
+    free-form data. A warehouse copy of the tables leaves them out (see
+    "What a warehouse may keep").
+    """
+    @spec content_columns() :: [{table :: atom(), [column :: atom()]}]
+    def content_columns, do: @content_columns
+
+    @doc """
+    The rest of the columns, in every table at `current_version/0`: ids,
+    names fixed in code, numbers, enums, and timestamps, which a warehouse
+    may keep. With `content_columns/0`, every column of every table.
+    """
+    @spec fact_columns() :: [{table :: atom(), [column :: atom()]}]
+    def fact_columns, do: @fact_columns
 
     @doc """
     Migrates `agent_runs` from version `:from` (default `0`, no table)
@@ -409,6 +662,97 @@ if Code.ensure_loaded?(Ecto.Migration) do
       create(index(@trace, [:run_id, :id], name: :agent_run_trace_run_index))
 
       create(unique_index(@trace, [:run_id, :epoch, :seq], name: :agent_run_trace_entry_index))
+
+      stamp(4)
+    end
+
+    # Counts and durations are bigint: a count past integer's range would
+    # fail the write that records it, and with it the run's end. No column
+    # is NOT NULL for its kinds (the moduledoc says why); the checks hold a
+    # value written to the ones it may take.
+    defp step_up(5) do
+      alter table(@trace) do
+        add(:iteration, :integer)
+        add(:tool_use_id, :text)
+        add(:provider, :text)
+        add(:model, :text)
+        add(:alias, :text)
+        add(:agent_fingerprint, :text)
+        add(:input_tokens, :bigint)
+        add(:output_tokens, :bigint)
+        add(:cache_read_tokens, :bigint)
+        add(:cache_write_tokens, :bigint)
+        add(:cost_micros, :bigint)
+        add(:currency, :text)
+        add(:duration_ms, :bigint)
+        add(:stop_reason, :text)
+        add(:tool_name, :text)
+        add(:is_error, :boolean)
+        add(:killed, :boolean)
+        add(:approval_verdict, :text)
+        add(:policy_verdict, :text)
+        add(:policy_failed, :boolean)
+        add(:skill_name, :text)
+        add(:delegate_key, :text)
+      end
+
+      create(
+        constraint(@trace, :agent_run_trace_cost_whole,
+          check: "(cost_micros IS NULL) = (currency IS NULL)"
+        )
+      )
+
+      create(
+        constraint(@trace, :agent_run_trace_approval_known,
+          check: "approval_verdict IN ('approved', 'denied')"
+        )
+      )
+
+      create(
+        constraint(@trace, :agent_run_trace_policy_known,
+          check: "policy_verdict IN ('allow', 'require_approval', 'deny')"
+        )
+      )
+
+      create(
+        constraint(@trace, :agent_run_trace_policy_whole,
+          check: "(policy_verdict IS NULL) = (policy_failed IS NULL)"
+        )
+      )
+
+      stamp(5)
+    end
+
+    defp step_down(5) do
+      drop(constraint(@trace, :agent_run_trace_policy_whole))
+      drop(constraint(@trace, :agent_run_trace_policy_known))
+      drop(constraint(@trace, :agent_run_trace_approval_known))
+      drop(constraint(@trace, :agent_run_trace_cost_whole))
+
+      alter table(@trace) do
+        remove(:delegate_key)
+        remove(:skill_name)
+        remove(:policy_failed)
+        remove(:policy_verdict)
+        remove(:approval_verdict)
+        remove(:killed)
+        remove(:is_error)
+        remove(:tool_name)
+        remove(:stop_reason)
+        remove(:duration_ms)
+        remove(:currency)
+        remove(:cost_micros)
+        remove(:cache_write_tokens)
+        remove(:cache_read_tokens)
+        remove(:output_tokens)
+        remove(:input_tokens)
+        remove(:agent_fingerprint)
+        remove(:alias)
+        remove(:model)
+        remove(:provider)
+        remove(:tool_use_id)
+        remove(:iteration)
+      end
 
       stamp(4)
     end

@@ -62,6 +62,12 @@ if postgres? do
     Clementine.Test.Ecto.UpgradeAgentRunsToVersion4
   )
 
+  Ecto.Migrator.up(
+    Clementine.TestRepo,
+    20_261_031_000_001,
+    Clementine.Test.Ecto.UpgradeAgentRunsToVersion5
+  )
+
   Ecto.Adapters.SQL.Sandbox.mode(Clementine.TestRepo, :manual)
 end
 

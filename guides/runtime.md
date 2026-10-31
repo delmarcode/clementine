@@ -9,7 +9,7 @@ reaches every host as a dependency bump.
 The host keeps three things:
 
 - a child after Oban in its supervision tree;
-- one migration calling `Clementine.Migration.up(version: 4)`;
+- one migration calling `Clementine.Migration.up(version: 5)`;
 - `use Clementine.Agent` modules.
 
 `mix clementine.install` writes them (plus the config and a test case),
@@ -52,16 +52,16 @@ loop inbox and the run trace beside it:
 defmodule MyApp.Repo.Migrations.AddClementine do
   use Ecto.Migration
 
-  def up, do: Clementine.Migration.up(version: 4)
-  def down, do: Clementine.Migration.down(version: 4)
+  def up, do: Clementine.Migration.up(version: 5)
+  def down, do: Clementine.Migration.down(version: 5)
 end
 ```
 
 Each version's DDL is frozen in `Clementine.Migration`, and each stamps
 its number on the table. The runtime checks the stamp as it starts and
 refuses to start against a table behind the code's version, naming the
-migration to write: a host on version 3 adds one calling
-`Clementine.Migration.up(from: 3, version: 4)`.
+migration to write: a host on version 4 adds one calling
+`Clementine.Migration.up(from: 4, version: 5)`.
 
 An agent is a module with a stable key, the string its run rows store:
 
@@ -281,12 +281,14 @@ back, oldest first, as `Clementine.Trace.Entry` structs:
 Clementine.Runs.trace(run.id)
 #=> [
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 1, kind: :execution,
-#=>     payload: %{"model" => "claude-sonnet-5", "tools" => ["lookup"], "deferred" => [],
+#=>     payload: %{"provider" => "anthropic", "model" => "claude-sonnet-5",
+#=>                "alias" => "claude_sonnet", "tools" => ["lookup"], "deferred" => [],
 #=>                "agent_fingerprint" => "33e5…", "instructions" => "…", "resumed" => false}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 2, kind: :model_call,
 #=>     payload: %{"iteration" => 1, "stop_reason" => "tool_use", "duration_ms" => 812,
 #=>                "usage" => %{"input_tokens" => 1204, "output_tokens" => 38,
 #=>                             "cache_read_tokens" => 1100, "cache_write_tokens" => 96},
+#=>                "provider" => "anthropic", "model" => "claude-sonnet-5",
 #=>                "alias" => "claude_sonnet", "cost" => %{"currency" => "USD", "micros" => 1284},
 #=>                "content" => […]}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 3, kind: :tool_call,
@@ -301,7 +303,8 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 
 - An `:execution` entry opens each execution: when the run starts, and
   again, `"resumed" => true`, when it resumes after an approval or a
-  delegation, under the next epoch. `"tools"` names every tool offered,
+  delegation, under the next epoch. It names the provider, the
+  provider's model id, and the alias the agent named. `"tools"` names every tool offered,
   `"deferred"` the ones among them the model loads through tool search,
   `"skills"` the skills it may load, and `"delegates"` the agents it may
   ask. Its `"agent_fingerprint"` is a sha256 over the system prompt, the
@@ -312,11 +315,12 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 - A `:model_call` entry records each call to the model, a call cut off
   by a cancel included, with the usage it had reported (its cache reads
   and writes show whether the call found the prompt cache warm), the
-  alias it ran on, and its cost at that alias's prices then (`nil`
+  provider, model, and alias it ran on, and its cost at that alias's prices then (`nil`
   without prices; `Clementine.Runs.cost/2` sums a run's, and
   `docs/MODELS.md` has the `pricing:` key). A `:tool_call`
   entry records each tool call started, with the arguments it ran with
-  and the decision it waited on (`"approval" => %{"verdict" => "approved",
+  (and `"unknown" => true` beside its `"name"` when the model asked for a
+  tool the agent does not offer) and the decision it waited on (`"approval" => %{"verdict" => "approved",
   "by" => ...}`); a call to a `{:policy, term}` tool also carries the
   tool policy's verdict (`"policy" => %{"verdict" => "allow" |
   "require_approval" | "deny", "reason" => ..., "failed" => ...}`), and a
@@ -347,6 +351,52 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   own table, from the tool or the context function that caused it.
 - `trace/1` checks nothing, like `get/1`: check the run's subject or actor
   before showing a trace to anyone.
+
+## The warehouse
+
+Every Clementine app has the same tables, so one warehouse model can
+compare them all: tokens by app, agent, provider, and model, and cost,
+which is directional, since each app prices calls at its own configured
+rates. Every column of the tables holds facts or content, and a
+warehouse copy keeps only the facts:
+
+- **Leave out** `Clementine.Migration.content_columns/0`: `agent_runs`'
+  `input`, `result`, `metadata`, `suspension` (the checkpoint holds the
+  conversation), `resume`, `cancel`, `error`, `loop_policy`, and
+  `envelope`;
+  `agent_run_inbox`'s `payload` and `dedup_key`; and `agent_run_trace`'s
+  `payload`. They hold prompts, replies, tool arguments and results, and
+  your free-form data.
+- **Keep** the rest, `Clementine.Migration.fact_columns/0`: ids, keys,
+  statuses, timestamps, `agent_runs.usage` (a run's tokens), and the
+  trace's fact columns. Each model call's row holds its `iteration`,
+  `provider`, `model`, `alias`, `input_tokens`, `output_tokens`,
+  `cache_read_tokens`, `cache_write_tokens`, `cost_micros`, `currency`,
+  `duration_ms`, and `stop_reason`; each tool call's holds its
+  `iteration`, `tool_use_id`, `tool_name`, `is_error`, `killed`,
+  `duration_ms`, `approval_verdict`, `policy_verdict`, and
+  `policy_failed`. A skill load's row holds its `skill_name`, and a
+  delegate's its `delegate_key`, each beside the `tool_use_id` of the call
+  that made it; a delegate's child is the run whose `tag_id` is that id.
+
+The fact columns hold no text a person, a model, or a tool produced: a
+fact is stored once, in its column, and `payload` keeps the rest of the
+entry. `Clementine.Migration`'s docs list every column and what each
+content column holds; a later version that adds a column says which it
+is.
+
+Three facts are only as safe as what you put in them; the
+`Clementine.Migration` docs say more:
+
+- `subject_id`, `actor_id`, and `tag_id` are facts while you keep them
+  ids. An email address or an email's Message-ID there is content, as in
+  `dedup_key`. A thread tags each turn with its message's id, so if you
+  send a Message-ID as both the message's `"id"` and its `dedup_key`, it
+  lands in `tag_id` too: leave `tag_id` out as well.
+- `skill_name` is a fact while your skills' names are names.
+- `agent_fingerprint` is a hash over the instructions and the rest of
+  what an execution offered. If your instructions differ by person, it
+  confirms a guess at them: leave it out.
 
 ## The host module
 
@@ -601,7 +651,7 @@ would leave old nodes failing on the missing column.
    end
    ```
 
-   Any later version arrives the same way, `up(from: 3, version: 4)`.
+   Any later version arrives the same way, `up(from: 4, version: 5)`.
 7. Keep `RunWorker` for one deploy, reduced to a forwarder. Jobs queued
    before the switch name it, and so do jobs the old nodes requeued while
    they drained; without it they fail, and the reaper interrupts their

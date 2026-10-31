@@ -9,10 +9,10 @@ the drain at shutdown.
 
 - One child after Oban, whose `repo` is Oban's repo:
   `{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: [MyApp.Agents.Triage], host: MyApp.Agents.Host}`.
-- One migration calling `Clementine.Migration.up(version: 4)`. Each
+- One migration calling `Clementine.Migration.up(version: 5)`. Each
   version stamps the table, and the runtime refuses to start against a
   table behind the code's version, naming the migration to write
-  (`Clementine.Migration.up(from: 3, version: 4)`).
+  (`Clementine.Migration.up(from: 4, version: 5)`).
 - Agent modules, each listed in `agents:`:
   `use Clementine.Agent, key: "triage", model: :claude_sonnet, instructions: "...", tools: [...]`.
   Every run row stores the key, so never rename a key that has runs. An
@@ -87,9 +87,10 @@ lifecycle, or a reaper into the app.
 - `get/1` returns the run or `nil`. Read `agent_runs` freely; only
   Clementine writes it.
 - `trace/1` returns the run's trace, oldest first: a
-  `Clementine.Trace.Entry` for each execution (`:execution`: the model,
-  the tools offered, the agent's fingerprint, the system prompt), each
-  model call (`:model_call`: usage, its cost, timing, what it said), each tool
+  `Clementine.Trace.Entry` for each execution (`:execution`: the
+  provider, model, and alias, the tools offered, the agent's fingerprint,
+  the system prompt), each model call (`:model_call`: the provider, model,
+  and alias, usage, its cost, timing, what it said), each tool
   call (`:tool_call`: name, arguments, result, timing, the approval it
   waited on, and the tool policy's verdict), each answer of the tool
   policy (`:policy`), each skill loaded (`:skill_load`: its name, the
@@ -624,6 +625,14 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   insert, cancel, or retry a run's or a loop's Oban job yourself.
   `send/3` steps a loop. A column of your own on `agent_runs` (a tool
   trace, say) is the same mistake: read `Runs.trace/1`.
+- Never copy `Clementine.Migration.content_columns/0` to a warehouse:
+  they hold prompts, replies, tool arguments and results, and your
+  `metadata`. Exclude them, and keep the facts (`fact_columns/0`): the
+  trace's columns hold each model call's provider, model, alias, tokens,
+  and cost, and each tool call's name and outcome. Keep `subject_id`,
+  `actor_id`, and `tag_id` ids (never an email address or a Message-ID),
+  or exclude them too, and exclude `agent_fingerprint` if your
+  instructions differ by person.
 - Never call `Clementine.Runs.resume/2` or `cancel/1` inside a
   transaction.
 - Never call `Clementine.Lifecycle.*` (the protocol, the Ecto adapter,
