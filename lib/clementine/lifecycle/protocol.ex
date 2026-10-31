@@ -411,8 +411,11 @@ defmodule Clementine.Lifecycle.Protocol do
   Approval payloads are normative: `{:approved, meta}` | `{:denied, meta}`.
   `{:until, _}` resumes carry `:elapsed`; `{:external, _}` payloads are
   host-defined.
+
+  `agent_key:` names the run's agent on the `:resumed` event, for a
+  caller that holds the run's row, as for `interrupt/5`.
   """
-  @spec resume(module(), ResumeToken.t(), term(), term()) ::
+  @spec resume(module(), ResumeToken.t(), term(), term(), keyword()) ::
           {:ok, Facts.t()}
           | {:error,
              :stale_reference
@@ -421,13 +424,13 @@ defmodule Clementine.Lifecycle.Protocol do
              | :wrong_reference_type
              | :not_found
              | term()}
-  def resume(lifecycle, %ResumeToken{} = token, payload, ctx \\ nil) do
-    do_resume(lifecycle, token, payload, ctx, 3)
+  def resume(lifecycle, %ResumeToken{} = token, payload, ctx \\ nil, opts \\ []) do
+    do_resume(lifecycle, token, payload, ctx, Keyword.get(opts, :agent_key), 3)
   end
 
-  defp do_resume(_lifecycle, _token, _payload, _ctx, 0), do: {:error, :conflict}
+  defp do_resume(_lifecycle, _token, _payload, _ctx, _agent_key, 0), do: {:error, :conflict}
 
-  defp do_resume(lifecycle, %ResumeToken{} = token, payload, ctx, attempts) do
+  defp do_resume(lifecycle, %ResumeToken{} = token, payload, ctx, agent_key, attempts) do
     with {:ok, %Facts{} = facts} <- lifecycle.fetch(token.run_ref, ctx) do
       cond do
         facts.status in [:queued, :running] ->
@@ -459,11 +462,16 @@ defmodule Clementine.Lifecycle.Protocol do
 
           case lifecycle.apply(transition, ctx) do
             {:ok, resumed} ->
-              emit(:resumed, %{}, %{run_ref: token.run_ref, epoch: resumed.epoch, agent_key: nil})
+              emit(:resumed, %{}, %{
+                run_ref: token.run_ref,
+                epoch: resumed.epoch,
+                agent_key: agent_key
+              })
+
               {:ok, resumed}
 
             {:error, :stale} ->
-              do_resume(lifecycle, token, payload, ctx, attempts - 1)
+              do_resume(lifecycle, token, payload, ctx, agent_key, attempts - 1)
 
             {:error, reason} ->
               {:error, reason}
@@ -496,18 +504,23 @@ defmodule Clementine.Lifecycle.Protocol do
   loop-owned — a kind-aware flag plus wake whose cascade cancels children
   first and finishes last. A terminal run answers `:already_terminal`
   whatever its kind: dead ends have nothing left to protect.
+
+  `agent_key:` names the run's agent on the `:finished` event a direct
+  cancel writes, for a caller that holds the run's row, as for
+  `interrupt/5`.
   """
-  @spec request_cancel(module(), term(), term(), term()) ::
+  @spec request_cancel(module(), term(), term(), term(), keyword()) ::
           {:ok, :flagged}
           | {:ok, :finished}
           | {:error, :already_terminal | :loop_run | :not_found | term()}
-  def request_cancel(lifecycle, run_ref, reason, ctx \\ nil) do
-    do_request_cancel(lifecycle, run_ref, reason, ctx, 3)
+  def request_cancel(lifecycle, run_ref, reason, ctx \\ nil, opts \\ []) do
+    do_request_cancel(lifecycle, run_ref, reason, ctx, Keyword.get(opts, :agent_key), 3)
   end
 
-  defp do_request_cancel(_lifecycle, _run_ref, _reason, _ctx, 0), do: {:error, :conflict}
+  defp do_request_cancel(_lifecycle, _run_ref, _reason, _ctx, _agent_key, 0),
+    do: {:error, :conflict}
 
-  defp do_request_cancel(lifecycle, run_ref, reason, ctx, attempts) do
+  defp do_request_cancel(lifecycle, run_ref, reason, ctx, agent_key, attempts) do
     with {:ok, %Facts{} = facts} <- lifecycle.fetch(run_ref, ctx) do
       cond do
         Facts.terminal?(facts) ->
@@ -525,9 +538,14 @@ defmodule Clementine.Lifecycle.Protocol do
           }
 
           case lifecycle.apply(transition, ctx) do
-            {:ok, _} -> {:ok, :flagged}
-            {:error, :stale} -> do_request_cancel(lifecycle, run_ref, reason, ctx, attempts - 1)
-            {:error, other} -> {:error, other}
+            {:ok, _} ->
+              {:ok, :flagged}
+
+            {:error, :stale} ->
+              do_request_cancel(lifecycle, run_ref, reason, ctx, agent_key, attempts - 1)
+
+            {:error, other} ->
+              {:error, other}
           end
 
         facts.status in [:queued, :waiting] ->
@@ -553,13 +571,14 @@ defmodule Clementine.Lifecycle.Protocol do
               # a duration from.
               emit_finished(run_ref, facts.epoch, result,
                 claimed_at: nil,
-                finished_at: cancelled_facts.finished_at
+                finished_at: cancelled_facts.finished_at,
+                agent_key: agent_key
               )
 
               {:ok, :finished}
 
             {:error, :stale} ->
-              do_request_cancel(lifecycle, run_ref, reason, ctx, attempts - 1)
+              do_request_cancel(lifecycle, run_ref, reason, ctx, agent_key, attempts - 1)
 
             {:error, other} ->
               {:error, other}

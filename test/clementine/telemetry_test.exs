@@ -34,7 +34,8 @@ defmodule Clementine.TelemetryTest do
   @llm_events [
     [:clementine, :llm, :start],
     [:clementine, :llm, :stop],
-    [:clementine, :llm, :exception]
+    [:clementine, :llm, :exception],
+    [:clementine, :llm, :usage]
   ]
 
   @run_events [
@@ -72,18 +73,26 @@ defmodule Clementine.TelemetryTest do
     end
   end
 
+  # The id is the kind an app may set per workspace: events never name
+  # an agent by it.
   defp agent(opts) do
     Clementine.Agent.new(
       Keyword.merge(
-        [id: "telemetry_test", model: :claude_sonnet, instructions: "test agent", tools: []],
+        [id: "workspace-7f3a2c", model: :claude_sonnet, instructions: "test agent", tools: []],
         opts
       )
     )
   end
 
+  # The key the runtime puts in a run's context, from its row.
   defp build_run(ref, agent_opts \\ [], rollout_opts \\ []) do
     rollout =
-      Rollout.new(Keyword.merge([agent: agent(agent_opts), input: "go"], rollout_opts))
+      Rollout.new(
+        Keyword.merge(
+          [agent: agent(agent_opts), input: "go", context: %{agent_key: "telemetry_test"}],
+          rollout_opts
+        )
+      )
 
     Run.new(ref: ref, rollout: rollout)
   end
@@ -198,7 +207,8 @@ defmodule Clementine.TelemetryTest do
                          agent_key: "telemetry_test",
                          provider: :anthropic,
                          kind: :error,
-                         reason: %Error{} = error
+                         reason: %Error{} = error,
+                         error_kind: :rollout
                        }}
 
       assert error.code == :max_iterations
@@ -216,11 +226,11 @@ defmodule Clementine.TelemetryTest do
       assert {:finished, %Facts{status: :failed}} = execute(build_run(ref), store)
 
       assert_received {:telemetry, [:clementine, :llm, :exception], %{duration: _},
-                       %{kind: :error, reason: {:llm_exception, _}}}
+                       %{kind: :error, reason: {:llm_exception, _}, error_code: :exception}}
 
       assert_received {:telemetry, [:clementine, :rollout, :exception],
                        %{duration: _, iterations: 1},
-                       %{kind: :error, reason: %Error{code: :exception}}}
+                       %{kind: :error, reason: %Error{code: :exception}, error_kind: :provider}}
     end
 
     test "a raise escaping the engine emits exception without an iteration count and re-raises" do
@@ -233,7 +243,11 @@ defmodule Clementine.TelemetryTest do
       end
 
       assert_received {:telemetry, [:clementine, :rollout, :exception], measurements,
-                       %{kind: :error, reason: %RuntimeError{message: "cancel probe blew up"}}}
+                       %{
+                         kind: :error,
+                         reason: %RuntimeError{message: "cancel probe blew up"},
+                         error_kind: :runtime
+                       }}
 
       refute Map.has_key?(measurements, :iterations)
       assert Map.has_key?(measurements, :duration)
@@ -387,6 +401,13 @@ defmodule Clementine.TelemetryTest do
       assert_received {:telemetry, [:clementine, :llm, :exception],
                        %{input_tokens: 1_000, output_tokens: 1, cost_micros: 3_015},
                        %{kind: :error, reason: :overloaded, currency: "USD"}}
+
+      # The usage event meters it as the error it was.
+      assert_received {:telemetry, [:clementine, :llm, :usage],
+                       %{input_tokens: 1_000, output_tokens: 1, cost_micros: 3_015} = usage,
+                       %{agent_key: "telemetry_test", outcome: :error, currency: "USD"}}
+
+      refute Map.has_key?(usage, :duration)
     end
 
     test "a provider error in the stream emits exception", %{store: store, ref: ref} do
@@ -397,7 +418,7 @@ defmodule Clementine.TelemetryTest do
       assert {:finished, %Facts{status: :failed}} = execute(build_run(ref), store)
 
       assert_received {:telemetry, [:clementine, :llm, :exception], %{duration: _},
-                       %{kind: :error, reason: :overloaded, streaming: true}}
+                       %{kind: :error, reason: :overloaded, streaming: true, error_code: :unknown}}
 
       refute_received {:telemetry, [:clementine, :llm, :stop], _, _}
     end
@@ -413,6 +434,47 @@ defmodule Clementine.TelemetryTest do
       assert_received {:telemetry, [:clementine, :llm, :stop],
                        %{duration: _, input_tokens: 0, output_tokens: 0},
                        %{stop_reason: nil, streaming: true}}
+
+      assert_received {:telemetry, [:clementine, :llm, :usage], %{input_tokens: 0},
+                       %{outcome: :aborted, stop_reason: nil}}
+    end
+
+    test "usage meters every completed call once, with its stop reason",
+         %{store: store, ref: ref} do
+      attach(@llm_events)
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_stream(tool_events("tu_1", "echo", %{"message" => "hi"}))
+      expect_stream(text_events("done"))
+
+      run = build_run(ref, tools: [Clementine.Test.Tools.Echo])
+      assert {:finished, %Facts{status: :completed}} = execute(run, store)
+
+      usages = for {[:clementine, :llm, :usage], m, meta} <- drain_events(), do: {m, meta}
+
+      assert [{first, %{outcome: :stop, stop_reason: "tool_use", iteration: 1}}, {_, second}] =
+               usages
+
+      assert %{outcome: :stop, stop_reason: "end_turn", iteration: 2, currency: nil} = second
+
+      assert %{alias: :claude_sonnet, model: "claude-sonnet-5", provider: :anthropic} = second
+      refute Map.has_key?(first, :cost_micros)
+    end
+
+    test "a raise in the stream meters nothing", %{store: store, ref: ref} do
+      attach(@llm_events)
+      MemoryLifecycle.seed_queued(store, ref)
+
+      # A malformed event raises inside the engine's own reduce, past the
+      # client's conversion of raises to errors; the runner's rescue tier
+      # fails the run.
+      expect_stream([{:text_delta, "par"}, {:server_tool_result, %{}}])
+
+      assert {:finished, %Facts{status: :failed}} = execute(build_run(ref), store)
+
+      assert_received {:telemetry, [:clementine, :llm, :exception], %{duration: _},
+                       %{kind: :error, error_code: :exception, currency: nil}}
+
+      refute_received {:telemetry, [:clementine, :llm, :usage], _, _}
     end
   end
 
@@ -451,9 +513,12 @@ defmodule Clementine.TelemetryTest do
                        %{run_ref: ^ref, epoch: 1, reason_type: :approval}}
 
       assert {:ok, %Facts{status: :queued}} =
-               Protocol.resume(MemoryLifecycle, token, {:approved, %{by: "me"}}, store)
+               Protocol.resume(MemoryLifecycle, token, {:approved, %{by: "me"}}, store,
+                 agent_key: "row_key"
+               )
 
-      assert_received {:telemetry, [:clementine, :run, :resumed], %{}, %{run_ref: ^ref, epoch: 1}}
+      assert_received {:telemetry, [:clementine, :run, :resumed], %{},
+                       %{run_ref: ^ref, epoch: 1, agent_key: "row_key"}}
     end
 
     test "finish emits :finished with terminal, usage, and the execution's duration",
@@ -608,6 +673,7 @@ defmodule Clementine.TelemetryTest do
                [:clementine, :rollout, :start],
                [:clementine, :llm, :start],
                [:clementine, :llm, :stop],
+               [:clementine, :llm, :usage],
                [:clementine, :rollout, :stop],
                [:clementine, :run, :finished]
              ]
@@ -618,7 +684,7 @@ defmodule Clementine.TelemetryTest do
   end
 
   describe "agent_key on run events" do
-    test "an execution's writes name its agent; a direct cancel and a resume do not",
+    test "an execution's writes name its agent, and a direct cancel names the one it is given",
          %{store: store, ref: ref} do
       attach(@run_events)
       MemoryLifecycle.seed_queued(store, ref)
@@ -648,6 +714,28 @@ defmodule Clementine.TelemetryTest do
 
       assert_received {:telemetry, [:clementine, :run, :finished], _,
                        %{run_ref: ^unowned, agent_key: nil}}
+
+      named = make_ref()
+      MemoryLifecycle.seed_queued(store, named)
+
+      assert {:ok, :finished} =
+               Protocol.request_cancel(MemoryLifecycle, named, :stop, store, agent_key: "row_key")
+
+      assert_received {:telemetry, [:clementine, :run, :finished], _,
+                       %{run_ref: ^named, agent_key: "row_key", terminal: :cancelled}}
+    end
+
+    test "an agent's id never names it: without a key in the context, events carry nil",
+         %{store: store, ref: ref} do
+      attach(@run_events ++ @rollout_events)
+      MemoryLifecycle.seed_queued(store, ref)
+      expect_stream(text_events("done"))
+
+      assert {:finished, _facts} = execute(build_run(ref, [], context: %{}), store)
+
+      for {_event, _measurements, metadata} <- drain_events() do
+        assert Map.fetch!(metadata, :agent_key) == nil
+      end
     end
 
     test "the reaper names the agent it read", %{store: store, ref: ref} do

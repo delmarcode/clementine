@@ -500,12 +500,13 @@ the currency, here $0.001284.
   `Clementine.Runs.purge/1`, a run's and its subject's cost is `nil`. To
   keep spend past a purge, copy `Clementine.Runs.cost(run.id)` into your
   own table from `run_finished/2`, which sees the run's whole trace.
-- `[:clementine, :llm, :stop]` carries a priced call's `cost_micros`,
-  with `currency` in its metadata, and so does `[:clementine, :llm,
-  :exception]` for a call a provider error ended, at what it had
-  reported; `Clementine.Telemetry.metrics/0` sums them by agent, provider,
-  model, alias, and currency, as `clementine_llm_cost_micros_total` and
-  `clementine_llm_exception_cost_micros_total`.
+- `[:clementine, :llm, :usage]` carries every metered call's
+  `cost_micros` when it is priced, with `currency` in its metadata,
+  however the call ended (`outcome`: `stop`, `aborted`, or `error`);
+  `:stop`, and `:exception` for a call a provider error ended, carry it
+  too. `Clementine.Telemetry.metrics/0` sums it by agent, provider,
+  model, alias, outcome, and currency as
+  `clementine_llm_cost_micros_total`.
 - `Clementine.Cost.of(usage, alias)` prices any usage at today's prices:
   an in-process run's `result.usage`, or a trace entry's usage to reprice
   it.

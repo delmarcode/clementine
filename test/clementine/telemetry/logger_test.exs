@@ -121,6 +121,42 @@ defmodule Clementine.Telemetry.LoggerTest do
       refute log =~ "iterations="
     end
 
+    test "llm and rollout failures log the error's class" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :llm, :exception],
+            %{duration: System.convert_time_unit(10, :millisecond, :native)},
+            %{
+              agent_key: "triage",
+              provider: :anthropic,
+              model: "claude-sonnet-5",
+              iteration: 1,
+              kind: :error,
+              reason: {:api_error, 429, %{}},
+              error_code: :rate_limited
+            }
+          )
+
+          :telemetry.execute(
+            [:clementine, :rollout, :exception],
+            %{duration: 0, iterations: 1},
+            %{
+              agent_key: "triage",
+              kind: :error,
+              reason: %Clementine.Error{kind: :provider, code: :rate_limited},
+              error_kind: :provider
+            }
+          )
+        end)
+
+      assert log =~ "[Clementine] LLM call failed agent=triage provider=anthropic"
+      assert log =~ "error_code=rate_limited"
+      assert log =~ "error_kind=provider"
+    end
+
     test "llm stop logs duration, tokens, and stop_reason" do
       TelemetryLogger.install()
 

@@ -49,6 +49,14 @@ defmodule MyApp.PromEx.Plugins.Clementine do
 end
 ```
 
+Across the fleet, compare by `provider` and `model`: they name what ran,
+in every app alike. `alias` is one app's own name for a model in its
+catalog, so it belongs to views within that app (and to its cost, which
+its prices attach to). Every metered call counts once in the call,
+token, and cost series, labeled by `outcome`, so a total is one series
+summed, whatever the calls' outcomes. A label nothing filled exports as
+`""` on Core and Peep alike.
+
 The one piece that needs a schedule is the inbox gauge — depth and age
 are states, not events, so a poller emits them from one aggregate query
 per period. This supervisor runs the poller and, for an app without

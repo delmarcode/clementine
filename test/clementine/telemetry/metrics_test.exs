@@ -4,9 +4,11 @@ defmodule Clementine.Telemetry.MetricsTest do
   read the way a Prometheus reporter reads it (the measurement, the tags
   from `tag_values`, and nothing exported for an event missing either),
   against real runs on the runtime and in process. Every metric in the
-  list exports, every label is bounded (an atom, a string, a number, or
-  nil), and the engine's series name the agent, provider, model, and
-  alias.
+  list exports, every label is bounded (an atom, a string, or a number;
+  `""` where the writer had no value), and the engine's series name the
+  agent, provider, model, and alias. The same runs, scraped through
+  PromEx's two stores (TelemetryMetricsPrometheus.Core and Peep), export
+  the same series.
   """
 
   use Clementine.RunsCase
@@ -27,6 +29,17 @@ defmodule Clementine.Telemetry.MetricsTest do
 
     @impl true
     def run(_args, _context), do: {:ok, "recorded"}
+  end
+
+  defmodule Plugin do
+    @moduledoc false
+    # The guide's plugin, as an app writes it.
+    use PromEx.Plugin
+
+    @impl true
+    def event_metrics(_opts) do
+      [Event.build(:clementine_event_metrics, Clementine.Telemetry.metrics())]
+    end
   end
 
   defmodule Exits do
@@ -117,7 +130,12 @@ defmodule Clementine.Telemetry.MetricsTest do
 
   defp series(exports, name), do: for({^name, labels, value} <- exports, do: {labels, value})
 
-  test "every metric exports from a real event, with bounded labels" do
+  # Every event the list reads, from real runs where a test can make one:
+  # on the runtime and in process, through a tool call, a park and its
+  # resume, a provider error, a tool that exits, a repaired call, an
+  # iteration limit, direct cancels, a drain requeue and its lost lease,
+  # the reaper, a thread through cascade and purge, and a stale loop.
+  defp exercise! do
     # A task with a tool call, then the answer, priced.
     {:ok, run} = Runs.start(Lookup, "Find the forecast", subject: {"ticket", "t-1"})
     expect_turn(tool_events("tu_1", "lookup", %{"query" => "forecast"}))
@@ -142,22 +160,32 @@ defmodule Clementine.Telemetry.MetricsTest do
 
     assert :ok = perform_job(Worker, %{"run_id" => failed.id})
 
+    # A queued run cancelled directly: its end names the row's key.
+    {:ok, cancelled} = Runs.start(Echo, "Never mind")
+    assert {:ok, :finished} = Runs.cancel(cancelled.id)
+
     # In process: a tool that exits, a garbled call the engine repairs,
-    # and an execution that runs out of iterations.
+    # and an execution that runs out of iterations. The caller names the
+    # agent in the context; its id (an app's own, per workspace say)
+    # never labels anything.
     agent =
       Clementine.Agent.new(
-        id: "in_process",
+        id: "workspace-42",
         model: :claude_sonnet,
         tools: [Exits, Verdict]
       )
 
+    in_process = [context: %{agent_key: "in_process"}]
+
     expect_turn(tool_events("tu_x", "exits", %{}))
     expect_turn(text_events("Exited."))
-    assert {:ok, _} = Clementine.run(agent, "Crash")
+    assert {:ok, _} = Clementine.run(agent, "Crash", in_process)
 
     garbled = %{"summary" => "Chest pain.</summary>\n<parameter name=\"tier\">urgent"}
     expect_turn(tool_events("tu_g", "record_verdict", garbled))
-    assert {:error, _} = Clementine.run(agent, "Triage", limits: [max_iterations: 1])
+
+    assert {:error, _} =
+             Clementine.run(agent, "Triage", [limits: [max_iterations: 1]] ++ in_process)
 
     # A drain's requeue, the lease it leaves behind, and the reaper.
     {:ok, drained} = Runs.start(Echo, "Wait")
@@ -227,6 +255,11 @@ defmodule Clementine.Telemetry.MetricsTest do
       to: 2
     })
 
+    :ok
+  end
+
+  test "every metric exports from a real event, with bounded labels" do
+    exercise!()
     exports = exported()
     names = exports |> Enum.map(&elem(&1, 0)) |> MapSet.new()
 
@@ -236,24 +269,29 @@ defmodule Clementine.Telemetry.MetricsTest do
     end
 
     for {name, labels, _value} <- exports, {label, value} <- labels do
-      assert is_nil(value) or is_atom(value) or is_binary(value) or is_number(value),
+      assert value != nil and (is_atom(value) or is_binary(value) or is_number(value)),
              "#{name} labels #{label} with #{inspect(value)}"
     end
 
     # The engine's series name the agent, the provider, the model, and
-    # the alias.
+    # the alias; every metered call counts once, by how it ended.
     lookup = @identity
+    stopped = Map.put(lookup, :outcome, :stop)
 
-    assert {lookup, 20} in sum_by(series(exports, "clementine_llm_input_tokens_total"))
-    assert {lookup, 10} in sum_by(series(exports, "clementine_llm_output_tokens_total"))
-    assert {lookup, 0} in sum_by(series(exports, "clementine_llm_cache_read_tokens_total"))
-    assert {lookup, 0} in sum_by(series(exports, "clementine_llm_cache_write_tokens_total"))
+    assert {stopped, 20} in sum_by(series(exports, "clementine_llm_input_tokens_total"))
+    assert {stopped, 10} in sum_by(series(exports, "clementine_llm_output_tokens_total"))
+    assert {stopped, 0} in sum_by(series(exports, "clementine_llm_cache_read_tokens_total"))
+    assert {stopped, 0} in sum_by(series(exports, "clementine_llm_cache_write_tokens_total"))
 
-    assert {Map.put(lookup, :currency, "USD"), 210} in sum_by(
+    assert {Map.put(stopped, :currency, "USD"), 210} in sum_by(
              series(exports, "clementine_llm_cost_micros_total")
            )
 
-    assert {Map.put(lookup, :stop_reason, "tool_use"), 1} in sum_by(
+    assert {Map.put(stopped, :stop_reason, "tool_use"), 1} in sum_by(
+             series(exports, "clementine_llm_calls_total")
+           )
+
+    assert {Map.put(stopped, :stop_reason, "end_turn"), 1} in sum_by(
              series(exports, "clementine_llm_calls_total")
            )
 
@@ -265,12 +303,22 @@ defmodule Clementine.Telemetry.MetricsTest do
              series(exports, "clementine_rollout_stops_total")
            )
 
-    echo = %{lookup | agent_key: "test_echo"}
+    # A call a provider error ended: in the same series, as an error,
+    # and counted again by its error code.
+    errored = %{lookup | agent_key: "test_echo"} |> Map.put(:outcome, :error)
 
-    assert {echo, 40} in sum_by(series(exports, "clementine_llm_exception_input_tokens_total"))
+    assert {errored, 40} in sum_by(series(exports, "clementine_llm_input_tokens_total"))
 
-    assert {Map.put(echo, :currency, "USD"), 135} in sum_by(
-             series(exports, "clementine_llm_exception_cost_micros_total")
+    assert {Map.put(errored, :currency, "USD"), 135} in sum_by(
+             series(exports, "clementine_llm_cost_micros_total")
+           )
+
+    assert {Map.put(errored, :stop_reason, ""), 1} in sum_by(
+             series(exports, "clementine_llm_calls_total")
+           )
+
+    assert {%{lookup | agent_key: "test_echo"} |> Map.put(:error_code, :unknown), 1} in sum_by(
+             series(exports, "clementine_llm_exceptions_total")
            )
 
     in_process = %{lookup | agent_key: "in_process"}
@@ -283,9 +331,14 @@ defmodule Clementine.Telemetry.MetricsTest do
              series(exports, "clementine_tool_input_repaired_total")
            )
 
-    assert {Map.put(in_process, :kind, :error), 1} in sum_by(
+    assert {Map.merge(in_process, %{kind: :error, error_kind: :rollout}), 1} in sum_by(
              series(exports, "clementine_rollout_exceptions_total")
            )
+
+    # The agent's id labels nothing.
+    refute Enum.any?(exports, fn {_name, labels, _value} ->
+             "workspace-42" in Map.values(labels)
+           end)
 
     # The run metrics name the agent where the writer knew it.
     assert {%{agent_key: "test_lookup", terminal: :completed}, 1} in sum_by(
@@ -319,8 +372,41 @@ defmodule Clementine.Telemetry.MetricsTest do
                &match?({%{agent_key: "thread"}, _}, &1)
              )
 
-    # A resume has no execution to name its agent.
-    assert {%{agent_key: nil}, 1} in sum_by(series(exports, "clementine_run_resumed_total"))
+    # A resume and a cancel name the row's agent: a direct cancel, and
+    # the turn the thread's cascade cancelled.
+    assert {%{agent_key: "test_approval"}, 1} in sum_by(
+             series(exports, "clementine_run_resumed_total")
+           )
+
+    assert {%{agent_key: "test_echo", terminal: :cancelled}, 1} in sum_by(
+             series(exports, "clementine_run_finished_total")
+           )
+
+    assert {%{agent_key: "test_chat", terminal: :cancelled}, 1} in sum_by(
+             series(exports, "clementine_run_finished_total")
+           )
+  end
+
+  test "PromEx's Core and Peep stores export the same series from the same runs" do
+    core = store(PromEx.Storage.Core, :clementine_metrics_core)
+    peep = store(PromEx.Storage.Peep, :clementine_metrics_peep)
+
+    exercise!()
+
+    core = scrape(core)
+    peep = scrape(peep)
+
+    for {store, scrape} <- [core: core, peep: peep] do
+      refute scrape.text =~ ~s(="nil"), "#{store} exported a nil label"
+
+      for metric <- Clementine.Telemetry.metrics() do
+        name = Enum.join(metric.name, "_")
+        assert Map.has_key?(scrape.types, name), "#{store} exported nothing for #{name}"
+      end
+    end
+
+    assert core.types == peep.types
+    assert core.samples == peep.samples
   end
 
   test "the list holds no summaries, and every name is unique, as a Prometheus registry needs" do
@@ -392,20 +478,109 @@ defmodule Clementine.Telemetry.MetricsTest do
         &(Enum.join(&1.name, "_") == "clementine_llm_calls_total")
       )
 
-    label = &calls.tag_values.(%{stop_reason: &1}).stop_reason
+    label = &calls.tag_values.(%{outcome: :stop, stop_reason: &1}).stop_reason
 
     assert label.("end_turn") == "end_turn"
     assert label.("max_tokens") == "max_tokens"
-    assert label.(nil) == "aborted"
+    assert label.(nil) == "other"
     assert label.("some_server_finish_reason_#{System.unique_integer()}") == "other"
+
+    # A call that did not stop has no stop reason.
+    assert calls.tag_values.(%{outcome: :aborted, stop_reason: nil}).stop_reason == ""
+    assert calls.tag_values.(%{outcome: :error, stop_reason: "end_turn"}).stop_reason == ""
+  end
+
+  test "the error labels are closed: every provider error's code, else other" do
+    by_name = Map.new(Clementine.Telemetry.metrics(), &{Enum.join(&1.name, "_"), &1})
+    code = &by_name["clementine_llm_exceptions_total"].tag_values.(%{error_code: &1}).error_code
+
+    kind =
+      &by_name["clementine_rollout_exceptions_total"].tag_values.(%{error_kind: &1}).error_kind
+
+    provider_errors =
+      [
+        {:api_error, 401, %{}},
+        {:api_error, 404, %{}},
+        {:api_error, 408, %{}},
+        {:api_error, 429, %{}},
+        {:api_error, 529, %{}},
+        {:api_error, 400, %{}},
+        {:api_error, 503, %{}},
+        {:api_error, 302, %{}},
+        {:request_failed, :econnrefused},
+        {:llm_exception, %{message: "boom"}},
+        %{"type" => "overloaded_error"}
+      ]
+
+    for reason <- provider_errors do
+      error = Clementine.Error.normalize(reason)
+      assert code.(error.code) == error.code, "#{inspect(reason)} is labeled other"
+      assert kind.(error.kind) == error.kind
+    end
+
+    assert code.(:exception) == :exception
+    assert code.(:an_apps_own_code) == :other
+    assert kind.(:an_apps_own_kind) == :other
+    assert code.(nil) == ""
   end
 
   test "the reaped counter collapses an app's own codes to a bounded label" do
     reaped =
       Enum.find(Clementine.Telemetry.metrics(), &(&1.event_name == [:clementine, :run, :reaped]))
 
-    assert %{code: :app, agent_key: nil} = reaped.tag_values.(%{code: {:app, {:custom, "why"}}})
+    assert %{code: :app, agent_key: ""} = reaped.tag_values.(%{code: {:app, {:custom, "why"}}})
     assert %{code: :lease_expired} = reaped.tag_values.(%{code: :lease_expired, agent_key: "a"})
+  end
+
+  defp store(store, name) do
+    previous = Application.get_env(:prom_ex, :storage_adapter)
+    Application.put_env(:prom_ex, :storage_adapter, store)
+
+    # Event.build/2 reads the store: for Peep it makes a bucket module of
+    # each distribution's buckets.
+    [%PromEx.MetricTypes.Event{metrics: metrics}] = Plugin.event_metrics([])
+
+    if previous,
+      do: Application.put_env(:prom_ex, :storage_adapter, previous),
+      else: Application.delete_env(:prom_ex, :storage_adapter)
+
+    start_supervised!(Supervisor.child_spec(store.child_spec(name, metrics), id: name))
+    {store, name}
+  end
+
+  # A scrape as the series it holds: each metric's type, and each
+  # sample's value by name and labels. A histogram compares by its count:
+  # Peep writes only the buckets it filled, its bounds as floats
+  # (le="250.0"), and its sum in whole units.
+  defp scrape({store, name}) do
+    text = store.scrape(name)
+    lines = String.split(text, "\n", trim: true)
+
+    types =
+      for "# TYPE " <> rest <- lines, into: %{} do
+        [name, type] = String.split(rest, " ")
+        {name, type}
+      end
+
+    histograms = for {name, "histogram"} <- types, do: name
+
+    samples =
+      for line <- lines,
+          not String.starts_with?(line, "#"),
+          [_, name, labels, value] = Regex.run(~r/^(\w+)(?:\{(.*)\})? (\S+)$/, line),
+          not Enum.any?(histograms, &(name in [&1 <> "_bucket", &1 <> "_sum"])),
+          into: %{} do
+        labels = Regex.scan(~r/(\w+)="((?:[^"\\]|\\.)*)"/, labels, capture: :all_but_first)
+        {{name, Map.new(labels, &List.to_tuple/1)}, number(value)}
+      end
+
+    %{text: text, types: types, samples: samples}
+  end
+
+  defp number(value) do
+    case Float.parse(value) do
+      {float, ""} -> float
+    end
   end
 
   # Each label set's total.

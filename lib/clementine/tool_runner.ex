@@ -44,7 +44,9 @@ defmodule Clementine.ToolRunner do
     do not start their timeout until they are actually spawned.
   - `:max_concurrency` - Maximum parallel tool executions (default: `length(tool_calls)`)
   - `:metadata` - a map merged into every `[:clementine, :tool, ...]`
-    event's metadata: the rollout's agent key, provider, model, and alias
+    event's metadata: the rollout's agent key, provider, model, and alias.
+    A rollout passes its own; a direct call without it names no agent or
+    model, and its tool metrics count under empty labels
 
   ## Returns
 

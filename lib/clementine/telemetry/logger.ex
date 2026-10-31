@@ -96,7 +96,7 @@ defmodule Clementine.Telemetry.Logger do
       end
 
     Logger.log(:error, fn ->
-      "[Clementine] Rollout failed #{identity(metadata)} duration=#{duration_ms(measurements)}ms#{iterations} kind=#{metadata.kind} reason=#{inspect(metadata.reason)}"
+      "[Clementine] Rollout failed #{identity(metadata)} duration=#{duration_ms(measurements)}ms#{iterations} kind=#{metadata.kind} error_kind=#{metadata[:error_kind]} reason=#{inspect(metadata.reason)}"
     end)
 
     _ = config
@@ -120,7 +120,7 @@ defmodule Clementine.Telemetry.Logger do
 
   def handle_event([:clementine, :llm, :exception], measurements, metadata, config) do
     Logger.log(:error, fn ->
-      "[Clementine] LLM call failed #{identity(metadata)} iteration=#{metadata.iteration} duration=#{duration_ms(measurements)}ms reason=#{inspect(metadata.reason)}"
+      "[Clementine] LLM call failed #{identity(metadata)} iteration=#{metadata.iteration} duration=#{duration_ms(measurements)}ms error_code=#{metadata[:error_code]} reason=#{inspect(metadata.reason)}"
     end)
 
     _ = config

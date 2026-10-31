@@ -1006,6 +1006,7 @@ defmodule Clementine.Rollout do
         # the input count the stream's start reported.
         call = metered(model, duration, acc.usage)
         emit_llm_stop(metadata, call, nil)
+        emit_llm_usage(metadata, call, :aborted, nil)
         {:signal, signal, Accumulator.to_response(acc), call}
 
       Accumulator.error?(acc) ->
@@ -1017,15 +1018,22 @@ defmodule Clementine.Rollout do
         :telemetry.execute(
           [:clementine, :llm, :exception],
           measurements,
-          Map.merge(metadata, %{kind: :error, reason: acc.error, currency: currency})
+          Map.merge(metadata, %{
+            kind: :error,
+            reason: acc.error,
+            error_code: Clementine.Error.normalize(acc.error).code,
+            currency: currency
+          })
         )
 
+        emit_llm_usage(metadata, call, :error, nil)
         {:error, acc.error, acc.usage, call}
 
       true ->
         response = Accumulator.to_response(acc)
         call = metered(model, duration, response.usage)
         emit_llm_stop(metadata, call, response.stop_reason)
+        emit_llm_usage(metadata, call, :stop, response.stop_reason)
         {:ok, response, call}
     end
   end
@@ -1040,10 +1048,26 @@ defmodule Clementine.Rollout do
     )
   end
 
+  # Every metered call, however it ended, in one event. The metrics count
+  # calls and sum tokens and spend from it alone, so a total is one
+  # series summed over `outcome`, never two series added, where an agent
+  # missing from either side drops out of the sum.
+  defp emit_llm_usage(metadata, call, outcome, stop_reason) do
+    {measurements, currency} = call_measurements(call)
+
+    :telemetry.execute(
+      [:clementine, :llm, :usage],
+      Map.delete(measurements, :duration),
+      Map.merge(metadata, %{outcome: outcome, stop_reason: stop_reason, currency: currency})
+    )
+  end
+
   # A call's measurements, and the currency of its cost. A priced call
   # adds `cost_micros`; an unpriced one leaves it out rather than
-  # reporting zero, and reporters skip an event whose measurement is
-  # missing.
+  # reporting zero. The metrics read it through a function that returns
+  # nil when it is missing, which every reporter skips: a missing atom
+  # measurement is skipped by some reporters and counted as 1 by others
+  # (Peep).
   defp call_measurements(%{duration: duration, usage: usage, cost: cost}) do
     measurements = %{
       duration: duration,
@@ -1062,11 +1086,19 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # A raise meters nothing, so no usage event follows it. Its error code
+  # is the one `Clementine.Error.from_exception/3` gives any raise.
   defp emit_llm_raise(metadata, started, kind, reason, stacktrace) do
     :telemetry.execute(
       [:clementine, :llm, :exception],
       %{duration: System.monotonic_time() - started},
-      Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: stacktrace, currency: nil})
+      Map.merge(metadata, %{
+        kind: kind,
+        reason: reason,
+        stacktrace: stacktrace,
+        error_code: :exception,
+        currency: nil
+      })
     )
   end
 
@@ -1832,7 +1864,7 @@ defmodule Clementine.Rollout do
         :telemetry.execute(
           [:clementine, :rollout, :exception],
           measurements,
-          Map.merge(identity(exec), %{kind: :error, reason: error})
+          Map.merge(identity(exec), %{kind: :error, reason: error, error_kind: error.kind})
         )
 
       _stopped ->
@@ -1855,12 +1887,18 @@ defmodule Clementine.Rollout do
   # A genuine raise concludes no exit value, so `conclude/2` never sees it:
   # the span still terminates — `:exception` with the raise's kind and
   # stacktrace, no iteration count — and the raise continues to the
-  # runner's rescue tier.
+  # runner's rescue tier. Its error kind is the one the runner's rescue
+  # gives it (`Clementine.Error.from_exception/3`).
   defp emit_rollout_raise(%Execution{} = exec, kind, reason, stacktrace) do
     :telemetry.execute(
       [:clementine, :rollout, :exception],
       %{duration: System.monotonic_time() - exec.started_at},
-      Map.merge(identity(exec), %{kind: kind, reason: reason, stacktrace: stacktrace})
+      Map.merge(identity(exec), %{
+        kind: kind,
+        reason: reason,
+        stacktrace: stacktrace,
+        error_kind: :runtime
+      })
     )
   end
 
@@ -1886,12 +1924,13 @@ defmodule Clementine.Rollout do
   defp delegate_entries(%Execution{delegates: delegates}), do: Delegation.entries(delegates)
 
   @doc false
-  # The agent key a rollout's records name: the runtime's (the run row's
-  # key, in the tool context), else the agent's `id` when it is a string
-  # (`use Clementine.Agent` sets it to the key), else nil.
+  # The agent key a rollout's records name: the run row's key, which the
+  # runtime puts in the tool context (an in-process caller may name one
+  # there too), else nil. Never the agent's `id`: an app may set that to
+  # anything (a per-workspace id, say), and a metric label must stay a
+  # key fixed in code.
   @spec agent_key(t()) :: String.t() | nil
   def agent_key(%__MODULE__{context: %{agent_key: key}}) when is_binary(key), do: key
-  def agent_key(%__MODULE__{agent: %Clementine.Agent{id: id}}) when is_binary(id), do: id
   def agent_key(%__MODULE__{}), do: nil
 
   # What every rollout, llm, and tool event of the execution says it
