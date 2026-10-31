@@ -130,6 +130,9 @@ defmodule Clementine.Runs.DelegationTest do
 
   defp facts(id), do: id |> Runs.get() |> Codec.to_facts(@fields)
 
+  @doc false
+  def forward(event, _measurements, metadata, test), do: send(test, {event, metadata})
+
   defp children(parent_id) do
     parent_id |> then(&Runs.list(parent: &1)) |> Enum.sort_by(& &1.tag_id)
   end
@@ -570,10 +573,28 @@ defmodule Clementine.Runs.DelegationTest do
     test "cancelled with only queued children, ends with them" do
       parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
       [echo] = children(parent_id)
+      handler = {__MODULE__, make_ref()}
+
+      :telemetry.attach_many(
+        handler,
+        [[:clementine, :run, :finished], [:clementine, :run, :resumed]],
+        &__MODULE__.forward/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
 
       assert {:ok, :flagged} = Runs.cancel(parent_id)
       assert %AgentRun{status: "cancelled"} = Runs.get(echo.id)
       assert %{status: :queued, cancel: %{}} = facts(parent_id)
+
+      # The child's cancel and the parent's resume name their own agents.
+      assert_received {[:clementine, :run, :finished],
+                       %{run_ref: echo_id, agent_key: "test_echo", terminal: :cancelled}}
+
+      assert echo_id == echo.id
+      assert_received {[:clementine, :run, :resumed], %{run_ref: ^parent_id, agent_key: planner}}
+      assert planner == Runs.get(parent_id).agent_key
 
       assert :ok = perform!(parent_id)
       assert %AgentRun{status: "cancelled"} = Runs.get(parent_id)

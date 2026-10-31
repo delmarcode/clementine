@@ -1,6 +1,9 @@
 defmodule Clementine.Runs.WorkerTest do
   use Clementine.RunsCase
 
+  @doc false
+  def forward(event, _measurements, metadata, test), do: send(test, {event, metadata})
+
   test "a drained run that has not touched the world is requeued for the next node" do
     {:ok, run} = Runs.start(Lookup, "Look it up")
     worker = self()
@@ -55,10 +58,17 @@ defmodule Clementine.Runs.WorkerTest do
   test "a run whose agent is gone is cancelled as unstartable, and the host hears why" do
     Process.register(self(), :clementine_runs_test)
     run = insert_queued_run!(%{agent_key: "retired_agent"})
+    handler = {__MODULE__, make_ref()}
+    :telemetry.attach(handler, [:clementine, :run, :finished], &__MODULE__.forward/4, self())
+    on_exit(fn -> :telemetry.detach(handler) end)
 
     assert {:cancel, reason} = perform_job(Worker, %{"run_id" => run.id})
     assert reason =~ "unknown_agent"
     assert %AgentRun{status: "cancelled"} = Runs.get(run.id)
+
+    # The cancel's end names the row's agent, retired or not.
+    assert_received {[:clementine, :run, :finished],
+                     %{agent_key: "retired_agent", terminal: :cancelled}}
 
     assert_received {:run_finished, _run,
                      %Clementine.Result.Cancelled{

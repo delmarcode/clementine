@@ -77,13 +77,13 @@ defmodule Clementine.Telemetry.Logger do
   @doc false
   def handle_event([:clementine, :rollout, :start], _measurements, metadata, config) do
     Logger.log(config.level, fn ->
-      "[Clementine] Rollout started model=#{format_model(metadata.model)} tools=#{metadata.tool_count} max_iterations=#{metadata.max_iterations}"
+      "[Clementine] Rollout started #{identity(metadata)} tools=#{metadata.tool_count} max_iterations=#{metadata.max_iterations}"
     end)
   end
 
   def handle_event([:clementine, :rollout, :stop], measurements, metadata, config) do
     Logger.log(config.level, fn ->
-      "[Clementine] Rollout stopped status=#{metadata.status} duration=#{duration_ms(measurements)}ms iterations=#{measurements.iterations}"
+      "[Clementine] Rollout stopped #{identity(metadata)} status=#{metadata.status} duration=#{duration_ms(measurements)}ms iterations=#{measurements.iterations}"
     end)
   end
 
@@ -96,7 +96,7 @@ defmodule Clementine.Telemetry.Logger do
       end
 
     Logger.log(:error, fn ->
-      "[Clementine] Rollout failed duration=#{duration_ms(measurements)}ms#{iterations} kind=#{metadata.kind} reason=#{inspect(metadata.reason)}"
+      "[Clementine] Rollout failed #{identity(metadata)} duration=#{duration_ms(measurements)}ms#{iterations} kind=#{metadata.kind} error_kind=#{metadata[:error_kind]} reason=#{inspect(metadata.reason)}"
     end)
 
     _ = config
@@ -106,7 +106,7 @@ defmodule Clementine.Telemetry.Logger do
     Logger.log(config.level, fn ->
       streaming = if metadata.streaming, do: " streaming=true", else: ""
 
-      "[Clementine] LLM call starting iteration=#{metadata.iteration} messages=#{metadata.message_count} tools=#{metadata.tool_count}#{streaming}"
+      "[Clementine] LLM call starting #{identity(metadata)} iteration=#{metadata.iteration} messages=#{metadata.message_count} tools=#{metadata.tool_count}#{streaming}"
     end)
   end
 
@@ -114,13 +114,13 @@ defmodule Clementine.Telemetry.Logger do
     Logger.log(config.level, fn ->
       streaming = if metadata.streaming, do: " streaming=true", else: ""
 
-      "[Clementine] LLM call completed iteration=#{metadata.iteration} duration=#{duration_ms(measurements)}ms input_tokens=#{measurements.input_tokens} output_tokens=#{measurements.output_tokens}#{cost(measurements, metadata)} stop_reason=#{metadata.stop_reason}#{streaming}"
+      "[Clementine] LLM call completed #{identity(metadata)} iteration=#{metadata.iteration} duration=#{duration_ms(measurements)}ms input_tokens=#{measurements.input_tokens} output_tokens=#{measurements.output_tokens}#{cost(measurements, metadata)} stop_reason=#{metadata.stop_reason}#{streaming}"
     end)
   end
 
   def handle_event([:clementine, :llm, :exception], measurements, metadata, config) do
     Logger.log(:error, fn ->
-      "[Clementine] LLM call failed iteration=#{metadata.iteration} duration=#{duration_ms(measurements)}ms reason=#{inspect(metadata.reason)}"
+      "[Clementine] LLM call failed #{identity(metadata)} iteration=#{metadata.iteration} duration=#{duration_ms(measurements)}ms error_code=#{metadata[:error_code]} reason=#{inspect(metadata.reason)}"
     end)
 
     _ = config
@@ -284,7 +284,21 @@ defmodule Clementine.Telemetry.Logger do
 
   defp run_summary(metadata, measurements \\ %{}) do
     epoch = Map.get(metadata, :epoch) || Map.get(measurements, :epoch)
-    "run=#{inspect(metadata.run_ref)} epoch=#{epoch}"
+    agent = if key = Map.get(metadata, :agent_key), do: " agent=#{key}", else: ""
+    "run=#{inspect(metadata.run_ref)} epoch=#{epoch}#{agent}"
+  end
+
+  # The agent and the model a rollout, llm, or tool event names; a key the
+  # event does not carry (a tool batch run outside a rollout) is left out.
+  defp identity(metadata) do
+    [agent: :agent_key, provider: :provider, model: :model]
+    |> Enum.flat_map(fn {label, key} ->
+      case Map.get(metadata, key) do
+        nil -> []
+        value -> ["#{label}=#{value}"]
+      end
+    end)
+    |> Enum.join(" ")
   end
 
   defp loop_summary(metadata) do
@@ -300,14 +314,18 @@ defmodule Clementine.Telemetry.Logger do
     System.convert_time_unit(duration, :native, :millisecond)
   end
 
-  defp tool_summary(%{tool_module: module, args: args}) when not is_nil(module) do
-    module.summarize(args)
-  rescue
-    _ -> Map.get(%{tool: "unknown"}, :tool, "unknown")
+  defp tool_summary(metadata) do
+    case identity(metadata) do
+      "" -> tool_call(metadata)
+      identity -> "#{tool_call(metadata)} #{identity}"
+    end
   end
 
-  defp tool_summary(%{tool: name}), do: name
+  defp tool_call(%{tool_module: module, args: args}) when not is_nil(module) do
+    module.summarize(args)
+  rescue
+    _ -> "unknown"
+  end
 
-  defp format_model(model) when is_atom(model), do: Atom.to_string(model)
-  defp format_model(model), do: inspect(model)
+  defp tool_call(%{tool: name}), do: name
 end

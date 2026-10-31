@@ -56,7 +56,7 @@ defmodule Clementine.Telemetry.LoggerTest do
       assert log =~ "max_iterations=30"
     end
 
-    test "rollout start logs tuple model refs without crashing" do
+    test "rollout start logs the agent, the provider, and the model" do
       TelemetryLogger.install()
 
       log =
@@ -64,12 +64,18 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :rollout, :start],
             %{system_time: System.system_time()},
-            %{model: {:openai, "gpt-5"}, tool_count: 0, max_iterations: 10}
+            %{
+              agent_key: "triage",
+              provider: :openai,
+              model: "gpt-5",
+              alias: nil,
+              tool_count: 0,
+              max_iterations: 10
+            }
           )
         end)
 
-      assert log =~ "[Clementine] Rollout started"
-      assert log =~ ~s(model={:openai, "gpt-5"})
+      assert log =~ "[Clementine] Rollout started agent=triage provider=openai model=gpt-5"
 
       handlers = :telemetry.list_handlers([:clementine, :rollout, :start])
       assert Enum.any?(handlers, fn h -> h.id == "clementine-logger" end)
@@ -113,6 +119,42 @@ defmodule Clementine.Telemetry.LoggerTest do
       assert log =~ "kind=error"
       assert log =~ "boom"
       refute log =~ "iterations="
+    end
+
+    test "llm and rollout failures log the error's class" do
+      TelemetryLogger.install()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute(
+            [:clementine, :llm, :exception],
+            %{duration: System.convert_time_unit(10, :millisecond, :native)},
+            %{
+              agent_key: "triage",
+              provider: :anthropic,
+              model: "claude-sonnet-5",
+              iteration: 1,
+              kind: :error,
+              reason: {:api_error, 429, %{}},
+              error_code: :rate_limited
+            }
+          )
+
+          :telemetry.execute(
+            [:clementine, :rollout, :exception],
+            %{duration: 0, iterations: 1},
+            %{
+              agent_key: "triage",
+              kind: :error,
+              reason: %Clementine.Error{kind: :provider, code: :rate_limited},
+              error_kind: :provider
+            }
+          )
+        end)
+
+      assert log =~ "[Clementine] LLM call failed agent=triage provider=anthropic"
+      assert log =~ "error_code=rate_limited"
+      assert log =~ "error_kind=provider"
     end
 
     test "llm stop logs duration, tokens, and stop_reason" do

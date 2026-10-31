@@ -138,14 +138,16 @@ defmodule Clementine.Loop.Runner do
     ctx = Keyword.get(opts, :ctx)
 
     # Spec columns are create-time-stable, so the pre-claim read is only
-    # trusted for the policy the claim's deadline is minted from; the
+    # trusted for the policy the claim's deadline is minted from, and the
+    # controller's key (a host that loads one) its run events name; the
     # envelope and cancel flag are re-read under the claim's fence.
     case host.load(loop_ref, ctx) do
-      {:ok, %{policy: policy}} ->
+      {:ok, %{policy: policy} = loaded} ->
         claim_opts = [
           executor: executor,
           ctx: ctx,
-          max_duration: Map.get(policy, "deadline_ms", @default_deadline_ms)
+          max_duration: Map.get(policy, "deadline_ms", @default_deadline_ms),
+          agent_key: Map.get(loaded, :agent_key)
         ]
 
         case Protocol.claim(lifecycle, loop_ref, claim_opts) do

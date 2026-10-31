@@ -184,8 +184,13 @@ defmodule Clementine.Rollout do
     # `loaded_skills` the names of those loaded, in load order, and
     # `delegates` the agent modules it may ask. `authorize_tool` answers
     # for `{:policy, term}` tools (nil: they gate like :required).
+    # `resolved` is `model` resolved once for the execution
+    # (`Trace.resolve_model/1`), and `agent_key` the run's agent key: every
+    # trace entry and telemetry event of the execution names both.
     defstruct [
       :model,
+      :resolved,
+      :agent_key,
       :system,
       :tools,
       :deferred,
@@ -310,8 +315,12 @@ defmodule Clementine.Rollout do
     config = to_config(rollout)
     input_message = UserMessage.new(rollout.input)
 
+    model = Keyword.fetch!(config, :model)
+
     exec = %Execution{
-      model: Keyword.fetch!(config, :model),
+      model: model,
+      resolved: Trace.resolve_model(model),
+      agent_key: agent_key(rollout),
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
       deferred: Keyword.get(config, :deferred, []),
@@ -336,7 +345,10 @@ defmodule Clementine.Rollout do
     :telemetry.execute(
       [:clementine, :rollout, :start],
       %{system_time: System.system_time()},
-      %{model: exec.model, max_iterations: exec.max_iterations, tool_count: length(exec.tools)}
+      Map.merge(identity(exec), %{
+        max_iterations: exec.max_iterations,
+        tool_count: length(exec.tools)
+      })
     )
 
     try do
@@ -932,10 +944,11 @@ defmodule Clementine.Rollout do
     )
   end
 
-  # One model call as it is recorded: the model it ran on, resolved once
-  # for the call, how long it took, what it burned, and what that cost at
-  # the model's prices then. Its trace entry and its telemetry event both
-  # read this, so they name the same model and the same cost.
+  # One model call as it is recorded: the model it ran on (the
+  # execution's resolution), how long it took, what it burned, and what
+  # that cost at the model's prices then. Its trace entry and its
+  # telemetry event both read this, so they name the same model and the
+  # same cost.
   defp metered(model, duration, usage) do
     usage = Clementine.Usage.new(usage)
     %{model: model, duration: duration, usage: usage, cost: Clementine.Cost.of(usage, model)}
@@ -944,16 +957,16 @@ defmodule Clementine.Rollout do
   defp stream_response(%Execution{} = exec) do
     alias Clementine.LLM.StreamParser.Accumulator
 
-    model = Trace.resolve_model(exec.model)
+    model = exec.resolved
     tools = offered_tools(exec)
 
-    metadata = %{
-      model: exec.model,
-      iteration: exec.iteration,
-      message_count: length(exec.messages),
-      tool_count: length(tools),
-      streaming: true
-    }
+    metadata =
+      Map.merge(identity(exec), %{
+        iteration: exec.iteration,
+        message_count: length(exec.messages),
+        tool_count: length(tools),
+        streaming: true
+      })
 
     :telemetry.execute(
       [:clementine, :llm, :start],
@@ -993,6 +1006,7 @@ defmodule Clementine.Rollout do
         # the input count the stream's start reported.
         call = metered(model, duration, acc.usage)
         emit_llm_stop(metadata, call, nil)
+        emit_llm_usage(metadata, call, :aborted, nil)
         {:signal, signal, Accumulator.to_response(acc), call}
 
       Accumulator.error?(acc) ->
@@ -1004,15 +1018,22 @@ defmodule Clementine.Rollout do
         :telemetry.execute(
           [:clementine, :llm, :exception],
           measurements,
-          Map.merge(metadata, %{kind: :error, reason: acc.error, currency: currency})
+          Map.merge(metadata, %{
+            kind: :error,
+            reason: acc.error,
+            error_code: Clementine.Error.normalize(acc.error).code,
+            currency: currency
+          })
         )
 
+        emit_llm_usage(metadata, call, :error, nil)
         {:error, acc.error, acc.usage, call}
 
       true ->
         response = Accumulator.to_response(acc)
         call = metered(model, duration, response.usage)
         emit_llm_stop(metadata, call, response.stop_reason)
+        emit_llm_usage(metadata, call, :stop, response.stop_reason)
         {:ok, response, call}
     end
   end
@@ -1027,10 +1048,26 @@ defmodule Clementine.Rollout do
     )
   end
 
+  # Every metered call, however it ended, in one event. The metrics count
+  # calls and sum tokens and spend from it alone, so a total is one
+  # series summed over `outcome`, never two series added, where an agent
+  # missing from either side drops out of the sum.
+  defp emit_llm_usage(metadata, call, outcome, stop_reason) do
+    {measurements, currency} = call_measurements(call)
+
+    :telemetry.execute(
+      [:clementine, :llm, :usage],
+      Map.delete(measurements, :duration),
+      Map.merge(metadata, %{outcome: outcome, stop_reason: stop_reason, currency: currency})
+    )
+  end
+
   # A call's measurements, and the currency of its cost. A priced call
   # adds `cost_micros`; an unpriced one leaves it out rather than
-  # reporting zero, and reporters skip an event whose measurement is
-  # missing.
+  # reporting zero. The metrics read it through a function that returns
+  # nil when it is missing, which every reporter skips: a missing atom
+  # measurement is skipped by some reporters and counted as 1 by others
+  # (Peep).
   defp call_measurements(%{duration: duration, usage: usage, cost: cost}) do
     measurements = %{
       duration: duration,
@@ -1049,11 +1086,19 @@ defmodule Clementine.Rollout do
     end
   end
 
+  # A raise meters nothing, so no usage event follows it. Its error code
+  # is the one `Clementine.Error.from_exception/3` gives any raise.
   defp emit_llm_raise(metadata, started, kind, reason, stacktrace) do
     :telemetry.execute(
       [:clementine, :llm, :exception],
       %{duration: System.monotonic_time() - started},
-      Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: stacktrace, currency: nil})
+      Map.merge(metadata, %{
+        kind: kind,
+        reason: reason,
+        stacktrace: stacktrace,
+        error_code: :exception,
+        currency: nil
+      })
     )
   end
 
@@ -1180,7 +1225,12 @@ defmodule Clementine.Rollout do
     :telemetry.execute(
       [:clementine, :tool, :input_repaired],
       %{count: length(fields)},
-      %{tool: tool_use.name, tool_call_id: tool_use.id, iteration: exec.iteration, fields: fields}
+      Map.merge(identity(exec), %{
+        tool: tool_use.name,
+        tool_call_id: tool_use.id,
+        iteration: exec.iteration,
+        fields: fields
+      })
     )
   end
 
@@ -1758,10 +1808,13 @@ defmodule Clementine.Rollout do
   defp cache_key_opts(nil), do: []
   defp cache_key_opts(key), do: [cache_key: key]
 
-  defp batch_opts(%Execution{deadline: nil}), do: []
+  defp batch_opts(%Execution{deadline: nil} = exec), do: [metadata: identity(exec)]
 
-  defp batch_opts(%Execution{deadline: deadline}) do
-    [timeout: min(ToolRunner.default_timeout(), remaining_ms(deadline))]
+  defp batch_opts(%Execution{deadline: deadline} = exec) do
+    [
+      timeout: min(ToolRunner.default_timeout(), remaining_ms(deadline)),
+      metadata: identity(exec)
+    ]
   end
 
   # Ceiling division: a cap computed by flooring could expire a hair
@@ -1811,14 +1864,14 @@ defmodule Clementine.Rollout do
         :telemetry.execute(
           [:clementine, :rollout, :exception],
           measurements,
-          %{model: exec.model, kind: :error, reason: error}
+          Map.merge(identity(exec), %{kind: :error, reason: error, error_kind: error.kind})
         )
 
       _stopped ->
         :telemetry.execute(
           [:clementine, :rollout, :stop],
           measurements,
-          %{model: exec.model, status: stop_status(result)}
+          Map.merge(identity(exec), %{status: stop_status(result)})
         )
     end
 
@@ -1834,12 +1887,18 @@ defmodule Clementine.Rollout do
   # A genuine raise concludes no exit value, so `conclude/2` never sees it:
   # the span still terminates — `:exception` with the raise's kind and
   # stacktrace, no iteration count — and the raise continues to the
-  # runner's rescue tier.
+  # runner's rescue tier. Its error kind is the one the runner's rescue
+  # gives it (`Clementine.Error.from_exception/3`).
   defp emit_rollout_raise(%Execution{} = exec, kind, reason, stacktrace) do
     :telemetry.execute(
       [:clementine, :rollout, :exception],
       %{duration: System.monotonic_time() - exec.started_at},
-      %{model: exec.model, kind: kind, reason: reason, stacktrace: stacktrace}
+      Map.merge(identity(exec), %{
+        kind: kind,
+        reason: reason,
+        stacktrace: stacktrace,
+        error_kind: :runtime
+      })
     )
   end
 
@@ -1851,7 +1910,7 @@ defmodule Clementine.Rollout do
     record(
       exec,
       :execution,
-      Trace.execution(Trace.resolve_model(exec.model), exec.system, agent_tools, resumed?,
+      Trace.execution(exec.resolved, exec.system, agent_tools, resumed?,
         deferred: exec.deferred,
         output_schema: exec.output_schema,
         skills: exec.skills,
@@ -1863,6 +1922,23 @@ defmodule Clementine.Rollout do
 
   defp delegate_entries(%Execution{delegates: []}), do: []
   defp delegate_entries(%Execution{delegates: delegates}), do: Delegation.entries(delegates)
+
+  @doc false
+  # The agent key a rollout's records name: the run row's key, which the
+  # runtime puts in the tool context (an in-process caller may name one
+  # there too), else nil. Never the agent's `id`: an app may set that to
+  # anything (a per-workspace id, say), and a metric label must stay a
+  # key fixed in code.
+  @spec agent_key(t()) :: String.t() | nil
+  def agent_key(%__MODULE__{context: %{agent_key: key}}) when is_binary(key), do: key
+  def agent_key(%__MODULE__{}), do: nil
+
+  # What every rollout, llm, and tool event of the execution says it
+  # ran: bounded values, fixed in code, that metrics may tag by
+  # (`Clementine.Telemetry`).
+  defp identity(%Execution{agent_key: agent_key, resolved: model}) do
+    %{agent_key: agent_key, provider: model.provider, model: model.id, alias: model.alias}
+  end
 
   defp record(%Execution{recorder: nil}, _kind, _payload), do: :ok
 

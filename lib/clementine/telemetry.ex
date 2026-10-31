@@ -10,12 +10,53 @@ defmodule Clementine.Telemetry do
   outcome is observable regardless of which caller drove it (runner,
   control plane, reaper, or the ephemeral facade).
 
-  > #### Breaking rename {: .warning}
+  > #### Breaking changes {: .warning}
   >
-  > The pre-RFC `[:clementine, :loop, ...]` events are gone; the engine
-  > emits `[:clementine, :rollout, ...]` instead. Dashboards and handlers
-  > swap the event name — measurements and metadata keep their shapes.
-  > `:llm` and `:tool` events are unchanged.
+  > - The pre-RFC `[:clementine, :loop, ...]` engine events are gone; the
+  >   engine emits `[:clementine, :rollout, ...]` instead, and `:loop`
+  >   now names the loop layer's events.
+  > - On rollout and llm events, `model` is the provider's id for the
+  >   model (`"claude-sonnet-5"`), no longer the agent's model reference
+  >   (`:claude_sonnet`), which moved to `alias`. A handler that matched
+  >   an alias in `model` reads `alias` now.
+  > - Rollout, llm, and tool events gain `agent_key`, `provider`, and
+  >   `alias` ("What a run names").
+
+  ## What a run names
+
+  Every rollout, llm, and tool event carries the execution's identity,
+  resolved once as it starts (the same resolution its trace records):
+
+  - `agent_key` — the run's agent key: the run row's on the runtime; in
+    process, the `agent_key` the caller puts in the rollout's context
+    (`Clementine.run(agent, prompt, context: %{agent_key: "triage"})`);
+    otherwise `nil`. Never the agent's `id`, which an app may set to
+    anything, a per-workspace id say
+  - `provider` — the provider the model resolved to (`:anthropic`,
+    `:openai`, ...)
+  - `model` — the provider's id for the model (`"claude-sonnet-5"`)
+  - `alias` — the catalog alias the agent named (`:claude_sonnet`), or
+    `nil` for a `{provider, id}` reference
+
+  A model reference the catalog does not hold (a test's, on a mock
+  client) has `provider: nil`: a `{provider, id}` reference keeps its id
+  as `model`, and an alias has `model: nil` beside its `alias`. Each is
+  fixed in code, so a metric may label by it, and a nil one exports as
+  `""`.
+
+  A tool batch run outside a rollout, through
+  `Clementine.ToolRunner.execute/4` or `run_batch/4`, names no execution:
+  its tool events carry only the identity its caller passes as
+  `metadata:`, and count under empty labels without it.
+
+  Run events carry `agent_key` wherever the writer holds the run's row:
+  an execution's own writes (the claim, heartbeats, a park, its end, a
+  drain's requeue, a lost lease, through its lease), a loop step's (the
+  controller's key), the reaper's, a resume, and a cancel, including the
+  cancels the runtime writes itself (a run it cannot start, a cancelled
+  run's or loop's children). A lifecycle other than the runtime's
+  (`Clementine.Lifecycle.Ephemeral` in process, or a host's own) names
+  the key its caller passes, else `nil`.
 
   ## Rollout Events
 
@@ -24,14 +65,14 @@ defmodule Clementine.Telemetry do
   Emitted when the Gather → Act engine begins animating a rollout.
 
   - Measurements: `%{system_time: integer}`
-  - Metadata: `%{model: model_ref, max_iterations: integer, tool_count: integer}`
+  - Metadata: `%{agent_key, provider, model, alias, max_iterations: integer, tool_count: integer}`
 
   ### `[:clementine, :rollout, :stop]`
 
   Emitted when the engine returns a non-error branch of its closed set.
 
   - Measurements: `%{duration: native_time, iterations: integer}`
-  - Metadata: `%{model: model_ref, status: :success | :suspended | :cancelled | :drained | :lost_lease}`
+  - Metadata: `%{agent_key, provider, model, alias, status: :success | :suspended | :cancelled | :drained | :lost_lease}`
 
   ### `[:clementine, :rollout, :exception]`
 
@@ -42,9 +83,11 @@ defmodule Clementine.Telemetry do
 
   - Measurements: `%{duration: native_time, iterations: integer}` —
     `iterations` is absent on a genuine raise
-  - Metadata: `%{model: model_ref, kind: atom, reason: term}` — a returned
-    error carries `kind: :error, reason: %Clementine.Error{}`; a raise
-    carries the raise's `kind`, `reason`, and `stacktrace`
+  - Metadata: `%{agent_key, provider, model, alias, kind: atom, reason: term, error_kind: Clementine.Error.kind()}` —
+    a returned error carries `kind: :error, reason: %Clementine.Error{}`,
+    and its `kind` as `error_kind`; a raise carries the raise's `kind`,
+    `reason`, and `stacktrace`, and `error_kind: :runtime`, the kind the
+    runner's rescue gives it
 
   ## Run Events
 
@@ -60,28 +103,28 @@ defmodule Clementine.Telemetry do
   as the attempt counter — was minted.
 
   - Measurements: `%{epoch: pos_integer}`
-  - Metadata: `%{run_ref: term, executor_id: String.t()}`
+  - Metadata: `%{run_ref: term, executor_id: String.t(), agent_key: String.t() | nil}`
 
   ### `[:clementine, :run, :heartbeat]`
 
   A heartbeat renewed the lease.
 
   - Measurements: `%{}`
-  - Metadata: `%{run_ref: term, epoch: pos_integer}`
+  - Metadata: `%{run_ref: term, epoch: pos_integer, agent_key: String.t() | nil}`
 
   ### `[:clementine, :run, :suspended]`
 
   The run parked in `waiting` with a durable checkpoint.
 
   - Measurements: `%{}`
-  - Metadata: `%{run_ref: term, epoch: pos_integer, reason_type: atom}`
+  - Metadata: `%{run_ref: term, epoch: pos_integer, agent_key: String.t() | nil, reason_type: atom}`
 
   ### `[:clementine, :run, :resumed]`
 
   A resume token was honored: `waiting -> queued`, payload stamped.
 
   - Measurements: `%{}`
-  - Metadata: `%{run_ref: term, epoch: pos_integer}`
+  - Metadata: `%{run_ref: term, epoch: pos_integer, agent_key: String.t() | nil}`
 
   ### `[:clementine, :run, :finished]`
 
@@ -90,7 +133,7 @@ defmodule Clementine.Telemetry do
 
   - Measurements: `%{duration: native_time}` — claim to finish on the
     storage clock; `0` when no execution owned the run
-  - Metadata: `%{run_ref: term, epoch: non_neg_integer, terminal: :completed | :failed | :cancelled | :interrupted, usage: Clementine.Usage.t()}`
+  - Metadata: `%{run_ref: term, epoch: non_neg_integer, agent_key: String.t() | nil, terminal: :completed | :failed | :cancelled | :interrupted, usage: Clementine.Usage.t()}`
 
   ### `[:clementine, :run, :requeued]`
 
@@ -98,7 +141,7 @@ defmodule Clementine.Telemetry do
   `running -> queued`, same epoch until the next claim.
 
   - Measurements: `%{}`
-  - Metadata: `%{run_ref: term, epoch: pos_integer, reason: term}`
+  - Metadata: `%{run_ref: term, epoch: pos_integer, agent_key: String.t() | nil, reason: term}`
 
   ### `[:clementine, :run, :lease_lost]`
 
@@ -106,14 +149,14 @@ defmodule Clementine.Telemetry do
   cancellation poll, effect fence, suspend, finish, or drain requeue.
 
   - Measurements: `%{}`
-  - Metadata: `%{run_ref: term, epoch: pos_integer}`
+  - Metadata: `%{run_ref: term, epoch: pos_integer, agent_key: String.t() | nil}`
 
   ### `[:clementine, :run, :reaped]`
 
   Reconciliation (or an admin) interrupted the run.
 
   - Measurements: `%{}`
-  - Metadata: `%{run_ref: term, epoch: non_neg_integer, code: Clementine.InterruptReason.code()}`
+  - Metadata: `%{run_ref: term, epoch: non_neg_integer, agent_key: String.t() | nil, code: Clementine.InterruptReason.code()}`
 
   ### `[:clementine, :runs, :purge]`
 
@@ -276,7 +319,7 @@ defmodule Clementine.Telemetry do
   Emitted before calling the LLM API.
 
   - Measurements: `%{system_time: integer}`
-  - Metadata: `%{model: model_ref, iteration: integer, message_count: integer, tool_count: integer, streaming: boolean}`
+  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, message_count: integer, tool_count: integer, streaming: boolean}`
 
   ### `[:clementine, :llm, :stop]`
 
@@ -288,9 +331,10 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{duration: native_time, input_tokens: integer, output_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer, cost_micros: integer}`
     (`Clementine.Usage`'s fields: the cache counts are parts of `input_tokens`).
     `cost_micros` is what the call cost in micro-units of `currency`
-    (`Clementine.Cost`), at the prices `model` has now; a call on a model
-    without prices leaves it out, never reports zero.
-  - Metadata: `%{model: model_ref, iteration: integer, stop_reason: String.t() | nil, currency: String.t() | nil, streaming: boolean}`
+    (`Clementine.Cost`), at the prices the alias has now, the same cost
+    the call's trace entry freezes; a call on a model without prices
+    leaves it out, never reports zero.
+  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, stop_reason: String.t() | nil, currency: String.t() | nil, streaming: boolean}`
     — `currency` is `nil` for an unpriced call
 
   ### `[:clementine, :llm, :exception]`
@@ -301,11 +345,28 @@ defmodule Clementine.Telemetry do
     stream also carries what the call reported before it, as stop does:
     the four token counts and, priced, `cost_micros`. A raise carries
     `duration` alone.
-  - Metadata: `%{model: model_ref, iteration: integer, kind: atom, reason: term, currency: String.t() | nil, streaming: boolean}`
-    — `currency` is `nil` but on a priced provider error
+  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, kind: atom, reason: term, error_code: atom, currency: String.t() | nil, streaming: boolean}`
+    — `error_code` is the code `Clementine.Error.normalize/2` gives the
+    provider's error (`:rate_limited`, `:overloaded`, `:network`, ...),
+    `:exception` for a raise; `currency` is `nil` but on a priced
+    provider error
 
-  Spend is the `cost_micros` of `:stop` and `:exception` together; the
-  trace prices both.
+  ### `[:clementine, :llm, :usage]`
+
+  Emitted once for every metered call, after its `:stop` or
+  `:exception`: a call that completed, one a runner signal aborted, and
+  one a provider error ended. A raise meters nothing and emits none. It
+  is the one event the token, cost, and call metrics read, so a total
+  over every call is one series.
+
+  - Measurements: `%{input_tokens: integer, output_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer, cost_micros: integer}`
+    — `:stop`'s counts and cost; `cost_micros` is left out for an
+    unpriced call
+  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, outcome: :stop | :aborted | :error, stop_reason: String.t() | nil, currency: String.t() | nil, ...}`
+    — `stop_reason` is the provider's, for `outcome: :stop` only
+
+  Spend is the `cost_micros` of `:usage`; the trace prices the same
+  calls.
 
   ### `[:clementine, :llm, :usage_clamped]`
 
@@ -324,21 +385,24 @@ defmodule Clementine.Telemetry do
   Emitted before executing a single tool.
 
   - Measurements: `%{system_time: integer}`
-  - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer}`
+  - Metadata: `%{agent_key, provider, model, alias, tool: String.t(), tool_call_id: String.t(), iteration: integer}`
+
+  A tool event fires only for a tool the agent offers, so `tool` is a
+  name fixed in code.
 
   ### `[:clementine, :tool, :stop]`
 
   Emitted when a tool completes execution.
 
   - Measurements: `%{duration: native_time}`
-  - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer, result: :ok | :error}`
+  - Metadata: `%{agent_key, provider, model, alias, tool: String.t(), tool_call_id: String.t(), iteration: integer, result: :ok | :error}`
 
   ### `[:clementine, :tool, :exception]`
 
   Emitted when a tool crashes.
 
   - Measurements: `%{duration: native_time}`
-  - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer, kind: atom, reason: term}`
+  - Metadata: `%{agent_key, provider, model, alias, tool: String.t(), tool_call_id: String.t(), iteration: integer, kind: atom, reason: term}`
 
   ### `[:clementine, :tool, :input_repaired]`
 
@@ -347,7 +411,7 @@ defmodule Clementine.Telemetry do
   recovered them before the call was gated or executed.
 
   - Measurements: `%{count: integer}` (parameters touched)
-  - Metadata: `%{tool: String.t(), tool_call_id: String.t(), iteration: integer, fields: [atom]}`
+  - Metadata: `%{agent_key, provider, model, alias, tool: String.t(), tool_call_id: String.t(), iteration: integer, fields: [atom]}`
 
   ## Logging
 
@@ -358,175 +422,553 @@ defmodule Clementine.Telemetry do
 
   ## Metrics
 
-  To add Clementine metrics to your Telemetry supervisor:
+  `metrics/0` is the one list every app exports: `Telemetry.Metrics`
+  counters, sums, and distributions, which Prometheus reporters
+  (PromEx, `TelemetryMetricsPrometheus`, Peep) take as they are and
+  LiveDashboard draws. It holds no summaries, which Prometheus reporters
+  drop. In Prometheus each name is its segments joined by `_`, under a
+  bare `clementine_` prefix, so every app exports the same series and a
+  fleet query aggregates them by the scrape's own labels.
 
-      def metrics do
-        Clementine.Telemetry.metrics() ++ [
-          # your other metrics...
-        ]
+  ### What is exported
+
+  The engine's metrics are labeled `agent_key`, `provider`, `model`, and
+  `alias` ("What a run names"), plus the labels shown:
+
+  | Series | Kind | From | Labels |
+  |--------|------|------|--------|
+  | `clementine_llm_calls_total` | counter | `:llm :usage` | + `outcome`, `stop_reason` |
+  | `clementine_llm_input_tokens_total`, `_output_tokens_total`, `_cache_read_tokens_total`, `_cache_write_tokens_total` | sum | `:llm :usage` | + `outcome` |
+  | `clementine_llm_cost_micros_total` | sum | `:llm :usage` | + `outcome`, `currency` |
+  | `clementine_llm_duration_milliseconds` | distribution | `:llm :stop` | |
+  | `clementine_llm_exceptions_total` | counter | `:llm :exception` | + `error_code` |
+  | `clementine_tool_calls_total` | counter | `:tool :stop` | + `tool`, `result` |
+  | `clementine_tool_duration_milliseconds` | distribution | `:tool :stop` | + `tool` |
+  | `clementine_tool_exceptions_total`, `clementine_tool_input_repaired_total` | counter | `:tool :exception`, `:tool :input_repaired` | + `tool` |
+  | `clementine_rollout_stops_total`, `clementine_rollout_duration_milliseconds`, `clementine_rollout_iterations` | counter, distributions | `:rollout :stop` | + `status` |
+  | `clementine_rollout_exceptions_total` | counter | `:rollout :exception` | + `kind`, `error_kind` |
+
+  Every metered call counts once in the call, token, and cost series,
+  however it ended: `outcome` is `stop`, `aborted` (a runner signal cut
+  it off), or `error` (a provider error ended it). A total is the one
+  series summed over `outcome`, so no agent drops out of it.
+  `stop_reason` is the provider's for `outcome="stop"` (`other` for a
+  reason outside the providers' known ones), and empty otherwise.
+  `clementine_llm_exceptions_total` counts provider errors again, by
+  `error_code`, with the raises no call series meters.
+
+  The error labels are closed sets: `error_code` is one of the codes
+  `Clementine.Error.normalize/2` gives a provider's error (`auth`,
+  `not_found`, `timeout`, `rate_limited`, `overloaded`,
+  `invalid_request`, `provider_unavailable`, `network`, `exception`,
+  `unknown`), else `other`; `error_kind` is `Clementine.Error`'s `kind`
+  (`provider`, `tool`, `rollout`, `runtime`), else `other`. An error's
+  `code` is any atom an app's tool or host sets, so the rollout series
+  labels by `kind` alone.
+
+  The run metrics are labeled `agent_key`:
+
+  | Series | Kind | From | Labels |
+  |--------|------|------|--------|
+  | `clementine_run_claims_total`, `_heartbeats_total`, `_resumed_total`, `_requeued_total`, `_lease_lost_total` | counter | `:run` events | |
+  | `clementine_run_suspended_total` | counter | `:run :suspended` | + `reason_type` |
+  | `clementine_run_finished_total`, `clementine_run_duration_milliseconds` | counter, distribution | `:run :finished` | + `terminal` |
+  | `clementine_run_reaped_total` | counter | `:run :reaped` | + `code` (an app's own code as `app`) |
+  | `clementine_runs_purged_total` | sum | `:runs :purge` | none |
+
+  The loop metrics keep their own labels: `clementine_loop_verdicts_total`
+  (`verdict`), `clementine_loop_step_duration_milliseconds` (`outcome`,
+  `mode`), `clementine_loop_step_inputs_total`,
+  `clementine_loop_step_failures_total` (`requeued`),
+  `clementine_loop_inputs_total` (`kind`, `outcome`),
+  `clementine_loop_dead_letters_total` (`reason`),
+  `clementine_loop_spawned_total`, `clementine_loop_cascades_total`
+  (`trigger`), `clementine_loop_upgrades_total`, and the inbox
+  distributions `clementine_loop_inbox_depth` and
+  `clementine_loop_inbox_oldest_age_milliseconds`, which need the
+  poller (`Clementine.Runs.emit_inbox_depths/0`). The usage-clamped
+  counter, `clementine_llm_usage_clamped_total`, is labeled `provider`.
+
+  ### Labels across apps and reporters
+
+  A label a writer could not fill (an `agent_key` no run named, the
+  `alias` of a `{provider, id}` reference) exports as `""`, which
+  Prometheus reads as the label absent, on every reporter: left to
+  themselves, `TelemetryMetricsPrometheus.Core` writes `""` and Peep
+  writes `"nil"`.
+
+  Compare the fleet by `provider` and `model`: they name what ran,
+  whatever an app calls it. `alias` is an app's own name for a model in
+  its catalog (one app's `:claude_sonnet` may be another's `:sonnet`),
+  so it is for views within one app, and for cost, which its prices
+  attach to.
+
+  Distributions carry Prometheus buckets in `reporter_options`.
+  `TelemetryMetricsPrometheus.Core`, PromEx's default store, uses them
+  as they are; PromEx's `Event.build/2` turns them into Peep's bucket
+  calculator for an app that stores in Peep. Aggregate histograms across
+  apps on one store: Peep writes `le="250.0"` where Core writes
+  `le="250"`, and puts a value equal to a bound in the next bucket.
+
+  ### Wiring it
+
+  A PromEx app passes the list to one plugin:
+
+      defmodule MyApp.PromEx.Plugins.Clementine do
+        use PromEx.Plugin
+
+        @impl true
+        def event_metrics(_opts) do
+          [Event.build(:clementine_event_metrics, Clementine.Telemetry.metrics())]
+        end
       end
 
-  ## Prometheus
+  and lists it in `MyApp.PromEx`'s `plugins/0`. Without PromEx, a
+  reporter takes it the same way:
 
-  Clementine's `metrics/0` returns standard `Telemetry.Metrics` structs.
-  Any Telemetry.Metrics-compatible reporter works — for Prometheus:
-
-      # mix.exs
-      {:telemetry_metrics_prometheus_core, "~> 1.0"}  # or peep, promex, etc.
-
-      # In your telemetry supervisor:
       children = [
-        {TelemetryMetricsPrometheus, metrics: Clementine.Telemetry.metrics() ++ your_metrics()}
+        {TelemetryMetricsPrometheus, metrics: Clementine.Telemetry.metrics() ++ my_metrics()}
       ]
+
+  and LiveDashboard takes it as `metrics: {MyAppWeb.Telemetry, :metrics}`
+  once `MyAppWeb.Telemetry.metrics/0` appends it.
   """
 
   import Telemetry.Metrics
 
+  @llm_usage [:clementine, :llm, :usage]
+  @llm_stop [:clementine, :llm, :stop]
+  @llm_exception [:clementine, :llm, :exception]
+  @tool_stop [:clementine, :tool, :stop]
+  @tool_exception [:clementine, :tool, :exception]
+  @rollout_stop [:clementine, :rollout, :stop]
+  @rollout_exception [:clementine, :rollout, :exception]
+
+  # What every rollout, llm, and tool event names: fixed in code, so
+  # bounded label sets.
+  @identity [:agent_key, :provider, :model, :alias]
+
+  @tokens [:input_tokens, :output_tokens, :cache_read_tokens, :cache_write_tokens]
+
+  # The stop reasons the provider clients normalize to. A reason outside
+  # them (an OpenAI-compatible server's own finish_reason) is labeled
+  # "other": a label may not take whatever a server sends.
+  @stop_reasons ~w(end_turn tool_use max_tokens stop_sequence pause_turn refusal
+                   model_context_window_exceeded content_filter incomplete)
+
+  # The codes Clementine.Error.normalize/2 gives a provider's error, and
+  # :exception for a raise. Error's `code` is any atom (a passthrough
+  # error keeps an app's own), so anything else is labeled "other".
+  @error_codes [
+    :auth,
+    :not_found,
+    :timeout,
+    :rate_limited,
+    :overloaded,
+    :invalid_request,
+    :provider_unavailable,
+    :network,
+    :exception,
+    :unknown
+  ]
+
+  @error_kinds [:provider, :tool, :rollout, :runtime]
+
   @doc """
-  Returns a list of `Telemetry.Metrics` definitions for Clementine events.
+  The metrics every Clementine app exports, as `Telemetry.Metrics`
+  structs: counters, sums, and distributions, never summaries, so a
+  Prometheus reporter takes all of them and LiveDashboard draws them.
 
-  These can be passed to any `Telemetry.Metrics`-compatible reporter.
+  Names carry a bare `clementine_` prefix in Prometheus
+  (`clementine_llm_calls_total`), so every app exports the same series
+  and a fleet query aggregates across them. Labels are bounded: the
+  agent's key, the provider, the provider's model id, and the catalog
+  alias on the engine's metrics, the agent's key on the run metrics, and
+  the event's own closed sets (outcome, stop reason, error code, status,
+  terminal, tool, ...); never a run, a subject, or a loop. A label with
+  no value exports as `""`. "What is exported" in the moduledoc lists
+  them.
   """
+  @spec metrics() :: [Telemetry.Metrics.t()]
   def metrics do
+    llm_metrics() ++ tool_metrics() ++ rollout_metrics() ++ run_metrics() ++ loop_metrics()
+  end
+
+  defp llm_metrics do
     [
-      # Rollouts
-      summary("clementine.rollout.stop.duration", unit: {:native, :millisecond}),
-      summary("clementine.rollout.stop.iterations"),
-      counter("clementine.rollout.stop.iterations", tags: [:status]),
-      # The mechanical rename of clementine.loop.exception.iterations. The
-      # count is synthesized because reporters drop an event whose
-      # measurement is missing, and the raise flavor omits :iterations —
-      # every exception must stay countable.
-      counter("clementine.rollout.exception.iterations",
-        event_name: [:clementine, :rollout, :exception],
-        measurement: fn _measurements -> 1 end
-      ),
+      counter(
+        [:clementine, :llm, :calls, :total],
+        [
+          event_name: @llm_usage,
+          measurement: &one/1,
+          description:
+            "Metered model calls, by outcome (stop, aborted, error) and, for stop, the " <>
+              "provider's stop reason (other for one outside the known set)."
+        ] ++ labels(@identity ++ [:outcome, :stop_reason], &call_labels/1)
+      )
+    ] ++
+      for token <- @tokens do
+        sum(
+          [:clementine, :llm, token, :total],
+          [
+            event_name: @llm_usage,
+            measurement: token,
+            description: "#{token(token)} of metered model calls, by outcome."
+          ] ++ labels(@identity ++ [:outcome])
+        )
+      end ++
+      [
+        sum(
+          [:clementine, :llm, :cost_micros, :total],
+          [
+            event_name: @llm_usage,
+            measurement: &Map.get(&1, :cost_micros),
+            description:
+              "What priced model calls cost, in micro-units of currency, by outcome " <>
+                "(unpriced calls add nothing)."
+          ] ++ labels(@identity ++ [:outcome, :currency])
+        ),
+        distribution(
+          [:clementine, :llm, :duration, :milliseconds],
+          [
+            event_name: @llm_stop,
+            measurement: :duration,
+            unit: {:native, :millisecond},
+            description: "Duration of model calls that completed or were cut off.",
+            reporter_options: [
+              buckets: [
+                250,
+                1_000,
+                2_500,
+                5_000,
+                10_000,
+                30_000,
+                60_000,
+                120_000,
+                300_000,
+                600_000
+              ]
+            ]
+          ] ++ labels(@identity)
+        ),
+        counter(
+          [:clementine, :llm, :exceptions, :total],
+          [
+            event_name: @llm_exception,
+            measurement: &one/1,
+            description: "Model calls that failed, by error code: a provider error, or a raise."
+          ] ++ labels(@identity ++ [:error_code], &error_code_labels/1)
+        ),
+        counter(
+          [:clementine, :llm, :usage_clamped, :total],
+          [
+            event_name: [:clementine, :llm, :usage_clamped],
+            measurement: &one/1,
+            description: "Provider usage reports whose input total was raised to its cache parts."
+          ] ++ labels([:provider])
+        )
+      ]
+  end
 
-      # Runs
-      counter("clementine.run.claimed.epoch"),
-      summary("clementine.run.claimed.epoch"),
-      counter("clementine.run.heartbeat.count",
-        event_name: [:clementine, :run, :heartbeat],
-        measurement: fn _measurements -> 1 end
+  defp tool_metrics do
+    [
+      counter(
+        [:clementine, :tool, :calls, :total],
+        [
+          event_name: @tool_stop,
+          measurement: &one/1,
+          description: "Tool executions completed, by tool and result."
+        ] ++ labels(@identity ++ [:tool, :result])
       ),
-      counter("clementine.run.suspended.count",
-        event_name: [:clementine, :run, :suspended],
-        measurement: fn _measurements -> 1 end,
-        tags: [:reason_type]
+      distribution(
+        [:clementine, :tool, :duration, :milliseconds],
+        [
+          event_name: @tool_stop,
+          measurement: :duration,
+          unit: {:native, :millisecond},
+          description: "Tool execution duration.",
+          reporter_options: [buckets: [10, 50, 250, 1_000, 5_000, 15_000, 60_000, 120_000]]
+        ] ++ labels(@identity ++ [:tool])
       ),
-      counter("clementine.run.resumed.count",
-        event_name: [:clementine, :run, :resumed],
-        measurement: fn _measurements -> 1 end
+      counter(
+        [:clementine, :tool, :exceptions, :total],
+        [
+          event_name: @tool_exception,
+          measurement: &one/1,
+          description: "Tool executions that crashed, exited, or timed out."
+        ] ++ labels(@identity ++ [:tool])
       ),
-      summary("clementine.run.finished.duration",
-        unit: {:native, :millisecond},
-        tags: [:terminal]
-      ),
-      counter("clementine.run.finished.count",
-        event_name: [:clementine, :run, :finished],
-        measurement: fn _measurements -> 1 end,
-        tags: [:terminal]
-      ),
-      counter("clementine.run.requeued.count",
-        event_name: [:clementine, :run, :requeued],
-        measurement: fn _measurements -> 1 end
-      ),
-      counter("clementine.run.lease_lost.count",
-        event_name: [:clementine, :run, :lease_lost],
-        measurement: fn _measurements -> 1 end
-      ),
-      counter("clementine.run.reaped.count",
-        event_name: [:clementine, :run, :reaped],
-        measurement: fn _measurements -> 1 end,
-        tags: [:code],
-        tag_values: &reaped_tag_values/1
-      ),
-      # Rows erased by Runs.purge/1, for audit.
-      sum("clementine.runs.purge.count"),
-
-      # Loops — alert on nonzero reconcile_children/wake_pending rates
-      # where the substrate is transactional (LOOP_RFC §Operations).
-      counter("clementine.loop.verdict.count",
-        event_name: [:clementine, :loop, :verdict],
-        measurement: fn _measurements -> 1 end,
-        tags: [:verdict]
-      ),
-      summary("clementine.loop.step.duration",
-        unit: {:native, :millisecond},
-        tags: [:outcome, :mode]
-      ),
-      summary("clementine.loop.step.batch",
-        event_name: [:clementine, :loop, :step],
-        measurement: fn _measurements, metadata -> metadata.batch end
-      ),
-      counter("clementine.loop.step_failed.count",
-        event_name: [:clementine, :loop, :step_failed],
-        measurement: fn _measurements -> 1 end,
-        tags: [:requeued]
-      ),
-      counter("clementine.loop.input.count",
-        event_name: [:clementine, :loop, :input],
-        measurement: fn _measurements -> 1 end,
-        tags: [:kind, :outcome]
-      ),
-      counter("clementine.loop.spawned.count",
-        event_name: [:clementine, :loop, :spawned],
-        measurement: fn _measurements -> 1 end
-      ),
-      # The paging rate by reason; reason: :terminal is the
-      # appends-to-terminal rate.
-      sum("clementine.loop.dead_letter.count", tags: [:reason]),
-      counter("clementine.loop.cascade.count",
-        event_name: [:clementine, :loop, :cascade],
-        measurement: fn _measurements -> 1 end,
-        tags: [:trigger]
-      ),
-      # Fleet distributions per poll; per-loop drill-down is the doctor's
-      # job (a loop_ref tag would be unbounded label cardinality).
-      summary("clementine.loop.inbox.depth"),
-      summary("clementine.loop.inbox.oldest_age_ms", unit: :millisecond),
-
-      # LLM
-      summary("clementine.llm.stop.duration", unit: {:native, :millisecond}),
-      summary("clementine.llm.stop.input_tokens"),
-      summary("clementine.llm.stop.output_tokens"),
-      summary("clementine.llm.stop.cache_read_tokens"),
-      summary("clementine.llm.stop.cache_write_tokens"),
-      counter("clementine.llm.stop.input_tokens"),
-      # Spend, a call that ended in a provider error included: an unpriced
-      # call carries no cost_micros, and reporters skip it.
-      sum("clementine.llm.stop.cost_micros", tags: [:currency]),
-      sum("clementine.llm.exception.cost_micros", tags: [:currency]),
-      counter("clementine.llm.exception.duration",
-        event_name: [:clementine, :llm, :exception],
-        measurement: fn _measurements -> 1 end
-      ),
-      counter("clementine.llm.usage_clamped.count",
-        event_name: [:clementine, :llm, :usage_clamped],
-        measurement: fn _measurements -> 1 end,
-        tags: [:provider]
-      ),
-
-      # Tools
-      summary("clementine.tool.stop.duration", unit: {:native, :millisecond}, tags: [:tool]),
-      counter("clementine.tool.stop.duration",
-        event_name: [:clementine, :tool, :stop],
-        measurement: fn _measurements -> 1 end,
-        tags: [:tool, :result]
-      ),
-      counter("clementine.tool.exception.duration",
-        event_name: [:clementine, :tool, :exception],
-        measurement: fn _measurements -> 1 end,
-        tags: [:tool]
+      counter(
+        [:clementine, :tool, :input_repaired, :total],
+        [
+          event_name: [:clementine, :tool, :input_repaired],
+          measurement: &one/1,
+          description:
+            "Tool calls whose parameters the model wrote as markup inside another string " <>
+              "parameter, recovered before gating and execution."
+        ] ++ labels(@identity ++ [:tool])
       )
     ]
   end
 
+  defp rollout_metrics do
+    [
+      counter(
+        [:clementine, :rollout, :stops, :total],
+        [
+          event_name: @rollout_stop,
+          measurement: &one/1,
+          description: "Executions that returned a non-error branch, by status."
+        ] ++ labels(@identity ++ [:status])
+      ),
+      distribution(
+        [:clementine, :rollout, :duration, :milliseconds],
+        [
+          event_name: @rollout_stop,
+          measurement: :duration,
+          unit: {:native, :millisecond},
+          description: "Model-tool cycle time per execution.",
+          reporter_options: [buckets: [1_000, 5_000, 15_000, 60_000, 300_000, 900_000]]
+        ] ++ labels(@identity ++ [:status])
+      ),
+      distribution(
+        [:clementine, :rollout, :iterations],
+        [
+          event_name: @rollout_stop,
+          measurement: :iterations,
+          description: "Model-tool cycle iterations per execution.",
+          reporter_options: [buckets: [1, 2, 3, 5, 8, 13, 21]]
+        ] ++ labels(@identity ++ [:status])
+      ),
+      counter(
+        [:clementine, :rollout, :exceptions, :total],
+        [
+          event_name: @rollout_exception,
+          measurement: &one/1,
+          description:
+            "Executions that returned an error or raised, by the raise's kind and the " <>
+              "error's kind."
+        ] ++ labels(@identity ++ [:kind, :error_kind], &error_kind_labels/1)
+      )
+    ]
+  end
+
+  defp run_metrics do
+    [
+      run_counter(:claimed, [:clementine, :run, :claims, :total], "Run claims (epoch mints)."),
+      run_counter(
+        :heartbeat,
+        [:clementine, :run, :heartbeats, :total],
+        "Lease renewals by live executions."
+      ),
+      run_counter(
+        :suspended,
+        [:clementine, :run, :suspended, :total],
+        "Runs parked in waiting with a durable checkpoint.",
+        [:reason_type]
+      ),
+      run_counter(
+        :resumed,
+        [:clementine, :run, :resumed, :total],
+        "Resume tokens honored (waiting -> queued)."
+      ),
+      run_counter(
+        :finished,
+        [:clementine, :run, :finished, :total],
+        "Terminals written by live executions, or by a direct cancel, by terminal kind.",
+        [:terminal]
+      ),
+      distribution(
+        [:clementine, :run, :duration, :milliseconds],
+        [
+          event_name: [:clementine, :run, :finished],
+          measurement: :duration,
+          unit: {:native, :millisecond},
+          description: "Claim-to-finish duration on the storage clock.",
+          reporter_options: [
+            buckets: [1_000, 5_000, 15_000, 60_000, 300_000, 900_000, 3_600_000, 14_400_000]
+          ]
+        ] ++ labels([:agent_key, :terminal])
+      ),
+      run_counter(
+        :requeued,
+        [:clementine, :run, :requeued, :total],
+        "Fence-gated same-run retries (drain or reaper policy)."
+      ),
+      run_counter(
+        :lease_lost,
+        [:clementine, :run, :lease_lost, :total],
+        "Lease-holding operations that discovered the lease is gone."
+      ),
+      counter(
+        [:clementine, :run, :reaped, :total],
+        [
+          event_name: [:clementine, :run, :reaped],
+          measurement: &one/1,
+          description: "Runs interrupted by reconciliation or an admin."
+        ] ++ labels([:agent_key, :code], &reaped_labels/1)
+      ),
+      sum([:clementine, :runs, :purged, :total],
+        event_name: [:clementine, :runs, :purge],
+        measurement: :count,
+        description: "Run rows erased by Clementine.Runs.purge/1."
+      )
+    ]
+  end
+
+  defp loop_metrics do
+    [
+      counter(
+        [:clementine, :loop, :verdicts, :total],
+        [
+          event_name: [:clementine, :loop, :verdict],
+          measurement: &one/1,
+          description:
+            "Non-healthy reconciliation verdicts on loop-kind runs. " <>
+              "Nonzero reconcile_children/wake_pending on Postgres is the alarm condition."
+        ] ++ labels([:verdict])
+      ),
+      distribution(
+        [:clementine, :loop, :step, :duration, :milliseconds],
+        [
+          event_name: [:clementine, :loop, :step],
+          measurement: :duration,
+          unit: {:native, :millisecond},
+          description: "Committed loop step duration (claim to commit).",
+          reporter_options: [buckets: [50, 250, 1_000, 5_000, 15_000, 60_000, 300_000]]
+        ] ++ labels([:outcome, :mode])
+      ),
+      sum([:clementine, :loop, :step, :inputs, :total],
+        event_name: [:clementine, :loop, :step],
+        measurement: fn _measurements, metadata -> metadata.batch end,
+        description: "Inbox inputs drained by committed steps."
+      ),
+      counter(
+        [:clementine, :loop, :step_failures, :total],
+        [
+          event_name: [:clementine, :loop, :step_failed],
+          measurement: &one/1,
+          description: "In-step exceptions resolved down the attempts path."
+        ] ++ labels([:requeued])
+      ),
+      counter(
+        [:clementine, :loop, :inputs, :total],
+        [
+          event_name: [:clementine, :loop, :input],
+          measurement: &one/1,
+          description: "Inputs landed in loop inboxes, by kind and outcome."
+        ] ++ labels([:kind, :outcome])
+      ),
+      sum(
+        [:clementine, :loop, :dead_letters, :total],
+        [
+          event_name: [:clementine, :loop, :dead_letter],
+          measurement: :count,
+          description:
+            "Dead letters created, by reason. The rate by reason is a paging " <>
+              "signal; reason=terminal is the appends-to-terminal rate."
+        ] ++ labels([:reason])
+      ),
+      counter([:clementine, :loop, :spawned, :total],
+        event_name: [:clementine, :loop, :spawned],
+        measurement: &one/1,
+        description: "Child rollout-runs created as step commit cargo."
+      ),
+      counter(
+        [:clementine, :loop, :cascades, :total],
+        [
+          event_name: [:clementine, :loop, :cascade],
+          measurement: &one/1,
+          description: "Committed steps that entered cascade mode."
+        ] ++ labels([:trigger])
+      ),
+      counter([:clementine, :loop, :upgrades, :total],
+        event_name: [:clementine, :loop, :upgraded],
+        measurement: &one/1,
+        description: "Committed steps that carried a handle_upgrade/2 state upgrade."
+      ),
+      # Fleet distributions per poll: a loop_ref label would be unbounded,
+      # and per-loop drill-down is the doctor's (Clementine.Runs.inspect/1).
+      distribution([:clementine, :loop, :inbox, :depth],
+        event_name: [:clementine, :loop, :inbox],
+        measurement: :depth,
+        description: "Pending inputs per loop with mail waiting, per poll.",
+        reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250]]
+      ),
+      distribution([:clementine, :loop, :inbox, :oldest_age, :milliseconds],
+        event_name: [:clementine, :loop, :inbox],
+        measurement: :oldest_age_ms,
+        unit: :millisecond,
+        description: "Age of each waiting loop's oldest pending input, per poll.",
+        reporter_options: [buckets: [1_000, 5_000, 30_000, 60_000, 300_000, 900_000, 3_600_000]]
+      )
+    ]
+  end
+
+  defp run_counter(event, name, description, tags \\ []) do
+    counter(
+      name,
+      [
+        event_name: [:clementine, :run, event],
+        measurement: &one/1,
+        description: description
+      ] ++ labels([:agent_key | tags])
+    )
+  end
+
+  defp one(_measurements), do: 1
+
+  defp token(:input_tokens), do: "Input tokens (cache reads and writes included)"
+  defp token(:output_tokens), do: "Output tokens (reasoning included)"
+  defp token(:cache_read_tokens), do: "Input tokens read from the provider's prompt cache"
+  defp token(:cache_write_tokens), do: "Input tokens written to the provider's prompt cache"
+
+  # A metric's tags and the function that fills them, as every reporter
+  # should export them: each tag present, whatever the event's metadata
+  # holds (Core drops an event whose tag_values lack a tag), and a value
+  # the writer could not fill (nil, or missing) as "" (Core writes nil as
+  # "", Peep as "nil"). `bound` first maps an open value into its closed
+  # set.
+  defp labels(tags, bound \\ &Function.identity/1) do
+    [tags: tags, tag_values: &fill(bound.(&1), tags)]
+  end
+
+  defp fill(metadata, tags) do
+    Map.new(tags, fn tag ->
+      case Map.get(metadata, tag) do
+        nil -> {tag, ""}
+        value -> {tag, value}
+      end
+    end)
+  end
+
+  # The provider's stop reason labels a call that stopped; one a runner
+  # signal aborted, or a provider error ended, has none.
+  defp call_labels(%{outcome: :stop} = metadata) do
+    Map.put(metadata, :stop_reason, stop_reason(metadata[:stop_reason]))
+  end
+
+  defp call_labels(metadata), do: Map.put(metadata, :stop_reason, nil)
+
+  defp stop_reason(reason) when reason in @stop_reasons, do: reason
+  defp stop_reason(_other), do: "other"
+
+  defp error_code_labels(metadata) do
+    Map.update(metadata, :error_code, nil, &bounded(&1, @error_codes))
+  end
+
+  defp error_kind_labels(metadata) do
+    Map.update(metadata, :error_kind, nil, &bounded(&1, @error_kinds))
+  end
+
+  defp bounded(nil, _set), do: nil
+  defp bounded(value, set), do: if(value in set, do: value, else: :other)
+
   # `{:app, term}` interrupt codes collapse to `:app`: the tuple's payload
   # is host vocabulary with unbounded cardinality, which a label must not
   # carry.
-  defp reaped_tag_values(metadata) do
-    Map.update!(metadata, :code, fn
+  defp reaped_labels(metadata) do
+    Map.update(metadata, :code, nil, fn
       {:app, _term} -> :app
       code -> code
     end)

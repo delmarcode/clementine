@@ -10,6 +10,9 @@ defmodule Clementine.Lease do
   write. Losing the lease is never detected proactively; it is discovered
   when a write returns stale.
 
+  `agent_key` is the run's agent key when the claimer named one, so the
+  run events the execution writes say which agent's run it was.
+
   When the claimed facts held a suspension and a resume payload, `resume`
   carries `{checkpoint, payload}` for the runner to hand to the rollout —
   the checkpoint half nil when the park stored none (a checkpoint-less
@@ -24,7 +27,8 @@ defmodule Clementine.Lease do
             resume: nil,
             lifecycle: nil,
             ctx: nil,
-            claimed_at: nil
+            claimed_at: nil,
+            agent_key: nil
 
   @type resume :: nil | {Clementine.Checkpoint.t() | nil, payload :: term()}
   @type t :: %__MODULE__{
@@ -35,6 +39,7 @@ defmodule Clementine.Lease do
           resume: resume(),
           lifecycle: module(),
           ctx: term(),
-          claimed_at: DateTime.t() | nil
+          claimed_at: DateTime.t() | nil,
+          agent_key: String.t() | nil
         }
 end

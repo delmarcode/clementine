@@ -282,7 +282,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           status: :waiting,
           suspension: %Suspension{reason: {:external, {:delegation, ids}}, token: token}
         } ->
-          if child.id in ids, do: resume_when_all_ended(parent.id, ids, token)
+          if child.id in ids, do: resume_when_all_ended(parent, ids, token)
           :ok
 
         %Facts{} ->
@@ -309,7 +309,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
                    status: :waiting,
                    suspension: %Suspension{reason: {:external, {:delegation, ids}}, token: token}
                  } <- Codec.to_facts(parent, @fields) do
-              if resume_when_all_ended(parent.id, ids, token), do: :resumed, else: :waiting
+              if resume_when_all_ended(parent, ids, token), do: :resumed, else: :waiting
             else
               _other -> :not_waiting
             end
@@ -344,7 +344,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp resume_when_all_ended(parent_id, ids, token) do
+    defp resume_when_all_ended(%AgentRun{id: parent_id} = parent, ids, token) do
       %Config{repo: repo} = Config.fetch!()
       children = repo.all(from(r in AgentRun, where: r.id in ^ids))
 
@@ -354,7 +354,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             {child.tag_id, Delegation.outcome(child.agent_key, Lifecycle.terminal_result(child))}
           end)
 
-        {:ok, _facts} = Protocol.resume(Lifecycle, token, {:delegated, outcomes})
+        {:ok, _facts} =
+          Protocol.resume(Lifecycle, token, {:delegated, outcomes}, nil,
+            agent_key: parent.agent_key
+          )
+
         :ok = Worker.re_enqueue!(parent_id)
         true
       else
@@ -492,11 +496,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       repo.all(
         from(r in AgentRun,
           where: r.parent_id == ^run_id and r.status in @active_statuses,
-          select: r.id
+          select: {r.id, r.agent_key}
         )
       )
-      |> Enum.each(fn child_id ->
-        case Protocol.request_cancel(Lifecycle, child_id, reason) do
+      |> Enum.each(fn {child_id, agent_key} ->
+        case Protocol.request_cancel(Lifecycle, child_id, reason, nil, agent_key: agent_key) do
           {:ok, _flagged_or_finished} -> :ok
           {:error, :already_terminal} -> :ok
           {:error, other} -> repo.rollback({:cancel_child_failed, child_id, other})

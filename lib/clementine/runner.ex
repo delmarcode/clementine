@@ -103,7 +103,8 @@ defmodule Clementine.Runner do
     case Protocol.claim(lifecycle, run.ref,
            executor: executor,
            ctx: ctx,
-           max_duration: max_duration
+           max_duration: max_duration,
+           agent_key: Rollout.agent_key(run.rollout)
          ) do
       {:ok, lease} -> run_leased(run, lease, opts)
       {:error, reason} -> {:discard, reason}
