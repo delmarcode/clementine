@@ -362,7 +362,8 @@ warehouse copy keeps only the facts:
 
 - **Leave out** `Clementine.Migration.content_columns/0`: `agent_runs`'
   `input`, `result`, `metadata`, `suspension` (the checkpoint holds the
-  conversation), `resume`, `cancel`, `error`, and `envelope`;
+  conversation), `resume`, `cancel`, `error`, `loop_policy`, and
+  `envelope`;
   `agent_run_inbox`'s `payload` and `dedup_key`; and `agent_run_trace`'s
   `payload`. They hold prompts, replies, tool arguments and results, and
   your free-form data.

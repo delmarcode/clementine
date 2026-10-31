@@ -37,7 +37,7 @@ if Code.ensure_loaded?(Ecto.Migration) do
         actor_type: :fact,
         actor_id: :fact,
         turn: :fact,
-        loop_policy: :fact,
+        loop_policy: {:content, "the app's policy map, stored as given"},
         envelope: {:content, "a loop controller's state, a thread's waiting messages included"},
         state_version: :fact,
         parent_id: :fact,
