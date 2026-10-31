@@ -309,7 +309,8 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
   schemas), and the delegates' keys, so runs that offered the model the
   same thing group together.
 - A `:model_call` entry records each call to the model, a call cut off
-  by a cancel included, with the usage it had reported. A `:tool_call`
+  by a cancel included, with the usage it had reported: its cache reads
+  and writes show whether the call found the prompt cache warm. A `:tool_call`
   entry records each tool call started, with the arguments it ran with
   and the decision it waited on (`"approval" => %{"verdict" => "approved",
   "by" => ...}`); a call to a `{:policy, term}` tool also carries the

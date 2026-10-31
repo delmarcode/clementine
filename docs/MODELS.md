@@ -8,7 +8,8 @@ Tinker or any self-hosted OpenAI-compatible server.
 
 The implementation lives in `Clementine.LLM.ModelRegistry` (catalog),
 `Clementine.LLM.Router` (provider dispatch), `Clementine.LLM.Reasoning`
-(reasoning translation), and the three clients: `Clementine.LLM.Anthropic`,
+(reasoning translation), `Clementine.LLM.Cache` (prompt caching), and
+the three clients: `Clementine.LLM.Anthropic`,
 `Clementine.LLM.OpenAI`, `Clementine.LLM.ChatCompletions`.
 
 ## The catalog in one look
@@ -83,6 +84,7 @@ alias, not mid-run.
 | `base_url` | no | chat-completions providers only | Endpoint override, OpenAI-SDK style: the client appends `/chat/completions`. Required (per-model or app-wide) for `:openai_compatible`. Rejected on `:anthropic`/`:openai` entries. |
 | `api_key` | no | chat-completions providers only | Per-model credential override. A literal string, `{:system, "ENV_VAR"}`, or `{module, function, args}` resolved per request (for short-lived tokens). Rejected on `:anthropic`/`:openai` entries. |
 | `structured_output` | no | chat-completions providers only | `:native` (default) sends an agent's `output_schema:` as `response_format`; `:instructions` sends none, for a server whose grammar would keep the model from calling tools (see "Structured output" below). `:instructions` is rejected on `:anthropic`/`:openai` entries. |
+| `cache` | no | all | Prompt caching, on by default. `false` sends no cache hints; `[ttl: ..., markers: ...]` changes the cache write's lifetime or, on `:openrouter`/`:openai_compatible`, whether `cache_control` markers go. Validated at boot for the entry's provider; see "Prompt caching" below. |
 
 "Chat-completions providers" means `:openrouter`, `:bedrock`, `:vertex`,
 and `:openai_compatible` — the four served by the shared
@@ -300,6 +302,91 @@ stops with `"max_tokens"` (OpenAI's `response.incomplete` with
 `max_output_tokens`, Chat Completions' `length`). A schema agent's
 `:invalid_output` error says which.
 
+## Prompt caching
+
+Every step of the model–tool cycle sends the tools, the system prompt,
+and the conversation so far, and each step's prompt starts with the
+last one's. Caching is on by default: each client sends what its
+provider needs for the provider to reuse that prefix, and reports what
+the provider says it read from and wrote to its cache in
+`Clementine.Usage`. `input_tokens` is every input token the request
+processed, and `cache_read_tokens` and `cache_write_tokens` are parts of
+it, whatever the provider's own convention; the trace's `:model_call`
+entries, results, checkpoints, and `[:clementine, :llm, :stop]`
+telemetry carry all four.
+
+| Provider | What Clementine sends | What's reported | Limits |
+|---|---|---|---|
+| `:anthropic` | `cache_control` on the system prompt (on the last tool loaded up front when there is none), and the top-level `cache_control` the API moves to the last cacheable block. TTL: `:five_minutes` (default) or `:one_hour`. | `cache_read_input_tokens` and `cache_creation_input_tokens`, added to `input_tokens`, which excludes them. | 2 of the 4 breakpoints a request may carry. A prefix under the model's minimum (512 to 4,096 tokens) is not cached and costs nothing extra. Each breakpoint looks back 20 positions for an earlier write. Writes cost 1.25× input (5 minutes) or 2× (1 hour); reads 0.1× or less. |
+| `:openai` | `prompt_cache_key`, a hash of the run's agent and subject. On GPT-5.6 and later, `prompt_cache_options.ttl` (`:thirty_minutes` default, or `:twelve_hours`); with `cache: false`, `prompt_cache_options.mode: "explicit"` and no breakpoints, which turns caching off. | `input_tokens_details.cached_tokens` and `cache_write_tokens`, parts of `input_tokens`. | Caching is automatic (from 1,024 tokens on GPT-5.6 and later). Writes cost nothing before GPT-5.6, and 1.25× (30 minutes) or 2.5× (12 hours) from it. Older models keep their own retention; `cache: false` cannot turn their caching off. |
+| `:openrouter` | `anthropic/` models: a `cache_control` content part on the system prompt and the top-level `cache_control`, as on Anthropic (`:five_minutes` or `:one_hour`). Every model: `prompt_cache_key`, which OpenRouter uses for sticky provider routing. | `prompt_tokens_details.cached_tokens` and `cache_write_tokens`, parts of `prompt_tokens`. | Other models cache on their own (OpenAI, DeepSeek, Gemini 2.5 and later, Grok, Moonshot); `markers: true` sends the markers to any model. |
+| `:bedrock` | Nothing. | `prompt_tokens_details.cached_tokens`, and `cache_write_tokens` where reported (GPT-5.6 and later). | Implicit caching where the model has it, from 1,024 tokens for OpenAI models. GPT-5.6 and later also take explicit `prompt_cache_breakpoint`s, which Clementine does not send: implicit mode already marks the latest message. |
+| `:vertex` | Nothing. | `prompt_tokens_details.cached_tokens` where reported. | Implicit caching only, in Preview, for some MaaS open models, from 4,096 tokens; Vertex names no request field. Its docs call the count `cachedContentTokenCount` and do not say how the OpenAI-compatible endpoint reports it. |
+| `:openai_compatible` | Nothing, unless `markers: true` (a proxy that fronts Claude), which sends the Anthropic-style markers. | `prompt_tokens_details.cached_tokens` and `cache_write_tokens` where the server reports them (vLLM: `--enable-prompt-tokens-details`). | vLLM and SGLang cache prefixes on their own. |
+
+Every Chat Completions stream asks for usage
+(`stream_options.include_usage`), since the dialect sends none
+otherwise.
+
+**The lifetime.** A run's steps are seconds apart, and every read
+renews an entry, so the shortest TTL keeps a running run's cache warm
+and is the cheapest write. A run that parks for an approval, or a
+thread whose user answers later, writes its prefix again on the first
+step after the cache expired. A longer TTL (`ttl: :one_hour` on
+Anthropic, `ttl: :twelve_hours` on GPT-5.6 and later) pays more for
+every write to keep that one, and pays off only when such gaps are
+common:
+
+```elixir
+claude_chat: [provider: :anthropic, id: "claude-sonnet-5", cache: [ttl: :one_hour]],
+classifier: [provider: :anthropic, id: "claude-haiku-5-5", cache: false],
+proxied_claude: [
+  provider: :openai_compatible,
+  base_url: "https://llm-proxy.internal/v1",
+  id: "claude-sonnet-5",
+  cache: [markers: true]
+]
+```
+
+`cache: false` suits an agent that makes one model call per run and
+whose prompt is never sent again, where a write is never read.
+
+**The key.** `prompt_cache_key` is a hash of the run's agent key and
+subject (a thread's turns share their conversation's), or of the agent
+and the run for a run without a subject, so one lane's requests share a
+cache, and two tenants never share one. An in-process run whose
+`:context` has no `agent_key` sends none.
+
+**What breaks the prefix**, so the next step writes it again instead of
+reading it:
+
+- A tool added mid-run. A skill's `use_skill` adds the skill's tools to
+  the tools block, which comes first in the prefix, so the call after a
+  load writes everything again, once.
+- Not deferred tools. Anthropic keeps tools with `defer_loading` out of
+  the prefix and expands the ones a search loads inline in the
+  conversation, so tool search leaves the cache alone. A deferred tool
+  never carries a breakpoint, which the API refuses.
+- A different `output_schema:` or reasoning setting. Both are fixed for
+  a run; a thread whose agent changes them between turns writes again.
+- Thinking, on older models. Claude Opus 4.5, Sonnet 4.6, Haiku 5.5, and
+  later keep earlier turns' thinking blocks; on older models a new user
+  message after tool use drops them, and the conversation after them is
+  written again. Thinking blocks never carry a breakpoint: the
+  automatic one finds the nearest block that can.
+- Instructions that change per run (a date, a user's name). They come
+  before the conversation, so put what varies in the input instead.
+
+Sources, read 2026-10-30: Anthropic's
+[prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
+[tool use with prompt caching](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching),
+and [tool search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool);
+OpenAI's [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+and [Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create);
+OpenRouter's [prompt caching](https://openrouter.ai/docs/guides/best-practices/prompt-caching);
+Amazon Bedrock's [prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html);
+and Vertex AI's [open models](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/maas/use-open-models).
+
 ## Adding a model, start to finish
 
 1. Find the lane. First-party Anthropic/OpenAI → `:anthropic`/`:openai`.
@@ -329,5 +416,10 @@ already covers it, no code required). Otherwise:
 3. Map the atom to the client in `Clementine.LLM.Router`'s defaults.
 4. Add a reasoning translation in `Clementine.LLM.Reasoning` (or extend the
    supported-provider guard) so `validate_model_config/2` accepts it.
-5. Mirror the Bypass test pattern in `test/clementine/llm/` — request-body
+5. Normalize the provider's usage into `Clementine.Usage`'s keys
+   (`Clementine.LLM.ProviderUsage`): `input_tokens` counts cache reads
+   and writes, and `cache_read_tokens` and `cache_write_tokens` are
+   parts of it. Send what the provider needs for caching, and say what
+   it does in the "Prompt caching" table above.
+6. Mirror the Bypass test pattern in `test/clementine/llm/` — request-body
    assertions, streaming, and failure paths.
