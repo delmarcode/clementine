@@ -30,8 +30,9 @@ keeps what an agent is apart from executing it:
 
 No process holds an agent or a run: a run's state is its row. In an app,
 Clementine owns that table, the Oban worker, the reaper that ends a dead
-node's runs as `interrupted`, and the drain that requeues, at shutdown,
-the runs that have not yet acted on the world. The app keeps its
+node's runs as `interrupted`, and the drain, which at shutdown requeues
+runs that haven't yet called an unsafe tool, so another node can run them
+cleanly, and ends the rest as `interrupted`. The app keeps its
 conversations in its own tables and answers a few questions in callbacks.
 There is no graph or chain DSL: what happens above a run is ordinary
 Elixir, or a durable loop (`Clementine.Loop`) when it must outlive a
@@ -163,29 +164,47 @@ With `ANTHROPIC_API_KEY` set, start the app (`iex -S mix`) and run it:
 <!-- guide-sample: parse-only -->
 ```elixir
 {:ok, run} = Clementine.Runs.start(MyApp.Agents.Weather, "Will it rain in Lisbon tomorrow?")
+run.status
+#=> "queued"
 
+# A worker runs it in the background. Once it has finished:
 Clementine.Runs.get(run.id)
 #=> %Clementine.Runs.AgentRun{status: "completed", result: %{"output" => "..."}, ...}
 
 Clementine.Runs.trace(run.id)   # its model calls and tool calls, oldest first
 ```
 
-`Runs.start/3` inserts the run and its Oban job in one transaction, and
-a worker on any node executes it. It also takes `subject:` (what the run
-is about, `{"ticket", id}`), `actor:` (whose authority it acts with,
+`Runs.start/3` only enqueues: it inserts the run and its Oban job in one
+transaction and returns the run `"queued"`. A worker on any node picks
+it up, so `Runs.get/1` shows it `"running"`, then `"completed"` with the
+answer in `result["output"]`. `start/3` also takes `subject:` (what the
+run is about, `{"ticket", id}`), `actor:` (whose authority it acts with,
 `{"user", id}`), and `metadata:`. `Runs.cancel/1` stops a run on
 whichever node runs it.
 
-What a run means to the app goes in an optional host module
-(`Clementine.Host`, the child's `host:`): `run_finished/2` commits with
-the run's end, `run_committed/2` and `run_transition/2` hear of changes
-after they commit, `run_event/2` streams tokens to a UI, and
-`resolve_subject/2` and `resolve_actor/2` load the run's subject and
-actor at every claim, where a refusal cancels the run. The generated
-test shows how to run an agent in a test: script the model with
-`expect_turn/1`, then
+In tests, the generated test scripts the model with `expect_turn/1` and
+runs the job inline with
 `perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})`.
-[The Durable Runtime](guides/runtime.md) covers all of this.
+
+What a run means to the app goes in an optional host module,
+`Clementine.Host`, named in the child's `host:`. Every callback is
+optional:
+
+- `run_finished/2`, inside the transaction that ends a run: store what
+  it produced, or insert the Oban job that sends it on.
+- `run_committed/2`, once, after that transaction commits: broadcast the
+  end.
+- `run_transition/2`, after each other change commits (claimed,
+  suspended, resumed, requeued, cancel requested): update a status in
+  the UI.
+- `run_event/2`, for each event while the run executes, in a process of
+  its own: stream tokens to the UI.
+- `resolve_subject/2` and `resolve_actor/2`, at every claim: load what
+  the run is about and whom it acts for. A refusal cancels the run.
+- `authorize_resume/2` and `authorize_tool/3`: who may approve a waiting
+  run, and the tool policy (see Tools, below).
+
+[The Durable Runtime](guides/runtime.md) covers each one.
 
 ## Conversations are threads
 
@@ -230,14 +249,21 @@ one per conversation, and send it each message:
   )
 ```
 
-The thread starts one turn at a time and queues the messages that arrive
-during one; with `"busy" => "interrupt"` in its args, a new message
-cancels the running turn and is answered in its place. It keeps no
-transcript; `history/1` reads it. `Runs.child(loop.id, {:turn,
-message.id})` is a message's turn once it starts, and
-`Clementine.Thread.waiting(loop.id)` the ids of the messages queued. In
-process, history is a list you pass: `Clementine.run(agent, prompt,
-messages: history)`.
+The thread:
+
+- starts one turn at a time, and queues the messages that arrive during
+  one;
+- with `"busy" => "interrupt"` in its args, cancels the running turn
+  instead and answers the new message;
+- keeps no transcript: the turn agent's `history/1` reads the thread
+  from your tables.
+
+`Runs.child(loop.id, {:turn, message.id})` finds a message's turn once
+it has started. `Clementine.Thread.waiting(loop.id)` lists the ids of
+the messages still queued.
+
+In process there is no thread: pass the history yourself, as
+`Clementine.run(agent, prompt, messages: history)`.
 
 ## Tools
 
@@ -310,7 +336,7 @@ config :clementine, :models,
     defaults: [max_tokens: 16_000],
     reasoning: [thinking: :adaptive, effort: :high]
   ],
-  gpt: [provider: :openai, id: "gpt-5.5", reasoning: :medium]
+  gpt_5: [provider: :openai, id: "gpt-5", reasoning: :medium]
 ```
 
 `:anthropic` (the Messages API) and `:openai` (the Responses API) have
