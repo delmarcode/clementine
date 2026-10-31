@@ -64,12 +64,6 @@ defmodule Clementine.MixProject do
           Clementine.Lease,
           Clementine.Heartbeat
         ],
-        "Durable runtime": [
-          Clementine.Runs,
-          Clementine.Runs.AgentRun,
-          Clementine.Host,
-          Clementine.Migration
-        ],
         "Suspension & approval": [
           Clementine.Checkpoint,
           Clementine.Suspension,

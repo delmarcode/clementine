@@ -68,7 +68,6 @@ defmodule Clementine.Tool do
             optional(:write) => boolean(),
             optional(:shell) => boolean()
           },
-          optional(:agent_pid) => pid(),
           optional(atom()) => any()
         }
 

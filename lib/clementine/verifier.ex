@@ -49,7 +49,6 @@ defmodule Clementine.Verifier do
 
   @type context :: %{
           optional(:working_dir) => String.t(),
-          optional(:agent_pid) => pid(),
           optional(atom()) => any()
         }
 
