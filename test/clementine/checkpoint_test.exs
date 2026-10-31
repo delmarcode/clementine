@@ -31,7 +31,12 @@ defmodule Clementine.CheckpointTest do
         }
       },
       skills: ["records", "audit"],
-      usage: %Usage{input_tokens: 1200, output_tokens: 340},
+      usage: %Usage{
+        input_tokens: 1200,
+        output_tokens: 340,
+        cache_read_tokens: 1000,
+        cache_write_tokens: 150
+      },
       cursor: {2, 57}
     }
   end

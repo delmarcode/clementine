@@ -1011,7 +1011,9 @@ defmodule Clementine.Rollout do
       %{
         duration: duration,
         input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens
       },
       Map.put(metadata, :stop_reason, stop_reason)
     )
@@ -1040,10 +1042,7 @@ defmodule Clementine.Rollout do
     delta = Clementine.Usage.new(response.usage)
 
     if Clementine.Usage.total(delta) > 0 do
-      emit_event(exec, :usage_delta, %{
-        input_tokens: delta.input_tokens,
-        output_tokens: delta.output_tokens
-      })
+      emit_event(exec, :usage_delta, Map.from_struct(delta))
     end
 
     %{exec | usage: Clementine.Usage.add(exec.usage, delta)}

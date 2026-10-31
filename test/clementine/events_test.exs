@@ -146,6 +146,31 @@ defmodule Clementine.EventsTest do
       assert Stamper.usage(stamper) == %Usage{input_tokens: 103, output_tokens: 45}
     end
 
+    test "accumulates the cache counts beside input and output" do
+      stamper = Events.stamper(CollectingSink, lease())
+
+      Stamper.emit(stamper, :usage_delta, %{
+        input_tokens: 100,
+        output_tokens: 5,
+        cache_read_tokens: 0,
+        cache_write_tokens: 90
+      })
+
+      Stamper.emit(stamper, :usage_delta, %{
+        input_tokens: 120,
+        output_tokens: 7,
+        cache_read_tokens: 90,
+        cache_write_tokens: 25
+      })
+
+      assert Stamper.usage(stamper) == %Usage{
+               input_tokens: 220,
+               output_tokens: 12,
+               cache_read_tokens: 90,
+               cache_write_tokens: 115
+             }
+    end
+
     test "is readable from another process — the heartbeat's sampling path" do
       stamper = Events.stamper(CollectingSink, lease())
       Stamper.emit(stamper, :usage_delta, %{input_tokens: 11, output_tokens: 2})

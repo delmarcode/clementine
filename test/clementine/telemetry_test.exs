@@ -259,6 +259,32 @@ defmodule Clementine.TelemetryTest do
                        %{iteration: 1, stop_reason: "end_turn", streaming: true}}
     end
 
+    test "stop carries the cache counts as measurements", %{store: store, ref: ref} do
+      attach(@llm_events)
+      MemoryLifecycle.seed_queued(store, ref)
+
+      expect_stream([
+        {:text_delta, "done"},
+        {:message_delta, %{"stop_reason" => "end_turn"},
+         %{
+           "input_tokens" => 900,
+           "output_tokens" => 3,
+           "cache_read_tokens" => 800,
+           "cache_write_tokens" => 60
+         }}
+      ])
+
+      assert {:finished, %Facts{status: :completed}} = execute(build_run(ref), store)
+
+      assert_received {:telemetry, [:clementine, :llm, :stop],
+                       %{
+                         input_tokens: 900,
+                         output_tokens: 3,
+                         cache_read_tokens: 800,
+                         cache_write_tokens: 60
+                       }, %{stop_reason: "end_turn"}}
+    end
+
     test "a provider error in the stream emits exception", %{store: store, ref: ref} do
       attach(@llm_events)
       MemoryLifecycle.seed_queued(store, ref)

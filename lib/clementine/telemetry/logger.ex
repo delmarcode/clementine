@@ -184,7 +184,7 @@ defmodule Clementine.Telemetry.Logger do
     Logger.log(config.level, fn ->
       %Clementine.Usage{} = usage = metadata.usage
 
-      "[Clementine] Run finished #{run_summary(metadata)} terminal=#{metadata.terminal} duration=#{duration_ms(measurements)}ms input_tokens=#{usage.input_tokens} output_tokens=#{usage.output_tokens}"
+      "[Clementine] Run finished #{run_summary(metadata)} terminal=#{metadata.terminal} duration=#{duration_ms(measurements)}ms input_tokens=#{usage.input_tokens} output_tokens=#{usage.output_tokens} cache_read_tokens=#{usage.cache_read_tokens} cache_write_tokens=#{usage.cache_write_tokens}"
     end)
   end
 
