@@ -346,7 +346,26 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(run.id) == nil
     end
 
-    test "is nil when a resumed run's node died, though earlier executions trace more",
+    test "is nil when a resumed run's node died mid-call", %{catalog: catalog} do
+      price_sonnet!(catalog)
+      {:ok, run} = Runs.start(Approval, "Tell the team")
+      expect_turn(call("tu_1", "send_note", %{"text" => "hi"}))
+      assert :ok = perform_job(Worker, %{"run_id" => run.id})
+      assert :ok = Runs.resume(run.id, {:approved, %{by: "alice"}})
+
+      # The heartbeat counts the run's calls from its checkpoint on: the
+      # first execution's 2,000 in and 50 out, then this call's.
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        reaped_mid_call!(run.id, %{"input_tokens" => 2_250, "output_tokens" => 100})
+        answer("Sent.")
+      end)
+
+      assert {:cancel, ":already_terminal"} = perform_job(Worker, %{"run_id" => run.id})
+      assert %AgentRun{status: "interrupted"} = Runs.get(run.id)
+      assert Runs.cost(run.id) == nil
+    end
+
+    test "is priced from the trace when a resumed run died before its first heartbeat",
          %{catalog: catalog} do
       price_sonnet!(catalog)
       {:ok, run} = Runs.start(Approval, "Tell the team")
@@ -354,16 +373,20 @@ defmodule Clementine.Runs.CostTest do
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
       assert :ok = Runs.resume(run.id, {:approved, %{by: "alice"}})
 
-      # The heartbeat counts one execution: this one's 300 tokens, less
-      # than the first execution's 2,050 in the trace.
+      # The column still holds what the park wrote, all of it in the trace:
+      # nothing shows a call the trace lacks, so the cost is no unknown.
       expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
-        reaped_mid_call!(run.id, %{"input_tokens" => 250, "output_tokens" => 50})
+        {:ok, facts} = Lifecycle.fetch(run.id, nil)
+        {:ok, _} = Protocol.interrupt(Lifecycle, facts, InterruptReason.new(:lease_expired))
         answer("Sent.")
       end)
 
       assert {:cancel, ":already_terminal"} = perform_job(Worker, %{"run_id" => run.id})
-      assert %AgentRun{status: "interrupted"} = Runs.get(run.id)
-      assert Runs.cost(run.id) == nil
+
+      assert %AgentRun{status: "interrupted", usage: %{"input_tokens" => 2_000}} =
+               Runs.get(run.id)
+
+      assert Runs.cost(run.id) == usd(@cached_micros)
     end
   end
 

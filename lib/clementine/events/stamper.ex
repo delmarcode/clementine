@@ -38,8 +38,19 @@ defmodule Clementine.Events.Stamper do
 
   @spec new(module(), Lease.t()) :: t()
   def new(sink, %Lease{} = lease) when is_atom(sink) do
-    %__MODULE__{sink: sink, lease: lease, counters: :atomics.new(5, signed: false)}
+    stamper = %__MODULE__{sink: sink, lease: lease, counters: :atomics.new(5, signed: false)}
+    accumulate_usage(stamper, :usage_delta, resumed_usage(lease.resume))
+    stamper
   end
+
+  # A resumed execution counts from the usage its checkpoint carries, as
+  # its rollout does, so the heartbeat's sample and a result built from it
+  # hold the run's earlier executions too: a resumed run that is reaped,
+  # cancelled, or fails keeps them.
+  defp resumed_usage({%Clementine.Checkpoint{usage: %Usage{} = usage}, _payload}),
+    do: Map.from_struct(usage)
+
+  defp resumed_usage(_fresh), do: %{}
 
   @doc """
   Stamps and delivers one execution event. The type must belong to the
@@ -69,8 +80,8 @@ defmodule Clementine.Events.Stamper do
   end
 
   @doc """
-  The usage accumulated from `usage_delta` events so far, as sampled by
-  the heartbeat. Reads may tear between the fields; the sample is an
+  The usage accumulated from `usage_delta` events so far, from the
+  checkpoint's on a resumed execution, as sampled by the heartbeat. Reads may tear between the fields; the sample is an
   approximation that trails live truth by design, and the terminal result
   carries the exact numbers.
   """

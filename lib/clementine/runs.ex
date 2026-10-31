@@ -969,14 +969,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # a call the trace does not: the heartbeat counts a call as it ends,
     # and the trace writes it at the next iteration boundary, or never if
     # the executor dies first. A trace whose total is short of the column
-    # is behind. The heartbeat counts one execution, so for a run whose
-    # last execution may not have written its end (running, or interrupted
-    # by the reaper, not while waiting or queued), the column is held
-    # against that execution's calls too: earlier executions' calls would
-    # otherwise hide a missing one. Every execution that ends through its
-    # runner writes its whole trace with that end, so its run is never
-    # behind. A loop calls no model, and its column counts its children's
-    # usage, so only a rollout is ever behind.
+    # is behind. The column counts every execution's calls a resume
+    # carried (the stamper starts from the checkpoint's usage), so the
+    # totals compare like for like; an execution that ends through its
+    # runner writes its whole trace with that end. A loop calls no model,
+    # and its column counts its children's usage, so only a rollout is
+    # ever behind.
     defp per_run_cost(runs) do
       from(r in AgentRun,
         left_join: t in "agent_run_trace",
@@ -999,35 +997,15 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
               """
               ? = 'rollout'
               AND (coalesce((?->>'input_tokens')::bigint, 0)
-                 > coalesce(sum((?->'usage'->>'input_tokens')::bigint), 0)
-               OR coalesce((?->>'output_tokens')::bigint, 0)
-                 > coalesce(sum((?->'usage'->>'output_tokens')::bigint), 0)
-               OR ((? = 'running'
-                    OR (? = 'interrupted' AND coalesce(?->>'code', '')
-                        NOT IN ('suspension_expired', 'claim_timeout', 'drain')))
-                   AND (coalesce((?->>'input_tokens')::bigint, 0)
-                          > coalesce(sum((?->'usage'->>'input_tokens')::bigint)
-                                       FILTER (WHERE ? = ?), 0)
-                        OR coalesce((?->>'output_tokens')::bigint, 0)
-                          > coalesce(sum((?->'usage'->>'output_tokens')::bigint)
-                                       FILTER (WHERE ? = ?), 0))))
+                     > coalesce(sum((?->'usage'->>'input_tokens')::bigint), 0)
+                   OR coalesce((?->>'output_tokens')::bigint, 0)
+                     > coalesce(sum((?->'usage'->>'output_tokens')::bigint), 0))
               """,
               r.kind,
               r.usage,
               t.payload,
               r.usage,
-              t.payload,
-              r.status,
-              r.status,
-              r.interrupt,
-              r.usage,
-              t.payload,
-              t.epoch,
-              r.lease_epoch,
-              r.usage,
-              t.payload,
-              t.epoch,
-              r.lease_epoch
+              t.payload
             )
         }
       )
