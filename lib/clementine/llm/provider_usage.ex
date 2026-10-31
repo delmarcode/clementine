@@ -7,6 +7,12 @@ defmodule Clementine.LLM.ProviderUsage do
   # are parts of it. A count the provider did not report is left out, so
   # a stream's later usage merges over its earlier one without zeroing
   # what the earlier one said.
+  #
+  # A total smaller than its own cache parts is raised to their sum, so
+  # uncached input never goes negative, and `[:clementine, :llm,
+  # :usage_clamped]` says so: a provider that changed its convention
+  # shows up there instead of being undercounted quietly. `meta`
+  # (`%{provider: atom, model: String.t()}`) is that event's metadata.
 
   @doc """
   The Messages API's usage. Its `input_tokens` is only what came after
@@ -40,46 +46,64 @@ defmodule Clementine.LLM.ProviderUsage do
   The Responses API's usage. Its `input_tokens` already counts cached
   tokens and cache writes; `input_tokens_details` breaks them out.
   """
-  @spec openai(map() | nil) :: map()
-  def openai(usage) when is_map(usage) do
+  @spec openai(map() | nil, map()) :: map()
+  def openai(usage, meta \\ %{})
+
+  def openai(usage, meta) when is_map(usage) do
     details = details(usage, "input_tokens_details")
 
     usage
     |> count("input_tokens")
-    |> with_parts(count(details, "cached_tokens"), count(details, "cache_write_tokens"))
+    |> with_parts(count(details, "cached_tokens"), count(details, "cache_write_tokens"), meta)
     |> put_output(count(usage, "output_tokens"))
   end
 
-  def openai(_usage), do: %{}
+  def openai(_usage, _meta), do: %{}
 
   @doc """
   Chat Completions usage. `prompt_tokens` counts cached tokens and cache
   writes as OpenAI's does; `prompt_tokens_details` breaks out what the
-  server reports (OpenRouter both, Vertex and vLLM reads only).
+  server reports (OpenRouter both, Vertex and vLLM reads only). A LiteLLM
+  proxy in front of Claude reports writes as a top-level
+  `cache_creation_input_tokens` (and may report reads as
+  `cache_read_input_tokens`), and its `prompt_tokens` is "all prompt
+  tokens including cache-miss and cache-hit input tokens" (LiteLLM's
+  prompt caching docs), so those are read as the same parts.
   """
-  @spec chat_completions(map() | nil) :: map()
-  def chat_completions(usage) when is_map(usage) do
+  @spec chat_completions(map() | nil, map()) :: map()
+  def chat_completions(usage, meta \\ %{})
+
+  def chat_completions(usage, meta) when is_map(usage) do
     details = details(usage, "prompt_tokens_details")
+    read = count(details, "cached_tokens") || count(usage, "cache_read_input_tokens")
+    write = count(details, "cache_write_tokens") || count(usage, "cache_creation_input_tokens")
 
     usage
     |> count("prompt_tokens")
-    |> with_parts(count(details, "cached_tokens"), count(details, "cache_write_tokens"))
+    |> with_parts(read, write, meta)
     |> put_output(count(usage, "completion_tokens"))
   end
 
-  def chat_completions(_usage), do: %{}
+  def chat_completions(_usage, _meta), do: %{}
 
-  # A total that includes its parts. The parts never exceed it: a server
-  # that reported a smaller total than its own parts gets the parts' sum,
-  # so uncached input never goes negative.
-  defp with_parts(nil, nil, nil), do: %{}
+  # A total that includes its parts.
+  defp with_parts(nil, nil, nil, _meta), do: %{}
 
-  defp with_parts(total, read, write) do
+  defp with_parts(total, read, write, meta) do
     read = read || 0
     write = write || 0
+    reported = total || 0
+
+    if reported < read + write do
+      :telemetry.execute(
+        [:clementine, :llm, :usage_clamped],
+        %{input_tokens: reported, cache_read_tokens: read, cache_write_tokens: write},
+        Map.merge(%{provider: nil, model: nil}, meta)
+      )
+    end
 
     %{
-      "input_tokens" => max(total || 0, read + write),
+      "input_tokens" => max(reported, read + write),
       "cache_read_tokens" => read,
       "cache_write_tokens" => write
     }

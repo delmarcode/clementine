@@ -16,7 +16,7 @@ defmodule Clementine.LLM.OpenAI do
   `required` (an optional one is typed `["string", "null"]`), and the
   API refuses a schema outside it.
 
-  Prompt caching is automatic. A request carries the lane's
+  Prompt caching is automatic. A request carries the run's
   `prompt_cache_key` (`Clementine.LLM.Cache.key/1`), and on GPT-5.6 and
   later `prompt_cache_options` with the alias's TTL, or, with `cache:
   false`, explicit mode with no breakpoints, which turns caching off.
@@ -253,7 +253,7 @@ defmodule Clementine.LLM.OpenAI do
     Map.merge(body, Reasoning.to_provider_config!(:openai, reasoning))
   end
 
-  # Caching is automatic. The key keeps a lane's requests on one cache
+  # Caching is automatic. The key keeps a user's requests on one cache
   # (routing on models before GPT-5.6, cache accounting after), and
   # GPT-5.6 and later take the write's lifetime in prompt_cache_options;
   # with caching off there, explicit mode and no breakpoints turn it off.
@@ -264,7 +264,7 @@ defmodule Clementine.LLM.OpenAI do
   end
 
   defp put_cache(body, %{cache: %{enabled: false}, id: id}, _key) do
-    if Cache.prompt_cache_options?(id),
+    if Cache.prompt_cache_options?(:openai, id),
       do: Map.put(body, "prompt_cache_options", %{"mode" => "explicit"}),
       else: body
   end
@@ -339,7 +339,7 @@ defmodule Clementine.LLM.OpenAI do
     %Response{
       content: content,
       stop_reason: stop_reason,
-      usage: ProviderUsage.openai(Map.get(body, "usage"))
+      usage: ProviderUsage.openai(Map.get(body, "usage"), usage_meta(body))
     }
   end
 
@@ -347,9 +347,11 @@ defmodule Clementine.LLM.OpenAI do
     %Response{
       content: [],
       stop_reason: nil,
-      usage: ProviderUsage.openai(Map.get(body, "usage"))
+      usage: ProviderUsage.openai(Map.get(body, "usage"), usage_meta(body))
     }
   end
+
+  defp usage_meta(body), do: %{provider: :openai, model: Map.get(body, "model")}
 
   defp refused?(output) do
     Enum.any?(output, fn

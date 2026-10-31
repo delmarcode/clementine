@@ -140,11 +140,11 @@ defmodule Clementine.LLM.StreamParser do
   defp enrich_events(events, state) do
     Enum.map_reduce(events, state, fn
       {:message_start, %{"usage" => usage} = message}, state when is_map(usage) ->
-        state = %{state | usage: Map.merge(state.usage, usage)}
+        state = %{state | usage: merge_usage(state.usage, usage)}
         {{:message_start, %{message | "usage" => ProviderUsage.anthropic(state.usage)}}, state}
 
       {:message_delta, delta, usage}, state ->
-        state = %{state | usage: Map.merge(state.usage, usage)}
+        state = %{state | usage: merge_usage(state.usage, usage)}
         {{:message_delta, delta, ProviderUsage.anthropic(state.usage)}, state}
 
       {:tool_use_start, id, _name} = event, state ->
@@ -166,6 +166,13 @@ defmodule Clementine.LLM.StreamParser do
         {event, state}
     end)
   end
+
+  # A count the end sends as null leaves the start's in place.
+  defp merge_usage(seen, usage) when is_map(usage) do
+    Map.merge(seen, Map.reject(usage, fn {_key, value} -> is_nil(value) end))
+  end
+
+  defp merge_usage(seen, _usage), do: seen
 
   # Split SSE data into complete events and remaining buffer
   defp split_events(data) do

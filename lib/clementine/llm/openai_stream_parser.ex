@@ -26,6 +26,8 @@ defmodule Clementine.LLM.OpenAIStreamParser do
     %State{}
   end
 
+  defp usage_meta(response), do: %{provider: :openai, model: Map.get(response, "model")}
+
   def parse(%State{buffer: buffer} = state, data) when is_binary(data) do
     full_data = buffer <> data
     {events_data, remaining} = split_events(full_data)
@@ -192,7 +194,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
 
   defp convert_event("response.completed", %{"response" => response}, state) do
     {fallback_tool_events, state} = ensure_completed_tool_events(response, state)
-    usage = ProviderUsage.openai(Map.get(response, "usage"))
+    usage = ProviderUsage.openai(Map.get(response, "usage"), usage_meta(response))
 
     events =
       fallback_tool_events ++
@@ -207,7 +209,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
   # Cut off: what streamed is the turn, and nothing more arrives. A call
   # still open has no complete arguments, so none is replayed.
   defp convert_event("response.incomplete", %{"response" => response}, state) do
-    usage = ProviderUsage.openai(Map.get(response, "usage"))
+    usage = ProviderUsage.openai(Map.get(response, "usage"), usage_meta(response))
 
     {[{:message_delta, %{"stop_reason" => stop_reason(response, state)}, usage}, {:message_stop}],
      state}

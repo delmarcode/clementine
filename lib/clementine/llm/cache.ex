@@ -19,8 +19,10 @@ defmodule Clementine.LLM.Cache do
         ]
 
   - `cache: false` sends no cache hints. A provider that caches on its
-    own (OpenAI, DeepSeek, vLLM) still does; on GPT-5.6 and later,
-    Clementine turns that off too.
+    own (OpenAI, DeepSeek, vLLM) still does, except OpenAI's GPT-5.6 and
+    later: through `:openai`, `:openrouter`, or `:bedrock`, Clementine
+    sends `prompt_cache_options.mode: "explicit"` with no breakpoints,
+    which turns caching and its write charge off.
   - `ttl:` how long a cache write lives, which sets its price. Each
     provider takes its own durations: `:five_minutes` (the default) or
     `:one_hour` where `cache_control` markers go (Anthropic, and
@@ -28,7 +30,7 @@ defmodule Clementine.LLM.Cache do
     (the default) or `:twelve_hours` on OpenAI's GPT-5.6 and later.
   - `markers:` for the Chat Completions providers: whether to send
     Anthropic-style `cache_control` markers. OpenRouter sends them to
-    `anthropic/` models by default; `:openai_compatible` sends none
+    `anthropic/` and `~anthropic/` models by default; `:openai_compatible` sends none
     unless asked, for a proxy that fronts Claude. Bedrock and Vertex
     take none.
 
@@ -111,7 +113,10 @@ defmodule Clementine.LLM.Cache do
   # Anthropic always marks its own requests; OpenAI has no markers to send.
   defp markers(:anthropic, _id, :error), do: {:ok, true}
   defp markers(:openai, _id, :error), do: {:ok, false}
-  defp markers(:openrouter, id, :error), do: {:ok, String.starts_with?(id, "anthropic/")}
+
+  defp markers(:openrouter, id, :error),
+    do: {:ok, String.starts_with?(id, ["anthropic/", "~anthropic/"])}
+
   defp markers(:openai_compatible, _id, :error), do: {:ok, false}
   defp markers(provider, _id, :error) when provider in [:bedrock, :vertex], do: {:ok, false}
 
@@ -126,10 +131,10 @@ defmodule Clementine.LLM.Cache do
 
   defp ttl(:openai, id, _markers, setting) do
     cond do
-      not prompt_cache_options?(id) and setting == :error ->
+      not prompt_cache_options?(:openai, id) and setting == :error ->
         {:ok, nil}
 
-      not prompt_cache_options?(id) ->
+      not prompt_cache_options?(:openai, id) ->
         {:error,
          ":ttl needs GPT-5.6 or later on :openai, where prompt_cache_options is " <>
            "documented; #{inspect(id)} keeps its own retention"}
@@ -139,12 +144,24 @@ defmodule Clementine.LLM.Cache do
     end
   end
 
-  defp ttl(_provider, _id, true, setting),
+  # OpenAI's GPT-5.6 and later on OpenRouter or Bedrock cache on their
+  # own and bill each write for 30 minutes; Clementine sends them no TTL.
+  defp ttl(provider, id, markers, setting) when provider in [:openrouter, :bedrock] do
+    cond do
+      not prompt_cache_options?(provider, id) -> marker_ttl(provider, markers, setting)
+      setting == :error -> {:ok, :thirty_minutes}
+      true -> {:error, ":ttl is not sent to OpenAI models on #{inspect(provider)}"}
+    end
+  end
+
+  defp ttl(provider, _id, markers, setting), do: marker_ttl(provider, markers, setting)
+
+  defp marker_ttl(_provider, true, setting),
     do: pick_ttl(:markers, setting, @marker_ttls, :five_minutes)
 
-  defp ttl(_provider, _id, false, :error), do: {:ok, nil}
+  defp marker_ttl(_provider, false, :error), do: {:ok, nil}
 
-  defp ttl(provider, _id, false, {:ok, _ttl}) do
+  defp marker_ttl(provider, false, {:ok, _ttl}) do
     {:error,
      ":ttl needs cache_control markers, and #{inspect(provider)} sends none for this " <>
        "model; set markers: true where the server takes them"}
@@ -162,12 +179,34 @@ defmodule Clementine.LLM.Cache do
   end
 
   @doc false
-  # Whether an OpenAI model id documents `prompt_cache_options`: GPT-5.6
-  # and later ("Supported for gpt-5.6 and later models", the Responses
-  # API reference, read 2026-10-30). Ids are `gpt-<major>[.<minor>]...`.
-  @spec prompt_cache_options?(String.t()) :: boolean()
-  def prompt_cache_options?(id) when is_binary(id) do
-    case Regex.run(~r/^gpt-(\d+)(?:\.(\d+))?/, id) do
+  # Whether a provider's model id is OpenAI's GPT-5.6 or later, which
+  # documents `prompt_cache_options` ("Supported for gpt-5.6 and later
+  # models", OpenAI's API reference; OpenRouter and Bedrock document it
+  # for the same models, read 2026-10-30). OpenAI ids are
+  # `gpt-<major>[.<minor>]...`; OpenRouter's are `openai/<id>`, and
+  # Bedrock's `openai.<id>`, behind any inference-profile prefix.
+  @spec prompt_cache_options?(atom(), String.t()) :: boolean()
+  def prompt_cache_options?(provider, id) when is_binary(id) do
+    case openai_model(provider, id) do
+      nil -> false
+      model -> gpt_5_6_or_later?(model)
+    end
+  end
+
+  defp openai_model(:openai, id), do: id
+  defp openai_model(:openrouter, "openai/" <> model), do: model
+
+  defp openai_model(:bedrock, id) do
+    case Regex.run(~r/(?:^|\.)openai\.(.+)$/, id) do
+      [_, model] -> model
+      nil -> nil
+    end
+  end
+
+  defp openai_model(_provider, _id), do: nil
+
+  defp gpt_5_6_or_later?(model) do
+    case Regex.run(~r/^gpt-(\d+)(?:\.(\d+))?/, model) do
       [_, major] -> String.to_integer(major) >= 6
       [_, major, minor] -> {String.to_integer(major), String.to_integer(minor)} >= {5, 6}
       nil -> false
@@ -188,17 +227,23 @@ defmodule Clementine.LLM.Cache do
   def cache_control(%{}), do: %{"type" => "ephemeral"}
 
   @doc """
-  The key that keeps one lane's requests on one cache, or `nil`.
+  The `prompt_cache_key` for a run's requests, or `nil`.
 
-  A run on the durable runtime is keyed by its agent and subject (a
-  thread's turns share their conversation's key), or by its agent and run
-  when it has no subject. The key is a hash, so no host id reaches the
-  provider, and two tenants never share one. An in-process run with
-  neither gets no key, and the provider routes by the prompt's prefix.
+  A run on the durable runtime is keyed by its agent and its actor, one
+  key per user as OpenAI's guide recommends: a user's runs and threads
+  with the agent share a cache, and two users never do, which keeps one
+  user from probing for another's cached prompts. A run with no actor is
+  keyed by its agent and subject, and one with neither by its agent and
+  run. The key is a hash, so no raw host id reaches the provider. An
+  in-process run without an `agent_key` in its context gets no key, and
+  the provider routes by the prompt's prefix.
   """
   @spec key(map()) :: String.t() | nil
   def key(%{agent_key: agent} = context) when is_binary(agent) do
     case context do
+      %{actor_type: type, actor_id: id} when not is_nil(type) and not is_nil(id) ->
+        hash([agent, "actor", to_string(type), to_string(id)])
+
       %{subject_type: type, subject_id: id} when not is_nil(type) and not is_nil(id) ->
         hash([agent, "subject", to_string(type), to_string(id)])
 
