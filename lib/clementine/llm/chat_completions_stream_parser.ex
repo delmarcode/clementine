@@ -22,11 +22,14 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
               finish_reason: nil,
               usage: %{},
               refused: false,
-              done: false
+              done: false,
+              usage_meta: %{}
   end
 
-  def new do
-    %State{}
+  # `usage_meta` names the provider and model for the usage normalizer's
+  # telemetry; the client passes it.
+  def new(usage_meta \\ %{}) do
+    %State{usage_meta: usage_meta}
   end
 
   def parse(%State{buffer: buffer} = state, data) when is_binary(data) do
@@ -218,7 +221,7 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
       stop_events ++
         [
           {:message_delta, %{"stop_reason" => stop_reason(state)},
-           ProviderUsage.chat_completions(state.usage)},
+           ProviderUsage.chat_completions(state.usage, state.usage_meta)},
           {:message_stop}
         ]
 

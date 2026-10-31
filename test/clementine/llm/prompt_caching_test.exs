@@ -66,6 +66,9 @@ defmodule Clementine.LLM.PromptCachingTest do
       ],
       or_deepseek: [provider: :openrouter, id: "deepseek/deepseek-v3.2"],
       or_off: [provider: :openrouter, id: "anthropic/claude-sonnet-5", cache: false],
+      or_gpt_off: [provider: :openrouter, id: "openai/gpt-5.6-sol", cache: false],
+      bedrock_gpt_off: [provider: :bedrock, id: "global.openai.gpt-5.6-sol", cache: false],
+      bedrock_off: [provider: :bedrock, id: "openai.gpt-oss-120b-1:0", cache: false],
       bedrock: [provider: :bedrock, id: "openai.gpt-oss-120b-1:0"],
       vertex: [provider: :vertex, id: "deepseek-ai/deepseek-v3.2-maas"],
       vllm: [provider: :openai_compatible, id: "qwen3"],
@@ -142,6 +145,29 @@ defmodule Clementine.LLM.PromptCachingTest do
 
       assert Usage.new(response.usage) == %Usage{
                input_tokens: 20 + 1_500 + 9_000,
+               output_tokens: 42,
+               cache_read_tokens: 9_000,
+               cache_write_tokens: 1_500
+             }
+    end
+
+    test "an end that reports its cache counts as null leaves the start's", %{bypass: bypass} do
+      final = %{
+        "input_tokens" => 60,
+        "cache_creation_input_tokens" => nil,
+        "cache_read_input_tokens" => nil,
+        "output_tokens" => 42
+      }
+
+      stream_back(bypass, "/v1/messages", anthropic_stream(final_usage: final))
+
+      assert {:ok, response} =
+               :claude
+               |> Anthropic.stream("Be brief.", [UserMessage.new("Hi")], [])
+               |> LLM.collect_stream()
+
+      assert Usage.new(response.usage) == %Usage{
+               input_tokens: 60 + 1_500 + 9_000,
                output_tokens: 42,
                cache_read_tokens: 9_000,
                cache_write_tokens: 1_500
@@ -349,6 +375,131 @@ defmodule Clementine.LLM.PromptCachingTest do
                output_tokens: 60,
                cache_read_tokens: 10_000,
                cache_write_tokens: 300
+             }
+    end
+
+    test "cache: false turns off GPT-5.6's own caching on OpenRouter and Bedrock", %{
+      bypass: bypass
+    } do
+      for {model, path} <- [
+            or_gpt_off: "/api/v1/chat/completions",
+            bedrock_gpt_off: "/bedrock/v1/chat/completions"
+          ] do
+        request = chat_request(bypass, path, model, cache_key: @key)
+
+        assert request["prompt_cache_options"] == %{"mode" => "explicit"}
+        refute Map.has_key?(request, "prompt_cache_key")
+        refute Map.has_key?(request, "cache_control")
+      end
+
+      # Nothing to turn off on a model that does not document it.
+      request = chat_request(bypass, "/bedrock/v1/chat/completions", :bedrock_off, [])
+      refute Map.has_key?(request, "prompt_cache_options")
+    end
+
+    test "OpenRouter's last chunk carries its usage beside the finish", %{bypass: bypass} do
+      body =
+        Enum.map_join(
+          [
+            %{"choices" => [%{"index" => 0, "delta" => %{"content" => "ok"}}]},
+            %{
+              "id" => "gen-1",
+              "provider" => "Anthropic",
+              "choices" => [
+                %{
+                  "index" => 0,
+                  "delta" => %{"role" => "assistant", "content" => ""},
+                  "finish_reason" => "stop",
+                  "native_finish_reason" => "end_turn"
+                }
+              ],
+              "usage" => %{
+                "prompt_tokens" => 12_000,
+                "completion_tokens" => 9,
+                "total_tokens" => 12_009,
+                "cost" => 0.0042,
+                "prompt_tokens_details" => %{
+                  "cached_tokens" => 11_000,
+                  "cache_write_tokens" => 900
+                },
+                "completion_tokens_details" => %{"reasoning_tokens" => 0}
+              }
+            }
+          ],
+          &("data: " <> Jason.encode!(&1) <> "\n\n")
+        ) <> "data: [DONE]\n\n"
+
+      stream_back(bypass, "/api/v1/chat/completions", body)
+
+      assert {:ok, response} =
+               :or_claude
+               |> ChatCompletions.stream("Be brief.", [UserMessage.new("Hi")], [])
+               |> LLM.collect_stream()
+
+      assert response.stop_reason == "end_turn"
+
+      assert Usage.new(response.usage) == %Usage{
+               input_tokens: 12_000,
+               output_tokens: 9,
+               cache_read_tokens: 11_000,
+               cache_write_tokens: 900
+             }
+    end
+
+    test "Vertex's usage on its last content chunk, and null details, are read", %{
+      bypass: bypass
+    } do
+      body =
+        Enum.map_join(
+          [
+            %{"choices" => [%{"index" => 0, "delta" => %{"content" => "o"}}]},
+            %{
+              "choices" => [
+                %{"index" => 0, "delta" => %{"content" => "k"}, "finish_reason" => "stop"}
+              ],
+              "usage" => %{
+                "prompt_tokens" => 5_000,
+                "completion_tokens" => 2,
+                "total_tokens" => 5_002,
+                "prompt_tokens_details" => nil
+              }
+            }
+          ],
+          &("data: " <> Jason.encode!(&1) <> "\n\n")
+        ) <> "data: [DONE]\n\n"
+
+      stream_back(bypass, "/vertex/v1/chat/completions", body)
+
+      assert {:ok, response} =
+               :vertex
+               |> ChatCompletions.stream("Be brief.", [UserMessage.new("Hi")], [])
+               |> LLM.collect_stream()
+
+      assert [%Content.Text{text: "ok"}] = response.content
+      assert Usage.new(response.usage) == %Usage{input_tokens: 5_000, output_tokens: 2}
+    end
+
+    test "a LiteLLM proxy's Anthropic cache writes are read", %{bypass: bypass} do
+      respond(bypass, "/oai/v1/chat/completions", %{
+        "choices" => [
+          %{"message" => %{"role" => "assistant", "content" => "ok"}, "finish_reason" => "stop"}
+        ],
+        "usage" => %{
+          "prompt_tokens" => 2_006,
+          "completion_tokens" => 300,
+          "prompt_tokens_details" => %{"cached_tokens" => 1_920},
+          "cache_creation_input_tokens" => 86
+        }
+      })
+
+      assert {:ok, response} =
+               ChatCompletions.call(:proxy, "Be brief.", [UserMessage.new("Hi")], [])
+
+      assert Usage.new(response.usage) == %Usage{
+               input_tokens: 2_006,
+               output_tokens: 300,
+               cache_read_tokens: 1_920,
+               cache_write_tokens: 86
              }
     end
 

@@ -5,16 +5,24 @@ defmodule Clementine.LLM.ProviderStream do
 
   @receive_timeout 300_000
 
-  def new(parser_module, request_fun)
-      when is_atom(parser_module) and is_function(request_fun, 2) do
+  # `parser` is a parser module, which starts from its `new/0`, or
+  # `{module, state}` for a parser that needs more than that to start. A
+  # retried request starts it over from the same state.
+  def new(parser, request_fun) when is_function(request_fun, 2) do
+    {parser_module, initial} =
+      case parser do
+        {module, state} when is_atom(module) -> {module, state}
+        module when is_atom(module) -> {module, module.new()}
+      end
+
     Stream.resource(
-      fn -> start(parser_module, request_fun) end,
-      &receive_chunk(&1, parser_module),
+      fn -> start(initial, request_fun) end,
+      &receive_chunk(&1, parser_module, initial),
       &cleanup/1
     )
   end
 
-  defp start(parser_module, request_fun) do
+  defp start(initial, request_fun) do
     parent = self()
     ref = make_ref()
 
@@ -23,7 +31,7 @@ defmodule Clementine.LLM.ProviderStream do
         run_request(request_fun, parent, ref)
       end)
 
-    {ref, pid, parser_module.new()}
+    {ref, pid, initial}
   end
 
   defp run_request(request_fun, parent, ref) do
@@ -36,14 +44,14 @@ defmodule Clementine.LLM.ProviderStream do
       send(parent, {ref, {:error, Error.normalize_exception(kind, reason)}})
   end
 
-  defp receive_chunk({ref, pid, parser}, parser_module) do
+  defp receive_chunk({ref, pid, parser}, parser_module, initial) do
     receive do
       {^ref, {:data, data}} ->
         {events, new_parser} = parser_module.parse(parser, data)
         {events, {ref, pid, new_parser}}
 
       {^ref, :retry_reset} ->
-        {[], {ref, pid, parser_module.new()}}
+        {[], {ref, pid, initial}}
 
       {^ref, :done} ->
         {:halt, :done}
@@ -65,7 +73,7 @@ defmodule Clementine.LLM.ProviderStream do
     end
   end
 
-  defp receive_chunk({:halting, pid}, _parser_module) do
+  defp receive_chunk({:halting, pid}, _parser_module, _initial) do
     {:halt, {:halting, pid}}
   end
 

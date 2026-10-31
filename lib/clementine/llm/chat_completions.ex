@@ -58,8 +58,10 @@ defmodule Clementine.LLM.ChatCompletions do
   models by default, any `:openrouter` or `:openai_compatible` alias with
   `cache: [markers: true]`) sends a `cache_control` content part on the
   system prompt and the top-level `cache_control` for the conversation's
-  tail. OpenRouter also gets the lane's `prompt_cache_key`, which it uses
-  for sticky routing. Other servers cache prefixes on their own. A stream
+  tail. OpenRouter also gets the run's `prompt_cache_key`, which it uses
+  for sticky routing. Other servers cache prefixes on their own; with
+  `cache: false`, OpenAI's GPT-5.6 and later on OpenRouter or Bedrock get
+  `prompt_cache_options.mode: "explicit"`, which turns that off. A stream
   asks for usage with `stream_options.include_usage`, and usage reads
   `prompt_tokens_details.cached_tokens` and `cache_write_tokens` wherever
   the server reports them.
@@ -91,13 +93,16 @@ defmodule Clementine.LLM.ChatCompletions do
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
 
-    do_call_with_retry(url, body, headers, max_attempts, 1)
+    case do_call_with_retry(url, body, headers, max_attempts, 1) do
+      {:ok, resp_body} -> {:ok, parse_response(resp_body, usage_meta(resolved))}
+      error -> error
+    end
   end
 
   defp do_call_with_retry(url, body, headers, max_attempts, attempt) do
     case Req.post(url, json: body, headers: headers, receive_timeout: 120_000) do
       {:ok, %{status: 200, body: resp_body}} ->
-        {:ok, parse_response(resp_body)}
+        {:ok, resp_body}
 
       {:ok, %{status: status}} when status in @retriable_statuses and attempt < max_attempts ->
         Process.sleep(calculate_backoff(attempt))
@@ -138,7 +143,9 @@ defmodule Clementine.LLM.ChatCompletions do
     receive_timeout = Keyword.get(opts, :receive_timeout, 300_000)
     budget_ends = System.monotonic_time(:millisecond) + receive_timeout
 
-    ProviderStream.new(ChatCompletionsStreamParser, fn parent, ref ->
+    parser = ChatCompletionsStreamParser.new(usage_meta(resolved))
+
+    ProviderStream.new({ChatCompletionsStreamParser, parser}, fn parent, ref ->
       do_stream_request(url, body, headers, parent, ref, budget_ends)
     end)
   end
@@ -308,10 +315,17 @@ defmodule Clementine.LLM.ChatCompletions do
 
   # Markers end with the top-level automatic breakpoint, which follows
   # the conversation's tail (OpenRouter documents it for Claude on every
-  # provider that serves it). OpenRouter routes a lane's requests to one
+  # provider that serves it). OpenRouter routes a user's requests to one
   # provider by prompt_cache_key; no other Chat Completions provider is
   # sent one, since a strict server may refuse a field it does not know.
-  defp put_cache(body, %{cache: %{enabled: false}}, _key), do: body
+  # With caching off, OpenAI's GPT-5.6 and later on OpenRouter or Bedrock
+  # get explicit mode and no breakpoints, which turns their implicit
+  # caching and its write charge off; nothing else can be turned off.
+  defp put_cache(body, %{cache: %{enabled: false}, provider: provider, id: id}, _key) do
+    if Cache.prompt_cache_options?(provider, id),
+      do: Map.put(body, "prompt_cache_options", %{"mode" => "explicit"}),
+      else: body
+  end
 
   defp put_cache(body, %{cache: cache, provider: provider}, key) do
     body =
@@ -442,7 +456,9 @@ defmodule Clementine.LLM.ChatCompletions do
     resolved
   end
 
-  defp parse_response(%{"choices" => [choice | _]} = body) do
+  defp usage_meta(resolved), do: %{provider: resolved.provider, model: resolved.id}
+
+  defp parse_response(%{"choices" => [choice | _]} = body, usage_meta) do
     message = Map.get(choice, "message", %{})
     content = Messages.decode_message(message)
 
@@ -455,15 +471,15 @@ defmodule Clementine.LLM.ChatCompletions do
     %Response{
       content: content,
       stop_reason: stop_reason,
-      usage: ProviderUsage.chat_completions(Map.get(body, "usage"))
+      usage: ProviderUsage.chat_completions(Map.get(body, "usage"), usage_meta)
     }
   end
 
-  defp parse_response(body) when is_map(body) do
+  defp parse_response(body, usage_meta) when is_map(body) do
     %Response{
       content: [],
       stop_reason: nil,
-      usage: ProviderUsage.chat_completions(Map.get(body, "usage"))
+      usage: ProviderUsage.chat_completions(Map.get(body, "usage"), usage_meta)
     }
   end
 

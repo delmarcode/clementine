@@ -314,20 +314,26 @@ the provider says it read from and wrote to its cache in
 processed, and `cache_read_tokens` and `cache_write_tokens` are parts of
 it, whatever the provider's own convention; the trace's `:model_call`
 entries, results, checkpoints, and `[:clementine, :llm, :stop]`
-telemetry carry all four.
+telemetry carry all four. A provider that reports a total smaller than
+its own cache parts has the total raised to their sum, and
+`[:clementine, :llm, :usage_clamped]` fires, so a provider that changed
+its convention shows up instead of undercounting quietly.
 
 | Provider | What Clementine sends | What's reported | Limits |
 |---|---|---|---|
 | `:anthropic` | `cache_control` on the system prompt (on the last tool loaded up front when there is none), and the top-level `cache_control` the API moves to the last cacheable block. TTL: `:five_minutes` (default) or `:one_hour`. | `cache_read_input_tokens` and `cache_creation_input_tokens`, added to `input_tokens`, which excludes them. | 2 of the 4 breakpoints a request may carry. A prefix under the model's minimum (512 to 4,096 tokens) is not cached and costs nothing extra. Each breakpoint looks back 20 positions for an earlier write. Writes cost 1.25× input (5 minutes) or 2× (1 hour); reads 0.1× or less. |
-| `:openai` | `prompt_cache_key`, a hash of the run's agent and subject. On GPT-5.6 and later, `prompt_cache_options.ttl` (`:thirty_minutes` default, or `:twelve_hours`); with `cache: false`, `prompt_cache_options.mode: "explicit"` and no breakpoints, which turns caching off. | `input_tokens_details.cached_tokens` and `cache_write_tokens`, parts of `input_tokens`. | Caching is automatic (from 1,024 tokens on GPT-5.6 and later). Writes cost nothing before GPT-5.6, and 1.25× (30 minutes) or 2.5× (12 hours) from it. Older models keep their own retention; `cache: false` cannot turn their caching off. |
-| `:openrouter` | `anthropic/` models: a `cache_control` content part on the system prompt and the top-level `cache_control`, as on Anthropic (`:five_minutes` or `:one_hour`). Every model: `prompt_cache_key`, which OpenRouter uses for sticky provider routing. | `prompt_tokens_details.cached_tokens` and `cache_write_tokens`, parts of `prompt_tokens`. | Other models cache on their own (OpenAI, DeepSeek, Gemini 2.5 and later, Grok, Moonshot); `markers: true` sends the markers to any model. |
-| `:bedrock` | Nothing. | `prompt_tokens_details.cached_tokens`, and `cache_write_tokens` where reported (GPT-5.6 and later). | Implicit caching where the model has it, from 1,024 tokens for OpenAI models. GPT-5.6 and later also take explicit `prompt_cache_breakpoint`s, which Clementine does not send: implicit mode already marks the latest message. |
+| `:openai` | `prompt_cache_key` (see "The key" below). On GPT-5.6 and later, `prompt_cache_options.ttl` (`:thirty_minutes` default, or `:twelve_hours`); with `cache: false`, `prompt_cache_options.mode: "explicit"` and no breakpoints, which turns caching off. | `input_tokens_details.cached_tokens` and `cache_write_tokens`, parts of `input_tokens`. | Caching is automatic (from 1,024 tokens on GPT-5.6 and later). Writes cost nothing before GPT-5.6, and 1.25× (30 minutes) or 2.5× (12 hours) from it. Older models keep their own retention; `cache: false` cannot turn their caching off. |
+| `:openrouter` | `anthropic/` and `~anthropic/` models: a `cache_control` content part on the system prompt and the top-level `cache_control`, as on Anthropic (`:five_minutes` or `:one_hour`). Every model: `prompt_cache_key`, which OpenRouter uses for sticky provider routing. `openai/` GPT-5.6 and later with `cache: false`: `prompt_cache_options.mode: "explicit"`, which turns their caching off. | `prompt_tokens_details.cached_tokens` and `cache_write_tokens`, parts of `prompt_tokens`. | Other models cache on their own (OpenAI, DeepSeek, Gemini 2.5 and later, Grok, Moonshot); `markers: true` sends the markers to any model. GPT-5.6 and later bill writes at 1.25× for 30 minutes. |
+| `:bedrock` | Nothing, except `prompt_cache_options.mode: "explicit"` for `openai.` GPT-5.6 and later with `cache: false`, which turns their caching and its write charge off. | `prompt_tokens_details.cached_tokens`, and `cache_write_tokens` where reported (GPT-5.6 and later). | Implicit caching where the model has it, from 1,024 tokens for OpenAI models; GPT-5.6 and later bill writes at 1.25× for 30 minutes. They also take explicit `prompt_cache_breakpoint`s, which Clementine does not send: implicit mode already marks the latest message. |
 | `:vertex` | Nothing. | `prompt_tokens_details.cached_tokens` where reported. | Implicit caching only, in Preview, for some MaaS open models, from 4,096 tokens; Vertex names no request field. Its docs call the count `cachedContentTokenCount` and do not say how the OpenAI-compatible endpoint reports it. |
-| `:openai_compatible` | Nothing, unless `markers: true` (a proxy that fronts Claude), which sends the Anthropic-style markers. | `prompt_tokens_details.cached_tokens` and `cache_write_tokens` where the server reports them (vLLM: `--enable-prompt-tokens-details`). | vLLM and SGLang cache prefixes on their own. |
+| `:openai_compatible` | Nothing, unless `markers: true` (a proxy that fronts Claude), which sends the Anthropic-style markers. | `prompt_tokens_details.cached_tokens` and `cache_write_tokens` where the server reports them (vLLM: `--enable-prompt-tokens-details`); a LiteLLM proxy's top-level `cache_creation_input_tokens` and `cache_read_input_tokens`. | vLLM and SGLang cache prefixes on their own. |
 
 Every Chat Completions stream asks for usage
 (`stream_options.include_usage`), since the dialect sends none
-otherwise.
+otherwise, whatever the alias's `cache:`. Every target takes or ignores
+it: Bedrock needs it for usage, OpenRouter treats it as a no-op, Vertex
+ignores parameters it does not know, and vLLM, Ollama, and LiteLLM
+support it.
 
 **The lifetime.** A run's steps are seconds apart, and every read
 renews an entry, so the shortest TTL keeps a running run's cache warm
@@ -352,11 +358,26 @@ proxied_claude: [
 `cache: false` suits an agent that makes one model call per run and
 whose prompt is never sent again, where a write is never read.
 
+An alias has one TTL, so a cost reckoned from it prices every write at
+that lifetime. On a one-hour Anthropic alias, the writes the API makes
+itself after a server tool's result (a tool search) are five-minute
+writes priced as one-hour ones: a small overcharge.
+
 **The key.** `prompt_cache_key` is a hash of the run's agent key and
-subject (a thread's turns share their conversation's), or of the agent
-and the run for a run without a subject, so one lane's requests share a
-cache, and two tenants never share one. An in-process run whose
-`:context` has no `agent_key` sends none.
+its actor, one key per user as OpenAI's guide recommends; a run without
+an actor hashes its subject instead, and one with neither its run. A
+user's runs and threads with an agent share a cache, so a new
+conversation reads the agent's instructions and tools that the user's
+last one wrote, and two users never share one, which keeps one user
+from probing for another's cached prompts. That isolation costs the
+sharing across users: each user's first request writes the agent's
+prefix. On models before GPT-5.6 the key routes requests to the same
+cache; from GPT-5.6, OpenAI routes on its own and the key scopes cache
+accounting. Only `:openai` and `:openrouter` get one. The key is an
+unsalted hash, so no raw host id reaches the provider. An in-process run
+whose `:context` has no `agent_key` sends none. Anthropic's cache has no
+key: an entry serves every request in the workspace with the same
+prefix.
 
 **What breaks the prefix**, so the next step writes it again instead of
 reading it:

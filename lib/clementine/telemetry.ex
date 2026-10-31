@@ -307,6 +307,16 @@ defmodule Clementine.Telemetry do
   Spend is the `cost_micros` of `:stop` and `:exception` together; the
   trace prices both.
 
+  ### `[:clementine, :llm, :usage_clamped]`
+
+  Emitted when a provider reports an input total smaller than its own
+  cache reads plus writes. The usage recorded raises the total to their
+  sum; this event says a provider's convention differs from the one its
+  client assumes, which would otherwise undercount quietly.
+
+  - Measurements: `%{input_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer}` (as reported)
+  - Metadata: `%{provider: atom, model: String.t() | nil}`
+
   ## Tool Events
 
   ### `[:clementine, :tool, :start]`
@@ -490,6 +500,11 @@ defmodule Clementine.Telemetry do
       counter("clementine.llm.exception.duration",
         event_name: [:clementine, :llm, :exception],
         measurement: fn _measurements -> 1 end
+      ),
+      counter("clementine.llm.usage_clamped.count",
+        event_name: [:clementine, :llm, :usage_clamped],
+        measurement: fn _measurements -> 1 end,
+        tags: [:provider]
       ),
 
       # Tools

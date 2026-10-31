@@ -26,8 +26,11 @@ defmodule Clementine.LLM.CacheTest do
         gpt_5: [provider: :openai, id: "gpt-5"],
         gpt_5_6: [provider: :openai, id: "gpt-5.6-sol"],
         or_claude: [provider: :openrouter, id: "anthropic/claude-sonnet-5"],
+        or_claude_latest: [provider: :openrouter, id: "~anthropic/claude-sonnet-latest"],
         or_deepseek: [provider: :openrouter, id: "deepseek/deepseek-v3.2"],
+        or_gpt_5_6: [provider: :openrouter, id: "openai/gpt-5.6-sol"],
         bedrock: [provider: :bedrock, id: "openai.gpt-oss-120b-1:0"],
+        bedrock_gpt_5_6: [provider: :bedrock, id: "global.openai.gpt-5.6-sol"],
         vertex: [provider: :vertex, id: "deepseek-ai/deepseek-v3.2-maas"],
         vllm: [provider: :openai_compatible, base_url: "http://localhost:8000/v1", id: "qwen3"]
       )
@@ -38,8 +41,13 @@ defmodule Clementine.LLM.CacheTest do
       assert cache(:gpt_5) == %{enabled: true, ttl: nil, markers: false}
       assert cache(:gpt_5_6) == %{enabled: true, ttl: :thirty_minutes, markers: false}
       assert cache(:or_claude) == %{enabled: true, ttl: :five_minutes, markers: true}
+      assert cache(:or_claude_latest) == %{enabled: true, ttl: :five_minutes, markers: true}
       assert cache(:or_deepseek) == %{enabled: true, ttl: nil, markers: false}
+      # GPT-5.6 and later cache on their own wherever they run, and bill
+      # each write for 30 minutes.
+      assert cache(:or_gpt_5_6) == %{enabled: true, ttl: :thirty_minutes, markers: false}
       assert cache(:bedrock) == %{enabled: true, ttl: nil, markers: false}
+      assert cache(:bedrock_gpt_5_6) == %{enabled: true, ttl: :thirty_minutes, markers: false}
       assert cache(:vertex) == %{enabled: true, ttl: nil, markers: false}
       assert cache(:vllm) == %{enabled: true, ttl: nil, markers: false}
     end
@@ -87,6 +95,8 @@ defmodule Clementine.LLM.CacheTest do
              ":ttl needs cache_control markers"},
             {[provider: :openrouter, id: "deepseek/deepseek-v3.2", cache: [ttl: :one_hour]],
              ":ttl needs cache_control markers"},
+            {[provider: :bedrock, id: "openai.gpt-5.6-terra", cache: [ttl: :twelve_hours]],
+             ":ttl is not sent to OpenAI models on :bedrock"},
             {[provider: :anthropic, id: "claude-sonnet-5", cache: [ttl: "1h"]],
              "expected :ttl to be one of"},
             {[provider: :anthropic, id: "claude-sonnet-5", cache: [retention: :long]],
@@ -103,34 +113,55 @@ defmodule Clementine.LLM.CacheTest do
     end
   end
 
-  test "prompt_cache_options is documented for GPT-5.6 and later" do
+  test "prompt_cache_options is documented for GPT-5.6 and later, wherever it runs" do
     for id <- ["gpt-5.6-sol", "gpt-5.6", "gpt-5.10-mini", "gpt-6-astra", "gpt-6.1-terra"],
-        do: assert(Cache.prompt_cache_options?(id), id)
+        do: assert(Cache.prompt_cache_options?(:openai, id), id)
 
     for id <- ["gpt-5", "gpt-5.5-pro", "gpt-4.1", "o3", "o4-mini", "chatgpt-4o-latest"],
-        do: refute(Cache.prompt_cache_options?(id), id)
+        do: refute(Cache.prompt_cache_options?(:openai, id), id)
+
+    assert Cache.prompt_cache_options?(:openrouter, "openai/gpt-5.6-sol")
+    refute Cache.prompt_cache_options?(:openrouter, "openai/gpt-5.5")
+    refute Cache.prompt_cache_options?(:openrouter, "gpt-5.6-sol")
+    assert Cache.prompt_cache_options?(:bedrock, "openai.gpt-5.6-luna")
+    assert Cache.prompt_cache_options?(:bedrock, "us.openai.gpt-6-astra")
+    refute Cache.prompt_cache_options?(:bedrock, "openai.gpt-oss-120b-1:0")
+    refute Cache.prompt_cache_options?(:vertex, "gpt-5.6-sol")
+    refute Cache.prompt_cache_options?(:openai_compatible, "gpt-5.6-sol")
   end
 
   describe "key/1" do
-    test "keys a run by its agent and subject, so a thread's turns share one" do
-      turn = %{agent_key: "chat", subject_type: "conversation", subject_id: 42, run_id: "r1"}
-      next_turn = %{turn | run_id: "r2"}
+    test "keys a run by its agent and actor: one user's runs and threads share one" do
+      turn = %{
+        agent_key: "chat",
+        actor_type: "user",
+        actor_id: 42,
+        subject_type: "conversation",
+        subject_id: 7,
+        run_id: "r1"
+      }
 
       assert "clementine-" <> hash = Cache.key(turn)
       assert hash =~ ~r/\A[0-9a-f]{32}\z/
-      assert Cache.key(next_turn) == Cache.key(turn)
+      assert Cache.key(%{turn | run_id: "r2"}) == Cache.key(turn)
+      assert Cache.key(%{turn | subject_id: 8, run_id: "r3"}) == Cache.key(turn)
     end
 
-    test "tenants and agents never share a key, and no host id reaches the provider" do
-      turn = %{agent_key: "chat", subject_type: "conversation", subject_id: "c-42"}
+    test "users and agents never share a key, and no raw host id reaches the provider" do
+      turn = %{agent_key: "chat", actor_type: "user", actor_id: "u-42"}
 
-      refute Cache.key(%{turn | subject_id: "c-43"}) == Cache.key(turn)
+      refute Cache.key(%{turn | actor_id: "u-43"}) == Cache.key(turn)
       refute Cache.key(%{turn | agent_key: "triage"}) == Cache.key(turn)
-      refute Cache.key(turn) =~ "c-42"
+      refute Cache.key(turn) =~ "u-42"
       refute Cache.key(turn) =~ "chat"
     end
 
-    test "a run without a subject is keyed by its run; one with neither gets none" do
+    test "a run without an actor is keyed by its subject, then by its run" do
+      task = %{agent_key: "screen", actor_type: nil, actor_id: nil, subject_type: "lead"}
+
+      assert Cache.key(Map.put(task, :subject_id, 1)) == Cache.key(Map.put(task, :subject_id, 1))
+      refute Cache.key(Map.put(task, :subject_id, 1)) == Cache.key(Map.put(task, :subject_id, 2))
+
       assert "clementine-" <> _ = Cache.key(%{agent_key: "sweep", subject_id: nil, run_id: "r1"})
 
       refute Cache.key(%{agent_key: "sweep", run_id: "r1"}) ==
@@ -141,7 +172,7 @@ defmodule Clementine.LLM.CacheTest do
     end
   end
 
-  test "the engine sends the lane's key with every model call" do
+  test "the engine sends the run's key with every model call" do
     key = Cache.key(%{agent_key: "chat", subject_type: "conversation", subject_id: 7})
 
     expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, opts ->
@@ -209,12 +240,58 @@ defmodule Clementine.LLM.CacheTest do
              }
     end
 
-    test "parts never exceed their total" do
-      assert %{"input_tokens" => 1_000, "cache_read_tokens" => 1_000} =
+    test "a LiteLLM proxy's top-level Anthropic cache counts are the same parts" do
+      assert ProviderUsage.chat_completions(%{
+               "prompt_tokens" => 2_006,
+               "completion_tokens" => 300,
+               "prompt_tokens_details" => %{"cached_tokens" => 1_920},
+               "cache_creation_input_tokens" => 80
+             }) == %{
+               "input_tokens" => 2_006,
+               "cache_read_tokens" => 1_920,
+               "cache_write_tokens" => 80,
+               "output_tokens" => 300
+             }
+
+      assert %{"cache_read_tokens" => 500, "cache_write_tokens" => 0} =
                ProviderUsage.chat_completions(%{
-                 "prompt_tokens" => 24,
-                 "prompt_tokens_details" => %{"cached_tokens" => 1_000}
+                 "prompt_tokens" => 600,
+                 "cache_read_input_tokens" => 500,
+                 "cache_creation_input_tokens" => 0
                })
+    end
+
+    test "parts never exceed their total, and a clamp says so in telemetry" do
+      ref = make_ref()
+      test = self()
+
+      :telemetry.attach(
+        "usage-clamped-#{inspect(ref)}",
+        [:clementine, :llm, :usage_clamped],
+        fn _event, measurements, metadata, _config ->
+          send(test, {:clamped, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach("usage-clamped-#{inspect(ref)}") end)
+
+      assert %{"input_tokens" => 1_000, "cache_read_tokens" => 1_000} =
+               ProviderUsage.chat_completions(
+                 %{"prompt_tokens" => 24, "prompt_tokens_details" => %{"cached_tokens" => 1_000}},
+                 %{provider: :openai_compatible, model: "qwen3"}
+               )
+
+      assert_received {:clamped,
+                       %{input_tokens: 24, cache_read_tokens: 1_000, cache_write_tokens: 0},
+                       %{provider: :openai_compatible, model: "qwen3"}}
+
+      ProviderUsage.openai(%{
+        "input_tokens" => 900,
+        "input_tokens_details" => %{"cached_tokens" => 600, "cache_write_tokens" => 100}
+      })
+
+      refute_received {:clamped, _, _}
     end
   end
 
