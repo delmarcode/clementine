@@ -48,13 +48,15 @@ Tool `run/2` must return one of three shapes:
 
 Both `content` and `reason` must be strings.
 
-`Clementine.Tool.execute/2` validates those callback returns and normalizes
-successful results to `{:ok, %Clementine.ToolResult{}}` before telemetry, stream
-events, or message formatting see them. Malformed callback returns become
-`{:error, "Invalid tool result: ..."}` invocation failures.
+The `execute/2` that `use Clementine.Tool` generates validates those callback
+returns and normalizes successful results to `{:ok, %Clementine.ToolResult{}}`
+before telemetry, stream events, or message formatting see them. Malformed
+callback returns become `{:error, "Invalid tool result: ..."}` invocation
+failures.
 
-Success options other than `:is_error` are preserved as
-`ToolResult.metadata`; they do not affect LLM message formatting.
+Success options other than `:is_error` stay in the `ToolResult`'s `metadata`
+that `execute/2` returns. The engine drops them: the model, the run's events,
+and its trace see only the content and the error flag.
 
 ### When to use each form
 
@@ -78,7 +80,7 @@ Success options other than `:is_error` are preserved as
 
 ### How results flow to the LLM
 
-`ToolRunner.format_results/1` converts result tuples into explicit tool-result content variants:
+The engine runs each batch of calls through `Clementine.ToolRunner` and sends every result back to the model as a tool-result content block:
 
 ```elixir
 %Clementine.LLM.Message.Content.ToolResult{
@@ -88,7 +90,7 @@ Success options other than `:is_error` are preserved as
 }
 ```
 
-`ToolRunner.has_errors?/1` and `get_errors/1` treat both `{:error, _}` and `{:ok, _, is_error: true}` as errors. This means downstream code that checks for failures (retry logic, verifiers, event callbacks) will see command-level failures.
+`{:error, reason}` arrives as `"Error: reason"` with `is_error: true`. The run's `:tool_result` event carries the same content and flag, and its trace's `:tool_call` entry the same flag, so whatever watches a run sees a command-level failure as a failure too.
 
 ## Execution Metadata
 
@@ -249,7 +251,6 @@ The second argument to `run/2` is a context map. Available keys:
 | `:working_dir` | string | Working directory for the agent (resolve relative paths against this). In-process it defaults to the current directory; on the durable runtime it has no default, and the built-in tools refuse without one |
 | `:workspace_root` | string | Optional stricter root for the built-in filesystem tools, and the directory `Bash` starts in (its shell is not confined to it) |
 | `:capabilities` | map | Explicit built-in tool capabilities, e.g. `%{read: true, write: false, shell: false}` |
-| `:agent_pid` | pid | PID of the agent GenServer |
 
 On the durable runtime (`Clementine.Runs`) every tool also sees the run it serves:
 
@@ -266,9 +267,9 @@ On the durable runtime (`Clementine.Runs`) every tool also sees the run it serve
 
 On the durable runtime an agent adds keys for its tools through `agent/1`'s
 `tool_context:` (`Clementine.Agent.new(..., tool_context: %{working_dir: dir, capabilities: %{read: true}})`);
-the runtime's keys above are merged over it and always win. In-process you
-pass additional context keys when starting the agent or calling
-`ToolRunner.execute/4` directly.
+the runtime's keys above are merged over it and always win. In process the
+context is exactly what `Clementine.run/3` or `stream/3` received as
+`context:`; the agent's `tool_context:` applies only on the durable runtime.
 
 ### Built-in tool capabilities
 

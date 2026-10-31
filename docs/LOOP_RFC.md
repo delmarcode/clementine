@@ -1,5 +1,36 @@
 # RFC: Clementine Durable Loops
 
+> **A design record.** This RFC records the design of Clementine's
+> durable loops as adopted in July 2026 and proven on Meli (SKUNK-156),
+> with the per-tag rule added in October 2026 (OPS-143). Its account of
+> the behaviour, the step, the inbox, children, timers, cancellation, and
+> the failure matrix (the L rows, which are named tests) still describes
+> the loop core. How a loop is stored and driven changed in October 2026,
+> when loops moved into the durable runtime (OPS-139):
+>
+> - A loop is a row of `agent_runs` with `kind = 'loop'`, and its inbox
+>   is `agent_run_inbox`, both built by `Clementine.Migration` (version 3
+>   and later). `loop_module`, `loop_args`, `loop_scope`, and `tag_key`
+>   are now `agent_key` (the controller's `key:`), `input`, the lane, and
+>   `(tag_kind, tag_id)`.
+> - The Loop Host Contract (`Clementine.Loop.Host`), `Clementine.Loop.Ecto`,
+>   `Clementine.Loop.Protocol`, and the loop migration helpers are gone;
+>   the runtime implements the contract internally. Apps call
+>   `Clementine.Runs.start_loop/3` (insert-or-get on the lane), `send/3`,
+>   `cancel/1`, `child/2`, `pending/2`, and `inspect/1`.
+> - A controller says `use Clementine.Loop, key: ...` and is listed in the
+>   child spec's `agents:`. A tag is two-part, `{kind, id}`. A child is
+>   `{:run, tag, %{"agent" => key, "prompt" => ...}}`, built at its claim
+>   like any run (there is no `build_child/4`), and `{:cancel, tag}`
+>   cancels one.
+> - `Clementine.Thread` is the thread controller that ships with the
+>   runtime, in place of the thread agent under Worked Examples.
+>
+> The current docs are [Durable Loops](../guides/durable-loops.md),
+> [Loop Operations](../guides/loop-operations.md), and
+> [usage-rules.md](../usage-rules.md). Where this text and the code
+> disagree, the code wins.
+
 Status: adopted — validated against Meli (SKUNK-156, 2026-07-09); see
 the Adoption Report at the end of this document  
 Amended: `handle_upgrade/2` finalized and implemented (SKUNK-212,
