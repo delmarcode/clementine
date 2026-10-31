@@ -1,448 +1,369 @@
 # Clementine
 
-A simple, process-oriented agent framework for Elixir inspired by Claude Code's architecture.
+Clementine runs LLM agents in Elixir apps. An agent is data: a model,
+instructions, and tools in a `%Clementine.Agent{}` struct. Running one is
+a separate, explicit act, and one execution engine does it two ways: in
+process, for scripts, evals, and tests; and durably, on your app's
+Postgres and Oban, where a run is a row that outlives the process that
+started it. A durable run can wait days for a person's approval, is never
+left hanging when its node dies, and keeps a trace of what it did.
 
-## Philosophy
+## The shape
 
-**The best agent framework is barely a framework at all.**
+Agent work outlives the request that starts it: the browser disconnects,
+a deploy replaces the node, the approver answers tomorrow. So Clementine
+keeps what an agent is apart from executing it:
 
-Clementine rejects the over-abstraction of LangChain-style frameworks in favor of the pattern that actually works in production: a simple loop with tools.
+- **`Clementine.Agent`**: model, instructions, tools, limits. Inert data,
+  built once or per request.
+- **`Clementine.Rollout`**: one execution's spec, an agent with its input
+  and history. Executing it is the model–tool cycle: call the model, run
+  the tools it asks for, send back the results, until it answers or hits
+  a limit.
+- **`Clementine.Run`**: one durable attempt at a rollout. In an app, a row
+  in `agent_runs`.
+- **`Clementine.Runner`**: executes a run against a `Clementine.Lifecycle`,
+  the storage contract. It claims the run, heartbeats, parks it for
+  approval, and writes its end exactly once.
+- **`Clementine.Result`**: how a run ended. `Completed`, `Failed`,
+  `Cancelled`, or `Interrupted`, each with its token usage.
 
-```
-gather context → act → verify → repeat
-```
+No process holds an agent or a run: a run's state is its row. In an app,
+Clementine owns that table, the Oban worker, the reaper that ends a dead
+node's runs as `interrupted`, and the drain, which at shutdown requeues
+runs that haven't yet called an unsafe tool, so another node can run them
+cleanly, and ends the rest as `interrupted`. The app keeps its
+conversations in its own tables and answers a few questions in callbacks.
+There is no graph or chain DSL: what happens above a run is ordinary
+Elixir, or a durable loop (`Clementine.Loop`) when it must outlive a
+process.
 
-This is how Claude Code works. This is how humans work. This is how Clementine works.
+## Install
 
-## Installation
+Clementine is not on Hex. Depend on it from GitHub; `mix.lock` pins the
+commit:
 
-Add `clementine` to your list of dependencies in `mix.exs`:
-
+<!-- guide-sample: parse-only -->
 ```elixir
 def deps do
   [
-    {:clementine, "~> 0.1.0"}
+    {:clementine, github: "delmarcode/clementine"}
   ]
 end
 ```
 
-### Durable agents in a Phoenix app
-
-In a Phoenix app with Ecto and Oban, Clementine runs agents durably: it
-owns the `agent_runs` table, the Oban worker, the reaper, and the drain,
-and your app keeps a child spec, one migration, and its agent modules.
-Two generators write that glue. They need
-[Igniter](https://hexdocs.pm/igniter) as a dev dependency
-(`{:igniter, "~> 0.8", only: [:dev, :test]}`):
+It needs Elixir 1.19. The in-process path needs nothing more than an API
+key and a model alias in config (below). The durable runtime needs Ecto
+on Postgres and Oban 2.18 or later in the app, typically a Phoenix app.
+Two generators write its glue. They run on [Igniter](https://hexdocs.pm/igniter), so add
+`{:igniter, "~> 0.8", only: [:dev, :test]}` as well. With Oban installed
+(`mix igniter.install oban`):
 
 ```bash
-mix clementine.install            # dependency, config, child spec, migration, test case
+mix clementine.install            # the child, a migration, config, a test case
 mix ecto.migrate
 mix clementine.gen.agent Weather  # an agent, a tool, and a test that runs them
 ```
 
-Then `Clementine.Runs.start(MyApp.Agents.Weather, "Will it rain?")` starts a
-run that survives deploys and crashes. Running either task again changes
-nothing. [The Durable Runtime](guides/runtime.md) guide covers the API, the
-host callbacks, and moving from a runtime an older installer copied into
-the app. Coding agents in the app get the rules from
-[`usage-rules.md`](usage-rules.md), which the
-[`usage_rules`](https://hexdocs.pm/usage_rules) package gathers into an
-`AGENTS.md`.
+`mix clementine.install` writes:
 
-## Quick Start
+- `{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []}`
+  in the application's children, right after Oban;
+- a migration calling `Clementine.Migration.up(version: 4)`, which builds
+  `agent_runs`, the loop inbox `agent_run_inbox`, and the run trace
+  `agent_run_trace`;
+- config: an `agents` Oban queue, `anthropic_api_key: {:system,
+  "ANTHROPIC_API_KEY"}`, a `:claude_sonnet` model alias, and the `run_id`
+  logger metadata key;
+- `MyApp.Agents.LLMMock` as the model client in `config/test.exs`,
+  `MyApp.AgentsCase`, whose helpers script it in tests, and `mox`.
 
-### 1. Configure your API key(s)
+`mix clementine.gen.agent Weather` writes `MyApp.Agents.Weather`, a tool
+for it, and a test that runs the two end to end against the scripted
+model, and lists the agent in the child's `agents:`. Running either task
+again changes nothing. A table on an earlier version moves up with a new
+migration (`Clementine.Migration.up(from: 3, version: 4)`); the runtime
+refuses to start against a table behind it, and names the migration to
+write.
+
+## Quick start: in process
+
+Configure a key and a model alias:
 
 ```elixir
 # config/config.exs
-config :clementine,
-  anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
-  openai_api_key: {:system, "OPENAI_API_KEY"}
+config :clementine, anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}
+
+config :clementine, :models,
+  claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5"]
 ```
 
-### 2. Define an agent
-
-```elixir
-defmodule MyApp.CodingAgent do
-  use Clementine.Agent,
-    name: "coding_agent",
-    model: :claude_sonnet,
-    tools: [
-      Clementine.Tools.ReadFile,
-      Clementine.Tools.WriteFile,
-      Clementine.Tools.Bash
-    ],
-    system: """
-    You are an expert Elixir developer. You have access to the filesystem
-    and can run commands. Always verify your changes by running tests.
-    """
-end
-```
-
-### 3. Use it
-
-```elixir
-{:ok, agent} =
-  MyApp.CodingAgent.start_link(
-    working_dir: File.cwd!(),
-    context: %{capabilities: %{read: true, write: true, shell: true}}
-  )
-
-{:ok, result} = Clementine.run(agent, "Add a fibonacci function to lib/math.ex")
-```
-
-## Core Concepts
-
-### Tools
-
-Tools are functions the agent can call. They're defined with a simple macro:
+Write a tool, build an agent, and run it:
 
 ```elixir
 defmodule MyApp.Tools.Weather do
   use Clementine.Tool,
     name: "get_weather",
-    description: "Get the current weather for a location",
+    description: "Get the current weather for a city",
     parameters: [
-      location: [type: :string, required: true, description: "City name"]
+      city: [type: :string, required: true, description: "City name"]
     ]
 
   @impl true
-  def run(%{location: location}, _context) do
-    # Fetch weather...
-    {:ok, "72°F and sunny in #{location}"}
+  def run(%{city: city}, _context) do
+    {:ok, "Sunny and 22°C in #{city}"}
   end
 end
 ```
 
-**Tool results are always strings.** The LLM consumes text. Don't make it complicated.
-
-Tools can also return `{:ok, content, is_error: true}` to signal a command-level failure (like a non-zero exit code) while still delivering the output to the model. Use `{:error, reason}` only for invocation failures (timeouts, crashes, bad args). See `docs/TOOL_AUTHORING.md` for the full guide.
-
-Built-in filesystem and shell tools require explicit capabilities in the tool context:
-
-```elixir
-context: %{
-  capabilities: %{read: true, write: true, shell: false}
-}
-```
-
-Filesystem paths are scoped to the agent's `:working_dir` or `:workspace_root`; parent traversal and symlink escapes outside that root return an error. In-process the default root is the current directory; on the durable runtime (`Clementine.Runs`) there is none: the agent sets `working_dir` in `agent/1`'s `tool_context:`, and a built-in file or shell tool refuses without it.
-
-### Verifiers
-
-Verifiers are optional checks that run after the model returns a final response:
-
-```elixir
-defmodule MyApp.Verifiers.TestsPassing do
-  use Clementine.Verifier
-
-  @impl true
-  def verify(_result, context) do
-    case System.cmd("mix", ["test"], cd: context.working_dir) do
-      {_, 0} -> :ok
-      {output, _} -> {:retry, "Tests failed:\n#{output}"}
-    end
-  end
-end
-```
-
-When a verifier returns `{:retry, reason}`, the reason is fed back to the model and the loop continues.
-
-### Agents
-
-Agents are GenServers that run the agentic loop:
-
-```elixir
-defmodule MyApp.Agent do
-  use Clementine.Agent,
-    name: "my_agent",
-    model: :claude_sonnet,
-    tools: [MyApp.Tools.Weather],
-    verifiers: [MyApp.Verifiers.TestsPassing],
-    system: "You are a helpful assistant."
-end
-```
-
-## API
-
-### Running Tasks
-
-```elixir
-# Synchronous
-{:ok, result} = Clementine.run(agent, "What's the weather?")
-
-# Asynchronous
-{:ok, task_id} = Clementine.run_async(agent, "Long running task")
-{:ok, :running} = Clementine.status(agent, task_id)
-```
-
-### Streaming
-
-Stream a run's execution events as they happen. `Clementine.stream/3` takes an
-agent value and returns a lazy enumerable of `(epoch, seq)`-stamped
-`Clementine.Event` structs, ending with `{:result, result}` carrying the
-terminal `Clementine.Result`:
-
+<!-- guide-sample: run -->
 ```elixir
 agent =
   Clementine.Agent.new(
     model: :claude_sonnet,
-    instructions: "You have tools. Use them when asked. Be brief.",
-    tools: [Clementine.Tools.ListDir]
+    instructions: "You are a weather assistant. Be brief.",
+    tools: [MyApp.Tools.Weather]
   )
 
-Clementine.stream(agent, "What files are in the current directory?")
-|> Enum.each(fn
-  %Clementine.Event{type: :text_delta, payload: %{content: text}} ->
-    IO.write(text)
+{:ok, %Clementine.Result.Completed{} = result} =
+  Clementine.run(agent, "How's Lisbon today?")
 
-  %Clementine.Event{type: :tool_use_start, payload: %{name: name}} ->
-    IO.write("\n[calling #{name}...] ")
-
-  %Clementine.Event{type: :tool_result, payload: %{is_error: is_error}} ->
-    IO.puts(if is_error, do: "[tool error]", else: "[done]")
-
-  {:result, %Clementine.Result.Completed{}} ->
-    IO.puts("")
-
-  {:result, %Clementine.Result.Failed{error: error}} ->
-    IO.puts("\nrun failed: #{error.message}")
-
-  _ ->
-    :ok
-end)
+result.output
 ```
 
-The stream is caller-owned: consuming it runs the rollout, and abandoning it
-aborts the run. Event types are the closed taxonomy in `Clementine.Event`
-(`iteration_start`, `text_delta`, `tool_use_start`, `tool_input_delta`,
-`tool_result`, `approval_requested`, `usage_delta`, `error`). Advisory deltas —
-including `error` events — may precede the terminal `{:result, _}` element;
-the result is truth.
+`Clementine.run/3` executes the run in the calling process against an
+in-memory lifecycle: the same runner and limits as production, and no
+database. Any other ending comes back as `{:error, result}`, carrying the
+`Failed`, `Cancelled`, or `Interrupted` result. `Clementine.stream/3`
+yields the run's `Clementine.Event`s as they happen, then
+`{:result, result}`. A run in process cannot wait for an approval or for
+another agent, because waiting must outlive the process: an
+approval-gated tool raises here, and delegates are left out.
 
-`Clementine.AgentServer.stream/2` yields the same vocabulary for interactive
-agent processes and folds a completed turn into the agent's history.
+## Quick start: durable
 
-For production hosts that need conversations to survive deploys, pod exits, or
-client reconnects, keep durable run state in the host application and drive the
-runner from a host-owned worker. See
-[`docs/DURABLE_EXECUTION_RFC.md`](docs/DURABLE_EXECUTION_RFC.md) and
-[`docs/DURABLE_HOST_HARNESSES.md`](docs/DURABLE_HOST_HARNESSES.md).
-
-#### Streaming in Phoenix LiveView
+`mix clementine.gen.agent Weather` writes an agent module with a stable
+key, the string its run rows store:
 
 ```elixir
-defmodule MyAppWeb.ChatLive do
-  use MyAppWeb, :live_view
-
-  def handle_event("submit", %{"prompt" => prompt}, socket) do
-    pid = self()
-    agent = MyApp.Agents.assistant()   # a %Clementine.Agent{} value
-
-    Task.start(fn ->
-      Clementine.stream(agent, prompt)
-      |> Enum.each(fn
-        %Clementine.Event{type: :text_delta, payload: %{content: text}} ->
-          send(pid, {:stream, text})
-
-        %Clementine.Event{type: :tool_use_start, payload: %{name: name}} ->
-          send(pid, {:tool, name})
-
-        {:result, result} ->
-          send(pid, {:done, result})
-
-        _ ->
-          :ok
-      end)
-    end)
-
-    {:noreply, assign(socket, :streaming, true)}
-  end
-
-  def handle_info({:stream, text}, socket) do
-    {:noreply, update(socket, :response, &(&1 <> text))}
-  end
-
-  def handle_info({:tool, name}, socket) do
-    {:noreply, assign(socket, :current_tool, name)}
-  end
-
-  def handle_info({:done, %Clementine.Result.Completed{}}, socket) do
-    {:noreply, assign(socket, :streaming, false)}
-  end
-
-  def handle_info({:done, result}, socket) do
-    {:noreply, assign(socket, :streaming, false) |> assign(:error, inspect(result))}
-  end
+defmodule MyApp.Agents.Weather do
+  use Clementine.Agent,
+    key: "weather",
+    model: :claude_sonnet,
+    instructions: """
+    You are the weather agent. Use your tools to find what you need,
+    then answer in a few sentences.
+    """,
+    tools: [MyApp.Agents.Weather.Tools.Lookup],
+    defaults: [max_iterations: 10, max_duration: :timer.minutes(5)]
 end
 ```
 
-### Conversation Management
+With `ANTHROPIC_API_KEY` set, start the app (`iex -S mix`) and run it:
 
+<!-- guide-sample: parse-only -->
 ```elixir
-# Get history
-history = Clementine.get_history(agent)
+{:ok, run} = Clementine.Runs.start(MyApp.Agents.Weather, "Will it rain in Lisbon tomorrow?")
+run.status
+#=> "queued"
 
-# Clear history (start fresh)
-Clementine.clear_history(agent)
+# A worker runs it in the background. Once it has finished:
+Clementine.Runs.get(run.id)
+#=> %Clementine.Runs.AgentRun{status: "completed", result: %{"output" => "..."}, ...}
 
-# Fork (create new agent with same history)
-{:ok, forked} = Clementine.fork(agent, MyApp.Agent)
+Clementine.Runs.trace(run.id)   # its model calls and tool calls, oldest first
 ```
 
-## Built-in Tools
+`Runs.start/3` only enqueues: it inserts the run and its Oban job in one
+transaction and returns the run `"queued"`. A worker on any node picks
+it up, so `Runs.get/1` shows it `"running"`, then `"completed"` with the
+answer in `result["output"]`. `start/3` also takes `subject:` (what the
+run is about, `{"ticket", id}`), `actor:` (whose authority it acts with,
+`{"user", id}`), and `metadata:`. `Runs.cancel/1` stops a run on
+whichever node runs it.
 
-| Tool | Description |
-|------|-------------|
-| `Clementine.Tools.ReadFile` | Read file contents with optional line ranges |
-| `Clementine.Tools.WriteFile` | Write/create files |
-| `Clementine.Tools.ListDir` | List directory contents |
-| `Clementine.Tools.Bash` | Execute shell commands |
-| `Clementine.Tools.Search` | Grep-like content search |
+In tests, the generated test scripts the model with `expect_turn/1` and
+runs the job inline with
+`perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})`.
 
-## Configuration
+What a run means to the app goes in an optional host module,
+`Clementine.Host`, named in the child's `host:`. Every callback is
+optional:
+
+- `run_finished/2`, inside the transaction that ends a run: store what
+  it produced, or insert the Oban job that sends it on.
+- `run_committed/2`, once, after that transaction commits: broadcast the
+  end.
+- `run_transition/2`, after each other change commits (claimed,
+  suspended, resumed, requeued, cancel requested): update a status in
+  the UI.
+- `run_event/2`, for each event while the run executes, in a process of
+  its own: stream tokens to the UI.
+- `resolve_subject/2` and `resolve_actor/2`, at every claim: load what
+  the run is about and whom it acts for. A refusal cancels the run.
+- `authorize_resume/2` and `authorize_tool/3`: who may approve a waiting
+  run, and the tool policy (see Tools, below).
+
+[The Durable Runtime](guides/runtime.md) covers each one.
+
+## Conversations are threads
+
+A conversation is a thread. Its messages live in the app's tables, and
+each answer is a **turn**: a run whose subject is the thread. A turn
+agent says `turn: true` and reads the thread back in `history/1`. The
+host stores what each turn said in `run_finished/2`, which commits with
+the turn's end. `trace: :facts` keeps the turn's trace to names,
+arguments, and timing, since the app already holds the text.
 
 ```elixir
-# config/config.exs
-config :clementine,
-  anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
-  openai_api_key: {:system, "OPENAI_API_KEY"},
-  default_model: :claude_sonnet,
-  max_iterations: 10,
-  timeout: :timer.minutes(5),
-  retry: [
-    max_attempts: 3,
-    base_delay: 1000,
-    max_delay: 30_000
-  ]
+defmodule MyApp.Agents.Chat do
+  use Clementine.Agent,
+    key: "chat",
+    turn: true,
+    trace: :facts,
+    model: :claude_sonnet,
+    instructions: "You are a helpful assistant. Be brief."
 
+  @impl true
+  def history(run), do: MyApp.Chat.messages(run.subject_id)
+end
+```
+
+A thread holds one active turn: a second `Runs.start/3` on a busy thread
+returns `{:error, :active_run_exists}`. To answer every message, in
+order, give the thread a loop. `Clementine.Thread` is the controller that
+ships with the runtime. List it in `agents:` beside the turn agent, start
+one per conversation, and send it each message:
+
+<!-- guide-sample: parse-only -->
+```elixir
+{:ok, loop} =
+  Clementine.Runs.start_loop(Clementine.Thread, %{"agent" => "chat"},
+    subject: {"conversation", conversation.id},
+    actor: {"user", user.id}
+  )
+
+{:ok, :appended} =
+  Clementine.Runs.send(loop.id, %{"prompt" => content, "id" => message.id},
+    dedup_key: message.id
+  )
+```
+
+The thread:
+
+- starts one turn at a time, and queues the messages that arrive during
+  one;
+- with `"busy" => "interrupt"` in its args, cancels the running turn
+  instead and answers the new message;
+- keeps no transcript: the turn agent's `history/1` reads the thread
+  from your tables.
+
+To follow a message:
+
+<!-- guide-sample: parse-only -->
+```elixir
+Clementine.Runs.child(loop.id, {:turn, message.id})
+#=> {:ok, %Clementine.Runs.AgentRun{}} once its turn has started, {:error, :no_child} before
+
+Clementine.Thread.waiting(loop.id)
+#=> {:ok, ids}, the ids of the messages still queued, in the order the thread will answer them
+```
+
+In process there is no thread: pass the history yourself, as
+`Clementine.run(agent, prompt, messages: history)`.
+
+## Tools
+
+`use Clementine.Tool` turns a parameter list into the JSON Schema the
+model sees, and checks arguments before `run/2`. A tool returns text:
+`{:ok, content}`; `{:ok, content, is_error: true}` for a failure the
+model should see and react to, such as a non-zero exit; or
+`{:error, reason}` for a call that could not run. Its second argument is
+the context: in process, what `Clementine.run/3`'s `context:` passed; on
+the durable runtime, the run's `run_id`, `subject`, `actor`, and
+`metadata`, plus what the agent's `tool_context:` adds.
+
+Two declarations matter once runs are durable:
+
+- `approval: :required` parks the run before the call executes, until
+  `Clementine.Runs.resume(run.id, {:approved, meta})` runs it or
+  `{:denied, meta}` tells the model no. `approval: {:policy, term}` asks
+  the host's `authorize_tool/3` about each call instead, and it answers
+  `:allow`, `:require_approval`, or `{:deny, reason}`.
+- `retry: :safe` declares a tool free of external effects: running it
+  twice is as good as once, so a run that has called only safe tools
+  has not acted on the world, and a drain may still requeue it. Any
+  other tool counts as unsafe.
+
+The built-in tools, `Clementine.Tools.ReadFile`, `WriteFile`, `ListDir`,
+`Search`, and `Bash`, refuse unless the context grants their capability
+(`capabilities: %{read: true, write: false, shell: false}`). The four
+file tools stay inside the context's `working_dir`. `Bash` only starts
+there: it runs the model's command in an unrestricted shell, so grant
+`shell` only where a sandbox confines the process. On the durable
+runtime `working_dir` comes only from the agent's `tool_context:`. An
+agent with many tools lists
+the ones it rarely needs as `deferred:`, and on Anthropic models the
+model searches for them. [docs/TOOL_AUTHORING.md](docs/TOOL_AUTHORING.md)
+has the full contract.
+
+## What else it does
+
+| You want | Use | Read |
+| --- | --- | --- |
+| A person to approve a call, or a policy to decide | `approval:`, `authorize_tool/3`, `Runs.resume/2` | [Approvals & Suspension](guides/approvals.md) |
+| To see what a run did | `Clementine.Runs.trace/1`, `trace: :facts` | [The trace](guides/runtime.md#the-trace) |
+| Instructions and tools loaded only when a task needs them | `Clementine.Skill`, `skills:` | [Skills](guides/getting-started.md#skills) |
+| An agent that asks other agents and waits for their answers | `delegates:` | [Asking other agents](guides/runtime.md#asking-other-agents) |
+| More tools than a model chooses among well | `deferred:` | [Many tools](guides/getting-started.md#many-tools) |
+| An answer code reads, not text | `output_schema:` | [Structured output](guides/getting-started.md#structured-output) |
+| Who a run acts for, checked at every claim | `actor:`, `resolve_actor/2` | [Subject, actor, and the lane](guides/runtime.md#subject-actor-and-the-lane) |
+| A thread, a judge, or a watcher that lives for months | `Clementine.Thread`, `Clementine.Loop` | [Durable Loops](guides/durable-loops.md) |
+| To run loops at scale | telemetry, the loop doctor | [Loop Operations](guides/loop-operations.md) |
+| Live tokens and status in a UI | `run_event/2`, `run_transition/2`, `Clementine.RunView` | [The host module](guides/runtime.md#the-host-module), [Observing Runs](guides/observation.md) |
+| Your own run table and worker | `Clementine.Runner`, `Clementine.Lifecycle` | [Durable Execution](guides/durable-execution.md) |
+| To judge a result and try again | `Clementine.Verifier` in process, a loop when durable | [Verification](guides/getting-started.md#verification-is-outer-control), [the judge loop](guides/durable-loops.md#the-judge-loop) |
+| A conversation held in an IEx process | `Clementine.AgentServer` | its module docs |
+
+[Getting Started](guides/getting-started.md) is the place to begin
+reading. The design and its failure matrices are in
+[docs/DURABLE_EXECUTION_RFC.md](docs/DURABLE_EXECUTION_RFC.md) and
+[docs/LOOP_RFC.md](docs/LOOP_RFC.md).
+
+## Models and providers
+
+An agent names its model by an alias from config, or by a
+`{provider, id}` tuple such as `{:anthropic, "claude-opus-4-8"}`. There
+are no built-in aliases: `:claude_sonnet` resolves because config names
+it. An alias may carry output limits and provider-neutral reasoning:
+
+```elixir
 config :clementine, :models,
-  claude_sonnet: [
-    provider: :anthropic,
-    id: "claude-sonnet-5",
-    defaults: [max_tokens: 8192],
-    reasoning: [thinking: :adaptive, effort: :high]
-  ],
+  claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5"],
   claude_opus: [
     provider: :anthropic,
     id: "claude-opus-4-8",
-    defaults: [max_tokens: 8192]
+    defaults: [max_tokens: 16_000],
+    reasoning: [thinking: :adaptive, effort: :high]
   ],
-  gpt_5: [
-    provider: :openai,
-    id: "gpt-5",
-    defaults: [max_output_tokens: 4096],
-    reasoning: [effort: :medium]
-  ],
-  gpt_5_codex: [
-    provider: :openai,
-    id: "gpt-5-codex",
-    defaults: [max_output_tokens: 4096]
-  ],
-  deepseek: [
-    provider: :openrouter,
-    id: "deepseek/deepseek-v3.2",
-    reasoning: [effort: :high]
-  ],
-  qwen_bedrock: [
-    provider: :bedrock,
-    id: "qwen.qwen3-235b-a22b-2507-v1:0"
-  ],
-  glm_vertex: [
-    provider: :vertex,
-    id: "zai/glm-4.7-maas"
-  ],
-  qwen_finetune: [
-    provider: :openai_compatible,
-    base_url: "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
-    api_key: {:system, "TINKER_API_KEY"},
-    id: "tinker://my-run:train:0/sampler_weights/000080"
-  ]
+  gpt_5: [provider: :openai, id: "gpt-5", reasoning: :medium]
 ```
 
-The optional `reasoning:` key is provider-neutral: a bare effort level
-(`reasoning: :high`) works for every provider, and richer keyword forms map
-to each provider's own controls — `effort`/`summary` for OpenAI,
-`thinking`/`effort`/`budget_tokens`/`display` for Anthropic, the unified
-`reasoning` object for OpenRouter, and `reasoning_effort` for the other
-chat-completions providers. Configure one alias per reasoning level to run
-the same model id at several levels. See `Clementine.LLM.Reasoning` for the
-full mapping.
+`:anthropic` (the Messages API) and `:openai` (the Responses API) have
+clients of their own. `:openrouter`, `:bedrock`, `:vertex`, and
+`:openai_compatible` (vLLM, SGLang, Tinker, any server that speaks it)
+share one Chat Completions client. Keys are config too
+(`openai_api_key`, `openrouter_api_key`, ...). The catalog is checked at
+boot, so a typo fails startup, not a run.
+[docs/MODELS.md](docs/MODELS.md) has every key, a recipe per provider,
+and how to add a model or a provider.
 
-### Open models and fine-tunes
+## For coding agents
 
-Beyond the first-party Anthropic and OpenAI clients, four provider atoms
-route through a shared OpenAI-compatible Chat Completions client
-(`Clementine.LLM.ChatCompletions`) — the dialect every open-model and
-fine-tune serving lane speaks:
-
-- `provider: :openrouter` — DeepSeek, Qwen, GLM, and hundreds of other
-  models behind one key. Configure `openrouter_api_key`.
-- `provider: :bedrock` — Amazon Bedrock's Chat Completions endpoint with a
-  Bedrock API key (bearer token, no SigV4). Configure `bedrock_api_key`
-  and `bedrock_region` (or `bedrock_base_url`).
-- `provider: :vertex` — Google Vertex AI's OpenAI-compatible MaaS endpoint.
-  Configure `vertex_project`, `vertex_region` (or `vertex_base_url`), and
-  `vertex_access_token` — typically an MFA tuple like
-  `{MyApp.GcpAuth, :access_token, []}` since OAuth tokens are short-lived.
-- `provider: :openai_compatible` — anything else that speaks the dialect:
-  Tinker (Thinking Machines) checkpoint inference, Together, Fireworks, or
-  self-hosted vLLM/SGLang. Set `base_url:` (and optionally `api_key:`) per
-  model; `api_key` may be omitted for keyless local servers.
-
-You can also bypass aliases and pass provider model IDs directly:
-
-```elixir
-agent = Clementine.Agent.new(model: {:openai, "gpt-5"})
-{:ok, result} = Clementine.run(agent, "Hi")
-```
-
-See [docs/MODELS.md](docs/MODELS.md) for the full catalog reference:
-per-provider recipes, endpoint/credential configuration, the reasoning
-mapping table, and the checklist for adding any model or provider.
-
-## Why Clementine?
-
-### vs LangChain
-
-- **Simpler**: One loop pattern, not chains of abstractions
-- **Transparent**: Direct API calls, no middleware maze
-- **Elixir-native**: Built on OTP, not ported from Python
-
-### vs Building from Scratch
-
-- **Tool schema generation**: Define params in Elixir, get JSON Schema
-- **Verification built-in**: Retry on failure without custom logic
-- **Process isolation**: Tool crashes don't kill the agent
-- **Supervised execution**: OTP patterns for reliability
-
-## The Loop
-
-Every Clementine agent runs the same core loop:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                                                         │
-│   ┌─────────┐    ┌─────────┐    ┌─────────┐           │
-│   │ Gather  │───▶│   Act   │───▶│ Verify  │───┐       │
-│   │ Context │    │         │    │         │   │       │
-│   └─────────┘    └─────────┘    └─────────┘   │       │
-│        ▲                                       │       │
-│        └───────────────────────────────────────┘       │
-│                                                         │
-│                    until done                           │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Gather**: Tools fetch files, search, query APIs
-**Act**: LLM processes context, calls tools or returns response
-**Verify**: Verifiers check output, trigger retry if needed
-
-The loop continues until:
-- The model returns a final response (no tool calls) and verifiers pass
-- Max iterations reached
-- An unrecoverable error occurs
+[`usage-rules.md`](usage-rules.md) is the durable runtime's rules, short
+and decisive: the glue, which callback runs inside a transaction, and
+what never to do. The [`usage_rules`](https://hexdocs.pm/usage_rules)
+package gathers it into an app's `AGENTS.md`.
 
 ## License
 

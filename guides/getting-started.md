@@ -34,7 +34,7 @@ Add `clementine` to your dependencies:
 ```elixir
 def deps do
   [
-    {:clementine, "~> 0.1.0"}
+    {:clementine, github: "delmarcode/clementine"}
   ]
 end
 ```
