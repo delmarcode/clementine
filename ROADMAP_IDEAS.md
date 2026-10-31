@@ -42,8 +42,9 @@ ones so the provider's tool search chooses among them.
 ## Caching
 
 Provider prompt caching (Anthropic's `cache_control` on the system prompt
-and the tools), and perhaps cached results for tools declared
-`retry: :safe`.
+and the tools), and perhaps cached tool results. Those would need a
+declaration and an invalidation rule of their own: `retry: :safe` says a
+second call is harmless, not that it returns the same answer.
 
 ## Replay
 

@@ -32,7 +32,7 @@ If no name was provided, ask the user for one before proceeding.
    - Module name: `Clementine.Tools.<PascalCaseName>`, with a `@moduledoc`
    - `use Clementine.Tool` with `name`, `description`, `parameters`, and the `retry:` or `approval:` from step 1
    - Implement `run/2`, starting with `Clementine.ToolContext.require_capability(context, capability)`
-   - Resolve every path with `Clementine.ToolContext.resolve_path(path, context)`: it keeps the path inside the context's root, and on the durable runtime refuses when the agent's `tool_context:` set no `working_dir`
+   - Resolve every path with `Clementine.ToolContext.resolve_path(path, context)`: it keeps the path inside the context's root (`workspace_root`, else `working_dir`), and on the durable runtime refuses when the agent's `tool_context:` set neither
    - Return strings: `{:ok, content}`, `{:ok, content, is_error: true}`, or `{:error, reason}`
    - Follow the existing tools (`lib/clementine/tools/read_file.ex`, `lib/clementine/tools/bash.ex`)
 
