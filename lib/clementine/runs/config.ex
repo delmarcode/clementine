@@ -114,13 +114,17 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     defp check_model!(module, key) do
       if agent?(module) do
         with :ok <- Clementine.Agent.check_declared(module),
-             :ok <- credentials(module.__model__()) do
+             :ok <- credentials(declared_model(module)) do
           :ok
         else
           {:error, message} ->
             raise ArgumentError, "agent #{inspect(key)} (#{inspect(module)}): #{message}"
         end
       end
+    end
+
+    defp declared_model(module) do
+      if function_exported?(module, :__model__, 0), do: module.__model__()
     end
 
     # Only for the provider clients Clementine routes to; a test's mock

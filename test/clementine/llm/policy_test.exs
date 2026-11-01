@@ -191,6 +191,33 @@ defmodule Clementine.LLM.PolicyTest do
   end
 
   describe "what never errors" do
+    defmodule HandWritten do
+      # The behaviour by hand, without `use`: no __model__/0, no
+      # __policy__/0. Boot has nothing of its declared to check.
+      @behaviour Clementine.Agent
+
+      @impl true
+      def key, do: "policy_hand_written"
+
+      @impl true
+      def turn, do: false
+
+      @impl true
+      def agent(_run), do: Clementine.Agent.new(model: "claude-sonnet-5-5")
+
+      @impl true
+      def history(_run), do: []
+    end
+
+    test "an agent module written by hand, without use, boots" do
+      Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
+      assert %{agents: %{"policy_hand_written" => HandWritten}} = boot([HandWritten])
+      assert :ok = Clementine.Agent.check_declared(HandWritten)
+
+      assert %Clementine.Agent{model: "claude-sonnet-5-5"} =
+               Clementine.Agent.declared!(HandWritten, HandWritten.agent(nil))
+    end
+
     test "a deprecated model, and one whose dates have passed, resolve" do
       # gpt-5 shuts down 2026-12-11; Haiku 4.5 is past its
       # retire-not-before date of 2026-10-15; Sonnet 4.5 is deprecated.

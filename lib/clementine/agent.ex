@@ -525,8 +525,7 @@ defmodule Clementine.Agent do
   # the run as unstartable.
   @spec declared!(module(), t()) :: t()
   def declared!(module, %__MODULE__{} = agent) do
-    declared = if function_exported?(module, :__policy__, 0), do: module.__policy__(), else: []
-    model = if function_exported?(module, :__model__, 0), do: module.__model__()
+    {model, declared} = declared(module)
 
     agent =
       Enum.reduce(declared, %{agent | model: agent.model || model}, fn {key, value}, agent ->
@@ -547,16 +546,24 @@ defmodule Clementine.Agent do
   # the app's config, as boot does for every agent in `agents:`.
   @spec check_declared(module()) :: :ok | {:error, String.t()}
   def check_declared(module) do
-    case module.__model__() do
-      nil ->
+    case declared(module) do
+      {nil, _policy} ->
         :ok
 
-      model ->
-        case Clementine.LLM.Policy.resolve(model, module.__policy__()) do
+      {model, policy} ->
+        case Clementine.LLM.Policy.resolve(model, policy) do
           {:ok, _policy} -> :ok
           {:error, message} -> {:error, message}
         end
     end
+  end
+
+  # What a module's `use` declares: its model and its choices. A module
+  # that implements the behaviour by hand declares neither.
+  defp declared(module) do
+    model = if function_exported?(module, :__model__, 0), do: module.__model__()
+    policy = if function_exported?(module, :__policy__, 0), do: module.__policy__(), else: []
+    {model, policy}
   end
 
   # An agent without a model is one the runtime completes from its
