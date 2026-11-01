@@ -509,13 +509,15 @@ defmodule Clementine.LLM.Message do
     Represents an assistant message.
 
     `binding` is set on a turn from a model that binds its thinking to
-    the conversation before it (Claude Fable 5.1, Opus 5.5, Sonnet 5.5,
-    Haiku 5.5, and later): a digest of the system prompt, tools, and
-    messages the turn was produced after, as Clementine sent them. When
-    the turn is replayed, Clementine sends its thinking blocks only if
-    the same digest still holds, so an edited history costs that
-    reasoning instead of failing the request. Store it with the message
-    (`Clementine.LLM.Message.to_map/1` does); it is nil everywhere else.
+    the conversation before it (Claude Fable 5.1, Mythos 5.1, Opus 5.5,
+    Sonnet 5.5, Haiku 5.5, and later): a digest of the system prompt,
+    tools, and messages the turn was produced after, as Clementine sent
+    them. When the turn is replayed to such a model, Clementine sends its
+    thinking blocks only if the same digest still holds, so an edited
+    history costs that reasoning instead of failing the request; a turn
+    without a binding is sent without its thinking. Store it with the
+    message (`Clementine.LLM.Message.to_map/1` does); it is nil
+    everywhere else.
     """
 
     @type t :: %__MODULE__{
@@ -609,9 +611,15 @@ defmodule Clementine.LLM.Message do
     and its tools are offered as ordinary tools.
 
     The engine records one after a skill load's result, naming the skill
-    in `skill` (`Clementine.Skill`). The API takes one only after a user
-    message (a prompt or tool results) and before the model's answer:
-    store it with the turn that returned it, and replay it where it was.
+    in `skill` (`Clementine.Skill`), with tool definitions and no text.
+    The API takes one only after a user message (a prompt or tool
+    results) and before the model's answer: store it with the turn that
+    returned it, replay it where it was, and keep it out of what people
+    see. Text in a system message right after tool results is a weak
+    channel on Claude Sonnet 5.5 and Haiku 5.5, which can treat it as
+    untrusted tool output and ignore it (Anthropic's mid-conversation
+    system messages doc); put an instruction that must hold in the
+    system prompt or after a user's own words.
     """
 
     @type t :: %__MODULE__{

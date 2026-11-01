@@ -242,7 +242,9 @@ without a budget, a budget with adaptive thinking, display or
 `prefix_mismatch` without adaptive or enabled thinking, anything beside
 `between_tools`) are rejected at boot. `between_tools` is Claude Sonnet
 5.5's lowest setting, at effort `high` or below; `display: :updates`
-returns the text 5.5-generation models write between tool calls. On
+returns the progress updates Claude Fable 5.1, Mythos 5.1, Opus 5.5,
+Sonnet 5.5, and Fable 5 write between tool calls (Haiku 5.5 writes
+none). On
 models that bind their thinking, see the runtime guide's
 [Models that bind their thinking](../guides/runtime.md#models-that-bind-their-thinking). Whether a *specific model* accepts a
 specific value (`budget_tokens` on adaptive-only Claude models, `effort`

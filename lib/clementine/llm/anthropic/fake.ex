@@ -1,14 +1,17 @@
 defmodule Clementine.LLM.Anthropic.Fake do
   @moduledoc """
-  A scripted Anthropic model for tests, which checks a replayed history
-  the way the Messages API does on models that bind their thinking.
+  A scripted Anthropic model for tests, which fails a turn whose request
+  lost an earlier turn's thinking, and checks a replayed history the way
+  the Messages API does on models that bind their thinking.
 
-  Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and later models
-  accept a thinking block only after the exact system prompt, tools, and
-  messages it was produced after, and only in the order its conversation
-  produced it. Use this fake in the model mock's expectation, and a test
-  fails on any edit the API would refuse: a rebuilt system prompt, a
-  changed tool list, a trimmed or reordered history.
+  Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and
+  later models accept a thinking block only after the exact system
+  prompt, tools, and messages it was produced after. Clementine checks
+  that before it sends (`Clementine.LLM.Message.AssistantMessage`'s
+  `binding`) and sends a turn without its thinking once the history
+  before it changed, so the API never refuses what an app replays: the
+  app loses the model's reasoning and its prompt cache instead, without
+  an error. This fake is how a test sees that loss.
 
       Mox.expect(MyApp.LLMMock, :stream, fn model, system, messages, tools, opts ->
         Clementine.LLM.Anthropic.Fake.stream(model, system, messages, tools, opts, [
@@ -18,15 +21,26 @@ defmodule Clementine.LLM.Anthropic.Fake do
         ])
       end)
 
-  It builds the request with `Clementine.LLM.Anthropic`'s own encoder,
-  so it sees what the API would: Clementine's own handling of an edited
-  history included (see the guide's "Models that bind their thinking").
-  Each thinking block it returns carries a signature that records the
-  conversation before it; a later request that replays the block after
-  that conversation changed gets the API's 400 as an
-  `{:error, {:api_error, 400, body}}` event, or, when the request sets
-  `prefix_mismatch: :drop_block`, the block and every later one dropped.
-  On a model that does not bind its thinking nothing is checked.
+  It builds the request with `Clementine.LLM.Anthropic`'s own encoder.
+  By default (`strict: true`, the last argument's option) a request that
+  sends any earlier turn without its thinking fails with a 400, as
+  `{:error, {:api_error, 400, body}}`, naming the first such message:
+  a rebuilt system prompt, a changed tool list, a history replayed in
+  another order than the model saw it, a moved window, a turn stored
+  without its `binding`. Store a thread's turns as each test turn
+  returns them and replay them unchanged, and the fake passes.
+
+  `strict: false` lets Clementine's drops through, for a test of a
+  deliberate change (a window's step, new instructions). The fake then
+  checks what the API does: each thinking block it returned carries a
+  signature recording the conversation before it, and a request that
+  replays a block after that conversation (a block moved into another
+  thread, say) gets the API's 400, or, when the request sets
+  `prefix_mismatch: :drop_block`, the block and every later one
+  dropped. Either way the fake refuses a mid-conversation system message
+  the API would: one that does not follow a user message, or that a
+  user message follows. On a model that does not bind its thinking,
+  only the system messages are checked.
 
   A script is a list of steps, answered in order:
 
@@ -39,9 +53,7 @@ defmodule Clementine.LLM.Anthropic.Fake do
   - `{:tool_use, id, name, input}`: a tool call.
 
   The turn ends on `"tool_use"` when it calls a tool and `"end_turn"`
-  otherwise. The fake also refuses a mid-conversation system message the
-  API would: one that does not follow a user message, or that a user
-  message follows.
+  otherwise.
   """
 
   alias Clementine.LLM.Anthropic
@@ -56,45 +68,61 @@ defmodule Clementine.LLM.Anthropic.Fake do
           | {:tool_use, String.t(), String.t(), map()}
 
   @doc """
-  The stream events of one scripted turn, or a one-event stream carrying
-  the API's 400 when the request replays thinking the API would refuse.
-  Takes the arguments the mock's `stream/5` receives, then the script.
+  The stream events of one scripted turn, or a stream that ends in a 400
+  when the request lost an earlier turn's thinking (`strict: true`, the
+  default) or replays thinking the API would refuse. Takes
+  the arguments the mock's `stream/5` receives, then the script, then
+  the fake's options: `strict:`.
   """
-  @spec stream(term(), String.t() | nil, list(), list(), keyword(), [step()]) :: list()
-  def stream(model, system, messages, tools, opts, script) when is_list(script) do
-    {body, binding} = Anthropic.request(model, system, messages, tools || [], opts)
+  @spec stream(term(), String.t() | nil, list(), list(), keyword(), [step()], keyword()) ::
+          list()
+  def stream(model, system, messages, tools, opts, script, fake_opts \\ [])
+      when is_list(script) do
+    {body, binding, dropped} = Anthropic.request(model, system, messages, tools || [], opts)
 
-    case checked(body) do
-      {:ok, body} ->
-        binding_events(binding) ++ turn(body, script)
-
-      {:error, error} ->
-        [{:error, error}]
+    # The client reports what it dropped before the API answers, so the
+    # engine's telemetry sees a drop the strict check then refuses.
+    case checked(body, dropped, fake_opts) do
+      {:ok, body} -> Binding.events(binding, dropped) ++ turn(body, script)
+      {:error, error} -> Binding.events(nil, dropped) ++ [{:error, error}]
     end
   end
 
   @doc """
-  Checks the request a turn would send, as the API would: `:ok`, or the
-  API's 400 as `{:error, {:api_error, 400, body}}`.
+  Checks the request a turn would send, as `stream/7` does: `:ok`, or
+  the 400 as `{:error, {:api_error, 400, body}}`.
   """
-  @spec check(term(), String.t() | nil, list(), list(), keyword()) ::
+  @spec check(term(), String.t() | nil, list(), list(), keyword(), keyword()) ::
           :ok | {:error, {:api_error, 400, map()}}
-  def check(model, system, messages, tools, opts \\ []) do
-    {body, _binding} = Anthropic.request(model, system, messages, tools || [], opts)
+  def check(model, system, messages, tools, opts \\ [], fake_opts \\ []) do
+    {body, _binding, dropped} = Anthropic.request(model, system, messages, tools || [], opts)
 
-    with {:ok, _body} <- checked(body), do: :ok
+    with {:ok, _body} <- checked(body, dropped, fake_opts), do: :ok
   end
-
-  defp binding_events(nil), do: []
-  defp binding_events(binding), do: [{:binding, binding}]
 
   ## The check
 
-  defp checked(body) do
-    with :ok <- check_system_messages(body["messages"]) do
+  defp checked(body, dropped, fake_opts) do
+    fake_opts = Keyword.validate!(fake_opts, strict: true)
+
+    with :ok <- check_dropped(dropped, fake_opts[:strict]),
+         :ok <- check_system_messages(body["messages"]) do
       if Binding.binds?(body["model"]), do: check_thinking(body), else: {:ok, body}
     end
   end
+
+  defp check_dropped(%{turns: turns, blocks: blocks, first_index: index}, true) do
+    refuse(
+      "messages.#{index}: Clementine sent this turn without its thinking, and " <>
+        "#{turns} earlier turn(s) in all (#{blocks} thinking block(s)): the history " <>
+        "before it is not the one it was produced after (a changed system prompt or " <>
+        "tool list, a reordered or trimmed history, or a turn stored without its " <>
+        "binding). Replay the thread as the model saw it, or pass strict: false to " <>
+        "Clementine.LLM.Anthropic.Fake where a test changes it on purpose."
+    )
+  end
+
+  defp check_dropped(_dropped, _strict), do: :ok
 
   # Consecutive system messages are judged together (the API's
   # mid-conversation system messages doc): a run of them must follow a
@@ -250,7 +278,7 @@ defmodule Clementine.LLM.Anthropic.Fake do
 
     {[
        {:content_block_start, index, :thinking},
-       {:thinking_delta, shown},
+       {:thinking_delta, index, shown},
        {:signature_delta, signature},
        {:content_block_stop, index}
      ], signature}

@@ -23,12 +23,15 @@ defmodule Clementine.Event do
   Payload fields are non-final; the identity envelope and the
   execution/transition split are decided.
 
-  `:thinking_delta` carries the text of a thinking block as it streams
-  (`%{content: text}`), only when the block has text to show: a progress
-  update a 5.5-generation model writes between tool calls under
-  `display: :updates` or `thinking: :between_tools`, or a reasoning
-  summary under `display: :summarized` (`Clementine.LLM.Reasoning`).
-  The same text is stored with the turn, in its thinking blocks.
+  `:thinking_delta` carries the text of a thinking block as it streams,
+  as `%{index: n, content: text}`, only when the block has text to
+  show: a progress update a model writes between tool calls (Claude
+  Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5) under `display: :updates`
+  or `thinking: :between_tools`, or a reasoning summary under `display:
+  :summarized` (`Clementine.LLM.Reasoning`). `index` is the block's place
+  in the model's turn: each update is a block of its own, so a new index
+  starts a new update. The same text is stored with the turn, in its
+  thinking blocks.
   """
 
   @types [

@@ -1120,10 +1120,23 @@ defmodule Clementine.Rollout do
 
   # Thinking with text to show: a progress update between tool calls, or
   # a reasoning summary. Empty deltas (omitted display) are not events.
-  defp forward_stream_event(_exec, {:thinking_delta, ""}), do: :ok
+  # The block's index tells one update from the next.
+  defp forward_stream_event(_exec, {:thinking_delta, _index, ""}), do: :ok
 
-  defp forward_stream_event(exec, {:thinking_delta, text}),
-    do: emit_event(exec, :thinking_delta, %{content: text})
+  defp forward_stream_event(exec, {:thinking_delta, index, text}),
+    do: emit_event(exec, :thinking_delta, %{index: index, content: text})
+
+  # The client sent earlier turns without their thinking: the history
+  # before them changed since they were produced.
+  defp forward_stream_event(exec, {:thinking_dropped, dropped}) do
+    :telemetry.execute(
+      [:clementine, :llm, :thinking_dropped],
+      %{turns: dropped.turns, blocks: dropped.blocks},
+      Map.merge(identity(exec), %{first_index: dropped.first_index, iteration: exec.iteration})
+    )
+
+    Clementine.LLM.Anthropic.Binding.log_dropped(dropped, exec.agent_key || "An agent")
+  end
 
   defp forward_stream_event(exec, {:tool_use_start, id, name}),
     do: emit_event(exec, :tool_use_start, %{tool_use_id: id, name: name})

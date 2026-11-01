@@ -2,15 +2,19 @@ defmodule Clementine.LLM.AnthropicBindingTest do
   @moduledoc """
   A thread on a model that binds its thinking to the conversation before
   it (Claude Sonnet 5.5 here), run turn by turn in process against
-  `Clementine.LLM.Anthropic.Fake`, which refuses what the API refuses:
-  an unchanged thread replays its thinking; a changed system prompt, a
-  changed tool list, and a window that moves cost the earlier turns'
-  thinking once and are never refused; a skill load keeps the tool list
-  as the first request sent it; and the text Sonnet 5.5 writes between
-  tool calls reaches the events and the stored turn.
+  `Clementine.LLM.Anthropic.Fake`, which refuses what the API refuses
+  and, strict, any turn Clementine sent without its thinking: an
+  unchanged thread replays its thinking; a changed system prompt, a
+  changed tool list, a reordered history, and a window that moves cost
+  the earlier turns' thinking once, are never refused by the API, and
+  are reported; a skill load keeps the tool list as the first request
+  sent it; and the text Sonnet 5.5 writes between tool calls reaches
+  the events and the stored turn.
   """
 
   use ExUnit.Case, async: false
+
+  @moduletag :capture_log
 
   import Mox
 
@@ -67,13 +71,13 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
   # One turn: each script answers one model call, through the fake. The
   # requests are sent to the test process as the mock receives them.
-  defp turn(agent, history, prompt, scripts) do
+  defp turn(agent, history, prompt, scripts, fake_opts \\ []) do
     test = self()
 
     for script <- scripts do
       expect(Clementine.LLM.MockClient, :stream, fn model, system, messages, tools, opts ->
         send(test, {:request, {model, system, messages, tools, opts}})
-        Fake.stream(model, system, messages, tools, opts, script)
+        Fake.stream(model, system, messages, tools, opts, script, fake_opts)
       end)
     end
 
@@ -86,9 +90,42 @@ defmodule Clementine.LLM.AnthropicBindingTest do
     end
   end
 
-  defp turn!(agent, history, prompt, scripts) do
-    {:ok, thread} = turn(agent, history, prompt, scripts)
+  defp turn!(agent, history, prompt, scripts, fake_opts \\ []) do
+    {:ok, thread} = turn(agent, history, prompt, scripts, fake_opts)
     thread
+  end
+
+  @lenient [strict: false]
+
+  defp unbound(thread) do
+    Enum.map(thread, fn
+      %AssistantMessage{} = message -> %{message | binding: nil}
+      message -> message
+    end)
+  end
+
+  defp flush_dropped do
+    receive do
+      {:thinking_dropped, _measurements, _metadata} -> flush_dropped()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp attach_dropped do
+    test = self()
+    id = make_ref()
+
+    :telemetry.attach(
+      id,
+      [:clementine, :llm, :thinking_dropped],
+      fn _event, measurements, metadata, _config ->
+        send(test, {:thinking_dropped, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
   end
 
   defp answer(text), do: [[{:thinking, "Thinking it over."}, {:text, text}]]
@@ -103,7 +140,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
   # The thinking blocks the last request sent, as the API saw them.
   defp sent_thinking do
     {model, system, messages, tools, opts} = last_request()
-    {body, _binding} = Anthropic.request(model, system, messages, tools, opts)
+    {body, _binding, _dropped} = Anthropic.request(model, system, messages, tools, opts)
 
     for message <- body["messages"],
         is_list(message["content"]),
@@ -125,7 +162,27 @@ defmodule Clementine.LLM.AnthropicBindingTest do
     end
   end
 
-  describe "binds?/1" do
+  describe "which models bind" do
+    test "an id Clementine cannot read is checked, and its system messages fold" do
+      assert Binding.model("my-sonnet-deployment") == :unknown
+      assert Binding.binds?("my-sonnet-deployment")
+      refute Binding.inline_system?("my-sonnet-deployment")
+      assert Binding.inline_system?("claude-sonnet-5-5")
+
+      system =
+        SystemMessage.new([%Content.ToolAddition{definition: %{"name" => "safe_echo"}}],
+          skill: "notes"
+        )
+
+      messages = [UserMessage.new("Hi"), system]
+      model = {:anthropic, "my-sonnet-deployment"}
+      {body, binding, nil} = Anthropic.request(model, "Be brief.", messages, [Echo], [])
+
+      assert is_binary(binding)
+      assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
+      refute Enum.any?(body["messages"], &(&1["role"] == "system"))
+    end
+
     test "the 5.1-and-later models bind; the ones before them do not" do
       for id <- ~w(claude-fable-5-1 claude-mythos-5-1 claude-opus-5-5 claude-sonnet-5-5
                    claude-haiku-5-5 claude-opus-6 claude-opus-5-5-20261101) do
@@ -164,16 +221,27 @@ defmodule Clementine.LLM.AnthropicBindingTest do
     end
 
     test "a changed system prompt costs the earlier thinking once, and is never refused" do
+      attach_dropped()
       thread = turn!(agent(), [], "Echo one.", tool_then_answer("one"))
 
-      flush_requests()
+      # The strict fake fails the turn that lost the thinking.
       changed = agent(instructions: "Be brief. The user is on mobile.")
-      thread = turn!(changed, thread, "Hi.", answer("Hi."))
-      assert sent_thinking() == []
+      assert {:error, %Result.Failed{error: error}} = turn(changed, thread, "Hi.", answer("Hi."))
+      assert inspect(error) =~ "messages.1: Clementine sent this turn without its thinking"
 
       flush_requests()
+      thread = turn!(changed, thread, "Hi.", answer("Hi."), @lenient)
+      assert sent_thinking() == []
+
+      # Reported once, with counts and where it starts, never content.
+      assert_received {:thinking_dropped, %{turns: 2, blocks: 2},
+                       %{first_index: 1, model: "claude-sonnet-5-5", provider: :anthropic}}
+
+      flush_requests()
+      flush_dropped()
       _thread = turn!(changed, thread, "Hi again.", answer("Hi again."))
       assert [_turn_two_thinking] = sent_thinking()
+      refute_received {:thinking_dropped, _, _}
     end
 
     test "a changed tool list costs the earlier thinking once, and is never refused" do
@@ -181,7 +249,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
       flush_requests()
       deployed = agent(tools: [Echo, SafeEcho])
-      thread = turn!(deployed, thread, "Hi.", answer("Hi."))
+      thread = turn!(deployed, thread, "Hi.", answer("Hi."), @lenient)
       assert sent_thinking() == []
 
       flush_requests()
@@ -189,12 +257,47 @@ defmodule Clementine.LLM.AnthropicBindingTest do
       assert [_turn_two_thinking] = sent_thinking()
     end
 
+    test "a history replayed out of order fails the strict fake, which the API would take" do
+      attach_dropped()
+      one = turn!(agent(), [], "One.", answer("1"))
+      two = turn!(agent(), one, "Two.", answer("2"))
+      [u1, a1, u2, a2] = two
+
+      # Sorted by when rows were written, as a queued message is: the
+      # prompts first, then the replies.
+      reordered = [u1, u2, a1, a2]
+
+      assert {:error, %Result.Failed{error: error}} =
+               turn(agent(), reordered, "Three.", answer("3"))
+
+      assert inspect(error) =~ "messages.2: Clementine sent this turn without its thinking"
+      assert_received {:thinking_dropped, %{turns: 2, blocks: 2}, %{first_index: 2}}
+
+      # The API takes it, as Clementine sends it, and the reasoning is gone.
+      flush_requests()
+      _thread = turn!(agent(), reordered, "Three.", answer("3"), @lenient)
+      assert sent_thinking() == []
+    end
+
+    test "a turn without its binding is sent without its thinking" do
+      thread = turn!(agent(), [], "Echo one.", tool_then_answer("one"))
+
+      assert {:error, %Result.Failed{error: error}} =
+               turn(agent(), unbound(thread), "Hi.", answer("Hi."))
+
+      assert inspect(error) =~ "messages.1: Clementine sent this turn without its thinking"
+
+      flush_requests()
+      _thread = turn!(agent(), unbound(thread), "Hi.", answer("Hi."), @lenient)
+      assert sent_thinking() == []
+    end
+
     test "a stepped window keeps the thinking after each cut until the next one" do
       thread =
         Enum.reduce(1..6, [], fn n, thread ->
           flush_requests()
 
-          turn!(agent(), History.window(thread, max: 8), "Turn #{n}.", answer("#{n}"))
+          turn!(agent(), History.window(thread, max: 8), "Turn #{n}.", answer("#{n}"), @lenient)
           |> then(&(thread ++ Enum.drop(&1, length(History.window(thread, max: 8)))))
         end)
 
@@ -209,43 +312,32 @@ defmodule Clementine.LLM.AnthropicBindingTest do
       assert length(sent_thinking()) >= 1
     end
 
-    test "the fake refuses an edit Clementine cannot see" do
-      thread = turn!(agent(), [], "Echo one.", tool_then_answer("one"))
+    test "the fake refuses thinking moved into another conversation, as the API does" do
+      one = turn!(agent(), [], "Echo one.", tool_then_answer("one"))
+      two = turn!(agent(), [], "Echo two.", tool_then_answer("two"))
 
-      # The host dropped the bindings and rebuilt the system prompt: the
-      # thinking goes out as stored, and the API's check refuses it.
-      unbound =
-        Enum.map(thread, fn
-          %AssistantMessage{} = message -> %{message | binding: nil}
-          message -> message
-        end)
-
-      changed = agent(instructions: "Something else.")
+      # Thread two's last turn with thread one's thinking: its binding
+      # holds, so Clementine sends it, and its signature says where it
+      # came from.
+      %AssistantMessage{content: [thinking | _]} = List.last(one)
+      %AssistantMessage{content: [_ | rest]} = last = List.last(two)
+      spliced = List.replace_at(two, -1, %{last | content: [thinking | rest]})
 
       assert {:error, %Result.Failed{error: error}} =
-               turn(changed, unbound, "Hi.", [[{:text, "Hi."}]])
+               turn(agent(), spliced, "Hi.", [[{:text, "Hi."}]], @lenient)
 
       assert inspect(error) =~ "bound to a different conversation"
-    end
 
-    test "prefix_mismatch: :drop_block lets the API drop what it refuses" do
+      # prefix_mismatch: :drop_block lets the API drop what it refuses.
       model = {:anthropic, "claude-sonnet-5-5"}
-      thread = turn!(agent(), [], "Echo one.", tool_then_answer("one"))
-
-      unbound =
-        Enum.map(thread, fn
-          %AssistantMessage{} = message -> %{message | binding: nil}
-          message -> message
-        end)
-
       opts = [reasoning: [thinking: :adaptive, prefix_mismatch: :drop_block]]
-      assert :ok = Fake.check(model, "Changed.", unbound, [Echo], opts)
+      assert :ok = Fake.check(model, "Be brief.", spliced, [Echo], opts)
 
-      {body, _binding} = Anthropic.request(model, "Changed.", unbound, [Echo], opts)
+      {body, _binding, nil} = Anthropic.request(model, "Be brief.", spliced, [Echo], opts)
       assert body["thinking"]["block_binding"] == %{"prefix_mismatch_behavior" => "drop_block"}
       assert "thinking-binding-controls-2026-08-01" in Anthropic.betas(body)
 
-      assert {:error, {:api_error, 400, _}} = Fake.check(model, "Changed.", unbound, [Echo], [])
+      assert {:error, {:api_error, 400, _}} = Fake.check(model, "Be brief.", spliced, [Echo], [])
     end
   end
 
@@ -266,7 +358,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
       assert [%{"name" => "safe_echo"}] = SystemMessage.tool_definitions(system)
 
       {model, system_prompt, messages, tools, opts} = last_request()
-      {body, _binding} = Anthropic.request(model, system_prompt, messages, tools, opts)
+      {body, _binding, _dropped} = Anthropic.request(model, system_prompt, messages, tools, opts)
       assert Enum.map(body["tools"], & &1["name"]) |> Enum.sort() == ["echo", "use_skill"]
       assert Enum.any?(body["messages"], &(&1["role"] == "system"))
       assert "inline-tools-2026-09-15" in Anthropic.betas(body)
@@ -283,6 +375,41 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
       # Turn one's three calls, then this turn's first: nothing dropped.
       assert length(sent_thinking()) == 4
+    end
+
+    test "a turn of thinking only after a skill's system message stays valid once stale" do
+      agent = agent(skills: [Notes])
+
+      # The model ends its turn on thinking alone, right after the load.
+      thread =
+        turn!(agent, [], "Load notes.", [
+          [{:thinking, "Load."}, {:tool_use, "toolu_1", "use_skill", %{"name" => "notes"}}],
+          [{:thinking, "Nothing to say."}]
+        ])
+
+      assert [_, _, _, %SystemMessage{}, %AssistantMessage{content: [%Content.Thinking{}]}] =
+               thread
+
+      # New instructions void that thinking. Sent without it the turn
+      # would be empty, and a system message the next prompt follows is
+      # refused: it goes as "(no reply)" instead.
+      changed = agent(instructions: "Be brief. The user is on mobile.", skills: [Notes])
+      flush_requests()
+      thread = turn!(changed, thread, "Hi.", answer("Hi."), @lenient)
+
+      {model, system, messages, tools, opts} = last_request()
+      {body, _binding, _dropped} = Anthropic.request(model, system, messages, tools, opts)
+
+      assert [%{"role" => "system"}, %{"role" => "assistant", "content" => stand_in}, _prompt] =
+               Enum.slice(body["messages"], 3, 3)
+
+      assert stand_in == [%{"type" => "text", "text" => "(no reply)"}]
+
+      # The stand-in is the same every time, so the turn after it keeps
+      # its thinking, and the strict fake passes.
+      flush_requests()
+      _thread = turn!(changed, thread, "Hi again.", answer("Hi again."))
+      assert [_turn_two_thinking] = sent_thinking()
     end
 
     test "two skills loaded in one batch add their tools in consecutive system messages" do
@@ -316,7 +443,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
         )
 
       messages = [UserMessage.new("Hi"), system]
-      {body, nil} = Anthropic.request(:sonnet_5, "Be brief.", messages, [Echo, SafeEcho], [])
+      {body, nil, nil} = Anthropic.request(:sonnet_5, "Be brief.", messages, [Echo, SafeEcho], [])
 
       assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
       refute Enum.any?(body["messages"], &(&1["role"] == "system"))
@@ -344,8 +471,12 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
       output = Clementine.stream(agent(model: :sonnet_55_updates), "Find it.") |> Enum.to_list()
 
-      assert ["Looking it up."] =
-               for(%Event{type: :thinking_delta, payload: %{content: text}} <- output, do: text)
+      # The update's block index, so a client tells one update from the next.
+      assert [{1, "Looking it up."}] =
+               for(
+                 %Event{type: :thinking_delta, payload: %{index: index, content: text}} <- output,
+                 do: {index, text}
+               )
 
       assert {:result, %Result.Completed{messages: [%AssistantMessage{content: content} | _]}} =
                List.last(output)
@@ -354,7 +485,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
                content
 
       {model, system, messages, tools, opts} = last_request()
-      {body, _binding} = Anthropic.request(model, system, messages, tools, opts)
+      {body, _binding, _dropped} = Anthropic.request(model, system, messages, tools, opts)
       assert body["thinking"] == %{"type" => "adaptive", "display" => "updates"}
       assert "thinking-display-updates-2026-08-18" in Anthropic.betas(body)
     end
@@ -373,7 +504,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
                end)
 
       {model, system, messages, tools, opts} = last_request()
-      {body, _binding} = Anthropic.request(model, system, messages, tools, opts)
+      {body, _binding, _dropped} = Anthropic.request(model, system, messages, tools, opts)
       assert body["thinking"] == %{"type" => "between_tools"}
       assert Anthropic.betas(body) == []
     end

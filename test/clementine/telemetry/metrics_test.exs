@@ -181,6 +181,31 @@ defmodule Clementine.Telemetry.MetricsTest do
     expect_turn(text_events("Exited."))
     assert {:ok, _} = Clementine.run(agent, "Crash", in_process)
 
+    # A history whose turn was produced after another conversation: on a
+    # model that binds its thinking, the call sends it without it.
+    binding_agent = Clementine.Agent.new(model: {:anthropic, "claude-sonnet-5-5"})
+
+    stale = [
+      Clementine.LLM.Message.UserMessage.new("Earlier."),
+      %Clementine.LLM.Message.AssistantMessage{
+        content: [
+          Clementine.LLM.Message.Content.thinking("", "sig"),
+          Clementine.LLM.Message.Content.text("Hello.")
+        ],
+        binding: "another-conversation"
+      }
+    ]
+
+    expect(Clementine.LLM.MockClient, :stream, fn model, system, messages, tools, opts ->
+      Clementine.LLM.Anthropic.Fake.stream(model, system, messages, tools, opts, [{:text, "Hi."}],
+        strict: false
+      )
+    end)
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      assert {:ok, _} = Clementine.run(binding_agent, "Hi", [messages: stale] ++ in_process)
+    end)
+
     garbled = %{"summary" => "Chest pain.</summary>\n<parameter name=\"tier\">urgent"}
     expect_turn(tool_events("tu_g", "record_verdict", garbled))
 
@@ -333,6 +358,10 @@ defmodule Clementine.Telemetry.MetricsTest do
 
     assert {Map.merge(in_process, %{kind: :error, error_kind: :rollout}), 1} in sum_by(
              series(exports, "clementine_rollout_exceptions_total")
+           )
+
+    assert {%{in_process | model: "claude-sonnet-5-5", alias: ""}, 1} in sum_by(
+             series(exports, "clementine_llm_thinking_dropped_total")
            )
 
     # The agent's id labels nothing.

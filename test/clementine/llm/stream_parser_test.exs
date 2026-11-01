@@ -74,7 +74,7 @@ defmodule Clementine.LLM.StreamParserTest do
         data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me reason"}}
         """)
 
-      assert [{:thinking_delta, "Let me reason"}] = thinking_events
+      assert [{:thinking_delta, 0, "Let me reason"}] = thinking_events
 
       signature_events =
         parse_one("""
@@ -575,8 +575,8 @@ defmodule Clementine.LLM.StreamParserTest do
       response =
         Accumulator.new()
         |> Accumulator.process({:content_block_start, 0, :thinking})
-        |> Accumulator.process({:thinking_delta, "Let me "})
-        |> Accumulator.process({:thinking_delta, "reason."})
+        |> Accumulator.process({:thinking_delta, 0, "Let me "})
+        |> Accumulator.process({:thinking_delta, 0, "reason."})
         |> Accumulator.process({:signature_delta, "sig"})
         |> Accumulator.process({:signature_delta, "123"})
         |> Accumulator.process({:content_block_stop, 0})
@@ -597,7 +597,7 @@ defmodule Clementine.LLM.StreamParserTest do
       response =
         Accumulator.new()
         |> Accumulator.process({:content_block_start, 0, :thinking})
-        |> Accumulator.process({:thinking_delta, "first"})
+        |> Accumulator.process({:thinking_delta, 0, "first"})
         |> Accumulator.process({:signature_delta, "sig_a"})
         |> Accumulator.process({:content_block_stop, 0})
         |> Accumulator.process({:redacted_thinking, "opaque123"})
@@ -620,13 +620,13 @@ defmodule Clementine.LLM.StreamParserTest do
       response =
         Accumulator.new()
         |> Accumulator.process({:content_block_start, 0, :thinking})
-        |> Accumulator.process({:thinking_delta, "first"})
+        |> Accumulator.process({:thinking_delta, 0, "first"})
         |> Accumulator.process({:content_block_stop, 0})
         |> Accumulator.process({:content_block_start, 1, :text})
         |> Accumulator.process({:text_delta, "Before."})
         |> Accumulator.process({:content_block_stop, 1})
         |> Accumulator.process({:content_block_start, 2, :thinking})
-        |> Accumulator.process({:thinking_delta, "second"})
+        |> Accumulator.process({:thinking_delta, 2, "second"})
         |> Accumulator.process({:content_block_stop, 2})
         |> Accumulator.process({:content_block_start, 3, :text})
         |> Accumulator.process({:text_delta, "After."})
