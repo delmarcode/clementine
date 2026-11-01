@@ -137,6 +137,10 @@ defmodule Clementine.MixProject do
       # `oban.install`. Nothing from it runs in production.
       {:igniter, "~> 0.8.4", optional: true},
       {:mox, "~> 1.1", only: :test},
+      # The metric list exported through PromEx's two stores, Core and
+      # Peep, at the versions Meli runs (test/clementine/telemetry/).
+      {:prom_ex, "1.11.0", only: :test},
+      {:peep, "~> 3.5.0", only: :test},
       {:bypass, "~> 2.1", only: :test},
       {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}

@@ -124,7 +124,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
               execute_built(config, row, run, authorize_tool, executor_id)
 
             {:error, reason} ->
-              cancel_unstartable(row.id, reason)
+              cancel_unstartable(row, reason)
           end
       end
     end
@@ -325,12 +325,18 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       if Keyword.has_key?(defaults, :max_duration), do: [], else: [max_duration: @max_duration]
     end
 
-    defp cancel_unstartable(run_id, reason) do
+    defp cancel_unstartable(%AgentRun{} = row, reason) do
       detail = if is_binary(reason), do: reason, else: inspect(reason)
 
       # String keys keep the stored reason readable as JSON.
       _ =
-        Protocol.request_cancel(Lifecycle, run_id, %{"code" => "unstartable", "detail" => detail})
+        Protocol.request_cancel(
+          Lifecycle,
+          row.id,
+          %{"code" => "unstartable", "detail" => detail},
+          nil,
+          agent_key: row.agent_key
+        )
 
       {:unstartable, reason}
     end
