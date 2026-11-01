@@ -164,6 +164,11 @@ defmodule Clementine.LLM.Anthropic do
     sleeper.(ms)
   end
 
+  @doc false
+  # The wait before the attempt after `attempt`, as a retry sleeps it:
+  # `Clementine.LLM.Anthropic.Fake` retries a scripted 429 or 529 here.
+  def retry_wait(attempt), do: retry_sleep(calculate_backoff(attempt))
+
   @doc """
   Makes a streaming call to the Anthropic API.
 

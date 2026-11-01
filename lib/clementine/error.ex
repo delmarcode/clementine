@@ -29,14 +29,83 @@ defmodule Clementine.Error do
 
   @max_body_message 200
 
+  # The stop reasons a final answer may not end on, as the provider
+  # clients normalize them. A refusal: Anthropic's "refusal" (its safety
+  # classifiers stopped the answer), OpenAI's refusal content, and
+  # OpenAI's content filter. A cut-off answer: max_tokens (OpenAI's
+  # max_output_tokens), Anthropic's context window, and an OpenAI
+  # response that ended incomplete for another reason.
+  @refused ~w(refusal content_filter)
+  @truncated ~w(max_tokens model_context_window_exceeded incomplete)
+
+  # The error types Anthropic's stream sends in an `error` event, after
+  # the 200 that started it: the statuses' codes, by type.
+  @stream_error_types %{
+    "overloaded_error" => {:overloaded, true},
+    "rate_limit_error" => {:rate_limited, true},
+    "api_error" => {:provider_unavailable, true},
+    "timeout_error" => {:timeout, true},
+    "invalid_request_error" => {:invalid_request, false},
+    "request_too_large" => {:invalid_request, false},
+    "authentication_error" => {:auth, false},
+    "permission_error" => {:auth, false},
+    "not_found_error" => {:not_found, false}
+  }
+
+  @doc """
+  The error a final turn's stop reason makes of its run, or `nil` for a
+  turn that ended as the model meant it to (`"end_turn"`,
+  `"stop_sequence"`, or a stream that named no reason).
+
+  A run whose final turn the provider refused fails `:refused`:
+  Anthropic's `"refusal"`, OpenAI's refusal content (`"refusal"` too),
+  and an OpenAI content filter's `"content_filter"`. A run whose final
+  answer was cut off fails `:truncated`: `"max_tokens"` (OpenAI's
+  `max_output_tokens` too), `"model_context_window_exceeded"`, and
+  `"incomplete"`. Both are `kind: :rollout` and not retryable: the same
+  request mostly gets the same answer. `raw` is
+  `%{"stop_reason" => reason}`.
+  """
+  @spec stopped(String.t() | nil) :: t() | nil
+  def stopped(reason) when reason in @refused, do: stopped(:refused, reason)
+  def stopped(reason) when reason in @truncated, do: stopped(:truncated, reason)
+  def stopped(_reason), do: nil
+
+  defp stopped(code, reason) do
+    %__MODULE__{
+      kind: :rollout,
+      code: code,
+      message: stop_message(reason),
+      retryable?: false,
+      raw: %{"stop_reason" => reason}
+    }
+  end
+
+  defp stop_message("refusal"), do: "The model refused to answer (stop_reason: refusal)."
+
+  defp stop_message("content_filter"),
+    do: "The provider's content filter stopped the answer (stop_reason: content_filter)."
+
+  defp stop_message("max_tokens"),
+    do: "The model's answer was cut off at max_tokens (stop_reason: max_tokens)."
+
+  defp stop_message("model_context_window_exceeded"),
+    do:
+      "The model's answer was cut off at its context window " <>
+        "(stop_reason: model_context_window_exceeded)."
+
+  defp stop_message("incomplete"),
+    do: "The provider ended the answer incomplete (stop_reason: incomplete)."
+
   @doc """
   Normalizes any error reason the engine can produce.
 
   Accepts the provider-boundary shapes (`{:api_error, status, body}`,
-  `{:request_failed, reason}`, `{:llm_exception, info}`), engine atoms
-  (`:max_iterations_reached`), and passes an existing `%Clementine.Error{}`
-  through unchanged. Anything unrecognized becomes a non-retryable
-  `:unknown` — never a crash.
+  `{:request_failed, reason}`, `{:llm_exception, info}`), the error event
+  Anthropic's stream sends mid-turn (`%{"type" => "overloaded_error",
+  "message" => ...}`), engine atoms (`:max_iterations_reached`), and
+  passes an existing `%Clementine.Error{}` through unchanged. Anything
+  unrecognized becomes a non-retryable `:unknown` — never a crash.
   """
   @spec normalize(term(), :anthropic | :openai | nil) :: t()
   def normalize(reason, provider \\ nil)
@@ -75,6 +144,19 @@ defmodule Clementine.Error do
       message: llm_exception_message(info),
       retryable?: false,
       raw: {:llm_exception, info}
+    }
+  end
+
+  def normalize(%{"type" => type} = event, provider) when is_map_key(@stream_error_types, type) do
+    {code, retryable?} = Map.fetch!(@stream_error_types, type)
+
+    %__MODULE__{
+      kind: :provider,
+      code: code,
+      provider: provider,
+      message: stream_error_message(event),
+      retryable?: retryable?,
+      raw: event
     }
   end
 
@@ -162,6 +244,11 @@ defmodule Clementine.Error do
   end
 
   defp api_message(_body, status), do: "HTTP #{status}"
+
+  defp stream_error_message(%{"type" => type, "message" => message}) when is_binary(message),
+    do: "#{type} mid-stream: #{message}"
+
+  defp stream_error_message(%{"type" => type}), do: "#{type} mid-stream"
 
   defp llm_exception_message(%{message: message}) when is_binary(message), do: message
   defp llm_exception_message(info), do: inspect(info)

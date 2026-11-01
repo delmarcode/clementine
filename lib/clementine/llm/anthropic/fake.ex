@@ -37,10 +37,11 @@ defmodule Clementine.LLM.Anthropic.Fake do
   replays a block after that conversation (a block moved into another
   thread, say) gets the API's 400, or, when the request sets
   `prefix_mismatch: :drop_block`, the block and every later one
-  dropped. Either way the fake refuses a mid-conversation system message
-  the API would: one that does not follow a user message, or that a
-  user message follows. On a model that does not bind its thinking,
-  only the system messages are checked.
+  dropped. Either way the fake refuses what the API refuses in any
+  history: a mid-conversation system message that does not follow a
+  user message, or that a user message follows; an empty text block;
+  and an empty message anywhere but last. On a model that does not bind
+  its thinking, only those are checked.
 
   A script is a list of steps, answered in order:
 
@@ -51,40 +52,106 @@ defmodule Clementine.LLM.Anthropic.Fake do
     `thinking: :between_tools`; under the default display it is empty.
   - `{:text, text}`: answer text.
   - `{:tool_use, id, name, input}`: a tool call.
+  - `{:error, type}`: an `error` event mid-stream, after the steps
+    before it, as the API sends one after its 200 (`"overloaded_error"`,
+    `"api_error"`, ...; or the event's whole map). The turn ends there,
+    with no stop reason, and the run fails with the error
+    `Clementine.Error.normalize/2` makes of it (`:overloaded`, ...),
+    charged for the input the stream's start reported. No step may
+    follow it.
 
   The turn ends on `"tool_use"` when it calls a tool and `"end_turn"`
-  otherwise.
+  otherwise. The fake's options (the last argument) script the rest of
+  the turn:
+
+  - `stop_reason:` the turn's stop reason, any the API sends:
+    `"refusal"` (the run fails `:refused`, and runs none of the turn's
+    tools), `"max_tokens"` (a final turn fails `:truncated`),
+    `"pause_turn"` (the engine sends the turn back, and the next
+    scripted turn continues it), `"model_context_window_exceeded"`.
+  - `usage:` the usage the turn reports, in the API's keys:
+    `input_tokens` (the uncached input), `output_tokens`,
+    `cache_read_input_tokens`, `cache_creation_input_tokens`, and
+    `cache_creation` (`%{ephemeral_5m_input_tokens: n,
+    ephemeral_1h_input_tokens: m}`, whose sum is the cache write when
+    `cache_creation_input_tokens` is left out). The keys given replace
+    the default's, 10 input and 5 output tokens. It reaches the engine
+    as the client normalizes it, the input counting the cache's reads
+    and writes, so `[:clementine, :llm, :usage]`, the token and cost
+    series, and the trace see what a real response's would. The stream
+    starts with the input, as the API's does, so a turn a stream error
+    ends is charged for it.
+  - `api_errors:` the HTTP statuses the request meets before the turn
+    answers it, in order, as the client meets them: it retries a `429`
+    or a `529` after `:retry`'s backoff, through the `:retry_sleep`
+    seam, until `:retry`'s `max_attempts` attempts are spent; any other
+    status, or the attempt that spends them, ends the turn with the
+    error the client gives up with, `{:error, {:api_error, status,
+    body}}` (`:rate_limited`, `:overloaded`, ...). `api_errors: [529]`
+    answers after one retry; `[529, 529, 529]` fails under the default
+    three attempts.
+  - `strict:` as above.
+
+      expect_claude_turn([{:text, "Sunny."}],
+        usage: [input_tokens: 40, cache_read_input_tokens: 900],
+        stop_reason: "max_tokens"
+      )
   """
 
-  alias Clementine.LLM.Anthropic
+  alias Clementine.LLM.{Anthropic, ProviderUsage}
   alias Clementine.LLM.Anthropic.Binding
 
   @prefix "clementine-fake."
+
+  @default_usage %{"input_tokens" => 10, "output_tokens" => 5}
+  @usage_keys ~w(input_tokens output_tokens cache_read_input_tokens cache_creation_input_tokens
+                 cache_creation)
+  @cache_creation_keys ~w(ephemeral_5m_input_tokens ephemeral_1h_input_tokens)
+
+  # What the API answers each status with, as the error's type and message.
+  @api_errors %{
+    400 => {"invalid_request_error", "Invalid request"},
+    401 => {"authentication_error", "invalid x-api-key"},
+    403 => {"permission_error", "Permission denied"},
+    404 => {"not_found_error", "Not found"},
+    413 => {"request_too_large", "Request exceeds the maximum allowed size"},
+    429 => {"rate_limit_error", "Rate limited"},
+    500 => {"api_error", "Internal server error"},
+    529 => {"overloaded_error", "Overloaded"}
+  }
 
   @type step ::
           {:thinking, String.t()}
           | {:update, String.t()}
           | {:text, String.t()}
           | {:tool_use, String.t(), String.t(), map()}
+          | {:error, String.t() | map()}
 
   @doc """
-  The stream events of one scripted turn, or a stream that ends in a 400
-  when the request lost an earlier turn's thinking (`strict: true`, the
-  default) or replays thinking the API would refuse. Takes
-  the arguments the mock's `stream/5` receives, then the script, then
-  the fake's options: `strict:`.
+  The stream events of one scripted turn, or a stream that ends in an
+  error: an HTTP error `api_errors:` scripts, or a 400 when the request
+  lost an earlier turn's thinking (`strict: true`, the default) or
+  sends what the API would refuse. Takes the arguments the mock's
+  `stream/5` receives, then the script, then the fake's options:
+  `strict:`, `stop_reason:`, `usage:`, `api_errors:`.
   """
   @spec stream(term(), String.t() | nil, list(), list(), keyword(), [step()], keyword()) ::
           list()
   def stream(model, system, messages, tools, opts, script, fake_opts \\ [])
       when is_list(script) do
+    fake_opts =
+      Keyword.validate!(fake_opts, strict: true, stop_reason: nil, usage: [], api_errors: [])
+
     {body, binding, dropped} = Anthropic.request(model, system, messages, tools || [], opts)
 
     # The client reports what it dropped before the API answers, so the
     # engine's telemetry sees a drop the strict check then refuses.
-    case checked(body, dropped, fake_opts) do
-      {:ok, body} -> Binding.events(binding, dropped) ++ turn(body, script)
-      {:error, error} -> Binding.events(nil, dropped) ++ [{:error, error}]
+    with :ok <- answered(fake_opts[:api_errors]),
+         {:ok, body} <- checked(body, dropped, fake_opts[:strict]) do
+      Binding.events(binding, dropped) ++ turn(body, script, fake_opts)
+    else
+      {:error, {:api_error, _status, _body} = error} ->
+        Binding.events(nil, dropped) ++ [{:error, error}]
     end
   end
 
@@ -95,20 +162,85 @@ defmodule Clementine.LLM.Anthropic.Fake do
   @spec check(term(), String.t() | nil, list(), list(), keyword(), keyword()) ::
           :ok | {:error, {:api_error, 400, map()}}
   def check(model, system, messages, tools, opts \\ [], fake_opts \\ []) do
+    fake_opts = Keyword.validate!(fake_opts, strict: true)
     {body, _binding, dropped} = Anthropic.request(model, system, messages, tools || [], opts)
 
-    with {:ok, _body} <- checked(body, dropped, fake_opts), do: :ok
+    with {:ok, _body} <- checked(body, dropped, fake_opts[:strict]), do: :ok
+  end
+
+  ## HTTP errors before the answer
+
+  # The attempts the client makes, each meeting the next scripted status:
+  # a 429 or a 529 it retries after its backoff while attempts remain;
+  # anything else ends the turn with the error it gives up with.
+  defp answered(statuses) do
+    max_attempts = Keyword.get(Application.get_env(:clementine, :retry, []), :max_attempts, 3)
+
+    statuses
+    |> Enum.with_index(1)
+    |> Enum.reduce_while(:ok, fn {status, attempt}, :ok ->
+      if status in [429, 529] and attempt < max_attempts do
+        Anthropic.retry_wait(attempt)
+        {:cont, :ok}
+      else
+        {:halt, {:error, {:api_error, status, api_error_body(status)}}}
+      end
+    end)
+  end
+
+  # The body as the client keeps it: the response's raw JSON.
+  defp api_error_body(status) when is_integer(status) and status in 400..599 do
+    {type, message} = Map.get(@api_errors, status, {"api_error", "HTTP #{status}"})
+    Jason.encode!(%{"type" => "error", "error" => %{"type" => type, "message" => message}})
+  end
+
+  defp api_error_body(status) do
+    raise ArgumentError,
+          "api_errors: takes HTTP error statuses (400..599), got: #{inspect(status)}"
   end
 
   ## The check
 
-  defp checked(body, dropped, fake_opts) do
-    fake_opts = Keyword.validate!(fake_opts, strict: true)
-
-    with :ok <- check_dropped(dropped, fake_opts[:strict]),
-         :ok <- check_system_messages(body["messages"]) do
+  defp checked(body, dropped, strict?) do
+    with :ok <- check_dropped(dropped, strict?),
+         :ok <- check_system_messages(body["messages"]),
+         :ok <- check_content(body["messages"]) do
       if Binding.binds?(body["model"]), do: check_thinking(body), else: {:ok, body}
     end
+  end
+
+  # The API refuses an empty text block anywhere in the history, and an
+  # empty message anywhere but last, where only an assistant's may be
+  # empty.
+  defp check_content(messages) do
+    last = length(messages) - 1
+
+    messages
+    |> Enum.with_index()
+    |> Enum.find_value(:ok, fn {message, index} ->
+      empty_text = &match?(%{"type" => "text", "text" => ""}, &1)
+
+      case message["content"] do
+        empty when empty in ["", []] ->
+          unless index == last and message["role"] == "assistant" do
+            refuse(
+              "messages.#{index}: all messages must have non-empty content except for " <>
+                "the optional final assistant message"
+            )
+          end
+
+        blocks when is_list(blocks) ->
+          if position = Enum.find_index(blocks, empty_text) do
+            refuse(
+              "messages.#{index}.content.#{position}.text: text content blocks must be " <>
+                "non-empty"
+            )
+          end
+
+        _text ->
+          nil
+      end
+    end)
   end
 
   defp check_dropped(%{turns: turns, blocks: blocks, first_index: index}, true) do
@@ -245,24 +377,112 @@ defmodule Clementine.LLM.Anthropic.Fake do
 
   ## The turn
 
-  defp turn(body, script) do
+  # The stream as the client hands it to the engine: its start with the
+  # input the request burned, the steps' blocks, then the stop and the
+  # whole usage, or a mid-stream error in its place. Usage leaves
+  # normalized, as the client's parser leaves it.
+  defp turn(body, script, fake_opts) do
     display = display(body)
     request = without_continuation(body["messages"])
     digest = Enum.reduce(request, start(body), &chain(&2, &1))
     previous = last_signature(body["messages"])
+    {steps, error} = until_error(script)
+    usage = usage(fake_opts[:usage])
 
     {events, _state} =
-      script
+      steps
       |> Enum.with_index()
       |> Enum.flat_map_reduce(previous, fn {step, index}, previous ->
         step_events(step, index, digest, previous, display)
       end)
 
-    stop =
-      if Enum.any?(script, &match?({:tool_use, _, _, _}, &1)), do: "tool_use", else: "end_turn"
+    started =
+      {:message_start,
+       %{
+         "type" => "message",
+         "role" => "assistant",
+         "model" => body["model"],
+         "usage" => ProviderUsage.anthropic(Map.delete(usage, "output_tokens"))
+       }}
 
-    events ++
-      [{:message_delta, %{"stop_reason" => stop}, %{"input_tokens" => 10, "output_tokens" => 5}}]
+    ending =
+      case error do
+        nil ->
+          {:message_delta, %{"stop_reason" => fake_opts[:stop_reason] || stop_reason(steps)},
+           ProviderUsage.anthropic(usage)}
+
+        error ->
+          {:error, error}
+      end
+
+    [started | events] ++ [ending]
+  end
+
+  defp until_error(script) do
+    case Enum.split_while(script, &(not match?({:error, _}, &1))) do
+      {steps, []} ->
+        {steps, nil}
+
+      {steps, [{:error, error}]} ->
+        {steps, stream_error(error)}
+
+      {_steps, [{:error, _} | _rest]} ->
+        raise ArgumentError, "a script's {:error, _} step ends the turn: no step may follow it"
+    end
+  end
+
+  # The error event's error, as the client's parser emits it.
+  defp stream_error(%{"type" => _} = error), do: error
+
+  defp stream_error(type) when is_binary(type) do
+    message =
+      case Enum.find(@api_errors, fn {_status, {error_type, _}} -> error_type == type end) do
+        {_status, {_type, message}} -> message
+        nil -> type
+      end
+
+    %{"type" => type, "message" => message}
+  end
+
+  defp stop_reason(steps) do
+    if Enum.any?(steps, &match?({:tool_use, _, _, _}, &1)), do: "tool_use", else: "end_turn"
+  end
+
+  # The usage the API reports, in its keys: the scripted keys over the
+  # default's, the cache write the TTLs' sum when only they are given.
+  defp usage(scripted) when is_list(scripted) or is_map(scripted) do
+    scripted = Map.new(scripted, fn {key, value} -> {to_string(key), value} end)
+
+    case Map.keys(scripted) -- @usage_keys do
+      [] ->
+        :ok
+
+      unknown ->
+        raise ArgumentError, "usage: takes #{inspect(@usage_keys)}, got: #{inspect(unknown)}"
+    end
+
+    usage = Map.merge(@default_usage, Map.delete(scripted, "cache_creation"))
+
+    case scripted["cache_creation"] do
+      nil ->
+        usage
+
+      ttls ->
+        ttls = Map.new(ttls, fn {key, value} -> {to_string(key), value} end)
+
+        case Map.keys(ttls) -- @cache_creation_keys do
+          [] ->
+            :ok
+
+          unknown ->
+            raise ArgumentError,
+                  "cache_creation: takes #{inspect(@cache_creation_keys)}, got: #{inspect(unknown)}"
+        end
+
+        usage
+        |> Map.put("cache_creation", ttls)
+        |> Map.put_new("cache_creation_input_tokens", ttls |> Map.values() |> Enum.sum())
+    end
   end
 
   defp step_events({kind, text}, index, digest, previous, display)
