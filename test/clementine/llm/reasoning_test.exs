@@ -1,386 +1,300 @@
 defmodule Clementine.LLM.ReasoningTest do
-  use ExUnit.Case, async: true
+  @moduledoc """
+  Each wire's thinking fields for a resolved policy (`Clementine.LLM.Policy`)
+  on a real model sheet: what goes, and what is left to the model's own
+  default.
+  """
 
-  alias Clementine.LLM.Reasoning
+  # Declared models live in application config.
+  use ExUnit.Case, async: false
 
-  describe "validate_config/1" do
-    test "accepts nil, atoms, strings, keyword lists, and maps" do
-      assert {:ok, nil} = Reasoning.validate_config(nil)
-      assert {:ok, :high} = Reasoning.validate_config(:high)
-      assert {:ok, "high"} = Reasoning.validate_config("high")
-      assert {:ok, [effort: :high]} = Reasoning.validate_config(effort: :high)
-      assert {:ok, %{effort: :high}} = Reasoning.validate_config(%{effort: :high})
+  alias Clementine.LLM.{Policy, Reasoning}
+
+  setup do
+    previous = Application.get_env(:clementine, :models)
+
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:clementine, :models, previous),
+        else: Application.delete_env(:clementine, :models)
+    end)
+  end
+
+  defp anthropic(id, opts \\ []), do: Reasoning.anthropic(Policy.resolve!(id, opts))
+  defp openai(id, opts \\ []), do: Reasoning.openai(Policy.resolve!(id, opts))
+  defp chat(id, opts \\ []), do: Reasoning.chat_completions(Policy.resolve!(id, opts))
+
+  defp declare(models), do: Application.put_env(:clementine, :models, models)
+
+  describe "anthropic/1: effort" do
+    test "the model's default effort always goes, so a recalibrated default never moves an agent" do
+      assert anthropic("claude-sonnet-5-5") == %{"output_config" => %{"effort" => "high"}}
+      assert anthropic("claude-opus-5-5") == %{"output_config" => %{"effort" => "medium"}}
+      assert anthropic("claude-haiku-5-5") == %{"output_config" => %{"effort" => "medium"}}
     end
 
-    test "rejects other shapes" do
-      assert {:error, "expected atom, string, keyword list, or map"} =
-               Reasoning.validate_config(12)
+    test "the agent's effort replaces the default" do
+      assert anthropic("claude-sonnet-5-5", effort: :low) ==
+               %{"output_config" => %{"effort" => "low"}}
 
-      assert {:error, "expected atom, string, keyword list, or map"} =
-               Reasoning.validate_config([1, 2])
+      assert anthropic("claude-opus-5-5", effort: :max) ==
+               %{"output_config" => %{"effort" => "max"}}
+    end
+
+    test "a model with no effort levels sends none" do
+      assert anthropic("claude-haiku-4-5") == %{}
+      assert anthropic("claude-sonnet-4-5-20250929") == %{}
     end
   end
 
-  describe "to_provider_config/2 for :openai" do
-    test "translates nothing for nil and empty configs" do
-      assert {:ok, %{}} = Reasoning.to_provider_config(:openai, nil)
-      assert {:ok, %{}} = Reasoning.to_provider_config(:openai, [])
-      assert {:ok, %{}} = Reasoning.to_provider_config(:openai, %{})
+  describe "anthropic/1: thinking :off" do
+    test "is disabled only on a model that thinks adaptively by default" do
+      assert anthropic("claude-sonnet-5", thinking: :off) == %{
+               "thinking" => %{"type" => "disabled"},
+               "output_config" => %{"effort" => "high"}
+             }
+
+      assert anthropic("claude-haiku-5-5", thinking: :off) == %{
+               "thinking" => %{"type" => "disabled"},
+               "output_config" => %{"effort" => "medium"}
+             }
     end
 
-    test "treats a bare value as effort shorthand" do
-      assert {:ok, %{"reasoning" => %{"effort" => "low"}}} =
-               Reasoning.to_provider_config(:openai, :low)
+    test "sends no thinking field on a model that does not think by default" do
+      assert anthropic("claude-opus-4-8", thinking: :off) ==
+               %{"output_config" => %{"effort" => "high"}}
 
-      assert {:ok, %{"reasoning" => %{"effort" => "xhigh"}}} =
-               Reasoning.to_provider_config(:openai, "xhigh")
-    end
+      assert anthropic("claude-opus-4-6", thinking: :off) ==
+               %{"output_config" => %{"effort" => "high"}}
 
-    test "translates keyword and map configs into the reasoning field" do
-      assert {:ok, %{"reasoning" => %{"effort" => "high", "summary" => "auto"}}} =
-               Reasoning.to_provider_config(:openai, effort: :high, summary: :auto)
-
-      assert {:ok, %{"reasoning" => %{"generate_summary" => "detailed"}}} =
-               Reasoning.to_provider_config(:openai, %{"generate_summary" => "detailed"})
-    end
-
-    test "rejects unsupported keys and values" do
-      assert {:error, "unsupported OpenAI reasoning key" <> _} =
-               Reasoning.to_provider_config(:openai, budget_tokens: 2048)
-
-      assert {:error, "unsupported OpenAI reasoning effort" <> _} =
-               Reasoning.to_provider_config(:openai, :max)
-
-      assert {:error, "unsupported OpenAI reasoning summary" <> _} =
-               Reasoning.to_provider_config(:openai, summary: :verbose)
-    end
-
-    test "rejects non-keyword lists and other shapes" do
-      message = "OpenAI reasoning config must be an atom, string, keyword list, or map"
-
-      assert {:error, ^message} = Reasoning.to_provider_config(:openai, [1, 2])
-      assert {:error, ^message} = Reasoning.to_provider_config(:openai, 42)
+      assert anthropic("claude-haiku-4-5", thinking: :off) == %{}
     end
   end
 
-  describe "to_provider_config/2 for :anthropic" do
-    test "translates nothing for nil and empty configs" do
-      assert {:ok, %{}} = Reasoning.to_provider_config(:anthropic, nil)
-      assert {:ok, %{}} = Reasoning.to_provider_config(:anthropic, [])
-      assert {:ok, %{}} = Reasoning.to_provider_config(:anthropic, %{})
+  describe "anthropic/1: thinking :adaptive" do
+    test "sends nothing where the model thinks adaptively by default" do
+      assert anthropic("claude-sonnet-5", thinking: :adaptive) ==
+               %{"output_config" => %{"effort" => "high"}}
+
+      assert anthropic("claude-sonnet-5-5", thinking: :adaptive, display: :omitted) ==
+               %{"output_config" => %{"effort" => "high"}}
     end
 
-    test "treats a bare value as effort shorthand" do
-      assert {:ok, %{"output_config" => %{"effort" => "high"}}} =
-               Reasoning.to_provider_config(:anthropic, :high)
+    test "is the default, and goes explicitly, on a model that does not think by default" do
+      assert anthropic("claude-opus-4-8") == %{
+               "thinking" => %{"type" => "adaptive"},
+               "output_config" => %{"effort" => "high"}
+             }
 
-      assert {:ok, %{"output_config" => %{"effort" => "max"}}} =
-               Reasoning.to_provider_config(:anthropic, "max")
+      # Claude Opus 4.6 summarizes by default, and an agent keeps the
+      # model's own display unless it asks for another.
+      assert anthropic("claude-opus-4-6") == %{
+               "thinking" => %{"type" => "adaptive"},
+               "output_config" => %{"effort" => "high"}
+             }
+
+      assert anthropic("claude-opus-4-6", display: :omitted) == %{
+               "thinking" => %{"type" => "adaptive", "display" => "omitted"},
+               "output_config" => %{"effort" => "high"}
+             }
+
+      assert anthropic("claude-opus-4-6", display: :summarized) == %{
+               "thinking" => %{"type" => "adaptive"},
+               "output_config" => %{"effort" => "high"}
+             }
     end
 
-    test "translates effort into output_config" do
-      assert {:ok, %{"output_config" => %{"effort" => "medium"}} = fields} =
-               Reasoning.to_provider_config(:anthropic, effort: :medium)
+    test "carries a display other than the model's own" do
+      assert anthropic("claude-sonnet-5-5", display: :updates) == %{
+               "thinking" => %{"type" => "adaptive", "display" => "updates"},
+               "output_config" => %{"effort" => "high"}
+             }
 
-      refute Map.has_key?(fields, "thinking")
+      assert anthropic("claude-sonnet-5-5", display: :summarized) == %{
+               "thinking" => %{"type" => "adaptive", "display" => "summarized"},
+               "output_config" => %{"effort" => "high"}
+             }
     end
 
-    test "translates adaptive thinking, with optional display" do
-      assert {:ok, %{"thinking" => %{"type" => "adaptive"}} = fields} =
-               Reasoning.to_provider_config(:anthropic, thinking: :adaptive)
+    test "carries the binding controls when the agent asks for them" do
+      assert anthropic("claude-sonnet-5-5", provider_options: [prefix_mismatch: :drop_block]) ==
+               %{
+                 "thinking" => %{
+                   "type" => "adaptive",
+                   "block_binding" => %{"prefix_mismatch_behavior" => "drop_block"}
+                 },
+                 "output_config" => %{"effort" => "high"}
+               }
 
-      refute Map.has_key?(fields, "output_config")
-
-      assert {:ok, %{"thinking" => %{"type" => "adaptive", "display" => "summarized"}}} =
-               Reasoning.to_provider_config(:anthropic,
-                 thinking: :adaptive,
-                 display: :summarized
-               )
-    end
-
-    test "translates thinking and effort together" do
-      assert {:ok,
-              %{
-                "thinking" => %{"type" => "adaptive"},
-                "output_config" => %{"effort" => "xhigh"}
-              }} =
-               Reasoning.to_provider_config(:anthropic, thinking: :adaptive, effort: :xhigh)
-    end
-
-    test "translates enabled thinking with a token budget" do
-      assert {:ok, %{"thinking" => %{"type" => "enabled", "budget_tokens" => 2048}}} =
-               Reasoning.to_provider_config(:anthropic, thinking: :enabled, budget_tokens: 2048)
-    end
-
-    test "budget_tokens alone implies enabled thinking" do
-      assert {:ok, %{"thinking" => %{"type" => "enabled", "budget_tokens" => 4096}}} =
-               Reasoning.to_provider_config(:anthropic, budget_tokens: 4096)
-
-      assert {:ok,
-              %{
-                "thinking" => %{
-                  "type" => "enabled",
-                  "budget_tokens" => 4096,
-                  "display" => "omitted"
-                }
-              }} =
-               Reasoning.to_provider_config(:anthropic, budget_tokens: 4096, display: :omitted)
-    end
-
-    test "translates disabled thinking" do
-      assert {:ok, %{"thinking" => %{"type" => "disabled"}}} =
-               Reasoning.to_provider_config(:anthropic, thinking: :disabled)
-    end
-
-    test "accepts string keys and values" do
-      assert {:ok,
-              %{
-                "thinking" => %{"type" => "adaptive"},
-                "output_config" => %{"effort" => "high"}
-              }} =
-               Reasoning.to_provider_config(:anthropic, %{
-                 "thinking" => "adaptive",
-                 "effort" => "high"
-               })
-    end
-
-    test "rejects enabled thinking without a budget" do
-      assert {:error, ~s(Anthropic reasoning thinking "enabled" requires budget_tokens)} =
-               Reasoning.to_provider_config(:anthropic, thinking: :enabled)
-    end
-
-    test "rejects a budget with adaptive or disabled thinking" do
-      message = ~s(Anthropic reasoning budget_tokens is only supported with thinking "enabled")
-
-      assert {:error, ^message} =
-               Reasoning.to_provider_config(:anthropic, thinking: :adaptive, budget_tokens: 1024)
-
-      assert {:error, ^message} =
-               Reasoning.to_provider_config(:anthropic, thinking: :disabled, budget_tokens: 1024)
-    end
-
-    test "between_tools, the updates display, and the prefix_mismatch behavior" do
-      assert {:ok,
-              %{
-                "thinking" => %{"type" => "between_tools"},
-                "output_config" => %{"effort" => "high"}
-              }} =
-               Reasoning.to_provider_config(:anthropic, thinking: :between_tools, effort: :high)
-
-      assert {:ok, %{"thinking" => %{"type" => "adaptive", "display" => "updates"}}} =
-               Reasoning.to_provider_config(:anthropic, thinking: :adaptive, display: :updates)
-
-      assert {:ok,
-              %{
-                "thinking" => %{
-                  "type" => "adaptive",
-                  "block_binding" => %{"prefix_mismatch_behavior" => "error"}
-                }
-              }} =
-               Reasoning.to_provider_config(:anthropic,
-                 thinking: :adaptive,
-                 prefix_mismatch: :error
-               )
-
-      between =
-        ~s(Anthropic reasoning thinking "between_tools" takes no display or prefix_mismatch)
-
-      assert {:error, ^between} =
-               Reasoning.to_provider_config(:anthropic,
-                 thinking: :between_tools,
-                 display: :updates
-               )
-
-      assert {:error, ^between} =
-               Reasoning.to_provider_config(:anthropic,
-                 thinking: :between_tools,
-                 prefix_mismatch: :drop_block
-               )
-
-      assert {:error, "unsupported Anthropic reasoning prefix_mismatch \"warn\"" <> _} =
-               Reasoning.to_provider_config(:anthropic,
-                 thinking: :adaptive,
-                 prefix_mismatch: :warn
-               )
-
-      assert {:error, _} = Reasoning.to_provider_config(:anthropic, prefix_mismatch: :error)
-    end
-
-    test "rejects display without thinking" do
-      message =
-        ~s(Anthropic reasoning display and prefix_mismatch require thinking "adaptive" or "enabled")
-
-      assert {:error, ^message} =
-               Reasoning.to_provider_config(:anthropic, display: :summarized)
-
-      assert {:error, ^message} =
-               Reasoning.to_provider_config(:anthropic, effort: :high, display: :summarized)
-
-      assert {:error, ^message} =
-               Reasoning.to_provider_config(:anthropic, thinking: :disabled, display: :summarized)
-    end
-
-    test "rejects unsupported keys and values" do
-      assert {:error, "unsupported Anthropic reasoning key" <> _} =
-               Reasoning.to_provider_config(:anthropic, summary: :auto)
-
-      assert {:error, "unsupported Anthropic reasoning effort" <> _} =
-               Reasoning.to_provider_config(:anthropic, :minimal)
-
-      assert {:error, "unsupported Anthropic reasoning thinking" <> _} =
-               Reasoning.to_provider_config(:anthropic, thinking: :sometimes)
-
-      assert {:error, "unsupported Anthropic reasoning display" <> _} =
-               Reasoning.to_provider_config(:anthropic, thinking: :adaptive, display: :full)
-
-      assert {:error, "unsupported Anthropic reasoning budget_tokens" <> _} =
-               Reasoning.to_provider_config(:anthropic, budget_tokens: 0)
-
-      assert {:error, "unsupported Anthropic reasoning budget_tokens" <> _} =
-               Reasoning.to_provider_config(:anthropic, budget_tokens: :lots)
-    end
-
-    test "rejects non-keyword lists and other shapes" do
-      message = "Anthropic reasoning config must be an atom, string, keyword list, or map"
-
-      assert {:error, ^message} = Reasoning.to_provider_config(:anthropic, [1, 2])
-      assert {:error, ^message} = Reasoning.to_provider_config(:anthropic, 42)
+      assert anthropic("claude-opus-5-5",
+               display: :updates,
+               provider_options: [prefix_mismatch: :error]
+             ) == %{
+               "thinking" => %{
+                 "type" => "adaptive",
+                 "display" => "updates",
+                 "block_binding" => %{"prefix_mismatch_behavior" => "error"}
+               },
+               "output_config" => %{"effort" => "medium"}
+             }
     end
   end
 
-  describe "to_provider_config/2 for :openrouter" do
-    test "translates nothing for nil and empty configs" do
-      assert {:ok, %{}} = Reasoning.to_provider_config(:openrouter, nil)
-      assert {:ok, %{}} = Reasoning.to_provider_config(:openrouter, [])
-      assert {:ok, %{}} = Reasoning.to_provider_config(:openrouter, %{})
-    end
+  describe "anthropic/1: thinking :between_tools" do
+    test "takes no other thinking field, and its effort goes" do
+      assert anthropic("claude-sonnet-5-5", thinking: :between_tools) == %{
+               "thinking" => %{"type" => "between_tools"},
+               "output_config" => %{"effort" => "high"}
+             }
 
-    test "treats a bare value as effort shorthand" do
-      assert {:ok, %{"reasoning" => %{"effort" => "max"}}} =
-               Reasoning.to_provider_config(:openrouter, :max)
-    end
-
-    test "translates the unified reasoning object" do
-      assert {:ok,
-              %{
-                "reasoning" => %{
-                  "effort" => "high",
-                  "max_tokens" => 2000,
-                  "exclude" => false,
-                  "enabled" => true
-                }
-              }} =
-               Reasoning.to_provider_config(:openrouter,
-                 effort: :high,
-                 max_tokens: 2000,
-                 exclude: false,
-                 enabled: true
-               )
-    end
-
-    test "rejects unsupported keys and values" do
-      assert {:error, "unsupported OpenRouter reasoning key" <> _} =
-               Reasoning.to_provider_config(:openrouter, thinking: :adaptive)
-
-      assert {:error, "unsupported OpenRouter reasoning effort" <> _} =
-               Reasoning.to_provider_config(:openrouter, effort: :ultra)
-
-      assert {:error, "unsupported OpenRouter reasoning max_tokens" <> _} =
-               Reasoning.to_provider_config(:openrouter, max_tokens: 0)
-
-      assert {:error, "unsupported OpenRouter reasoning exclude" <> _} =
-               Reasoning.to_provider_config(:openrouter, exclude: "yes")
-    end
-
-    test "rejects non-keyword lists and other shapes" do
-      message = "OpenRouter reasoning config must be an atom, string, keyword list, or map"
-
-      assert {:error, ^message} = Reasoning.to_provider_config(:openrouter, [1, 2])
-      assert {:error, ^message} = Reasoning.to_provider_config(:openrouter, 42)
+      assert anthropic("claude-sonnet-5-5", thinking: :between_tools, effort: :low) == %{
+               "thinking" => %{"type" => "between_tools"},
+               "output_config" => %{"effort" => "low"}
+             }
     end
   end
 
-  describe "to_provider_config/2 for chat completions effort providers" do
-    for {provider, label} <- [
-          bedrock: "Bedrock",
-          vertex: "Vertex",
-          openai_compatible: "OpenAI-compatible"
-        ] do
-      test "#{provider} translates effort into reasoning_effort" do
-        provider = unquote(provider)
+  describe "anthropic/1: thinking :enabled" do
+    test "carries its budget, which alone implies it" do
+      assert anthropic("claude-opus-4-6", provider_options: [budget_tokens: 2048]) == %{
+               "thinking" => %{
+                 "type" => "enabled",
+                 "budget_tokens" => 2048
+               },
+               "output_config" => %{"effort" => "high"}
+             }
 
-        assert {:ok, %{}} = Reasoning.to_provider_config(provider, nil)
-        assert {:ok, %{}} = Reasoning.to_provider_config(provider, [])
+      assert anthropic("claude-haiku-4-5",
+               thinking: :enabled,
+               provider_options: [budget_tokens: 4096]
+             ) == %{
+               "thinking" => %{
+                 "type" => "enabled",
+                 "budget_tokens" => 4096
+               }
+             }
+    end
 
-        assert {:ok, %{"reasoning_effort" => "high"}} =
-                 Reasoning.to_provider_config(provider, :high)
+    test "leaves out the display where it is the model's own" do
+      assert anthropic("claude-haiku-4-5",
+               display: :summarized,
+               provider_options: [budget_tokens: 4096]
+             ) == %{"thinking" => %{"type" => "enabled", "budget_tokens" => 4096}}
+    end
+  end
 
-        assert {:ok, %{"reasoning_effort" => "minimal"}} =
-                 Reasoning.to_provider_config(provider, effort: "minimal")
+  describe "openai/1" do
+    test "sends the model's default effort, or none where it has none" do
+      assert openai("gpt-6.1-sol") == %{"reasoning" => %{"effort" => "medium"}}
+      assert openai("gpt-5.4-mini") == %{"reasoning" => %{"effort" => "none"}}
+      assert openai("gpt-6-astra") == %{}
+      assert openai("gpt-4.1") == %{}
+    end
+
+    test "sends the agent's effort and its summary options" do
+      assert openai("gpt-6.1-terra", effort: :none) == %{"reasoning" => %{"effort" => "none"}}
+
+      assert openai("gpt-6.1-sol",
+               effort: :high,
+               provider_options: [summary: :auto, generate_summary: :detailed]
+             ) == %{
+               "reasoning" => %{
+                 "effort" => "high",
+                 "summary" => "auto",
+                 "generate_summary" => "detailed"
+               }
+             }
+
+      assert openai("gpt-6-astra", provider_options: [summary: :concise]) ==
+               %{"reasoning" => %{"summary" => "concise"}}
+    end
+  end
+
+  describe "chat_completions/1 on OpenRouter" do
+    setup do
+      declare(%{
+        "deepseek/deepseek-v3.2" => [
+          vendor: :deepseek,
+          context: 163_840,
+          max_output: 16_000,
+          thinking: [
+            default: :adaptive,
+            types: [:adaptive],
+            efforts: [:low, :medium, :high],
+            default_effort: :medium
+          ],
+          platforms: [openrouter: []]
+        ],
+        "moonshotai/kimi-k3" => [
+          vendor: :moonshot,
+          context: 256_000,
+          max_output: 32_000,
+          thinking: [default: :adaptive, types: [:adaptive]],
+          platforms: [openrouter: []]
+        ],
+        "mistralai/mistral-medium-4" => [
+          vendor: :mistral,
+          context: 128_000,
+          max_output: 32_000,
+          platforms: [openrouter: []]
+        ]
+      })
+    end
+
+    test "sends the effort in the reasoning object" do
+      assert chat("deepseek/deepseek-v3.2") == %{"reasoning" => %{"effort" => "medium"}}
+
+      assert chat("deepseek/deepseek-v3.2", effort: :high) ==
+               %{"reasoning" => %{"effort" => "high"}}
+    end
+
+    test "carries OpenRouter's own reasoning options" do
+      assert chat("deepseek/deepseek-v3.2",
+               effort: :low,
+               provider_options: [exclude: false, enabled: true]
+             ) == %{"reasoning" => %{"effort" => "low", "exclude" => false, "enabled" => true}}
+
+      assert chat("moonshotai/kimi-k3", provider_options: [max_tokens: 2000, exclude: true]) ==
+               %{"reasoning" => %{"max_tokens" => 2000, "exclude" => true}}
+    end
+
+    test "sends no reasoning object for a model with no effort and no options" do
+      assert chat("moonshotai/kimi-k3") == %{}
+      assert chat("mistralai/mistral-medium-4") == %{}
+    end
+  end
+
+  describe "chat_completions/1 on other platforms" do
+    for platform <- [:bedrock, :vertex, :openai_compatible] do
+      test "#{platform} sends the effort as reasoning_effort" do
+        platform = unquote(platform)
+
+        declare(%{
+          "reasoner" => [
+            vendor: :acme,
+            context: 128_000,
+            max_output: 16_000,
+            thinking: [
+              default: :adaptive,
+              types: [:adaptive],
+              efforts: [:minimal, :low, :medium, :high],
+              default_effort: :low
+            ],
+            platforms: [{platform, []}]
+          ],
+          "plain" => [
+            vendor: :acme,
+            context: 128_000,
+            max_output: 16_000,
+            platforms: [{platform, []}]
+          ]
+        })
+
+        assert %Policy{platform: ^platform} = Policy.resolve!("reasoner")
+        assert chat("reasoner") == %{"reasoning_effort" => "low"}
+        assert chat("reasoner", effort: :minimal) == %{"reasoning_effort" => "minimal"}
+        assert chat("plain") == %{}
       end
-
-      test "#{provider} rejects unsupported keys, values, and shapes" do
-        provider = unquote(provider)
-        label = unquote(label)
-
-        assert {:error, effort_message} = Reasoning.to_provider_config(provider, :max)
-        assert effort_message =~ "unsupported #{label} reasoning effort"
-
-        assert {:error, key_message} =
-                 Reasoning.to_provider_config(provider, budget_tokens: 1024)
-
-        assert key_message =~ "unsupported #{label} reasoning key"
-
-        assert {:error, "#{label} reasoning config must be an atom, string, keyword list, or map"} ==
-                 Reasoning.to_provider_config(provider, 42)
-      end
-    end
-  end
-
-  describe "to_provider_config!/2" do
-    test "returns the fields on success" do
-      assert %{"output_config" => %{"effort" => "high"}} =
-               Reasoning.to_provider_config!(:anthropic, :high)
-    end
-
-    test "raises ArgumentError on invalid config" do
-      assert_raise ArgumentError, ~r/unsupported Anthropic reasoning effort/, fn ->
-        Reasoning.to_provider_config!(:anthropic, :ultra)
-      end
-    end
-  end
-
-  describe "validate_model_config/2" do
-    test "accepts nil for any provider" do
-      assert {:ok, nil} = Reasoning.validate_model_config(:anthropic, nil)
-      assert {:ok, nil} = Reasoning.validate_model_config(:some_future_provider, nil)
-    end
-
-    test "returns the config as given for supported providers" do
-      assert {:ok, [effort: :high]} = Reasoning.validate_model_config(:openai, effort: :high)
-
-      assert {:ok, [thinking: :adaptive]} =
-               Reasoning.validate_model_config(:anthropic, thinking: :adaptive)
-
-      assert {:ok, [effort: :high, max_tokens: 2000]} =
-               Reasoning.validate_model_config(:openrouter, effort: :high, max_tokens: 2000)
-
-      assert {:ok, :low} = Reasoning.validate_model_config(:bedrock, :low)
-      assert {:ok, :low} = Reasoning.validate_model_config(:vertex, :low)
-      assert {:ok, :low} = Reasoning.validate_model_config(:openai_compatible, :low)
-    end
-
-    test "propagates translation errors" do
-      assert {:error, "unsupported OpenAI reasoning effort" <> _} =
-               Reasoning.validate_model_config(:openai, effort: :max)
-
-      assert {:error, "unsupported Anthropic reasoning effort" <> _} =
-               Reasoning.validate_model_config(:anthropic, effort: :minimal)
-    end
-
-    test "rejects providers without a reasoning translation" do
-      assert {:error, "is not supported by Clementine's :some_future_provider adapter yet"} =
-               Reasoning.validate_model_config(:some_future_provider, :high)
     end
   end
 end

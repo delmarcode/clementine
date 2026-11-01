@@ -6,7 +6,8 @@ defmodule Clementine.Telemetry.MetricsTest do
   against real runs on the runtime and in process. Every metric in the
   list exports, every label is bounded (an atom, a string, or a number;
   `""` where the writer had no value), and the engine's series name the
-  agent, provider, model, and alias. The same runs, scraped through
+  agent, provider, and model, with `alias` empty now that models are
+  named by id. The same runs, scraped through
   PromEx's two stores (TelemetryMetricsPrometheus.Core and Peep), export
   the same series.
   """
@@ -54,11 +55,13 @@ defmodule Clementine.Telemetry.MetricsTest do
 
   @moduletag runtime: false
   @subject {"conversation", "metrics-1"}
+  # `alias` is never filled now that models are named by id; it exports
+  # as "" until OPS-190 removes it.
   @identity %{
     agent_key: "test_lookup",
     provider: :anthropic,
     model: "claude-sonnet-5",
-    alias: :claude_sonnet
+    alias: ""
   }
 
   setup do
@@ -69,10 +72,8 @@ defmodule Clementine.Telemetry.MetricsTest do
     Application.put_env(
       :clementine,
       :models,
-      Keyword.put(previous, :claude_sonnet,
-        provider: :anthropic,
-        id: "claude-sonnet-5",
-        pricing: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
+      Map.put(previous || %{}, "claude-sonnet-5",
+        prices: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
       )
     )
 
@@ -171,7 +172,7 @@ defmodule Clementine.Telemetry.MetricsTest do
     agent =
       Clementine.Agent.new(
         id: "workspace-42",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5",
         tools: [Exits, Verdict]
       )
 
@@ -183,7 +184,7 @@ defmodule Clementine.Telemetry.MetricsTest do
 
     # A history whose turn was produced after another conversation: on a
     # model that binds its thinking, the call sends it without it.
-    binding_agent = Clementine.Agent.new(model: {:anthropic, "claude-sonnet-5-5"})
+    binding_agent = Clementine.Agent.new(model: "claude-sonnet-5-5")
 
     stale = [
       Clementine.LLM.Message.UserMessage.new("Earlier."),
@@ -298,8 +299,8 @@ defmodule Clementine.Telemetry.MetricsTest do
              "#{name} labels #{label} with #{inspect(value)}"
     end
 
-    # The engine's series name the agent, the provider, the model, and
-    # the alias; every metered call counts once, by how it ended.
+    # The engine's series name the agent, the provider, and the model,
+    # with the alias empty; every metered call counts once, by how it ended.
     lookup = @identity
     stopped = Map.put(lookup, :outcome, :stop)
 
@@ -520,11 +521,22 @@ defmodule Clementine.Telemetry.MetricsTest do
   end
 
   test "a label nothing filled exports as an empty string, never nil, on every metric" do
-    # An alias the catalog lacks resolves to no provider and no model id,
-    # and a direct tool batch names no agent.
-    metadata = %{agent_key: nil, provider: nil, model: nil, alias: :not_in_catalog}
+    # An id no sheet holds resolves to no provider, keeping its id; no
+    # model fills the alias now; and a direct tool batch names nothing.
+    unknown = Clementine.Trace.resolve_model("not-a-model")
 
-    for metric <- Clementine.Telemetry.metrics(), metric.tags != [] do
+    unknown = %{
+      agent_key: nil,
+      provider: unknown.provider,
+      model: unknown.id,
+      alias: unknown.alias
+    }
+
+    nothing = %{agent_key: nil, provider: nil, model: nil, alias: nil}
+
+    for metadata <- [unknown, nothing],
+        metric <- Clementine.Telemetry.metrics(),
+        metric.tags != [] do
       labels = metric.tag_values.(metadata)
       assert Map.keys(labels) |> Enum.sort() == Enum.sort(metric.tags)
       refute Enum.any?(Map.values(labels), &is_nil/1), "#{inspect(metric.name)} kept a nil"
@@ -536,8 +548,11 @@ defmodule Clementine.Telemetry.MetricsTest do
         &(Enum.join(&1.name, "_") == "clementine_llm_input_tokens_total")
       )
 
-    assert %{agent_key: "", provider: "", model: "", alias: :not_in_catalog, outcome: ""} =
-             tokens.tag_values.(metadata)
+    assert %{agent_key: "", provider: "", model: "not-a-model", alias: "", outcome: ""} =
+             tokens.tag_values.(unknown)
+
+    assert %{agent_key: "", provider: "", model: "", alias: "", outcome: ""} =
+             tokens.tag_values.(nothing)
   end
 
   test "the error labels are closed: every provider error's code, else other" do

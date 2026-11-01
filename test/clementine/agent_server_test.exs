@@ -13,7 +13,7 @@ defmodule Clementine.AgentServerTest do
   defmodule TestAgent do
     use Clementine.AgentServer,
       name: "test_agent",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       tools: [],
       system: "You are a test assistant."
   end
@@ -60,7 +60,7 @@ defmodule Clementine.AgentServerTest do
       config = TestAgent.__config__()
 
       assert config.name == "test_agent"
-      assert config.model == :claude_sonnet
+      assert config.model == "claude-sonnet-5"
       assert config.tools == []
       assert config.system == "You are a test assistant."
     end
@@ -587,7 +587,7 @@ defmodule Clementine.AgentServerTest do
   defmodule ForkTargetAgent do
     use Clementine.AgentServer,
       name: "fork_target",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       tools: [],
       system: "You are a fork target."
   end
@@ -612,12 +612,12 @@ defmodule Clementine.AgentServerTest do
     end
 
     test "forked agent copies context, model, and system from source" do
-      {:ok, source} = TestAgent.start_link(model: :claude_opus, context: %{custom: "data"})
+      {:ok, source} = TestAgent.start_link(model: "claude-opus-4-8", context: %{custom: "data"})
 
       {:ok, forked} = Clementine.AgentServer.fork(source, ForkTargetAgent)
 
       forked_state = GenServer.call(forked, :get_state)
-      assert forked_state.model == :claude_opus
+      assert forked_state.model == "claude-opus-4-8"
       assert forked_state.system == "You are a test assistant."
       assert forked_state.context.custom == "data"
 
@@ -652,12 +652,12 @@ defmodule Clementine.AgentServerTest do
 
       {:ok, forked} =
         Clementine.AgentServer.fork(source, ForkTargetAgent,
-          model: :claude_haiku,
+          model: "claude-haiku-4-5",
           context: %{overridden: true}
         )
 
       forked_state = GenServer.call(forked, :get_state)
-      assert forked_state.model == :claude_haiku
+      assert forked_state.model == "claude-haiku-4-5"
       assert forked_state.context.overridden == true
 
       GenServer.stop(forked)
@@ -667,10 +667,10 @@ defmodule Clementine.AgentServerTest do
 
   describe "runtime configuration" do
     test "allows overriding model at runtime" do
-      {:ok, agent} = TestAgent.start_link(model: :claude_opus)
+      {:ok, agent} = TestAgent.start_link(model: "claude-opus-4-8")
 
       state = GenServer.call(agent, :get_state)
-      assert state.model == :claude_opus
+      assert state.model == "claude-opus-4-8"
 
       GenServer.stop(agent)
     end

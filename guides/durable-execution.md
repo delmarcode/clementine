@@ -303,7 +303,7 @@ defmodule MyApp.Runs.Builder do
   def build_run(%AgentRun{} = row) do
     agent =
       Clementine.Agent.new(
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "You are a helpful assistant.",
         tools: [MyApp.Tools.Weather],
         defaults: [max_iterations: 20]

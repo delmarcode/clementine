@@ -15,7 +15,7 @@ defmodule Clementine do
 
       agent =
         Clementine.Agent.new(
-          model: :claude_sonnet,
+          model: "claude-sonnet-5-5",
           instructions: "You are a helpful assistant.",
           tools: [MyApp.Tools.ReadFile]
         )
@@ -85,35 +85,15 @@ defmodule Clementine do
         anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
         openai_api_key: {:system, "OPENAI_API_KEY"}
 
-      config :clementine, :models,
-        claude_sonnet: [
-          provider: :anthropic,
-          id: "claude-sonnet-5",
-          defaults: [max_tokens: 8192],
-          reasoning: [thinking: :adaptive, effort: :high]
-        ],
-        gpt_5: [
-          provider: :openai,
-          id: "gpt-5",
-          defaults: [max_output_tokens: 4096],
-          reasoning: [effort: :medium]
-        ],
-        deepseek: [
-          provider: :openrouter,
-          id: "deepseek/deepseek-v3.2",
-          reasoning: [effort: :high]
-        ]
-
-  Open models and fine-tunes served over the OpenAI-compatible Chat
-  Completions dialect (OpenRouter, AWS Bedrock, GCP Vertex, Tinker,
-  self-hosted vLLM) route through `Clementine.LLM.ChatCompletions` —
-  see that module for provider endpoint and credential configuration.
-
-  There are no built-in model aliases: an agent names one the catalog
-  defines, or a `{provider, id}` tuple. `:retry` tunes provider retries.
-  `:default_model` and `:max_iterations` matter only to
-  `Clementine.AgentServer`, for a process that names neither; an agent
-  names its own model and limits.
+  An agent names its model by the vendor's id (`"claude-sonnet-5-5"`).
+  Clementine ships a fact sheet for each current Anthropic and OpenAI
+  model (`Clementine.Models`); an app overrides a fact or declares a
+  model it does not ship under `config :clementine, :models`, a map from
+  id to facts (`docs/MODELS.md`). Open models and fine-tunes served over
+  the OpenAI-compatible Chat Completions dialect (OpenRouter, AWS
+  Bedrock, GCP Vertex, Tinker, self-hosted vLLM) route through
+  `Clementine.LLM.ChatCompletions`; see that module for endpoint and
+  credential configuration. `:retry` tunes provider retries.
   """
 
   alias Clementine.{AgentServer, Events, Result, Rollout, Run, Runner}

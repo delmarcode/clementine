@@ -32,7 +32,7 @@ defmodule Clementine.Runs.ToolContextTest do
     @impl true
     def agent(run) do
       Clementine.Agent.new(
-        model: :claude_sonnet,
+        model: "claude-sonnet-5",
         instructions: "Go.",
         tools: [Probe, ReadFile],
         tool_context: %{
@@ -53,7 +53,7 @@ defmodule Clementine.Runs.ToolContextTest do
     @impl true
     def agent(_run) do
       Clementine.Agent.new(
-        model: :claude_sonnet,
+        model: "claude-sonnet-5",
         instructions: "Go.",
         tools: [ReadFile],
         tool_context: %{capabilities: %{read: true}}
@@ -68,7 +68,7 @@ defmodule Clementine.Runs.ToolContextTest do
     @impl true
     def agent(_run) do
       Clementine.Agent.new(
-        model: :claude_sonnet,
+        model: "claude-sonnet-5",
         instructions: "Go.",
         tool_context: [:not, :a, :map]
       )

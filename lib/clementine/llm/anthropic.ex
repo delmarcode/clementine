@@ -14,28 +14,23 @@ defmodule Clementine.LLM.Anthropic do
 
   ## Models
 
-  Configure model mappings:
-
-      config :clementine, :models,
-        claude_sonnet: [
-          provider: :anthropic,
-          id: "claude-sonnet-5",
-          defaults: [max_tokens: 8192],
-          reasoning: [thinking: :adaptive, effort: :high]
-        ]
-
-  `:reasoning` translates to the Messages API `thinking` and
-  `output_config` request fields (see `Clementine.LLM.Reasoning`); a
-  `:reasoning` entry in request opts overrides the configured value.
+  A request names a model by its id (`"claude-sonnet-5-5"`), and the
+  client reads the model's sheet (`Clementine.Model`) for everything it
+  sends or withholds: the id, `max_tokens`, the `thinking` and
+  `output_config.effort` fields (`Clementine.LLM.Reasoning`), whether
+  deferred tools can go, whether thinking is bound to the conversation,
+  where a system message goes, and the cache TTLs. The request's opts
+  carry the agent's choices (`Clementine.LLM.Policy`), checked against
+  the sheet before anything is sent.
 
   ## Deferred tools
 
   Tools named in the `:deferred` request option (a subset of `tools`)
   go with `defer_loading: true`, beside the API's tool search tool
   (`tool_search_tool_regex_20251119`): Claude sees only the tools that
-  are not deferred until a search loads the ones it needs. Models older
-  than Claude Opus 4.5, Sonnet 4.5, and Haiku 4.5 have no tool search, so
-  their deferred tools go as ordinary tools. The search's
+  are not deferred until a search loads the ones it needs. A model whose
+  sheet has no `features.tool_search` gets its deferred tools as
+  ordinary tools. The search's
   `server_tool_use` and `tool_search_tool_result` blocks come back as
   `Clementine.LLM.Message.Content.ServerToolUse` and `ServerToolResult`
   and are replayed with the turn as far as the request can honour them:
@@ -58,19 +53,20 @@ defmodule Clementine.LLM.Anthropic do
 
   ## Models that bind their thinking
 
-  Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and
-  later models accept a replayed thinking block only after the exact
-  system prompt, tools, and messages it was produced after. On those
-  models each response carries a `binding`
+  A model whose sheet says `thinking.binding: :prefix` (Claude Fable
+  5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) accepts a replayed
+  thinking block only after the exact system prompt, tools, and
+  messages it was produced after. On those models each response
+  carries a `binding`
   (`Clementine.LLM.Message.AssistantMessage`), and a replay sends a
   turn's thinking only while its binding still holds (a turn without
   one goes without its thinking), so an edited history costs that
   reasoning and is never refused; the engine reports it as
-  `[:clementine, :llm, :thinking_dropped]`. A
+  `[:clementine, :llm, :thinking_dropped]`. Where the sheet has
+  `features.mid_conversation_system`, a
   `Clementine.LLM.Message.SystemMessage` goes as a mid-conversation
   `role: "system"` message, its tools as inline definitions, and the
-  tools it adds stay out of `tools`; on other models, and on a model id
-  Clementine cannot read (checked all the same), its text joins the
+  tools it adds stay out of `tools`; elsewhere its text joins the
   system prompt and its tools join `tools`. The runtime guide's "Models
   that bind their thinking" has the whole policy.
 
@@ -81,14 +77,14 @@ defmodule Clementine.LLM.Anthropic do
 
   ## Prompt caching
 
-  Every request carries two cache breakpoints unless the alias sets
+  Every request carries two cache breakpoints unless the agent sets
   `cache: false` (`Clementine.LLM.Cache`): `cache_control` on the system
   prompt, which ends the prefix every run of the agent shares (the
   tools, then the system prompt), and the top-level `cache_control` the
   API moves to the last cacheable block, so each call of the model–tool
   cycle reads the prefix the call before it wrote. Without a system
   prompt the first one goes on the last tool loaded up front: a deferred
-  tool cannot carry one. Both use the alias's TTL, five minutes unless it
+  tool cannot carry one. Both use the agent's TTL, five minutes unless it
   says `ttl: :one_hour`. A prefix shorter than the model's minimum is not
   cached, and costs nothing extra. Usage counts the cache reads and writes
   the API reports as parts of `input_tokens`.
@@ -96,16 +92,15 @@ defmodule Clementine.LLM.Anthropic do
 
   @behaviour Clementine.LLM.ClientBehaviour
 
-  alias Clementine.LLM.ModelRegistry
+  alias Clementine.Model
   alias Clementine.LLM.Anthropic.{Binding, Messages, Tools}
   alias Clementine.LLM.Message.SystemMessage
-  alias Clementine.LLM.{Cache, ProviderStream, ProviderUsage}
+  alias Clementine.LLM.{Cache, Policy, ProviderStream, ProviderUsage}
   alias Clementine.LLM.Reasoning
   alias Clementine.LLM.Response
   alias Clementine.LLM.StreamParser
 
   @anthropic_version "2023-06-01"
-  @default_max_tokens 8192
 
   @doc """
   Makes a synchronous call to the Anthropic API.
@@ -326,22 +321,20 @@ defmodule Clementine.LLM.Anthropic do
   # and `Clementine.LLM.Anthropic.Fake` both build requests here, so a
   # test sees exactly what the API would.
   def request(model, system, messages, tools, opts) do
-    resolved = resolve_model(model)
-    model_id = resolved.id
-    binds? = Binding.binds?(model_id)
-    inline? = Binding.inline_system?(model_id)
-
-    max_tokens =
-      Keyword.get(
-        opts,
-        :max_tokens,
-        Keyword.get(resolved.defaults, :max_tokens, @default_max_tokens)
-      )
+    policy = policy!(model, opts)
+    facts = policy.model
+    binds? = facts.thinking.binding == :prefix
+    inline? = facts.features.mid_conversation_system
 
     {system, tools, added} = arrange(inline?, system, messages, tools || [])
 
+    # A model without tool search gets its deferred tools as ordinary
+    # tools, as every other provider does, rather than a request the API
+    # refuses.
+    deferred = if facts.features.tool_search, do: Keyword.get(opts, :deferred, []), else: []
+
     encoded_tools =
-      case Tools.encode_all(tools, deferred(model_id, opts)) ++ added do
+      case Tools.encode_all(tools, deferred) ++ added do
         [] -> nil
         encoded -> encoded
       end
@@ -361,21 +354,23 @@ defmodule Clementine.LLM.Anthropic do
       end
 
     body =
-      %{"model" => model_id, "max_tokens" => max_tokens, "messages" => encoded_messages}
-      |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
+      %{
+        "model" => Model.platform_id(facts),
+        "max_tokens" => policy.max_tokens,
+        "messages" => encoded_messages
+      }
+      |> Map.merge(Reasoning.anthropic(policy))
       |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
-      |> put_prompt(system, encoded_tools, resolved.cache)
+      |> put_prompt(system, encoded_tools, policy.cache)
 
     {body, binding, dropped}
   end
 
-  # A conversation on a model known to bind its thinking keeps its
-  # system messages in place, and a tool one of them adds goes inline
-  # there, not in `tools`: the request's tools stay as the first turn
-  # sent them. Elsewhere (older models, and ids Clementine cannot read:
-  # `Binding.inline_system?/1`) a system message's text joins the system
-  # prompt, and the tools it adds join the request's (the engine already
-  # offers a loaded skill's).
+  # A model that takes mid-conversation system messages keeps them in
+  # place, and a tool one of them adds goes inline there, not in `tools`:
+  # the request's tools stay as the first turn sent them. Elsewhere a
+  # system message's text joins the system prompt, and the tools it adds
+  # join the request's (the engine already offers a loaded skill's).
   defp arrange(true, system, messages, tools) do
     added = MapSet.new(added_definitions(messages), & &1["name"])
     {system, Enum.reject(tools, &(tool_name(&1) in added)), []}
@@ -475,18 +470,6 @@ defmodule Clementine.LLM.Anthropic do
     end
   end
 
-  # A model without tool search gets its deferred tools as ordinary tools,
-  # as every other provider does, rather than a request the API refuses.
-  defp deferred(model_id, opts) do
-    if Tools.searchable?(model_id), do: Keyword.get(opts, :deferred, []), else: []
-  end
-
-  defp maybe_put_reasoning(body, nil), do: body
-
-  defp maybe_put_reasoning(body, reasoning) do
-    Map.merge(body, Reasoning.to_provider_config!(:anthropic, reasoning))
-  end
-
   # output_config may already carry the reasoning effort; the format
   # joins it.
   defp maybe_put_output_schema(body, nil), do: body
@@ -550,14 +533,17 @@ defmodule Clementine.LLM.Anthropic do
   defp resolve_api_key(key) when is_binary(key), do: key
   defp resolve_api_key(_), do: nil
 
-  defp resolve_model(model_ref) do
-    resolved = ModelRegistry.resolve!(model_ref)
+  # The agent's choices, checked against the model's sheet; a model
+  # Anthropic's client cannot serve is refused before anything is sent.
+  defp policy!(model, opts) do
+    policy = Policy.resolve!(model, opts)
 
-    if resolved.provider != :anthropic do
-      raise "Model #{inspect(model_ref)} is configured for provider #{inspect(resolved.provider)}, not :anthropic"
+    if policy.platform != :anthropic do
+      raise ArgumentError,
+            "#{inspect(model)} goes to #{inspect(policy.platform)}, not :anthropic"
     end
 
-    resolved
+    policy
   end
 
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do

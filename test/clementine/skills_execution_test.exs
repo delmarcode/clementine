@@ -94,7 +94,7 @@ defmodule Clementine.SkillsExecutionTest do
 
   defp agent(opts) do
     Clementine.Agent.new(
-      Keyword.merge([model: :claude_sonnet, instructions: @instructions, tools: [Echo]], opts)
+      Keyword.merge([model: "claude-sonnet-5", instructions: @instructions, tools: [Echo]], opts)
     )
   end
 
@@ -561,14 +561,14 @@ defmodule Clementine.SkillsExecutionTest do
              } = payload
 
       assert fingerprint ==
-               Trace.fingerprint(:claude_sonnet, @instructions, [SafeEcho, GatedDeploy],
+               Trace.fingerprint("claude-sonnet-5", @instructions, [SafeEcho, GatedDeploy],
                  deferred: [GatedDeploy],
                  output_schema: @answer_schema,
                  skills: [Notes.__skill__()]
                )
 
       refute fingerprint ==
-               Trace.fingerprint(:claude_sonnet, @instructions, [SafeEcho, GatedDeploy],
+               Trace.fingerprint("claude-sonnet-5", @instructions, [SafeEcho, GatedDeploy],
                  deferred: [GatedDeploy],
                  output_schema: @answer_schema
                )
@@ -730,7 +730,7 @@ defmodule Clementine.SkillsExecutionTest do
              } = execution.payload
 
       assert fingerprint ==
-               Trace.fingerprint(:claude_sonnet, @instructions, [Echo],
+               Trace.fingerprint("claude-sonnet-5", @instructions, [Echo],
                  skills: [Deploys.__skill__(), Notes.__skill__()]
                )
 
@@ -913,29 +913,29 @@ defmodule Clementine.SkillsExecutionTest do
   describe "the fingerprint" do
     test "covers each skill's name, description, and tools, and is unchanged for an agent " <>
            "offering none" do
-      base = Trace.fingerprint(:claude_sonnet, @instructions, [Echo])
+      base = Trace.fingerprint("claude-sonnet-5", @instructions, [Echo])
 
-      assert base == Trace.fingerprint(:claude_sonnet, @instructions, [Echo], skills: [])
+      assert base == Trace.fingerprint("claude-sonnet-5", @instructions, [Echo], skills: [])
 
       %Skill{} = notes = Notes.__skill__()
-      with_notes = Trace.fingerprint(:claude_sonnet, @instructions, [Echo], skills: [notes])
+      with_notes = Trace.fingerprint("claude-sonnet-5", @instructions, [Echo], skills: [notes])
       refute with_notes == base
 
       reworded = %{notes | description: "Take longer notes."}
 
       refute with_notes ==
-               Trace.fingerprint(:claude_sonnet, @instructions, [Echo], skills: [reworded])
+               Trace.fingerprint("claude-sonnet-5", @instructions, [Echo], skills: [reworded])
 
       retooled = %{notes | tools: [SafeEcho]}
 
       refute with_notes ==
-               Trace.fingerprint(:claude_sonnet, @instructions, [Echo], skills: [retooled])
+               Trace.fingerprint("claude-sonnet-5", @instructions, [Echo], skills: [retooled])
 
       # The body is read at load, per run: it is not the agent's identity.
       rebodied = %{notes | body: "Anything."}
 
       assert with_notes ==
-               Trace.fingerprint(:claude_sonnet, @instructions, [Echo], skills: [rebodied])
+               Trace.fingerprint("claude-sonnet-5", @instructions, [Echo], skills: [rebodied])
     end
   end
 end

@@ -172,7 +172,7 @@ may treat it (`docs/TOOL_AUTHORING.md`).
 ```elixir
 agent =
   Clementine.Agent.new(
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "System prompt",
     tools: [MyTool],
     defaults: [max_iterations: 10, max_duration: :timer.minutes(5)]
@@ -210,13 +210,13 @@ changes once runs exist.
 ## Configuration
 
 `config/` configures this repo's own development and tests; a host app
-configures `:clementine` itself. The library reads `:models` (the
-catalog of aliases; there are no built-in ones, so an alias resolves
-only if config names it, and `docs/MODELS.md` has every key), provider
-credentials and endpoints (`anthropic_api_key: {:system, "..."}`, ...),
-`:retry` for provider calls, and `:llm_client` (the mock, in tests).
-`:default_model` and `:max_iterations` are read only by
-`Clementine.AgentServer`; an agent names its own model and limits.
+configures `:clementine` itself. The library reads `:models` (a map
+from model id to facts: overrides of the sheets Clementine ships in
+`lib/clementine/models/`, and declarations of models it does not;
+`docs/MODELS.md` has every key), provider credentials and endpoints
+(`anthropic_api_key: {:system, "..."}`, ...), `:retry` for provider
+calls, and `:llm_client` (the mock, in tests). An agent names its own
+model by id, with its own choices for it (`Clementine.LLM.Policy`).
 
 ## Common tasks
 
@@ -229,12 +229,15 @@ with `Clementine.ToolContext.resolve_path/2`.
 
 ### Adding a model or a provider
 
-Follow `docs/MODELS.md`. Most new providers are OpenAI-compatible
-endpoints: a `provider: :openai_compatible` catalog entry with a
-`base_url`, and no code. A new wire dialect needs a
-`Clementine.LLM.ClientBehaviour` implementation, the provider atom in
-`Clementine.LLM.ModelRegistry`, a `Clementine.LLM.Router` mapping, and a
-`Clementine.LLM.Reasoning` translation.
+Follow `docs/MODELS.md`. A new Anthropic or OpenAI model is a sheet in
+`Clementine.Models.Anthropic` or `Clementine.Models.OpenAI`, each fact
+read from the vendor's page with its source and read date; never infer
+a fact from an id. Most new providers are OpenAI-compatible endpoints:
+an app declares the model on `:openai_compatible` with a `base_url`, and
+no code. A new wire dialect needs a `Clementine.LLM.ClientBehaviour`
+implementation, the platform in `Clementine.Model`'s list and a
+`Clementine.LLM.Router` mapping, and a `Clementine.LLM.Reasoning`
+translation.
 
 ### Changing the public surface or the generators
 

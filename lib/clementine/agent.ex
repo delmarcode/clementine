@@ -18,7 +18,7 @@ defmodule Clementine.Agent do
       defmodule MyApp.Agents.Weather do
         use Clementine.Agent,
           key: "weather",
-          model: :claude_sonnet,
+          model: "claude-sonnet-5-5",
           instructions: "Answer questions about the weather.",
           tools: [MyApp.Agents.Weather.Tools.Forecast],
           defaults: [max_iterations: 10, max_duration: :timer.minutes(5)]
@@ -33,7 +33,7 @@ defmodule Clementine.Agent do
         @impl true
         def agent(run) do
           Clementine.Agent.new(
-            model: :claude_sonnet,
+            model: "claude-sonnet-5-5",
             instructions: MyApp.Triage.instructions(run.subject),
             tools: [MyApp.Agents.Triage.Tools.Assess]
           )
@@ -43,6 +43,51 @@ defmodule Clementine.Agent do
   The fields given to `use` build the agent at compile time, so a typo in
   them fails the build. List the module in the child spec's `agents:`.
 
+  ## The model and its policy
+
+  An agent names its model by the vendor's id and makes its own choices
+  for it, checked against the model's fact sheet (`Clementine.Model`):
+
+      use Clementine.Agent,
+        key: "triage",
+        model: "claude-sonnet-5-5",
+        effort: :high,
+        max_tokens: 16_000,
+        cache: [ttl: :one_hour]
+
+  - `max_tokens:` the output ceiling of one response, thinking included;
+    default `min(16_000, the model's max_output)`.
+  - `effort:` one of the model's effort levels; default the model's own,
+    sent explicitly.
+  - `thinking:` `:adaptive`, `:enabled`, `:between_tools`, or `:off`;
+    default `:adaptive` where the model takes it.
+  - `display:` `:omitted` (default), `:summarized`, or `:updates`, for
+    the thinking a Claude model returns.
+  - `cache:` `true` (default, the model's shortest TTL), `false`, or
+    `[ttl: ...]`.
+  - `provider_options:` what one vendor alone takes (`budget_tokens:` on
+    a Claude model before 4.7, OpenAI's `summary:`).
+
+  `Clementine.LLM.Policy` has each in full. A model the sheets and the
+  app's config do not know, or a choice its sheet refuses, fails
+  `new/1` and boot, naming what the model takes instead.
+
+  `use` with `model:` defines `__model__/0`, so a module whose
+  `c:agent/1` builds the agent per run still declares its model where
+  the child spec and tools can read it. The runtime fills a model and
+  policy that `c:agent/1` leaves unset from the module's `use`, so an
+  eval may pass a model per run and keep the agent's policy:
+
+      use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", effort: :high
+
+      @impl true
+      def agent(run) do
+        Clementine.Agent.new(
+          model: run.metadata["model"] || __model__(),
+          instructions: MyApp.Triage.instructions(run.subject)
+        )
+      end
+
   ## Deferred tools
 
   An agent with more tools than a model can choose among well (tens, or
@@ -51,7 +96,7 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent,
         key: "support",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Help customers with their orders.",
         tools: [MyApp.Tools.LookupOrder],
         deferred: [MyApp.Tools.IssueRefund, MyApp.Tools.ChangeAddress]
@@ -75,7 +120,7 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent,
         key: "grader",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Grade the essay against the rubric.",
         tools: [MyApp.Tools.FetchRubric],
         output_schema: %{
@@ -116,7 +161,7 @@ defmodule Clementine.Agent do
         use Clementine.Agent,
           key: "chat",
           turn: true,
-          model: :claude_sonnet,
+          model: "claude-sonnet-5-5",
           instructions: "You are a helpful assistant."
 
         @impl true
@@ -156,7 +201,7 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent,
         key: "support",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Help customers with their orders.",
         tools: [MyApp.Tools.Search],
         skills: [MyApp.Skills.Refunds, MyApp.Skills.Shipping]
@@ -183,7 +228,7 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent,
         key: "planner",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Plan the work. Ask the researcher for facts.",
         delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
 
@@ -194,7 +239,7 @@ defmodule Clementine.Agent do
       use Clementine.Agent,
         key: "researcher",
         description: "Finds and cites facts. Ask it for anything you would look up.",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "..."
 
   `description:` goes to `use` in either form, beside `key:`, with the
@@ -209,9 +254,16 @@ defmodule Clementine.Agent do
   The in-memory agent *process* lives at `Clementine.AgentServer`.
   """
 
-  @enforce_keys [:model]
+  @policy Clementine.LLM.Policy.keys()
+
   defstruct id: nil,
             model: nil,
+            max_tokens: nil,
+            effort: nil,
+            thinking: nil,
+            display: nil,
+            cache: nil,
+            provider_options: nil,
             instructions: nil,
             tools: [],
             deferred: [],
@@ -225,7 +277,13 @@ defmodule Clementine.Agent do
 
   @type t :: %__MODULE__{
           id: term(),
-          model: Clementine.LLM.ModelRegistry.model_ref(),
+          model: String.t() | nil,
+          max_tokens: pos_integer() | nil,
+          effort: Clementine.Model.effort() | nil,
+          thinking: Clementine.Model.thinking_type() | nil,
+          display: :omitted | :summarized | :updates | nil,
+          cache: boolean() | keyword() | nil,
+          provider_options: keyword() | nil,
           instructions: String.t() | nil,
           tools: [module()],
           deferred: [module()],
@@ -350,6 +408,15 @@ defmodule Clementine.Agent do
       @clementine_agent_key key
       @clementine_agent_turn turn
       @clementine_agent_description description
+      @clementine_agent_model Keyword.get(fields, :model)
+      @clementine_agent_policy Keyword.take(fields, Clementine.LLM.Policy.keys())
+
+      @doc "The model id this agent declares on `use`, or `nil`."
+      def __model__, do: @clementine_agent_model
+
+      @doc false
+      # The policy this agent declares on `use`.
+      def __policy__, do: @clementine_agent_policy
 
       @impl Clementine.Agent
       def key, do: @clementine_agent_key
@@ -397,7 +464,13 @@ defmodule Clementine.Agent do
 
   ## Options
 
-  - `:model` (required) - model alias atom or `{provider, id}` tuple
+  - `:model` - the model's id (`"claude-sonnet-5-5"`), one Clementine
+    ships a sheet for or `config :clementine, :models` declares. An agent
+    the runtime builds from a module may leave it out and take the
+    module's `__model__/0`
+  - `:max_tokens`, `:effort`, `:thinking`, `:display`, `:cache`,
+    `:provider_options` - the agent's choices for its model (see "The
+    model and its policy" above)
   - `:id` - host-app identifier, kept for audit trails
   - `:instructions` - system prompt
   - `:tools` - tool modules
@@ -424,6 +497,7 @@ defmodule Clementine.Agent do
   def new(opts) when is_list(opts) do
     agent = struct!(__MODULE__, opts)
     Clementine.Trace.validate_fidelity!(agent.trace)
+    check_model!(agent)
 
     case Enum.filter(agent.deferred, &(&1 in agent.tools)) do
       [] ->
@@ -432,6 +506,68 @@ defmodule Clementine.Agent do
       both ->
         raise ArgumentError,
               "a tool is in tools: or deferred:, not both; found in both: #{inspect(both)}"
+    end
+  end
+
+  @doc """
+  The agent's choices for its model, as `Clementine.LLM.Policy` and a
+  client's request opts take them: the ones it sets, and no others.
+  """
+  @spec policy(t()) :: keyword()
+  def policy(%__MODULE__{} = agent) do
+    for key <- @policy, value = Map.fetch!(agent, key), value != nil, do: {key, value}
+  end
+
+  @doc false
+  # The agent `module.agent/1` built, with the model and the choices it
+  # left unset taken from the module's `use`, checked against the model's
+  # sheet. The runtime calls it at every claim; an ArgumentError cancels
+  # the run as unstartable.
+  @spec declared!(module(), t()) :: t()
+  def declared!(module, %__MODULE__{} = agent) do
+    declared = if function_exported?(module, :__policy__, 0), do: module.__policy__(), else: []
+    model = if function_exported?(module, :__model__, 0), do: module.__model__()
+
+    agent =
+      Enum.reduce(declared, %{agent | model: agent.model || model}, fn {key, value}, agent ->
+        if Map.fetch!(agent, key) == nil, do: Map.put(agent, key, value), else: agent
+      end)
+
+    if agent.model == nil do
+      raise ArgumentError,
+            "#{inspect(module)}.agent/1 names no model, and its use Clementine.Agent declares " <>
+              "none: give one (model: \"claude-sonnet-5-5\")"
+    end
+
+    check_model!(agent)
+  end
+
+  @doc false
+  # Checks a module's declared model and policy against the sheets and
+  # the app's config, as boot does for every agent in `agents:`.
+  @spec check_declared(module()) :: :ok | {:error, String.t()}
+  def check_declared(module) do
+    case module.__model__() do
+      nil ->
+        :ok
+
+      model ->
+        case Clementine.LLM.Policy.resolve(model, module.__policy__()) do
+          {:ok, _policy} -> :ok
+          {:error, message} -> {:error, message}
+        end
+    end
+  end
+
+  # An agent without a model is one the runtime completes from its
+  # module (`declared!/2`); one with a model is checked now, so a typo or
+  # a choice its sheet refuses fails the build.
+  defp check_model!(%__MODULE__{model: nil} = agent), do: agent
+
+  defp check_model!(%__MODULE__{model: model} = agent) do
+    case Clementine.LLM.Policy.resolve(model, policy(agent)) do
+      {:ok, _policy} -> agent
+      {:error, message} -> raise ArgumentError, "Clementine.Agent: " <> message
     end
   end
 

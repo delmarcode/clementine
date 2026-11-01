@@ -30,6 +30,8 @@ defmodule Clementine.LLM.PromptCachingTest do
   ]
 
   @key "clementine-0123456789abcdef0123456789abcdef"
+  @claude "claude-sonnet-5"
+  @or_claude "anthropic/claude-sonnet-5"
 
   setup do
     bypass = Bypass.open()
@@ -49,31 +51,29 @@ defmodule Clementine.LLM.PromptCachingTest do
     Application.put_env(:clementine, :vertex_access_token, "test-vertex-token")
     Application.put_env(:clementine, :openai_compatible_base_url, base <> "/oai/v1")
 
-    Application.put_env(:clementine, :models,
-      claude: [provider: :anthropic, id: "claude-sonnet-5"],
-      claude_hour: [provider: :anthropic, id: "claude-sonnet-5", cache: [ttl: :one_hour]],
-      claude_off: [provider: :anthropic, id: "claude-sonnet-5", cache: false],
-      gpt_5: [provider: :openai, id: "gpt-5"],
-      gpt_5_6: [provider: :openai, id: "gpt-5.6-sol"],
-      gpt_5_6_long: [provider: :openai, id: "gpt-5.6-sol", cache: [ttl: :twelve_hours]],
-      gpt_5_6_off: [provider: :openai, id: "gpt-5.6-sol", cache: false],
-      gpt_5_off: [provider: :openai, id: "gpt-5", cache: false],
-      or_claude: [provider: :openrouter, id: "anthropic/claude-sonnet-5"],
-      or_claude_hour: [
-        provider: :openrouter,
-        id: "anthropic/claude-sonnet-5",
-        cache: [ttl: :one_hour]
-      ],
-      or_deepseek: [provider: :openrouter, id: "deepseek/deepseek-v3.2"],
-      or_off: [provider: :openrouter, id: "anthropic/claude-sonnet-5", cache: false],
-      or_gpt_off: [provider: :openrouter, id: "openai/gpt-5.6-sol", cache: false],
-      bedrock_gpt_off: [provider: :bedrock, id: "global.openai.gpt-5.6-sol", cache: false],
-      bedrock_off: [provider: :bedrock, id: "openai.gpt-oss-120b-1:0", cache: false],
-      bedrock: [provider: :bedrock, id: "openai.gpt-oss-120b-1:0"],
-      vertex: [provider: :vertex, id: "deepseek-ai/deepseek-v3.2-maas"],
-      vllm: [provider: :openai_compatible, id: "qwen3"],
-      proxy: [provider: :openai_compatible, id: "claude-sonnet-5", cache: [markers: true]]
-    )
+    # Shipped sheets ("claude-sonnet-5", "gpt-5", "gpt-5.6-sol",
+    # "gpt-6.1-sol") carry their own cache facts; the models below are
+    # declarations, and their cache.ttls decide what goes on the wire.
+    Application.put_env(:clementine, :models, %{
+      # Claude on OpenRouter: cache_control markers.
+      "anthropic/claude-sonnet-5" =>
+        declared(:anthropic, [openrouter: []], cache: [ttls: [:five_minutes, :one_hour]]),
+      # Claude behind a LiteLLM proxy, which takes the vendor's id.
+      "proxy/claude-sonnet-5" =>
+        declared(:anthropic, [openai_compatible: [id: "claude-sonnet-5"]],
+          cache: [ttls: [:five_minutes, :one_hour]]
+        ),
+      # GPT-5.6 on OpenRouter and Bedrock: billed for 30 minutes, no TTL sent.
+      "openai/gpt-5.6-sol" =>
+        declared(:openai, [openrouter: []], cache: [ttls: [:thirty_minutes]]),
+      "global.openai.gpt-5.6-sol" =>
+        declared(:openai, [bedrock: []], cache: [ttls: [:thirty_minutes]]),
+      # Models that cache on their own, if at all.
+      "deepseek/deepseek-v3.2" => declared(:deepseek, openrouter: []),
+      "openai.gpt-oss-120b-1:0" => declared(:openai, bedrock: []),
+      "deepseek-ai/deepseek-v3.2-maas" => declared(:deepseek, vertex: []),
+      "qwen3" => declared(:qwen, openai_compatible: [])
+    })
 
     on_exit(fn ->
       Enum.each(previous, fn
@@ -87,7 +87,7 @@ defmodule Clementine.LLM.PromptCachingTest do
 
   describe "Anthropic" do
     test "marks the system prompt and the conversation's tail", %{bypass: bypass} do
-      request = anthropic_request(bypass, :claude, "Be brief.", [Echo])
+      request = anthropic_request(bypass, @claude, "Be brief.", [Echo])
 
       assert request["system"] == [
                %{"type" => "text", "text" => "Be brief.", "cache_control" => ephemeral()}
@@ -98,8 +98,8 @@ defmodule Clementine.LLM.PromptCachingTest do
       refute Map.has_key?(echo, "cache_control")
     end
 
-    test "a one-hour alias marks both breakpoints with it", %{bypass: bypass} do
-      request = anthropic_request(bypass, :claude_hour, "Be brief.", [])
+    test "cache: [ttl: :one_hour] marks both breakpoints with it", %{bypass: bypass} do
+      request = anthropic_request(bypass, @claude, "Be brief.", [], cache: [ttl: :one_hour])
       hour = %{"type" => "ephemeral", "ttl" => "1h"}
 
       assert [%{"cache_control" => ^hour}] = request["system"]
@@ -110,7 +110,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       bypass: bypass
     } do
       request =
-        anthropic_request(bypass, :claude, nil, [Echo, Add, GatedDeploy], deferred: [GatedDeploy])
+        anthropic_request(bypass, @claude, nil, [Echo, Add, GatedDeploy], deferred: [GatedDeploy])
 
       refute Map.has_key?(request, "system")
 
@@ -126,7 +126,7 @@ defmodule Clementine.LLM.PromptCachingTest do
     end
 
     test "cache: false sends no breakpoints", %{bypass: bypass} do
-      request = anthropic_request(bypass, :claude_off, "Be brief.", [Echo])
+      request = anthropic_request(bypass, @claude, "Be brief.", [Echo], cache: false)
 
       assert request["system"] == "Be brief."
       refute Map.has_key?(request, "cache_control")
@@ -139,7 +139,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       stream_back(bypass, "/v1/messages", anthropic_stream(final_usage: %{"output_tokens" => 42}))
 
       assert {:ok, response} =
-               :claude
+               @claude
                |> Anthropic.stream("Be brief.", [UserMessage.new("Hi")], [])
                |> LLM.collect_stream()
 
@@ -162,7 +162,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       stream_back(bypass, "/v1/messages", anthropic_stream(final_usage: final))
 
       assert {:ok, response} =
-               :claude
+               @claude
                |> Anthropic.stream("Be brief.", [UserMessage.new("Hi")], [])
                |> LLM.collect_stream()
 
@@ -185,7 +185,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       stream_back(bypass, "/v1/messages", anthropic_stream(final_usage: final))
 
       assert {:ok, response} =
-               :claude
+               @claude
                |> Anthropic.stream("Be brief.", [UserMessage.new("Hi")], [])
                |> LLM.collect_stream()
 
@@ -209,7 +209,7 @@ defmodule Clementine.LLM.PromptCachingTest do
         }
       })
 
-      assert {:ok, response} = Anthropic.call(:claude, "Be brief.", [UserMessage.new("Hi")], [])
+      assert {:ok, response} = Anthropic.call(@claude, "Be brief.", [UserMessage.new("Hi")], [])
 
       assert Usage.new(response.usage) == %Usage{
                input_tokens: 4_007,
@@ -220,33 +220,54 @@ defmodule Clementine.LLM.PromptCachingTest do
   end
 
   describe "OpenAI Responses" do
-    test "sends the lane's prompt_cache_key; a model before GPT-5.6 gets no cache options", %{
+    test "sends the lane's prompt_cache_key; a sheet offering no TTL gets no cache options", %{
       bypass: bypass
     } do
-      request = openai_request(bypass, :gpt_5, cache_key: @key)
+      # GPT-5's sheet offers no TTL: it keeps its own retention.
+      request = openai_request(bypass, "gpt-5", cache_key: @key)
 
       assert request["prompt_cache_key"] == @key
       refute Map.has_key?(request, "prompt_cache_options")
     end
 
-    test "GPT-5.6 and later get the write's lifetime", %{bypass: bypass} do
-      assert openai_request(bypass, :gpt_5_6, cache_key: @key)["prompt_cache_options"] ==
-               %{"ttl" => "30m"}
-
-      assert openai_request(bypass, :gpt_5_6_long, [])["prompt_cache_options"] ==
-               %{"ttl" => "12h"}
-    end
-
-    test "cache: false turns caching off where the model allows, and sends no key", %{
+    test "a sheet offering prompt_cache_options TTLs gets the write's lifetime", %{
       bypass: bypass
     } do
-      off = openai_request(bypass, :gpt_5_6_off, cache_key: @key)
+      for id <- ["gpt-5.6-sol", "gpt-6.1-sol"] do
+        request = openai_request(bypass, id, cache_key: @key)
+        assert request["prompt_cache_options"] == %{"ttl" => "30m"}, id
+        assert request["prompt_cache_key"] == @key
+      end
+
+      assert openai_request(bypass, "gpt-6.1-sol", cache: [ttl: :twelve_hours])[
+               "prompt_cache_options"
+             ] == %{"ttl" => "12h"}
+    end
+
+    test "cache: false turns caching off where the sheet allows, and sends no key", %{
+      bypass: bypass
+    } do
+      off = openai_request(bypass, "gpt-6.1-sol", cache_key: @key, cache: false)
       assert off["prompt_cache_options"] == %{"mode" => "explicit"}
       refute Map.has_key?(off, "prompt_cache_key")
 
-      older = openai_request(bypass, :gpt_5_off, cache_key: @key)
+      older = openai_request(bypass, "gpt-5", cache_key: @key, cache: false)
       refute Map.has_key?(older, "prompt_cache_options")
       refute Map.has_key?(older, "prompt_cache_key")
+    end
+
+    test "a TTL the sheet does not offer is refused before anything is sent" do
+      assert_raise ArgumentError, ~r/cache: \[ttl: :thirty_minutes\] is not offered/, fn ->
+        OpenAI.stream("gpt-5", "Be brief.", [UserMessage.new("Hi")], [],
+          cache: [ttl: :thirty_minutes]
+        )
+      end
+
+      assert_raise ArgumentError, ~r/cache: \[ttl: :one_hour\] is not offered/, fn ->
+        OpenAI.stream("gpt-6.1-sol", "Be brief.", [UserMessage.new("Hi")], [],
+          cache: [ttl: :one_hour]
+        )
+      end
     end
 
     test "the stream's usage reads cached and written tokens out of the input", %{
@@ -266,7 +287,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       stream_back(bypass, "/v1/responses", openai_stream(usage))
 
       assert {:ok, response} =
-               :gpt_5_6
+               "gpt-6.1-sol"
                |> OpenAI.stream("Be brief.", [UserMessage.new("Hi")], [])
                |> LLM.collect_stream()
 
@@ -280,10 +301,10 @@ defmodule Clementine.LLM.PromptCachingTest do
   end
 
   describe "Chat Completions" do
-    test "OpenRouter marks an Anthropic model's system prompt and tail, and keys the lane", %{
+    test "OpenRouter marks a model offering marker TTLs, and keys the lane", %{
       bypass: bypass
     } do
-      request = chat_request(bypass, "/api/v1/chat/completions", :or_claude, cache_key: @key)
+      request = chat_request(bypass, "/api/v1/chat/completions", @or_claude, cache_key: @key)
 
       assert [
                %{
@@ -304,49 +325,67 @@ defmodule Clementine.LLM.PromptCachingTest do
       assert request["stream_options"] == %{"include_usage" => true}
     end
 
-    test "OpenRouter carries a one-hour alias's TTL on its markers", %{bypass: bypass} do
-      request = chat_request(bypass, "/api/v1/chat/completions", :or_claude_hour, [])
+    test "OpenRouter carries a one-hour TTL on its markers", %{bypass: bypass} do
+      request =
+        chat_request(bypass, "/api/v1/chat/completions", @or_claude, cache: [ttl: :one_hour])
+
       hour = %{"type" => "ephemeral", "ttl" => "1h"}
 
       assert [%{"content" => [%{"cache_control" => ^hour}]} | _] = request["messages"]
       assert request["cache_control"] == hour
     end
 
-    test "OpenRouter leaves other models to cache on their own, on the lane's key", %{
+    test "OpenRouter leaves a model offering no TTL to cache on its own, on the lane's key", %{
       bypass: bypass
     } do
-      request = chat_request(bypass, "/api/v1/chat/completions", :or_deepseek, cache_key: @key)
+      request =
+        chat_request(bypass, "/api/v1/chat/completions", "deepseek/deepseek-v3.2",
+          cache_key: @key
+        )
 
       assert [%{"role" => "system", "content" => "Be brief."} | _] = request["messages"]
       refute Map.has_key?(request, "cache_control")
+      refute Map.has_key?(request, "prompt_cache_options")
       assert request["prompt_cache_key"] == @key
     end
 
     test "OpenRouter with cache: false sends neither markers nor a key", %{bypass: bypass} do
-      request = chat_request(bypass, "/api/v1/chat/completions", :or_off, cache_key: @key)
+      request =
+        chat_request(bypass, "/api/v1/chat/completions", @or_claude,
+          cache_key: @key,
+          cache: false
+        )
 
       assert [%{"role" => "system", "content" => "Be brief."} | _] = request["messages"]
       refute Map.has_key?(request, "cache_control")
       refute Map.has_key?(request, "prompt_cache_key")
+      # Marker TTLs have no explicit mode to turn off.
+      refute Map.has_key?(request, "prompt_cache_options")
     end
 
     test "Bedrock, Vertex, and a self-hosted server get no cache fields", %{bypass: bypass} do
       for {model, path} <- [
-            bedrock: "/bedrock/v1/chat/completions",
-            vertex: "/vertex/v1/chat/completions",
-            vllm: "/oai/v1/chat/completions"
+            {"openai.gpt-oss-120b-1:0", "/bedrock/v1/chat/completions"},
+            {"deepseek-ai/deepseek-v3.2-maas", "/vertex/v1/chat/completions"},
+            {"qwen3", "/oai/v1/chat/completions"}
           ] do
         request = chat_request(bypass, path, model, cache_key: @key)
 
         assert [%{"role" => "system", "content" => "Be brief."} | _] = request["messages"]
         refute Map.has_key?(request, "cache_control")
         refute Map.has_key?(request, "prompt_cache_key")
+        refute Map.has_key?(request, "prompt_cache_options")
         assert request["stream_options"] == %{"include_usage" => true}
       end
     end
 
-    test "markers: true sends them through a proxy", %{bypass: bypass} do
-      request = chat_request(bypass, "/oai/v1/chat/completions", :proxy, cache_key: @key)
+    test "marker TTLs send the markers through a proxy, under the id it takes", %{
+      bypass: bypass
+    } do
+      request =
+        chat_request(bypass, "/oai/v1/chat/completions", "proxy/claude-sonnet-5", cache_key: @key)
+
+      assert request["model"] == "claude-sonnet-5"
 
       assert [%{"content" => [%{"cache_control" => %{"type" => "ephemeral"}}]} | _] =
                request["messages"]
@@ -366,7 +405,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       stream_back(bypass, "/api/v1/chat/completions", chat_stream(usage))
 
       assert {:ok, response} =
-               :or_claude
+               @or_claude
                |> ChatCompletions.stream("Be brief.", [UserMessage.new("Hi")], [])
                |> LLM.collect_stream()
 
@@ -378,23 +417,46 @@ defmodule Clementine.LLM.PromptCachingTest do
              }
     end
 
-    test "cache: false turns off GPT-5.6's own caching on OpenRouter and Bedrock", %{
+    test "cache: false turns off the caching of a model offering prompt_cache_options TTLs", %{
       bypass: bypass
     } do
       for {model, path} <- [
-            or_gpt_off: "/api/v1/chat/completions",
-            bedrock_gpt_off: "/bedrock/v1/chat/completions"
+            {"openai/gpt-5.6-sol", "/api/v1/chat/completions"},
+            {"global.openai.gpt-5.6-sol", "/bedrock/v1/chat/completions"}
           ] do
-        request = chat_request(bypass, path, model, cache_key: @key)
+        request = chat_request(bypass, path, model, cache_key: @key, cache: false)
 
         assert request["prompt_cache_options"] == %{"mode" => "explicit"}
         refute Map.has_key?(request, "prompt_cache_key")
         refute Map.has_key?(request, "cache_control")
+
+        # With caching on, it caches on its own: no TTL goes, and no markers.
+        request = chat_request(bypass, path, model, [])
+        refute Map.has_key?(request, "prompt_cache_options")
+        refute Map.has_key?(request, "cache_control")
       end
 
-      # Nothing to turn off on a model that does not document it.
-      request = chat_request(bypass, "/bedrock/v1/chat/completions", :bedrock_off, [])
+      # Nothing to turn off on a model whose sheet offers no TTL.
+      request =
+        chat_request(bypass, "/bedrock/v1/chat/completions", "openai.gpt-oss-120b-1:0",
+          cache: false
+        )
+
       refute Map.has_key?(request, "prompt_cache_options")
+    end
+
+    test "a TTL the model does not offer on its platform is refused before anything is sent" do
+      for {model, ttl} <- [
+            {@or_claude, :thirty_minutes},
+            {"openai/gpt-5.6-sol", :twelve_hours},
+            {"deepseek/deepseek-v3.2", :five_minutes}
+          ] do
+        assert_raise ArgumentError, ~r/cache: \[ttl: #{inspect(ttl)}\] is not offered/, fn ->
+          ChatCompletions.stream(model, "Be brief.", [UserMessage.new("Hi")], [],
+            cache: [ttl: ttl]
+          )
+        end
+      end
     end
 
     test "OpenRouter's last chunk carries its usage beside the finish", %{bypass: bypass} do
@@ -432,7 +494,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       stream_back(bypass, "/api/v1/chat/completions", body)
 
       assert {:ok, response} =
-               :or_claude
+               @or_claude
                |> ChatCompletions.stream("Be brief.", [UserMessage.new("Hi")], [])
                |> LLM.collect_stream()
 
@@ -471,7 +533,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       stream_back(bypass, "/vertex/v1/chat/completions", body)
 
       assert {:ok, response} =
-               :vertex
+               "deepseek-ai/deepseek-v3.2-maas"
                |> ChatCompletions.stream("Be brief.", [UserMessage.new("Hi")], [])
                |> LLM.collect_stream()
 
@@ -493,7 +555,12 @@ defmodule Clementine.LLM.PromptCachingTest do
       })
 
       assert {:ok, response} =
-               ChatCompletions.call(:proxy, "Be brief.", [UserMessage.new("Hi")], [])
+               ChatCompletions.call(
+                 "proxy/claude-sonnet-5",
+                 "Be brief.",
+                 [UserMessage.new("Hi")],
+                 []
+               )
 
       assert Usage.new(response.usage) == %Usage{
                input_tokens: 2_006,
@@ -516,7 +583,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       })
 
       assert {:ok, response} =
-               ChatCompletions.call(:vllm, "Be brief.", [UserMessage.new("Hi")], [])
+               ChatCompletions.call("qwen3", "Be brief.", [UserMessage.new("Hi")], [])
 
       assert Usage.new(response.usage) == %Usage{
                input_tokens: 2_048,
@@ -543,7 +610,7 @@ defmodule Clementine.LLM.PromptCachingTest do
       sse(conn, Clementine.Test.Fixtures.sse_text_stream("ok"))
     end)
 
-    :claude |> Anthropic.stream("Be brief.", history, [Add]) |> Stream.run()
+    @claude |> Anthropic.stream("Be brief.", history, [Add]) |> Stream.run()
 
     assert_received {:request, request}
     assert request["cache_control"] == ephemeral()
@@ -554,6 +621,13 @@ defmodule Clementine.LLM.PromptCachingTest do
   end
 
   defp ephemeral, do: %{"type" => "ephemeral"}
+
+  defp declared(vendor, platforms, facts \\ []) do
+    Keyword.merge(
+      [vendor: vendor, context: 200_000, max_output: 32_000, platforms: platforms],
+      facts
+    )
+  end
 
   defp anthropic_request(bypass, model, system, tools, opts \\ []) do
     test = self()

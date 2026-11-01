@@ -15,12 +15,11 @@ defmodule Clementine.Telemetry do
   > - The pre-RFC `[:clementine, :loop, ...]` engine events are gone; the
   >   engine emits `[:clementine, :rollout, ...]` instead, and `:loop`
   >   now names the loop layer's events.
-  > - On rollout and llm events, `model` is the provider's id for the
-  >   model (`"claude-sonnet-5"`), no longer the agent's model reference
-  >   (`:claude_sonnet`), which moved to `alias`. A handler that matched
-  >   an alias in `model` reads `alias` now.
+  > - On rollout and llm events, `model` is the model's id
+  >   (`"claude-sonnet-5"`), as the agent names it.
   > - Rollout, llm, and tool events gain `agent_key`, `provider`, and
-  >   `alias` ("What a run names").
+  >   `alias` ("What a run names"). Models are named by id, so `alias`
+  >   is always `nil`; it leaves with OPS-190.
 
   ## What a run names
 
@@ -32,15 +31,14 @@ defmodule Clementine.Telemetry do
     (`Clementine.run(agent, prompt, context: %{agent_key: "triage"})`);
     otherwise `nil`. Never the agent's `id`, which an app may set to
     anything, a per-workspace id say
-  - `provider` — the provider the model resolved to (`:anthropic`,
-    `:openai`, ...)
-  - `model` — the provider's id for the model (`"claude-sonnet-5"`)
-  - `alias` — the catalog alias the agent named (`:claude_sonnet`), or
-    `nil` for a `{provider, id}` reference
+  - `provider` — the platform the model's request goes to
+    (`:anthropic`, `:openai`, ...)
+  - `model` — the model's id (`"claude-sonnet-5"`, `Clementine.Model`)
+  - `alias` — always `nil` now that models are named by id; it leaves
+    with OPS-190
 
-  A model reference the catalog does not hold (a test's, on a mock
-  client) has `provider: nil`: a `{provider, id}` reference keeps its id
-  as `model`, and an alias has `model: nil` beside its `alias`. Each is
+  An id no sheet holds, or choices its sheet refuses (a test's, on a
+  mock client), has `provider: nil` and keeps the id as `model`. Each is
   fixed in code, so a metric may label by it, and a nil one exports as
   `""`.
 
@@ -331,7 +329,7 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{duration: native_time, input_tokens: integer, output_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer, cost_micros: integer}`
     (`Clementine.Usage`'s fields: the cache counts are parts of `input_tokens`).
     `cost_micros` is what the call cost in micro-units of `currency`
-    (`Clementine.Cost`), at the prices the alias has now, the same cost
+    (`Clementine.Cost`), at the prices the model has now, the same cost
     the call's trace entry freezes; a call on a model without prices
     leaves it out, never reports zero.
   - Metadata: `%{agent_key, provider, model, alias, iteration: integer, stop_reason: String.t() | nil, currency: String.t() | nil, streaming: boolean}`
@@ -514,16 +512,14 @@ defmodule Clementine.Telemetry do
   ### Labels across apps and reporters
 
   A label a writer could not fill (an `agent_key` no run named, the
-  `alias` of a `{provider, id}` reference) exports as `""`, which
+  `alias` no model has now) exports as `""`, which
   Prometheus reads as the label absent, on every reporter: left to
   themselves, `TelemetryMetricsPrometheus.Core` writes `""` and Peep
   writes `"nil"`.
 
-  Compare the fleet by `provider` and `model`: they name what ran,
-  whatever an app calls it. `alias` is an app's own name for a model in
-  its catalog (one app's `:claude_sonnet` may be another's `:sonnet`),
-  so it is for views within one app, and for cost, which its prices
-  attach to.
+  Compare the fleet by `provider` and `model`: they name what ran, and
+  a model's prices attach to its id. `alias` is always `""` until
+  OPS-190 drops the label.
 
   Distributions carry Prometheus buckets in `reporter_options`.
   `TelemetryMetricsPrometheus.Core`, PromEx's default store, uses them
@@ -604,8 +600,8 @@ defmodule Clementine.Telemetry do
   Names carry a bare `clementine_` prefix in Prometheus
   (`clementine_llm_calls_total`), so every app exports the same series
   and a fleet query aggregates across them. Labels are bounded: the
-  agent's key, the provider, the provider's model id, and the catalog
-  alias on the engine's metrics, the agent's key on the run metrics, and
+  agent's key, the provider, the model's id, and `alias` (always empty
+  now) on the engine's metrics, the agent's key on the run metrics, and
   the event's own closed sets (outcome, stop reason, error code, status,
   terminal, tool, ...); never a run, a subject, or a loop. A label with
   no value exports as `""`. "What is exported" in the moduledoc lists

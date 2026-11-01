@@ -93,6 +93,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         end
 
         key = module.key()
+        check_model!(module, key)
 
         case acc do
           %{^key => other} ->
@@ -103,6 +104,37 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             Map.put(acc, key, module)
         end
       end)
+    end
+
+    # Boot checks every agent's declared model and choices against the
+    # sheets and the app's config, and that the platform its model goes
+    # to has a credential configured. Nothing here reads the date: a
+    # model whose vendor shut it down still boots, and the vendor's own
+    # error ends the run that reaches it.
+    defp check_model!(module, key) do
+      if agent?(module) do
+        with :ok <- Clementine.Agent.check_declared(module),
+             :ok <- credentials(module.__model__()) do
+          :ok
+        else
+          {:error, message} ->
+            raise ArgumentError, "agent #{inspect(key)} (#{inspect(module)}): #{message}"
+        end
+      end
+    end
+
+    # Only for the provider clients Clementine routes to; a test's mock
+    # client needs no key.
+    defp credentials(nil), do: :ok
+
+    defp credentials(model) do
+      if Application.get_env(:clementine, :llm_client, Clementine.LLM.Router) ==
+           Clementine.LLM.Router do
+        policy = Clementine.LLM.Policy.resolve!(model)
+        Clementine.LLM.Router.credential(policy)
+      else
+        :ok
+      end
     end
 
     @doc "True for a `use Clementine.Agent` module."

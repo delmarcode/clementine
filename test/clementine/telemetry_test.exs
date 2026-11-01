@@ -78,7 +78,7 @@ defmodule Clementine.TelemetryTest do
   defp agent(opts) do
     Clementine.Agent.new(
       Keyword.merge(
-        [id: "workspace-7f3a2c", model: :claude_sonnet, instructions: "test agent", tools: []],
+        [id: "workspace-7f3a2c", model: "claude-sonnet-5", instructions: "test agent", tools: []],
         opts
       )
     )
@@ -175,7 +175,7 @@ defmodule Clementine.TelemetryTest do
                          agent_key: "telemetry_test",
                          provider: :anthropic,
                          model: "claude-sonnet-5",
-                         alias: :claude_sonnet,
+                         alias: nil,
                          max_iterations: 10,
                          tool_count: 0
                        }}
@@ -279,7 +279,7 @@ defmodule Clementine.TelemetryTest do
                          agent_key: "telemetry_test",
                          provider: :anthropic,
                          model: "claude-sonnet-5",
-                         alias: :claude_sonnet,
+                         alias: nil,
                          iteration: 1,
                          message_count: 1,
                          tool_count: 0,
@@ -327,10 +327,8 @@ defmodule Clementine.TelemetryTest do
       Application.put_env(
         :clementine,
         :models,
-        Keyword.put(previous, :claude_sonnet,
-          provider: :anthropic,
-          id: "claude-sonnet-5",
-          pricing: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
+        Map.put(previous || %{}, "claude-sonnet-5",
+          prices: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
         )
       )
 
@@ -354,7 +352,12 @@ defmodule Clementine.TelemetryTest do
       # 40 × 3.00 + 800 × 0.30 + 60 × 3.75 + 3 × 15.00 = 630 micro-dollars.
       assert_received {:telemetry, [:clementine, :llm, :stop],
                        %{input_tokens: 900, cost_micros: 630},
-                       %{alias: :claude_sonnet, provider: :anthropic, currency: "USD"}}
+                       %{
+                         model: "claude-sonnet-5",
+                         alias: nil,
+                         provider: :anthropic,
+                         currency: "USD"
+                       }}
 
       Application.put_env(:clementine, :models, previous)
       unpriced = make_ref()
@@ -380,10 +383,8 @@ defmodule Clementine.TelemetryTest do
       Application.put_env(
         :clementine,
         :models,
-        Keyword.put(previous, :claude_sonnet,
-          provider: :anthropic,
-          id: "claude-sonnet-5",
-          pricing: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
+        Map.put(previous || %{}, "claude-sonnet-5",
+          prices: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
         )
       )
 
@@ -456,7 +457,7 @@ defmodule Clementine.TelemetryTest do
 
       assert %{outcome: :stop, stop_reason: "end_turn", iteration: 2, currency: nil} = second
 
-      assert %{alias: :claude_sonnet, model: "claude-sonnet-5", provider: :anthropic} = second
+      assert %{alias: nil, model: "claude-sonnet-5", provider: :anthropic} = second
       refute Map.has_key?(first, :cost_micros)
     end
 

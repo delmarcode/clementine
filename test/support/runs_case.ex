@@ -322,7 +322,7 @@ end
 
 defmodule Clementine.RunsCase.Echo do
   @moduledoc "A test agent with no tools: one model turn answers."
-  use Clementine.Agent, key: "test_echo", model: :claude_sonnet, instructions: "Answer."
+  use Clementine.Agent, key: "test_echo", model: "claude-sonnet-5", instructions: "Answer."
 end
 
 defmodule Clementine.RunsCase.Lookup do
@@ -350,7 +350,7 @@ defmodule Clementine.RunsCase.Lookup do
   @impl true
   def agent(run) do
     Clementine.Agent.new(
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Look up #{inspect(run.subject)} for #{inspect(run.actor)}.",
       tools: [Tool, Clementine.RunsCase.Context]
     )
@@ -375,7 +375,7 @@ defmodule Clementine.RunsCase.Approval do
 
   use Clementine.Agent,
     key: "test_approval",
-    model: :claude_sonnet,
+    model: "claude-sonnet-5",
     instructions: "Send notes.",
     tools: [SendNote]
 end
@@ -391,7 +391,7 @@ defmodule Clementine.RunsCase.Chat do
   use Clementine.Agent,
     key: "test_chat",
     turn: true,
-    model: :claude_sonnet,
+    model: "claude-sonnet-5",
     instructions: "Chat.",
     tools: [Clementine.RunsCase.Approval.SendNote]
 
@@ -417,7 +417,7 @@ defmodule Clementine.RunsCase.Handoff do
   use Clementine.Agent,
     key: "test_handoff",
     turn: true,
-    model: :claude_sonnet,
+    model: "claude-sonnet-5",
     instructions: "Take over.",
     tools: [Clementine.RunsCase.Context]
 
@@ -434,7 +434,7 @@ defmodule Clementine.RunsCase.Planner do
 
   use Clementine.Agent,
     key: "test_planner",
-    model: :claude_sonnet,
+    model: "claude-sonnet-5",
     instructions: "Plan.",
     tools: [Clementine.RunsCase.Approval.SendNote],
     delegates: [Clementine.RunsCase.Echo, Clementine.RunsCase.Lookup, Clementine.RunsCase.Chat]

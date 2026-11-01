@@ -44,6 +44,35 @@ defmodule Clementine.LLM.ChatCompletionsTest do
     %{bypass: bypass, base_url: "http://localhost:#{bypass.port}"}
   end
 
+  # Models an app declares under config :clementine, :models: Clementine
+  # ships no sheet for them, so each names its platform and its facts.
+  @deepseek "deepseek/deepseek-v3.2"
+  @qwen "qwen/qwen3-235b-a22b"
+
+  defp deepseek(facts \\ [features: [structured_outputs: true]]) do
+    Keyword.merge(
+      [vendor: :deepseek, context: 163_840, max_output: 65_536, platforms: [openrouter: []]],
+      facts
+    )
+  end
+
+  defp qwen do
+    [
+      vendor: :qwen,
+      context: 131_072,
+      max_output: 32_768,
+      thinking: [
+        default: :adaptive,
+        types: [:adaptive],
+        efforts: [:low, :medium, :high],
+        default_effort: :medium
+      ],
+      platforms: [openrouter: []]
+    ]
+  end
+
+  defp put_models(models), do: Application.put_env(:clementine, :models, models)
+
   defp text_response(text) do
     Jason.encode!(%{
       "choices" => [
@@ -62,14 +91,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       Application.put_env(:clementine, :openrouter_base_url, base_url <> "/api/v1")
       Application.put_env(:clementine, :openrouter_api_key, "test-openrouter-key")
 
-      Application.put_env(:clementine, :models,
-        deepseek: [provider: :openrouter, id: "deepseek/deepseek-v3.2"],
-        deepseek_reasoning: [
-          provider: :openrouter,
-          id: "deepseek/deepseek-v3.2",
-          reasoning: [effort: :high, max_tokens: 2000]
-        ]
-      )
+      put_models(%{@deepseek => deepseek(), @qwen => qwen()})
 
       :ok
     end
@@ -83,14 +105,17 @@ defmodule Clementine.LLM.ChatCompletionsTest do
                  ["Bearer test-openrouter-key"]
 
         assert request["model"] == "deepseek/deepseek-v3.2"
-        assert request["max_tokens"] == 8192
+        # The policy's default: min(16_000, the sheet's max_output).
+        assert request["max_tokens"] == 16_000
 
         assert request["messages"] == [
                  %{"role" => "system", "content" => "system"},
                  %{"role" => "user", "content" => "Hi"}
                ]
 
+        # A model whose sheet takes no effort gets no reasoning field.
         refute Map.has_key?(request, "reasoning")
+        refute Map.has_key?(request, "reasoning_effort")
         refute Map.has_key?(request, "response_format")
 
         conn
@@ -99,7 +124,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{} = response} =
-               ChatCompletions.call(:deepseek, "system", [UserMessage.new("Hi")], [])
+               ChatCompletions.call(@deepseek, "system", [UserMessage.new("Hi")], [])
 
       assert [%Content.Text{text: "Hello from OpenRouter"}] = response.content
       assert response.stop_reason == "end_turn"
@@ -110,6 +135,32 @@ defmodule Clementine.LLM.ChatCompletionsTest do
                "cache_read_tokens" => 0,
                "cache_write_tokens" => 0
              }
+    end
+
+    test "call/5 sends the request's max_tokens, up to the sheet's max_output", %{
+      bypass: bypass
+    } do
+      Bypass.expect_once(bypass, "POST", "/api/v1/chat/completions", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert Jason.decode!(body)["max_tokens"] == 65_536
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("Long"))
+      end)
+
+      assert {:ok, %Response{}} =
+               ChatCompletions.call(@deepseek, "system", [UserMessage.new("Hi")], [],
+                 max_tokens: 65_536
+               )
+
+      assert_raise ArgumentError,
+                   ~r/max_tokens: 65537 is over the model's ceiling of 65536/,
+                   fn ->
+                     ChatCompletions.call(@deepseek, "system", [UserMessage.new("Hi")], [],
+                       max_tokens: 65_537
+                     )
+                   end
     end
 
     test "call/5 sends an output schema as response_format", %{bypass: bypass} do
@@ -135,21 +186,17 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{content: [%Content.Text{text: ~s({"verdict": "pass"})}]}} =
-               ChatCompletions.call(:deepseek, "system", [UserMessage.new("Hi")], [],
+               ChatCompletions.call(@deepseek, "system", [UserMessage.new("Hi")], [],
                  output_schema: schema
                )
     end
 
-    test "call/5 sends no response_format for a structured_output: :instructions model",
+    test "call/5 sends no response_format to a model whose sheet lacks structured_outputs",
          %{bypass: bypass} do
-      Application.put_env(:clementine, :models,
-        deepseek: [provider: :openrouter, id: "deepseek/deepseek-v3.2"],
-        grammar_bound: [
-          provider: :openrouter,
-          id: "deepseek/deepseek-v3.2",
-          structured_output: :instructions
-        ]
-      )
+      # The same model, declared without the fact: a grammar-enforcing
+      # server would take its tools away, so the instructions describe
+      # the answer instead.
+      put_models(%{@deepseek => deepseek([])})
 
       Bypass.expect(bypass, "POST", "/api/v1/chat/completions", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -161,7 +208,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{}} =
-               ChatCompletions.call(:grammar_bound, "system", [UserMessage.new("Hi")], [],
+               ChatCompletions.call(@deepseek, "system", [UserMessage.new("Hi")], [],
                  output_schema: %{"type" => "object"}
                )
     end
@@ -190,53 +237,79 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{} = response} =
-               ChatCompletions.call(:deepseek, "system", [UserMessage.new("Hi")], [])
+               ChatCompletions.call(@deepseek, "system", [UserMessage.new("Hi")], [])
 
       assert [%Content.Text{text: "I can't help with that."}] = response.content
       assert response.stop_reason == "refusal"
     end
 
-    test "call/5 includes configured reasoning", %{bypass: bypass} do
+    test "call/5 sends the sheet's default effort as OpenRouter's reasoning", %{
+      bypass: bypass
+    } do
       Bypass.expect(bypass, "POST", "/api/v1/chat/completions", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         request = Jason.decode!(body)
 
-        assert request["reasoning"] == %{"effort" => "high", "max_tokens" => 2000}
+        assert request["reasoning"] == %{"effort" => "medium"}
+        refute Map.has_key?(request, "reasoning_effort")
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(200, text_response("Configured reasoning"))
+        |> Plug.Conn.resp(200, text_response("Default reasoning"))
       end)
 
       assert {:ok, %Response{}} =
-               ChatCompletions.call(:deepseek_reasoning, "system", [UserMessage.new("Hi")], [])
+               ChatCompletions.call(@qwen, "system", [UserMessage.new("Hi")], [])
     end
 
-    test "call/5 lets request opts override configured reasoning", %{bypass: bypass} do
+    test "call/5 sends the request's effort and OpenRouter's reasoning options", %{
+      bypass: bypass
+    } do
+      test = self()
+
       Bypass.expect(bypass, "POST", "/api/v1/chat/completions", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
-        request = Jason.decode!(body)
-
-        assert request["reasoning"] == %{"effort" => "low"}
+        send(test, {:reasoning, Jason.decode!(body)["reasoning"]})
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(200, text_response("Overridden"))
+        |> Plug.Conn.resp(200, text_response("Chosen reasoning"))
       end)
 
       assert {:ok, %Response{}} =
-               ChatCompletions.call(
-                 :deepseek_reasoning,
-                 "system",
-                 [UserMessage.new("Hi")],
-                 [],
-                 reasoning: :low
+               ChatCompletions.call(@qwen, "system", [UserMessage.new("Hi")], [],
+                 effort: :high,
+                 provider_options: [max_tokens: 2000]
                )
+
+      assert_received {:reasoning, %{"effort" => "high", "max_tokens" => 2000}}
+
+      assert {:ok, %Response{}} =
+               ChatCompletions.call(@qwen, "system", [UserMessage.new("Hi")], [],
+                 effort: :low,
+                 provider_options: [exclude: true]
+               )
+
+      assert_received {:reasoning, %{"effort" => "low", "exclude" => true}}
     end
 
-    test "call/5 rejects invalid reasoning opts" do
-      assert_raise ArgumentError, ~r/unsupported OpenRouter reasoning effort/, fn ->
-        ChatCompletions.call(:deepseek, "system", [UserMessage.new("Hi")], [], reasoning: :ultra)
+    test "call/5 refuses an effort the sheet does not offer, before sending" do
+      assert_raise ArgumentError, ~r/effort: takes one of/, fn ->
+        ChatCompletions.call(@qwen, "system", [UserMessage.new("Hi")], [], effort: :ultra)
+      end
+
+      assert_raise ArgumentError, ~r/takes effort \[:low, :medium, :high\], got: :xhigh/, fn ->
+        ChatCompletions.call(@qwen, "system", [UserMessage.new("Hi")], [], effort: :xhigh)
+      end
+
+      assert_raise ArgumentError, ~r/takes no effort setting/, fn ->
+        ChatCompletions.call(@deepseek, "system", [UserMessage.new("Hi")], [], effort: :low)
+      end
+
+      assert_raise ArgumentError, ~r/provider_options: unknown options \[:budget_tokens\]/, fn ->
+        ChatCompletions.call(@qwen, "system", [UserMessage.new("Hi")], [],
+          provider_options: [budget_tokens: 1024]
+        )
       end
     end
 
@@ -285,7 +358,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       ]
 
       assert {:ok, %Response{}} =
-               ChatCompletions.call(:deepseek, "system", messages, [Clementine.Test.Tools.Echo])
+               ChatCompletions.call(@deepseek, "system", messages, [Clementine.Test.Tools.Echo])
     end
 
     test "call/5 decodes tool call responses", %{bypass: bypass} do
@@ -318,7 +391,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{} = response} =
-               ChatCompletions.call(:deepseek, "system", [UserMessage.new("Hi")], [])
+               ChatCompletions.call(@deepseek, "system", [UserMessage.new("Hi")], [])
 
       assert [%Content.ToolUse{id: "call_9", name: "echo", input: %{"message" => "yo"}}] =
                response.content
@@ -344,7 +417,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       events =
-        ChatCompletions.stream(:deepseek, "system", [UserMessage.new("Hi")], [])
+        ChatCompletions.stream(@deepseek, "system", [UserMessage.new("Hi")], [])
         |> Enum.to_list()
 
       assert {:text_delta, "Hel"} in events
@@ -366,7 +439,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       events =
-        ChatCompletions.stream(:deepseek, "system", [UserMessage.new("Hi")], [])
+        ChatCompletions.stream(@deepseek, "system", [UserMessage.new("Hi")], [])
         |> Enum.to_list()
 
       assert [{:error, {:api_error, 404, ^error_body}}] = events
@@ -382,7 +455,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       events =
-        ChatCompletions.stream(:deepseek, "system", [UserMessage.new("Hi")], [])
+        ChatCompletions.stream(@deepseek, "system", [UserMessage.new("Hi")], [])
         |> Enum.to_list()
 
       assert {:error, {:api_error, 502, error_body}} in events
@@ -395,16 +468,26 @@ defmodule Clementine.LLM.ChatCompletionsTest do
   end
 
   describe ":bedrock" do
+    setup do
+      put_models(%{
+        "qwen.qwen3-235b-a22b-2507-v1:0" => [
+          vendor: :qwen,
+          context: 262_144,
+          max_output: 32_768,
+          thinking: [default: :adaptive, types: [:adaptive], efforts: [:low, :medium, :high]],
+          platforms: [bedrock: []]
+        ]
+      })
+
+      :ok
+    end
+
     test "call/5 authenticates with the Bedrock API key and maps reasoning_effort", %{
       bypass: bypass,
       base_url: base_url
     } do
       Application.put_env(:clementine, :bedrock_base_url, base_url <> "/v1")
       Application.put_env(:clementine, :bedrock_api_key, "test-bedrock-key")
-
-      Application.put_env(:clementine, :models,
-        qwen: [provider: :bedrock, id: "qwen.qwen3-235b-a22b-2507-v1:0", reasoning: :low]
-      )
 
       Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -413,6 +496,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
         assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer test-bedrock-key"]
         assert request["model"] == "qwen.qwen3-235b-a22b-2507-v1:0"
         assert request["reasoning_effort"] == "low"
+        refute Map.has_key?(request, "reasoning")
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
@@ -420,28 +504,63 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{content: [%Content.Text{text: "Hello from Bedrock"}]}} =
-               ChatCompletions.call(:qwen, "system", [UserMessage.new("Hi")], [])
+               ChatCompletions.call(
+                 "qwen.qwen3-235b-a22b-2507-v1:0",
+                 "system",
+                 [UserMessage.new("Hi")],
+                 [],
+                 effort: :low
+               )
+    end
+
+    test "call/5 refuses OpenRouter's reasoning options on Bedrock" do
+      Application.put_env(:clementine, :bedrock_api_key, "test-bedrock-key")
+
+      assert_raise ArgumentError, ~r/provider_options: :bedrock takes none/, fn ->
+        ChatCompletions.call(
+          "qwen.qwen3-235b-a22b-2507-v1:0",
+          "system",
+          [UserMessage.new("Hi")],
+          [],
+          provider_options: [max_tokens: 2000]
+        )
+      end
     end
 
     test "call/5 raises without a Bedrock endpoint configuration" do
       Application.put_env(:clementine, :bedrock_api_key, "test-bedrock-key")
-      Application.put_env(:clementine, :models, qwen: [provider: :bedrock, id: "qwen.qwen3"])
 
       assert_raise RuntimeError, ~r/:bedrock_base_url or :bedrock_region/, fn ->
-        ChatCompletions.call(:qwen, "system", [UserMessage.new("Hi")], [])
+        ChatCompletions.call(
+          "qwen.qwen3-235b-a22b-2507-v1:0",
+          "system",
+          [UserMessage.new("Hi")],
+          []
+        )
       end
     end
   end
 
   describe ":vertex" do
+    setup do
+      put_models(%{
+        "zai/glm-4.7-maas" => [
+          vendor: :zai,
+          context: 200_000,
+          max_output: 128_000,
+          platforms: [vertex: []]
+        ]
+      })
+
+      :ok
+    end
+
     test "call/5 resolves the access token through an MFA", %{
       bypass: bypass,
       base_url: base_url
     } do
       Application.put_env(:clementine, :vertex_base_url, base_url <> "/v1/endpoints/openapi")
       Application.put_env(:clementine, :vertex_access_token, {TokenSource, :fetch, []})
-
-      Application.put_env(:clementine, :models, glm: [provider: :vertex, id: "zai/glm-4.7-maas"])
 
       Bypass.expect(bypass, "POST", "/v1/endpoints/openapi/chat/completions", fn conn ->
         assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer vertex-token-123"]
@@ -452,35 +571,43 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{content: [%Content.Text{text: "Hello from Vertex"}]}} =
-               ChatCompletions.call(:glm, "system", [UserMessage.new("Hi")], [])
+               ChatCompletions.call("zai/glm-4.7-maas", "system", [UserMessage.new("Hi")], [])
     end
 
     test "call/5 raises without a Vertex endpoint configuration" do
       Application.put_env(:clementine, :vertex_access_token, "test-vertex-token")
-      Application.put_env(:clementine, :models, glm: [provider: :vertex, id: "zai/glm-4.7-maas"])
 
       assert_raise RuntimeError, ~r/:vertex_base_url or :vertex_project/, fn ->
-        ChatCompletions.call(:glm, "system", [UserMessage.new("Hi")], [])
+        ChatCompletions.call("zai/glm-4.7-maas", "system", [UserMessage.new("Hi")], [])
       end
     end
   end
 
   describe ":openai_compatible" do
-    test "call/5 uses the model's base_url and env-resolved api key", %{
+    test "call/5 uses the platform entry's base_url and env-resolved api key", %{
       bypass: bypass,
       base_url: base_url
     } do
       System.put_env("CLEMENTINE_CC_TEST_KEY", "sk-finetune")
       on_exit(fn -> System.delete_env("CLEMENTINE_CC_TEST_KEY") end)
 
-      Application.put_env(:clementine, :models,
-        qwen_finetune: [
-          provider: :openai_compatible,
-          id: "tinker://run:train:0/sampler_weights/000080",
-          base_url: base_url <> "/oai/api/v1",
-          api_key: {:system, "CLEMENTINE_CC_TEST_KEY"}
+      # App config the platform entry overrides.
+      Application.put_env(:clementine, :openai_compatible_base_url, "http://unused.invalid/v1")
+      Application.put_env(:clementine, :openai_compatible_api_key, "sk-unused")
+
+      put_models(%{
+        "tinker://run:train:0/sampler_weights/000080" => [
+          vendor: :qwen,
+          context: 32_768,
+          max_output: 8_192,
+          platforms: [
+            openai_compatible: [
+              base_url: base_url <> "/oai/api/v1",
+              api_key: {:system, "CLEMENTINE_CC_TEST_KEY"}
+            ]
+          ]
         ]
-      )
+      })
 
       Bypass.expect(bypass, "POST", "/oai/api/v1/chat/completions", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -488,6 +615,8 @@ defmodule Clementine.LLM.ChatCompletionsTest do
 
         assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer sk-finetune"]
         assert request["model"] == "tinker://run:train:0/sampler_weights/000080"
+        # min(16_000, max_output)
+        assert request["max_tokens"] == 8_192
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
@@ -495,18 +624,33 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{content: [%Content.Text{text: "Hello from the finetune"}]}} =
-               ChatCompletions.call(:qwen_finetune, "system", [UserMessage.new("Hi")], [])
+               ChatCompletions.call(
+                 "tinker://run:train:0/sampler_weights/000080",
+                 "system",
+                 [UserMessage.new("Hi")],
+                 []
+               )
     end
 
-    test "call/5 sends no authorization header for keyless servers", %{
+    test "call/5 sends the id the platform entry names, on the app's base_url", %{
       bypass: bypass,
       base_url: base_url
     } do
-      Application.put_env(:clementine, :models,
-        local: [provider: :openai_compatible, id: "my-model", base_url: base_url <> "/v1"]
-      )
+      Application.put_env(:clementine, :openai_compatible_base_url, base_url <> "/v1")
+
+      put_models(%{
+        "qwen3-8b-local" => [
+          vendor: :qwen,
+          context: 32_768,
+          max_output: 8_192,
+          platforms: [openai_compatible: [id: "Qwen/Qwen3-8B"]]
+        ]
+      })
 
       Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert Jason.decode!(body)["model"] == "Qwen/Qwen3-8B"
+        # A keyless server: no key anywhere, and no authorization header.
         assert Plug.Conn.get_req_header(conn, "authorization") == []
 
         conn
@@ -515,16 +659,21 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       end)
 
       assert {:ok, %Response{content: [%Content.Text{text: "Hello from vLLM"}]}} =
-               ChatCompletions.call(:local, "system", [UserMessage.new("Hi")], [])
+               ChatCompletions.call("qwen3-8b-local", "system", [UserMessage.new("Hi")], [])
     end
 
     test "call/5 raises without a base_url" do
-      Application.put_env(:clementine, :models,
-        local: [provider: :openai_compatible, id: "my-model"]
-      )
+      put_models(%{
+        "qwen3-8b-local" => [
+          vendor: :qwen,
+          context: 32_768,
+          max_output: 8_192,
+          platforms: [openai_compatible: []]
+        ]
+      })
 
       assert_raise RuntimeError, ~r/:base_url in model config/, fn ->
-        ChatCompletions.call(:local, "system", [UserMessage.new("Hi")], [])
+        ChatCompletions.call("qwen3-8b-local", "system", [UserMessage.new("Hi")], [])
       end
     end
   end
@@ -566,13 +715,21 @@ defmodule Clementine.LLM.ChatCompletionsTest do
            ] = encoded
   end
 
-  test "call/5 rejects models configured for non chat-completions providers" do
-    Application.put_env(:clementine, :models,
-      claude_test: [provider: :anthropic, id: "claude-sonnet-5"]
-    )
+  test "call/5 refuses a model that goes to a platform outside the Chat Completions dialect" do
+    assert_raise ArgumentError,
+                 ~r/"claude-sonnet-5" goes to :anthropic, not a Chat Completions/,
+                 fn ->
+                   ChatCompletions.call("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
+                 end
 
-    assert_raise RuntimeError, ~r/not an OpenAI-compatible chat completions provider/, fn ->
-      ChatCompletions.call(:claude_test, "system", [UserMessage.new("Hi")], [])
+    assert_raise ArgumentError, ~r/"gpt-6.1-sol" goes to :openai, not a Chat Completions/, fn ->
+      ChatCompletions.call("gpt-6.1-sol", "system", [UserMessage.new("Hi")], [])
+    end
+  end
+
+  test "call/5 refuses an id no sheet or declaration names" do
+    assert_raise ArgumentError, ~r/unknown model "deepseek\/deepseek-v9"/, fn ->
+      ChatCompletions.call("deepseek/deepseek-v9", "system", [UserMessage.new("Hi")], [])
     end
   end
 end

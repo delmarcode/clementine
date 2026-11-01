@@ -14,10 +14,30 @@ the drain at shutdown.
   table behind the code's version, naming the migration to write
   (`Clementine.Migration.up(from: 4, version: 5)`).
 - Agent modules, each listed in `agents:`:
-  `use Clementine.Agent, key: "triage", model: :claude_sonnet, instructions: "...", tools: [...]`.
+  `use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", instructions: "...", tools: [...]`.
   Every run row stores the key, so never rename a key that has runs. An
   agent whose runs are turns on a thread says `turn: true` and writes
   `history/1`.
+
+## Models
+
+- Name a model by the vendor's id (`"claude-sonnet-5-5"`, `"gpt-6.1-sol"`),
+  never an alias. Clementine ships its fact sheet (`Clementine.Models.get!/1`).
+- Put the agent's choices on the agent, not in config: `use
+  Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", effort:
+  :high, max_tokens: 16_000, cache: [ttl: :one_hour]`. Two agents that
+  share a choice share a module attribute.
+- Leave out what the model's default already says; `max_tokens`
+  defaults to `min(16_000, the model's max_output)`, effort to the
+  model's own.
+- A model Clementine does not ship, or a fact the app knows better (its
+  prices), goes under `config :clementine, :models`, keyed by id
+  (`docs/MODELS.md`). Never infer a fact from an id.
+- An `agent/1` that picks a model per run (an eval's `--model`) passes
+  `model: run.metadata["model"] || __model__()`; the runtime fills the
+  rest of the policy from `use`.
+- A boot error naming a model says what it takes instead; change the
+  agent, not Clementine.
 
 `mix clementine.install` writes the glue, and `mix clementine.gen.agent
 Triage` adds an agent with a tool and a test. Never copy a worker, a
@@ -27,8 +47,8 @@ Metrics are `Clementine.Telemetry.metrics/0`: pass it whole to the
 app's reporter (a PromEx plugin's `Event.build/2`, or
 `TelemetryMetricsPrometheus`), and never hand-copy Clementine's metric
 definitions into the app. Its series are labeled by agent key, provider,
-model, and alias, and keep the bare `clementine_` names every app
-exports.
+model (and `alias`, empty since models are named by id), and keep the
+bare `clementine_` names every app exports.
 
 ## Subject, actor, turn, lane
 
@@ -95,9 +115,9 @@ exports.
   Clementine writes it.
 - `trace/1` returns the run's trace, oldest first: a
   `Clementine.Trace.Entry` for each execution (`:execution`: the
-  provider, model, and alias, the tools offered, the agent's fingerprint,
-  the system prompt), each model call (`:model_call`: the provider, model,
-  and alias, usage, its cost, timing, what it said), each tool
+  provider and model, the tools offered, the agent's fingerprint,
+  the system prompt), each model call (`:model_call`: the provider and
+  model, usage, its cost, timing, what it said), each tool
   call (`:tool_call`: name, arguments, result, timing, the approval it
   waited on, and the tool policy's verdict), each answer of the tool
   policy (`:policy`), each skill loaded (`:skill_load`: its name, the
@@ -109,7 +129,7 @@ exports.
   do: name`. Like `get/1` it checks nothing: check the subject or actor
   before showing it.
 - `cost(run_id)` is what a run's model calls cost, a `Clementine.Cost`
-  (integer `micros` of the catalog's currency), frozen on each call at
+  (integer `micros` of the models' currency), frozen on each call at
   the prices of the moment; `children: true` adds every run below it
   (delegates, a loop's turns), and `subject_cost(subject)` totals a
   subject. Prices are your config, the `pricing:` key in
@@ -139,7 +159,7 @@ runtime sends them to the model, then the prompt.
 
 ```elixir
 defmodule MyApp.Agents.Chat do
-  use Clementine.Agent, key: "chat", turn: true, model: :claude_sonnet, instructions: "Be brief."
+  use Clementine.Agent, key: "chat", turn: true, model: "claude-sonnet-5-5", instructions: "Be brief."
 
   @impl true
   def history(run), do: MyApp.Chat.messages(run.subject_id)
@@ -232,7 +252,7 @@ its own:
 ```elixir
 use Clementine.Agent,
   key: "planner",
-  model: :claude_sonnet,
+  model: "claude-sonnet-5-5",
   instructions: "Plan the launch. Ask the researcher for facts you lack.",
   delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
 ```
@@ -553,7 +573,7 @@ several MCP servers' worth) lists the ones it rarely needs as
 `deferred:`, beside `tools:`:
 
 ```elixir
-use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "...",
+use Clementine.Agent, key: "support", model: "claude-sonnet-5-5", instructions: "...",
   tools: [MyApp.Tools.LookupOrder], deferred: [MyApp.Tools.IssueRefund, MyApp.Tools.CancelOrder]
 ```
 
@@ -580,7 +600,7 @@ use Clementine.Agent, key: "support", model: :claude_sonnet, instructions: "..."
 An agent whose answer code reads gives the answer's JSON schema:
 
 ```elixir
-use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
+use Clementine.Agent, key: "grader", model: "claude-sonnet-5-5", instructions: "...",
   output_schema: %{"type" => "object", "properties" => %{"verdict" => %{"type" => "string"}},
                    "required" => ["verdict"], "additionalProperties" => false}
 ```
@@ -600,9 +620,9 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   subset, and the run fails with its error.
 - On a Chat Completions server that enforces `response_format` with a
   grammar over the whole completion (vLLM, SGLang, Ollama, llama.cpp),
-  the model cannot call tools. Set `structured_output: :instructions` on
-  that model's catalog entry and describe the answer in the agent's
-  instructions; see `docs/MODELS.md`.
+  the model cannot call tools. Leave `structured_outputs` off that
+  model's declaration (the default) and describe the answer in the
+  agent's instructions; see `docs/MODELS.md`.
 - An answer that does not decode or match fails the run:
   `Result.Failed` with a `Clementine.Error` of code `:invalid_output`,
   whose `raw["output"]` is the text the model wrote. There is no retry
@@ -617,11 +637,11 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   afresh; put it in the input.
 - `usage.input_tokens` is the whole input; `cache_read_tokens` and
   `cache_write_tokens` are parts of it, never added to it.
-- Change caching per model in the catalog, never per agent: `cache:
-  false` for a model whose prompts are never sent twice, `cache: [ttl:
-  :one_hour]` for an Anthropic model whose runs often wait between steps
-  (approvals, slow replies). `docs/MODELS.md` has what each provider
-  takes.
+- Change caching on the agent: `cache: false` for an agent whose
+  prompts are never sent twice, `cache: [ttl: :one_hour]` for a Claude
+  agent whose runs often wait between steps (approvals, slow replies).
+  The model's sheet says which TTLs it offers; `docs/MODELS.md` has what
+  each provider takes.
 
 ## Models that bind their thinking
 
@@ -632,7 +652,7 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   (`clementine_llm_thinking_dropped_total`) is replayed out of order.
 - For the text Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, and
   Fable 5 write between tool calls, set
-  `reasoning: [thinking: :adaptive, display: :updates]` (or
+  `thinking: :adaptive, display: :updates` on the agent (or
   `thinking: :between_tools` on Sonnet 5.5), render `:thinking_delta`
   events (a new `index` is a new update), and show non-empty thinking
   blocks of stored turns.
@@ -664,7 +684,7 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
 - Never copy `Clementine.Migration.content_columns/0` to a warehouse:
   they hold prompts, replies, tool arguments and results, and your
   `metadata`. Exclude them, and keep the facts (`fact_columns/0`): the
-  trace's columns hold each model call's provider, model, alias, tokens,
+  trace's columns hold each model call's provider, model, tokens,
   and cost, and each tool call's name and outcome. Keep `subject_id`,
   `actor_id`, and `tag_id` ids (never an email address or a Message-ID),
   or exclude them too, and exclude `agent_fingerprint` if your

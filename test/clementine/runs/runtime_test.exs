@@ -17,7 +17,7 @@ defmodule Clementine.Runs.RuntimeTest do
 
     test "refuses two agents with one key" do
       defmodule EchoTwin do
-        use Clementine.Agent, key: "test_echo", model: :claude_sonnet
+        use Clementine.Agent, key: "test_echo", model: "claude-sonnet-5"
       end
 
       assert_raise ArgumentError, ~r/share the agent key "test_echo"/, fn ->
@@ -106,14 +106,14 @@ defmodule Clementine.Runs.RuntimeTest do
     test "builds the agent from the fields given to use" do
       assert "test_echo" = Echo.key()
 
-      assert %Clementine.Agent{id: "test_echo", model: :claude_sonnet, instructions: "Answer."} =
+      assert %Clementine.Agent{id: "test_echo", model: "claude-sonnet-5", instructions: "Answer."} =
                Echo.agent(%AgentRun{})
     end
 
     test "needs a key" do
       assert_raise ArgumentError, ~r/needs a non-empty string key:/, fn ->
         defmodule NoKey do
-          use Clementine.Agent, model: :claude_sonnet
+          use Clementine.Agent, model: "claude-sonnet-5"
         end
       end
     end
@@ -121,7 +121,7 @@ defmodule Clementine.Runs.RuntimeTest do
     test "fails the build on a field Clementine.Agent does not have" do
       assert_raise KeyError, ~r/:modle/, fn ->
         defmodule Typo do
-          use Clementine.Agent, key: "typo", modle: :claude_sonnet
+          use Clementine.Agent, key: "typo", modle: "claude-sonnet-5"
         end
       end
     end
@@ -136,14 +136,14 @@ defmodule Clementine.Runs.RuntimeTest do
     test "a turn agent must define history/1" do
       assert_raise ArgumentError, ~r/TurnWithoutHistory is a turn agent .* history\/1/, fn ->
         defmodule TurnWithoutHistory do
-          use Clementine.Agent, key: "turn_without_history", turn: true, model: :claude_sonnet
+          use Clementine.Agent, key: "turn_without_history", turn: true, model: "claude-sonnet-5"
         end
       end
     end
 
     test "a task agent may define history/1 too" do
       defmodule TaskWithHistory do
-        use Clementine.Agent, key: "task_with_history", model: :claude_sonnet
+        use Clementine.Agent, key: "task_with_history", model: "claude-sonnet-5"
 
         @impl true
         def history(_run), do: [Clementine.LLM.Message.UserMessage.new("Earlier.")]
@@ -156,7 +156,7 @@ defmodule Clementine.Runs.RuntimeTest do
     test "turn: takes a boolean" do
       assert_raise ArgumentError, ~r/takes turn: true or false, got: "yes"/, fn ->
         defmodule TurnString do
-          use Clementine.Agent, key: "turn_string", turn: "yes", model: :claude_sonnet
+          use Clementine.Agent, key: "turn_string", turn: "yes", model: "claude-sonnet-5"
         end
       end
     end

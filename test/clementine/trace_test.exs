@@ -62,7 +62,7 @@ defmodule Clementine.TraceTest do
 
   defp agent(opts) do
     Clementine.Agent.new(
-      Keyword.merge([model: :claude_sonnet, instructions: "Trace me.", tools: []], opts)
+      Keyword.merge([model: "claude-sonnet-5", instructions: "Trace me.", tools: []], opts)
     )
   end
 
@@ -139,15 +139,18 @@ defmodule Clementine.TraceTest do
                "resumed" => false
              } = execution.payload
 
-      assert fingerprint == Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
+      assert fingerprint == Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho])
       assert fingerprint =~ ~r/\A[0-9a-f]{64}\z/
 
-      # The alias that priced the call; it has no prices here, so no cost.
+      # The model that priced the call; it has no prices here, so no cost.
+      # No model has an alias now that models are named by id.
       assert %{
                "iteration" => 1,
                "stop_reason" => "tool_use",
                "usage" => %{"input_tokens" => 5, "output_tokens" => 2},
-               "alias" => "claude_sonnet",
+               "provider" => "anthropic",
+               "model" => "claude-sonnet-5",
+               "alias" => nil,
                "cost" => nil,
                "content" => [
                  %{
@@ -718,36 +721,38 @@ defmodule Clementine.TraceTest do
 
   describe "the fingerprint" do
     test "moves with the instructions, the tool schemas, and the model, and nothing else" do
-      base = Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
+      base = Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho])
 
-      assert base == Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
-      refute base == Trace.fingerprint(:claude_sonnet, "Trace you.", [SafeEcho])
-      refute base == Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho, GatedDeploy])
-      refute base == Trace.fingerprint({:openai, "gpt-5"}, "Trace me.", [SafeEcho])
+      assert base == Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho])
+      refute base == Trace.fingerprint("claude-sonnet-5", "Trace you.", [SafeEcho])
+      refute base == Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho, GatedDeploy])
+      refute base == Trace.fingerprint("gpt-5", "Trace me.", [SafeEcho])
     end
 
     test "moves when a tool is deferred, and not for an agent with none" do
       both = [SafeEcho, GatedDeploy]
-      base = Trace.fingerprint(:claude_sonnet, "Trace me.", both)
+      base = Trace.fingerprint("claude-sonnet-5", "Trace me.", both)
 
-      assert base == Trace.fingerprint(:claude_sonnet, "Trace me.", both, deferred: [])
-      refute base == Trace.fingerprint(:claude_sonnet, "Trace me.", both, deferred: [GatedDeploy])
+      assert base == Trace.fingerprint("claude-sonnet-5", "Trace me.", both, deferred: [])
+
+      refute base ==
+               Trace.fingerprint("claude-sonnet-5", "Trace me.", both, deferred: [GatedDeploy])
     end
 
     test "moves with the output schema, and not for an agent without one" do
-      base = Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
+      base = Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho])
       schema = %{"type" => "object", "required" => ["verdict"]}
 
       with_schema =
-        Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho], output_schema: schema)
+        Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho], output_schema: schema)
 
       assert base ==
-               Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho], output_schema: nil)
+               Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho], output_schema: nil)
 
       refute base == with_schema
 
       refute with_schema ==
-               Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho],
+               Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho],
                  output_schema: %{schema | "required" => ["score"]}
                )
     end
@@ -764,7 +769,7 @@ defmodule Clementine.TraceTest do
       assert [execution, _call] = MemoryLifecycle.trace(store, ref)
 
       assert execution.payload["agent_fingerprint"] ==
-               Trace.fingerprint(:claude_sonnet, "Trace me.", [],
+               Trace.fingerprint("claude-sonnet-5", "Trace me.", [],
                  output_schema: %{"type" => "object", "required" => ["verdict"]}
                )
     end
@@ -804,7 +809,7 @@ defmodule Clementine.TraceTest do
       assert %{"tools" => ["safe_echo", "add"], "deferred" => ["add"]} = execution.payload
 
       assert execution.payload["agent_fingerprint"] ==
-               Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho, Add], deferred: [Add])
+               Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho, Add], deferred: [Add])
 
       # Each call to the model is its own entry, the paused one included,
       # and keeps the search it ran.
@@ -850,8 +855,8 @@ defmodule Clementine.TraceTest do
       assert payload["approval"] == %{"verdict" => "approved", "by" => "{:user, 7}"}
     end
 
-    test "a model call on a direct reference has no alias, so nothing prices it" do
-      model = Trace.resolve_model({:anthropic, "claude-sonnet-5"})
+    test "a model call on a model without prices has no cost, and no alias" do
+      model = Trace.resolve_model("claude-sonnet-5")
       usage = %Clementine.Usage{input_tokens: 100, output_tokens: 10}
       assert Clementine.Cost.of(usage, model) == nil
 
@@ -871,29 +876,43 @@ defmodule Clementine.TraceTest do
              } = payload
     end
 
-    test "a reference the catalog does not hold resolves as written, with no provider or prices" do
-      # An alias is not a provider's id: the alias names it, and the id is
-      # nil.
-      assert %{provider: nil, id: nil, alias: :no_such_alias, pricing: nil} =
-               Trace.resolve_model(:no_such_alias)
+    test "an id no sheet holds resolves as written, with no provider or prices" do
+      assert %{provider: nil, id: "no-such-model", alias: nil, pricing: nil, cache: nil} =
+               Trace.resolve_model("no-such-model")
 
-      assert %{provider: nil, id: "m-1", alias: nil, pricing: nil} =
-               Trace.resolve_model({:no_such_provider, "m-1"})
+      # Choices the sheet refuses resolve the same way: the request fails
+      # where it must, never the record of it.
+      assert %{provider: nil, id: "claude-sonnet-5", alias: nil, pricing: nil, cache: nil} =
+               Trace.resolve_model("claude-sonnet-5", max_tokens: 10_000_000)
 
-      assert %{provider: :anthropic, id: "claude-sonnet-5", alias: :claude_sonnet} =
+      # A name that is not an id at all (an alias of old) keeps no id.
+      assert %{provider: nil, id: nil, alias: nil, pricing: nil} =
                Trace.resolve_model(:claude_sonnet)
 
-      # Its execution's fingerprint is the one it always had, hashing the
-      # alias's name, so two such aliases still fingerprint apart.
-      gone = Trace.fingerprint(:no_such_alias, "Trace me.", [SafeEcho])
-      assert gone =~ ~r/\A[0-9a-f]{64}\z/
-      assert gone == Trace.fingerprint(:no_such_alias, "Trace me.", [SafeEcho])
-      refute gone == Trace.fingerprint(:other_missing_alias, "Trace me.", [SafeEcho])
-      refute gone == Trace.fingerprint(:claude_sonnet, "Trace me.", [SafeEcho])
+      assert %{
+               provider: :anthropic,
+               id: "claude-sonnet-5",
+               alias: nil,
+               pricing: nil,
+               cache: %{enabled: true, ttl: :five_minutes}
+             } = Trace.resolve_model("claude-sonnet-5")
 
-      assert %{"model" => nil, "alias" => :no_such_alias, "agent_fingerprint" => ^gone} =
+      # Its execution's fingerprint hashes the id as written, so two such
+      # ids fingerprint apart, and apart from a model a sheet holds.
+      gone = Trace.fingerprint("no-such-model", "Trace me.", [SafeEcho])
+      assert gone =~ ~r/\A[0-9a-f]{64}\z/
+      assert gone == Trace.fingerprint("no-such-model", "Trace me.", [SafeEcho])
+      refute gone == Trace.fingerprint("other-missing-model", "Trace me.", [SafeEcho])
+      refute gone == Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho])
+
+      assert %{
+               "provider" => nil,
+               "model" => "no-such-model",
+               "alias" => nil,
+               "agent_fingerprint" => ^gone
+             } =
                Trace.execution(
-                 Trace.resolve_model(:no_such_alias),
+                 Trace.resolve_model("no-such-model"),
                  "Trace me.",
                  [SafeEcho],
                  false
@@ -905,7 +924,7 @@ defmodule Clementine.TraceTest do
     # Payloads as the engine records them, at both fidelities: every kind,
     # and every shape a column takes.
     defp recorded do
-      model = Trace.resolve_model(:claude_sonnet)
+      model = Trace.resolve_model("claude-sonnet-5")
       usage = %Clementine.Usage{input_tokens: 1204, output_tokens: 38, cache_read_tokens: 1100}
       cost = %Clementine.Cost{currency: "USD", micros: 1284}
 
@@ -967,7 +986,7 @@ defmodule Clementine.TraceTest do
       end
     end
 
-    test "every fact column is filled by some kind" do
+    test "every fact column is filled by some kind, but alias" do
       filled =
         for {kind, payload} <- recorded(),
             {column, value} <- elem(Trace.to_row(kind, payload), 0),
@@ -975,7 +994,9 @@ defmodule Clementine.TraceTest do
             into: MapSet.new(),
             do: column
 
-      assert filled == MapSet.new(Trace.columns())
+      # Models are named by id now, so nothing fills alias; its column
+      # goes with trace version 6 (OPS-190).
+      assert filled == MapSet.new(Trace.columns() -- [:alias])
     end
 
     test "a name the agent does not offer stays in the payload, never in tool_name" do
@@ -1009,7 +1030,7 @@ defmodule Clementine.TraceTest do
     end
 
     test "a model call's numbers and a tool call's outcome read from the columns alone" do
-      model = Trace.resolve_model(:claude_sonnet)
+      model = Trace.resolve_model("claude-sonnet-5")
       usage = %Clementine.Usage{input_tokens: 1204, output_tokens: 38, cache_write_tokens: 96}
       cost = %Clementine.Cost{currency: "USD", micros: 1284}
 
@@ -1020,7 +1041,7 @@ defmodule Clementine.TraceTest do
                iteration: 2,
                provider: "anthropic",
                model: "claude-sonnet-5",
-               alias: "claude_sonnet",
+               alias: nil,
                input_tokens: 1204,
                output_tokens: 38,
                cache_read_tokens: 0,

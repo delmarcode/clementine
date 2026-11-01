@@ -115,7 +115,7 @@ defmodule Mix.Tasks.Clementine.Gen.AgentTest do
       use Clementine.Agent, key: "triage"
 
       @impl true
-      def agent(_run), do: Clementine.Agent.new(model: :claude_sonnet)
+      def agent(_run), do: Clementine.Agent.new(model: "claude-sonnet-5")
     end
     """
 
@@ -141,7 +141,7 @@ defmodule Mix.Tasks.Clementine.Gen.AgentTest do
       def key, do: "triage"
 
       @impl true
-      def agent(_run), do: AgentDef.new(model: :claude_sonnet)
+      def agent(_run), do: AgentDef.new(model: "claude-sonnet-5")
     end
     """
 

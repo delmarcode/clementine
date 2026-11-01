@@ -28,7 +28,7 @@ defmodule Clementine.DeferredToolsDurableTest do
 
     use Clementine.Agent,
       key: "test_deferred_refunds",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Help with orders.",
       tools: [Clementine.RunsCase.Context],
       deferred: [IssueRefund]

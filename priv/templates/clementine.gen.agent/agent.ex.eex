@@ -8,7 +8,7 @@ defmodule <%= @module %> do
 
   use Clementine.Agent,
     key: "<%= @key %>",
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: """
     You are the <%= @human %> agent. Use your tools to find what you need,
     then answer in a few sentences.

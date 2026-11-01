@@ -20,7 +20,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
   alias Clementine.{Agent, Event, History, Result}
   alias Clementine.LLM.Anthropic
-  alias Clementine.LLM.Anthropic.{Binding, Fake}
+  alias Clementine.LLM.Anthropic.Fake
   alias Clementine.LLM.Message
   alias Clementine.LLM.Message.{AssistantMessage, Content, SystemMessage, UserMessage}
   alias Clementine.Test.Tools.{Echo, SafeEcho, SafePush}
@@ -31,22 +31,11 @@ defmodule Clementine.LLM.AnthropicBindingTest do
   setup do
     previous = Application.get_env(:clementine, :models)
 
-    Application.put_env(:clementine, :models,
-      sonnet_55: [provider: :anthropic, id: "claude-sonnet-5-5"],
-      sonnet_55_updates: [
-        provider: :anthropic,
-        id: "claude-sonnet-5-5",
-        reasoning: [thinking: :adaptive, display: :updates]
-      ],
-      sonnet_55_between: [
-        provider: :anthropic,
-        id: "claude-sonnet-5-5",
-        reasoning: [thinking: :between_tools, effort: :high]
-      ],
-      sonnet_5: [provider: :anthropic, id: "claude-sonnet-5"]
-    )
-
-    on_exit(fn -> Application.put_env(:clementine, :models, previous) end)
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:clementine, :models, previous),
+        else: Application.delete_env(:clementine, :models)
+    end)
   end
 
   defmodule Notes do
@@ -66,7 +55,9 @@ defmodule Clementine.LLM.AnthropicBindingTest do
   end
 
   defp agent(opts \\ []) do
-    Agent.new(Keyword.merge([model: :sonnet_55, instructions: "Be brief.", tools: [Echo]], opts))
+    Agent.new(
+      Keyword.merge([model: "claude-sonnet-5-5", instructions: "Be brief.", tools: [Echo]], opts)
+    )
   end
 
   # One turn: each script answers one model call, through the fake. The
@@ -162,38 +153,125 @@ defmodule Clementine.LLM.AnthropicBindingTest do
     end
   end
 
+  # A stored turn with thinking and no binding, then a prompt: a model
+  # that binds sends the turn without its thinking; one that does not
+  # sends it as stored.
+  defp unbound_history do
+    [
+      UserMessage.new("Hi"),
+      %AssistantMessage{content: [Content.thinking("Hmm.", "sig_1"), Content.text("Hello.")]},
+      UserMessage.new("Again.")
+    ]
+  end
+
+  defp skill_load do
+    [
+      UserMessage.new("Hi"),
+      SystemMessage.new([%Content.ToolAddition{definition: %{"name" => "safe_echo"}}],
+        skill: "notes"
+      )
+    ]
+  end
+
+  defp request(model, messages, tools \\ [Echo]) do
+    Anthropic.request(model, "Be brief.", messages, tools, [])
+  end
+
   describe "which models bind" do
-    test "an id Clementine cannot read is checked, and its system messages fold" do
-      assert Binding.model("my-sonnet-deployment") == :unknown
-      assert Binding.binds?("my-sonnet-deployment")
-      refute Binding.inline_system?("my-sonnet-deployment")
-      assert Binding.inline_system?("claude-sonnet-5-5")
+    test "the 5.1-generation sheets bind their thinking; the ones before them do not" do
+      binding = ~w(claude-fable-5-1 claude-mythos-5-1 claude-opus-5-5 claude-sonnet-5-5
+                   claude-haiku-5-5)
 
-      system =
-        SystemMessage.new([%Content.ToolAddition{definition: %{"name" => "safe_echo"}}],
-          skill: "notes"
-        )
+      assert Enum.sort(binding) ==
+               Enum.sort(
+                 for model <- Clementine.Models.list(vendor: :anthropic),
+                     model.thinking.binding == :prefix,
+                     do: model.id
+               )
 
-      messages = [UserMessage.new("Hi"), system]
-      model = {:anthropic, "my-sonnet-deployment"}
-      {body, binding, nil} = Anthropic.request(model, "Be brief.", messages, [Echo], [])
+      for id <- binding do
+        assert {body, stamp, %{turns: 1, blocks: 1, first_index: 1}} =
+                 request(id, unbound_history())
 
-      assert is_binary(binding)
-      assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
-      refute Enum.any?(body["messages"], &(&1["role"] == "system"))
+        assert is_binary(stamp), id
+        assert [%{"type" => "text"}] = Enum.at(body["messages"], 1)["content"]
+      end
+
+      for id <- ~w(claude-sonnet-5 claude-opus-5 claude-opus-4-8 claude-sonnet-4-6
+                   claude-haiku-4-5-20251001) do
+        assert {body, nil, nil} = request(id, unbound_history()), id
+
+        assert [%{"type" => "thinking", "signature" => "sig_1"}, %{"type" => "text"}] =
+                 Enum.at(body["messages"], 1)["content"]
+      end
     end
 
-    test "the 5.1-and-later models bind; the ones before them do not" do
-      for id <- ~w(claude-fable-5-1 claude-mythos-5-1 claude-opus-5-5 claude-sonnet-5-5
-                   claude-haiku-5-5 claude-opus-6 claude-opus-5-5-20261101) do
-        assert Binding.binds?(id), id
-      end
+    test "the check follows the sheet: an override or a declaration decides it" do
+      Application.put_env(:clementine, :models, %{
+        "claude-sonnet-5" => [thinking: [binding: :prefix]],
+        "my-sonnet-deployment" => [
+          vendor: :anthropic,
+          context: 200_000,
+          max_output: 64_000,
+          platforms: [anthropic: []]
+        ],
+        "my-binding-deployment" => [
+          vendor: :anthropic,
+          context: 200_000,
+          max_output: 64_000,
+          thinking: [binding: :prefix],
+          features: [mid_conversation_system: true],
+          platforms: [anthropic: []]
+        ]
+      })
 
-      for id <- ~w(claude-sonnet-5 claude-opus-5 claude-fable-5 claude-opus-4-8
-                   claude-haiku-4-5-20251001 claude-sonnet-4-20250514 claude-3-5-sonnet-20241022
-                   claude-mythos-preview) do
-        refute Binding.binds?(id), id
+      assert {_body, stamp, %{turns: 1}} = request("claude-sonnet-5", unbound_history())
+      assert is_binary(stamp)
+
+      # A declaration binds nothing and folds system messages unless it
+      # says otherwise.
+      assert {body, nil, nil} = request("my-sonnet-deployment", unbound_history())
+      assert [%{"type" => "thinking"}, _text] = Enum.at(body["messages"], 1)["content"]
+
+      {body, nil, nil} = request("my-sonnet-deployment", skill_load())
+      assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
+      refute Enum.any?(body["messages"], &(&1["role"] == "system"))
+
+      assert {_body, stamp, %{turns: 1}} = request("my-binding-deployment", unbound_history())
+      assert is_binary(stamp)
+
+      {body, _stamp, nil} = request("my-binding-deployment", skill_load())
+      assert Enum.map(body["tools"], & &1["name"]) == ["echo"]
+      assert Enum.any?(body["messages"], &(&1["role"] == "system"))
+
+      # An id neither shipped nor declared is refused before anything is sent.
+      assert_raise ArgumentError, ~r/unknown model "my-other-deployment"/, fn ->
+        request("my-other-deployment", unbound_history())
       end
+    end
+  end
+
+  describe "where a system message goes" do
+    test "in place only where the sheet takes mid-conversation system messages" do
+      # Claude Sonnet 5 does not; Claude Sonnet 5.5 does, and binds.
+      {folded, nil, nil} = request("claude-sonnet-5", skill_load(), [Echo, SafeEcho])
+      assert Enum.map(folded["tools"], & &1["name"]) == ["echo", "safe_echo"]
+      refute Enum.any?(folded["messages"], &(&1["role"] == "system"))
+      assert Anthropic.betas(folded) == []
+
+      {inline, stamp, nil} = request("claude-sonnet-5-5", skill_load(), [Echo, SafeEcho])
+      assert is_binary(stamp)
+      assert Enum.map(inline["tools"], & &1["name"]) == ["echo"]
+      assert [_user, %{"role" => "system"}] = inline["messages"]
+      assert "inline-tools-2026-09-15" in Anthropic.betas(inline)
+    end
+
+    test "in place on a model that takes them without binding its thinking" do
+      # Claude Opus 5 takes mid-conversation system messages and binds nothing.
+      {body, nil, nil} = request("claude-opus-5", skill_load(), [Echo, SafeEcho])
+      assert Enum.map(body["tools"], & &1["name"]) == ["echo"]
+      assert [_user, %{"role" => "system"}] = body["messages"]
+      assert "inline-tools-2026-09-15" in Anthropic.betas(body)
     end
   end
 
@@ -329,8 +407,8 @@ defmodule Clementine.LLM.AnthropicBindingTest do
       assert inspect(error) =~ "bound to a different conversation"
 
       # prefix_mismatch: :drop_block lets the API drop what it refuses.
-      model = {:anthropic, "claude-sonnet-5-5"}
-      opts = [reasoning: [thinking: :adaptive, prefix_mismatch: :drop_block]]
+      model = "claude-sonnet-5-5"
+      opts = [provider_options: [prefix_mismatch: :drop_block]]
       assert :ok = Fake.check(model, "Be brief.", spliced, [Echo], opts)
 
       {body, _binding, nil} = Anthropic.request(model, "Be brief.", spliced, [Echo], opts)
@@ -434,25 +512,16 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
       # Lenient, so the placement check answers, not the dropped thinking.
       assert {:error, {:api_error, 400, %{"error" => %{"message" => message}}}} =
-               Fake.check(:sonnet_55, "Be brief.", broken, [Echo, SafeEcho, SafePush], [],
+               Fake.check(
+                 "claude-sonnet-5-5",
+                 "Be brief.",
+                 broken,
+                 [Echo, SafeEcho, SafePush],
+                 [],
                  strict: false
                )
 
       assert message =~ "a system message must follow a user message"
-    end
-
-    test "on a model that does not bind, the skill's tools go in the tool list" do
-      system =
-        SystemMessage.new([%Content.ToolAddition{definition: %{"name" => "safe_echo"}}],
-          skill: "notes"
-        )
-
-      messages = [UserMessage.new("Hi"), system]
-      {body, nil, nil} = Anthropic.request(:sonnet_5, "Be brief.", messages, [Echo, SafeEcho], [])
-
-      assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
-      refute Enum.any?(body["messages"], &(&1["role"] == "system"))
-      assert Anthropic.betas(body) == []
     end
   end
 
@@ -474,7 +543,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
         end)
       end
 
-      output = Clementine.stream(agent(model: :sonnet_55_updates), "Find it.") |> Enum.to_list()
+      output = Clementine.stream(agent(display: :updates), "Find it.") |> Enum.to_list()
 
       # The update's block index, so a client tells one update from the next.
       assert [{1, "Looking it up."}] =
@@ -497,7 +566,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
     test "comes back with its text under thinking: :between_tools, with no beta" do
       thread =
-        turn!(agent(model: :sonnet_55_between), [], "Find it.", [
+        turn!(agent(thinking: :between_tools, effort: :high), [], "Find it.", [
           [{:update, "Checking."}, {:tool_use, "toolu_1", "echo", %{"message" => "x"}}],
           [{:text, "Found it."}]
         ])

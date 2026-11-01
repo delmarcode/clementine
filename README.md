@@ -53,7 +53,7 @@ end
 ```
 
 It needs Elixir 1.19. The in-process path needs nothing more than an API
-key and a model alias in config (below). The durable runtime needs Ecto
+key in config (below). The durable runtime needs Ecto
 on Postgres and Oban 2.18 or later in the app, typically a Phoenix app.
 Two generators write its glue. They run on [Igniter](https://hexdocs.pm/igniter), so add
 `{:igniter, "~> 0.8", only: [:dev, :test]}` as well. With Oban installed
@@ -73,8 +73,7 @@ mix clementine.gen.agent Weather  # an agent, a tool, and a test that runs them
   `agent_runs`, the loop inbox `agent_run_inbox`, and the run trace
   `agent_run_trace`;
 - config: an `agents` Oban queue, `anthropic_api_key: {:system,
-  "ANTHROPIC_API_KEY"}`, a `:claude_sonnet` model alias, and the `run_id`
-  logger metadata key;
+  "ANTHROPIC_API_KEY"}`, and the `run_id` logger metadata key;
 - `MyApp.Agents.LLMMock` as the model client in `config/test.exs`,
   `MyApp.AgentsCase`, whose helpers script it in tests, and `mox`.
 
@@ -88,14 +87,11 @@ write.
 
 ## Quick start: in process
 
-Configure a key and a model alias:
+Configure a key:
 
 ```elixir
 # config/config.exs
 config :clementine, anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}
-
-config :clementine, :models,
-  claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5"]
 ```
 
 Write a tool, build an agent, and run it:
@@ -120,7 +116,7 @@ end
 ```elixir
 agent =
   Clementine.Agent.new(
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "You are a weather assistant. Be brief.",
     tools: [MyApp.Tools.Weather]
   )
@@ -149,7 +145,7 @@ key, the string its run rows store:
 defmodule MyApp.Agents.Weather do
   use Clementine.Agent,
     key: "weather",
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: """
     You are the weather agent. Use your tools to find what you need,
     then answer in a few sentences.
@@ -221,7 +217,7 @@ defmodule MyApp.Agents.Chat do
     key: "chat",
     turn: true,
     trace: :facts,
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "You are a helpful assistant. Be brief."
 
   @impl true
@@ -332,31 +328,31 @@ reading. The design and its failure matrices are in
 
 ## Models and providers
 
-An agent names its model by an alias from config, or by a
-`{provider, id}` tuple such as `{:anthropic, "claude-opus-4-8"}`. There
-are no built-in aliases: `:claude_sonnet` resolves because config names
-it. An alias may carry output limits and provider-neutral reasoning:
+An agent names its model by the vendor's id and makes its own choices
+for it:
 
 ```elixir
-config :clementine, :models,
-  claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5"],
-  claude_opus: [
-    provider: :anthropic,
-    id: "claude-opus-4-8",
-    defaults: [max_tokens: 16_000],
-    reasoning: [thinking: :adaptive, effort: :high]
-  ],
-  gpt_5: [provider: :openai, id: "gpt-5", reasoning: :medium]
+use Clementine.Agent,
+  key: "triage",
+  model: "claude-sonnet-5-5",
+  effort: :high,
+  max_tokens: 16_000,
+  cache: [ttl: :one_hour]
 ```
 
-`:anthropic` (the Messages API) and `:openai` (the Responses API) have
-clients of their own. `:openrouter`, `:bedrock`, `:vertex`, and
-`:openai_compatible` (vLLM, SGLang, Tinker, any server that speaks it)
-share one Chat Completions client. Keys are config too
-(`openai_api_key`, `openrouter_api_key`, ...). The catalog is checked at
-boot, so a typo fails startup, not a run.
-[docs/MODELS.md](docs/MODELS.md) has every key, a recipe per provider,
-and how to add a model or a provider.
+Clementine ships a fact sheet for each current Anthropic and OpenAI
+model (`Clementine.Model`): its lifecycle, its ceilings, how it thinks
+and what it refuses, its cache TTLs, and its id on each platform, each
+with the page it was read from and the date. The clients read the sheet
+to decide what to send, so an app never encodes what a model accepts,
+and an agent whose model or choices the sheet refuses fails to build
+and to boot, naming what the model takes instead. An app overrides a
+shipped fact, or declares a model Clementine does not ship (an open
+model on OpenRouter, a fine-tune on a self-hosted server), under
+`config :clementine, :models`, keyed by id. Keys are config
+(`openai_api_key`, `openrouter_api_key`, ...).
+[docs/MODELS.md](docs/MODELS.md) has the sheets, the agent's choices,
+declarations, and how to adopt a new model.
 
 ## For coding agents
 

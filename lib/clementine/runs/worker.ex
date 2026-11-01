@@ -190,7 +190,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
            {:ok, actor} <- resolve(config.host, :resolve_actor, row.actor_type, row.actor_id),
            row = %{row | subject: subject, actor: actor},
            {:ok, history} <- history(module, row) do
-        agent = module.agent(row)
+        agent = Clementine.Agent.declared!(module, module.agent(row))
 
         rollout =
           Clementine.Rollout.new(
@@ -218,7 +218,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         {:ok, Clementine.Run.new(ref: row.id, rollout: rollout), authorize_tool(config.host, row)}
       end
     rescue
-      # Construction failures (a bad model alias, a malformed agent) happen
+      # Construction failures (an unknown model, a malformed agent) happen
       # before any claim; left alone, the row would sit queued until the
       # reaper's claim timeout.
       e in [ArgumentError, KeyError, FunctionClauseError] -> {:error, Exception.message(e)}

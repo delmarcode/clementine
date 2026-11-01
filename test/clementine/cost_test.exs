@@ -8,7 +8,7 @@ defmodule Clementine.CostTest do
 
   use ExUnit.Case, async: false
 
-  alias Clementine.{Cost, Usage}
+  alias Clementine.{Agent, Cost, Trace, Usage}
   alias Clementine.LLM.{Pricing, ProviderUsage}
 
   # Per million tokens: input 3.00, output 15.00, cache read 0.30, cache
@@ -36,9 +36,9 @@ defmodule Clementine.CostTest do
     validated
   end
 
-  # Prices as `Pricing.of/1` gives them for a resolved alias writing with `ttl`.
-  defp at_ttl(pricing, provider, ttl) do
-    Pricing.of(%{provider: provider, pricing: pricing!(pricing), cache: %{ttl: ttl}})
+  # Prices as `Pricing.of/1` gives them for a resolved model writing with `ttl`.
+  defp at_ttl(pricing, ttl) do
+    Pricing.of(%{pricing: pricing!(pricing), cache: %{ttl: ttl}})
   end
 
   describe "price/2" do
@@ -54,16 +54,16 @@ defmodule Clementine.CostTest do
 
       # 1,000 × 3.00 + 8,000 × 0.30 + 1,000 × 3.75 + 500 × 15.00, per million:
       # 0.003 + 0.0024 + 0.00375 + 0.0075 = $0.01665.
-      assert Cost.price(usage, at_ttl(@card, :anthropic, :five_minutes)) ==
+      assert Cost.price(usage, at_ttl(@card, :five_minutes)) ==
                %Cost{currency: "USD", micros: 16_650}
 
       # The same call writing for an hour: 1,000 × 6.00 per million more.
-      assert Cost.price(usage, at_ttl(@card, :anthropic, :one_hour)) ==
+      assert Cost.price(usage, at_ttl(@card, :one_hour)) ==
                %Cost{currency: "USD", micros: 18_900}
     end
 
     test "sums the parts exactly and rounds once, half up, to the micro-unit" do
-      pricing = at_ttl(@card, :anthropic, :five_minutes)
+      pricing = at_ttl(@card, :five_minutes)
 
       # One cache read is 0.3 of a micro-unit; five are 1.5.
       assert %Cost{micros: 0} =
@@ -88,7 +88,7 @@ defmodule Clementine.CostTest do
     end
 
     test "never charges negative uncached input when a provider's cache parts exceed it" do
-      pricing = at_ttl(@card, :anthropic, :five_minutes)
+      pricing = at_ttl(@card, :five_minutes)
 
       assert Cost.price(%Usage{input_tokens: 10, cache_read_tokens: 20}, pricing) ==
                Cost.price(%Usage{input_tokens: 20, cache_read_tokens: 20}, pricing)
@@ -96,23 +96,15 @@ defmodule Clementine.CostTest do
 
     test "nothing burned costs zero" do
       assert %Cost{currency: "USD", micros: 0} =
-               Cost.price(%Usage{}, at_ttl(@card, :anthropic, :five_minutes))
+               Cost.price(%Usage{}, at_ttl(@card, :five_minutes))
     end
   end
 
   # Each test starts from the provider's own usage object, normalized as
   # its client normalizes it, so what is priced is what a run records.
-  describe "of/2: each provider's usage, from the wire, priced from the catalog" do
-    test "Anthropic: reads and writes are parts of input, writes at the alias's TTL" do
-      put_models(
-        claude: [provider: :anthropic, id: "claude-sonnet-5", pricing: @card],
-        claude_hour: [
-          provider: :anthropic,
-          id: "claude-sonnet-5",
-          cache: [ttl: :one_hour],
-          pricing: @card
-        ]
-      )
+  describe "of/2: each provider's usage, from the wire, priced from the models' prices" do
+    test "Anthropic: reads and writes are parts of input, writes at the agent's TTL" do
+      put_models(%{"claude-sonnet-5" => [prices: @card]})
 
       # A second step of a run: the prefix read, the new turn written. The
       # Messages API's input_tokens is only what follows the last breakpoint.
@@ -129,9 +121,13 @@ defmodule Clementine.CostTest do
         })
 
       # 100 × 3.00 + 11,000 × 0.30 + 900 × 3.75 + 200 × 15.00 = 9,975 micros.
-      assert Cost.of(usage, :claude) == %Cost{currency: "USD", micros: 9_975}
-      # 900 × 6.00 in place of 900 × 3.75: 2,025 more.
-      assert Cost.of(usage, :claude_hour) == %Cost{currency: "USD", micros: 12_000}
+      assert Cost.of(usage, "claude-sonnet-5") == %Cost{currency: "USD", micros: 9_975}
+
+      # An agent that writes for an hour: 900 × 6.00 in place of 900 × 3.75,
+      # 2,025 more.
+      agent = Agent.new(model: "claude-sonnet-5", cache: [ttl: :one_hour])
+      hour = Trace.resolve_model(agent.model, Agent.policy(agent))
+      assert Cost.of(usage, hour) == %Cost{currency: "USD", micros: 12_000}
     end
 
     test "OpenAI Responses: thirty-minute and twelve-hour writes on GPT-5.6 and later" do
@@ -143,10 +139,7 @@ defmodule Clementine.CostTest do
         cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0]
       ]
 
-      put_models(
-        gpt: [provider: :openai, id: "gpt-5.6", pricing: card],
-        gpt_day: [provider: :openai, id: "gpt-5.6", cache: [ttl: :twelve_hours], pricing: card]
-      )
+      put_models(%{"gpt-5.6-sol" => [prices: card]})
 
       # The Responses API's input_tokens counts the cached and written tokens.
       usage =
@@ -161,16 +154,16 @@ defmodule Clementine.CostTest do
         })
 
       # 1,000 × 2.00 + 3,000 × 0.20 + 1,000 × 2.50 + 1,000 × 8.00 = 13,100.
-      assert Cost.of(usage, :gpt) == %Cost{currency: "USD", micros: 13_100}
-      assert Cost.of(usage, :gpt_day) == %Cost{currency: "USD", micros: 15_600}
+      assert Cost.of(usage, "gpt-5.6-sol") == %Cost{currency: "USD", micros: 13_100}
+
+      day = Trace.resolve_model("gpt-5.6-sol", cache: [ttl: :twelve_hours])
+      assert Cost.of(usage, day) == %Cost{currency: "USD", micros: 15_600}
     end
 
     test "OpenAI before GPT-5.6: reads only, and a single write rate that never applies" do
-      put_models(
-        gpt_old: [
-          provider: :openai,
-          id: "gpt-5",
-          pricing: [
+      put_models(%{
+        "gpt-5.5" => [
+          prices: [
             currency: "USD",
             input: 1.25,
             output: 10.0,
@@ -178,7 +171,7 @@ defmodule Clementine.CostTest do
             cache_write: 1.25
           ]
         ]
-      )
+      })
 
       usage =
         ProviderUsage.openai(%{
@@ -188,15 +181,17 @@ defmodule Clementine.CostTest do
         })
 
       # 1,000 × 1.25 + 3,000 × 0.125 + 100 × 10.00 = 2,625.
-      assert Cost.of(usage, :gpt_old) == %Cost{currency: "USD", micros: 2_625}
+      assert Cost.of(usage, "gpt-5.5") == %Cost{currency: "USD", micros: 2_625}
     end
 
     test "Chat Completions: OpenRouter writes priced at the single rate when no TTL applies" do
-      put_models(
-        deepseek: [
-          provider: :openrouter,
-          id: "deepseek/deepseek-v3.2",
-          pricing: [
+      put_models(%{
+        "deepseek/deepseek-v3.2" => [
+          vendor: :deepseek,
+          context: 163_840,
+          max_output: 16_000,
+          platforms: [openrouter: []],
+          prices: [
             currency: "USD",
             input: 0.28,
             output: 0.42,
@@ -204,7 +199,7 @@ defmodule Clementine.CostTest do
             cache_write: 0.28
           ]
         ]
-      )
+      })
 
       usage =
         ProviderUsage.chat_completions(%{
@@ -214,22 +209,35 @@ defmodule Clementine.CostTest do
         })
 
       # 1,000 × 0.28 + 15,000 × 0.028 + 4,000 × 0.28 + 1,000 × 0.42 = 2,240.
-      assert Cost.of(usage, :deepseek) == %Cost{currency: "USD", micros: 2_240}
+      assert Cost.of(usage, "deepseek/deepseek-v3.2") == %Cost{currency: "USD", micros: 2_240}
     end
 
     test "Chat Completions: Bedrock, Vertex, and a self-hosted server" do
       cheap = [currency: "USD", input: 0.5, output: 1.5, cache_read: 0.05, cache_write: 0]
 
-      put_models(
-        qwen_bedrock: [provider: :bedrock, id: "qwen.qwen3-235b-a22b-2507-v1:0", pricing: cheap],
-        glm_vertex: [provider: :vertex, id: "zai/glm-4.7-maas", pricing: cheap],
-        local: [
-          provider: :openai_compatible,
-          id: "my-qwen",
-          base_url: "http://localhost:8000/v1",
-          pricing: [currency: "USD", input: 0, output: 0, cache_read: 0, cache_write: 0]
+      declared = fn platform, prices ->
+        [
+          vendor: :open,
+          context: 131_072,
+          max_output: 8_192,
+          platforms: [platform],
+          prices: prices
         ]
-      )
+      end
+
+      put_models(%{
+        "qwen.qwen3-235b-a22b-2507-v1:0" => declared.({:bedrock, []}, cheap),
+        "zai/glm-4.7-maas" => declared.({:vertex, []}, cheap),
+        "my-qwen" =>
+          declared.(
+            {:openai_compatible, [base_url: "http://localhost:8000/v1"]},
+            currency: "USD",
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0
+          )
+      })
 
       # Vertex MaaS and vLLM report reads only.
       reads =
@@ -240,36 +248,44 @@ defmodule Clementine.CostTest do
         })
 
       # 4,000 × 0.50 + 6,000 × 0.05 + 2,000 × 1.50 = 5,300.
-      assert Cost.of(reads, :glm_vertex) == %Cost{currency: "USD", micros: 5_300}
-      assert Cost.of(reads, :qwen_bedrock) == %Cost{currency: "USD", micros: 5_300}
+      assert Cost.of(reads, "zai/glm-4.7-maas") == %Cost{currency: "USD", micros: 5_300}
+
+      assert Cost.of(reads, "qwen.qwen3-235b-a22b-2507-v1:0") == %Cost{
+               currency: "USD",
+               micros: 5_300
+             }
 
       # A host that prices its own server at zero gets zero, not nil.
-      assert Cost.of(reads, :local) == %Cost{currency: "USD", micros: 0}
+      assert Cost.of(reads, "my-qwen") == %Cost{currency: "USD", micros: 0}
     end
 
-    test "an alias as the trace records it, a string" do
-      put_models(claude: [provider: :anthropic, id: "claude-sonnet-5", pricing: @one_rate])
+    test "a model id as the trace records it, and the model resolved for a call" do
+      put_models(%{"claude-sonnet-5" => [prices: @one_rate]})
 
-      assert %Cost{micros: 3_000} = Cost.of(%Usage{input_tokens: 1_000}, "claude")
+      assert %Cost{micros: 3_000} = Cost.of(%Usage{input_tokens: 1_000}, "claude-sonnet-5")
+
+      assert %Cost{micros: 3_000} =
+               Cost.of(%Usage{input_tokens: 1_000}, Trace.resolve_model("claude-sonnet-5"))
     end
   end
 
   describe "what is not priced costs nil, never zero" do
-    test "an alias without prices, a direct reference, and a reference the catalog lacks" do
-      put_models(claude: [provider: :anthropic, id: "claude-sonnet-5"])
+    test "a model without prices, an id no sheet holds, and an alias of old" do
+      put_models(%{"claude-sonnet-5" => [prices: @one_rate]})
       usage = %Usage{input_tokens: 1_000, output_tokens: 10}
 
-      assert Cost.of(usage, :claude) == nil
-      assert Cost.of(usage, {:anthropic, "claude-sonnet-5"}) == nil
-      assert Cost.of(usage, :not_in_the_catalog) == nil
-      assert Cost.of(usage, "not_an_existing_atom_#{System.unique_integer([:positive])}") == nil
+      assert Cost.of(usage, "claude-sonnet-5-5") == nil
+      assert Cost.of(usage, Trace.resolve_model("claude-sonnet-5-5")) == nil
+      assert Cost.of(usage, "not-a-model") == nil
+      assert Cost.of(usage, Trace.resolve_model("not-a-model")) == nil
+      assert Cost.of(usage, :claude_sonnet) == nil
       assert Cost.of(usage, nil) == nil
     end
 
-    test "no usage on a priced alias is zero" do
-      put_models(claude: [provider: :anthropic, id: "claude-sonnet-5", pricing: @one_rate])
+    test "no usage on a priced model is zero" do
+      put_models(%{"claude-sonnet-5" => [prices: @one_rate]})
 
-      assert Cost.of(%Usage{}, :claude) == %Cost{currency: "USD", micros: 0}
+      assert Cost.of(%Usage{}, "claude-sonnet-5") == %Cost{currency: "USD", micros: 0}
     end
   end
 
@@ -291,15 +307,14 @@ defmodule Clementine.CostTest do
                nil
     end
 
-    test "nothing is zero in the catalog's currency, or nil when the catalog prices nothing" do
-      put_models(
-        plain: [provider: :anthropic, id: "claude-haiku-4-5"],
-        claude: [provider: :anthropic, id: "claude-sonnet-5", pricing: @card]
-      )
+    test "nothing is zero in the models' currency, or nil when no model has prices" do
+      # An override that sets no prices leaves its model unpriced.
+      plain = [display_name: "Haiku, as the app calls it"]
+      put_models(%{"claude-haiku-5-5" => plain, "claude-sonnet-5" => [prices: @card]})
 
       assert Cost.sum([]) == %Cost{currency: "USD", micros: 0}
 
-      put_models(plain: [provider: :anthropic, id: "claude-haiku-4-5"])
+      put_models(%{"claude-haiku-5-5" => plain})
       assert Cost.sum([]) == nil
     end
   end

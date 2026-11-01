@@ -17,7 +17,7 @@ defmodule Clementine.AgentServer do
       defmodule MyApp.CodingAgent do
         use Clementine.AgentServer,
           name: "coding_agent",
-          model: :claude_sonnet,
+          model: "claude-sonnet-5-5",
           tools: [
             MyApp.Tools.ReadFile,
             MyApp.Tools.WriteFile,
@@ -43,10 +43,11 @@ defmodule Clementine.AgentServer do
   The following options can be set at compile time via `use Clementine.AgentServer`:
 
   - `:name` - Required. The agent's name for identification.
-  - `:model` - The LLM model to use (default: from config)
+  - `:model` - The model's id (`"claude-sonnet-5-5"`); here or in
+    `start_link/1`
   - `:tools` - List of tool modules (default: [])
   - `:system` - System prompt (default: "")
-  - `:max_iterations` - Maximum loop iterations (default: from config)
+  - `:max_iterations` - Maximum loop iterations (default: 10)
 
   Runtime options can override compile-time options when calling `start_link/1`.
 
@@ -74,7 +75,7 @@ defmodule Clementine.AgentServer do
   ## Options
 
   - `:name` - Required. The agent's name.
-  - `:model` - LLM model reference (default: from config)
+  - `:model` - The model's id; required here or in `start_link/1`
   - `:tools` - List of tool modules
   - `:system` - System prompt
   - `:max_iterations` - Maximum loop iterations
@@ -98,7 +99,7 @@ defmodule Clementine.AgentServer do
       ## Options
 
       - `:name` - Process name for registration
-      - `:model` - Override the default model
+      - `:model` - The model's id, over the one `use` names
       - `:system` - Override the system prompt
       - `:max_iterations` - Override max iterations
       - `:context` - Initial context map
@@ -128,8 +129,13 @@ defmodule Clementine.AgentServer do
 
       @impl true
       def init(opts) do
-        default_model = Application.get_env(:clementine, :default_model, :claude_sonnet)
-        default_max_iterations = Application.get_env(:clementine, :max_iterations, 10)
+        model = Keyword.get(opts, :model, @agent_model)
+
+        unless is_binary(model) do
+          raise ArgumentError,
+                "#{inspect(__MODULE__)} names no model: give one to use " <>
+                  "Clementine.AgentServer or to start_link/1 (model: \"claude-sonnet-5-5\")"
+        end
 
         context =
           Keyword.get(opts, :context, %{})
@@ -140,11 +146,10 @@ defmodule Clementine.AgentServer do
 
         state = %Clementine.AgentServer.State{
           name: @agent_name,
-          model: Keyword.get(opts, :model, @agent_model || default_model),
+          model: model,
           system: Keyword.get(opts, :system, @agent_system),
           tools: @agent_tools,
-          max_iterations:
-            Keyword.get(opts, :max_iterations, @agent_max_iterations || default_max_iterations),
+          max_iterations: Keyword.get(opts, :max_iterations, @agent_max_iterations || 10),
           context: context,
           history: history,
           tasks: %{}

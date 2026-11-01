@@ -8,7 +8,7 @@ defmodule Clementine.DelegationTest do
     use Clementine.Agent,
       key: "researcher",
       description: "Looks things up.",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Research."
   end
 
@@ -17,12 +17,12 @@ defmodule Clementine.DelegationTest do
     use Clementine.Agent, key: "also"
 
     @impl true
-    def agent(_run), do: Clementine.Agent.new(model: :claude_sonnet)
+    def agent(_run), do: Clementine.Agent.new(model: "claude-sonnet-5")
   end
 
   defmodule AlsoResearcher do
     @moduledoc false
-    use Clementine.Agent, key: "researcher", model: :claude_sonnet, instructions: "Research."
+    use Clementine.Agent, key: "researcher", model: "claude-sonnet-5", instructions: "Research."
   end
 
   describe "tool/1" do
@@ -49,7 +49,7 @@ defmodule Clementine.DelegationTest do
     test "an agent's description is checked when it is built" do
       assert_raise ArgumentError, ~r/description: as a non-empty string/, fn ->
         defmodule Blank do
-          use Clementine.Agent, key: "blank", description: "", model: :claude_sonnet
+          use Clementine.Agent, key: "blank", description: "", model: "claude-sonnet-5"
         end
       end
     end

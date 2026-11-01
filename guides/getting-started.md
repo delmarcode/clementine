@@ -39,24 +39,22 @@ def deps do
 end
 ```
 
-Configure an API key and, optionally, your model registry:
+Configure an API key:
 
 <!-- guide-sample: parse-only -->
 ```elixir
 # config/config.exs
 import Config
 
-config :clementine,
-  anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
-  default_model: :claude_sonnet
-
-config :clementine, :models,
-  claude_sonnet: [
-    provider: :anthropic,
-    id: "claude-sonnet-5",
-    defaults: [max_tokens: 8192]
-  ]
+config :clementine, anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}
 ```
+
+An agent names its model by the vendor's id (`"claude-sonnet-5-5"`).
+Clementine ships a fact sheet for each current Anthropic and OpenAI
+model, and checks what the agent asks of its model (`effort:`,
+`max_tokens:`, `thinking:`, `cache:`) against it when the agent is
+built; [`docs/MODELS.md`](../docs/MODELS.md) has the sheets and how to
+declare a model Clementine does not ship.
 
 ## One line
 
@@ -66,7 +64,7 @@ The simplest consumption stays one line:
 ```elixir
 agent =
   Clementine.Agent.new(
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "You are a concise research assistant."
   )
 
@@ -88,16 +86,16 @@ other terminal comes back as `{:error, result}` carrying the matching
 `Clementine.Result` variant — a `Failed` with a normalized
 `Clementine.Error` (including whether it is retryable), a `Cancelled`, or
 an `Interrupted`. All variants carry `usage`; tokens burn on failures too.
-`Clementine.Cost.of(result.usage, :claude_sonnet)` prices it, once the
-model's catalog entry has prices (`pricing:` in
-[`docs/MODELS.md`](../docs/MODELS.md#pricing)).
+`Clementine.Cost.of(result.usage, "claude-sonnet-5-5")` prices it, once
+the model has prices (`prices:` in
+[`docs/MODELS.md`](../docs/MODELS.md#prices)).
 
 Prompt caching is on by default: each step of a run reads the prompt
 the step before it sent from the provider's cache instead of paying for
 it again. `usage.input_tokens` counts every input token, and
 `cache_read_tokens` and `cache_write_tokens` are the parts of it the
-provider read from its cache and wrote to it. A catalog entry's `cache:`
-key turns caching off or changes how long a write lives; the table of
+provider read from its cache and wrote to it. An agent's `cache:`
+turns caching off or changes how long a write lives; the table of
 what each provider does is in
 [`docs/MODELS.md`](../docs/MODELS.md#prompt-caching).
 
@@ -136,7 +134,7 @@ Wire tools into the agent, and pass request-scoped data through
 ```elixir
 agent =
   Clementine.Agent.new(
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "You are a weather assistant.",
     tools: [MyApp.Tools.Weather]
   )
@@ -164,7 +162,7 @@ large catalog (several MCP servers, say), keep the few it always uses in
 ```elixir
 agent =
   Clementine.Agent.new(
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "You help customers with their orders.",
     tools: [MyApp.Tools.LookupOrder],
     deferred: [MyApp.Tools.IssueRefund, MyApp.Tools.ChangeAddress, MyApp.Tools.CancelOrder]
@@ -192,7 +190,7 @@ text:
 ```elixir
 agent =
   Clementine.Agent.new(
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "Classify the support ticket.",
     tools: [MyApp.Tools.LookupCustomer],
     output_schema: %{
@@ -293,7 +291,7 @@ end
 ```elixir
 agent =
   Clementine.Agent.new(
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "You are a weather assistant.",
     skills: [MyApp.Skills.Forecasts]
   )

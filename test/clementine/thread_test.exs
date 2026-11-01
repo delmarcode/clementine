@@ -349,7 +349,10 @@ defmodule Clementine.ThreadTest do
 
     build = fn tag, child ->
       send(test, {:spawn, tag, child})
-      agent = Clementine.Agent.new(model: :claude_sonnet, instructions: "Answer.", tools: tools)
+
+      agent =
+        Clementine.Agent.new(model: "claude-sonnet-5", instructions: "Answer.", tools: tools)
+
       {:ok, Rollout.new(agent: agent, input: child["prompt"])}
     end
 

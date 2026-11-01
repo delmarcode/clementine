@@ -32,18 +32,22 @@ defmodule Clementine.DelegationExecutionTest do
     use Clementine.Agent,
       key: "researcher",
       description: "Finds and cites facts.",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Research."
   end
 
   defmodule Writer do
     @moduledoc false
-    use Clementine.Agent, key: "writer", model: :claude_sonnet, instructions: "Write."
+    use Clementine.Agent, key: "writer", model: "claude-sonnet-5", instructions: "Write."
   end
 
   defmodule Chatter do
     @moduledoc false
-    use Clementine.Agent, key: "chatter", turn: true, model: :claude_sonnet, instructions: "Chat."
+    use Clementine.Agent,
+      key: "chatter",
+      turn: true,
+      model: "claude-sonnet-5",
+      instructions: "Chat."
 
     @impl true
     def history(_run), do: []
@@ -69,7 +73,7 @@ defmodule Clementine.DelegationExecutionTest do
     Clementine.Agent.new(
       Keyword.merge(
         [
-          model: :claude_sonnet,
+          model: "claude-sonnet-5",
           instructions: @instructions,
           tools: [Echo, GatedDeploy],
           delegates: [Researcher, Writer, Chatter]
@@ -537,16 +541,17 @@ defmodule Clementine.DelegationExecutionTest do
     test "fingerprints the delegates by key and description, and records their keys on the " <>
            "execution entry",
          %{store: store, ref: ref} do
-      base = Trace.fingerprint(:claude_sonnet, "x", [Echo])
-      assert Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: []) == base
-      keyed = Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: ["writer"])
+      base = Trace.fingerprint("claude-sonnet-5", "x", [Echo])
+      assert Trace.fingerprint("claude-sonnet-5", "x", [Echo], delegates: []) == base
+      keyed = Trace.fingerprint("claude-sonnet-5", "x", [Echo], delegates: ["writer"])
       refute keyed == base
 
       # A delegate with no description fingerprints by its key alone; one
       # with a description, by both.
-      assert Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: [{"writer", nil}]) == keyed
+      assert Trace.fingerprint("claude-sonnet-5", "x", [Echo], delegates: [{"writer", nil}]) ==
+               keyed
 
-      refute Trace.fingerprint(:claude_sonnet, "x", [Echo], delegates: [{"writer", "Writes."}]) ==
+      refute Trace.fingerprint("claude-sonnet-5", "x", [Echo], delegates: [{"writer", "Writes."}]) ==
                keyed
 
       MemoryLifecycle.seed_queued(store, ref)

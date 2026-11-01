@@ -20,7 +20,7 @@ defmodule Clementine.Runs.CostTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_cost_middle",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Ask the echo.",
       delegates: [Clementine.RunsCase.Echo]
   end
@@ -29,7 +29,7 @@ defmodule Clementine.Runs.CostTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_cost_outer",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Ask the middle.",
       delegates: [Middle]
   end
@@ -38,9 +38,19 @@ defmodule Clementine.Runs.CostTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_cost_terse",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Answer.",
       trace: :facts
+  end
+
+  defmodule Hourly do
+    @moduledoc false
+    # Writes its cache for an hour, so its writes are billed at that rate.
+    use Clementine.Agent,
+      key: "test_cost_hourly",
+      model: "claude-sonnet-5",
+      instructions: "Answer.",
+      cache: [ttl: :one_hour]
   end
 
   defmodule Ledger do
@@ -65,18 +75,16 @@ defmodule Clementine.Runs.CostTest do
     Process.register(self(), :clementine_runs_test)
     previous = Application.get_env(:clementine, :models)
     on_exit(fn -> Application.put_env(:clementine, :models, previous) end)
-    {:ok, catalog: previous}
+    {:ok, models: previous}
   end
 
-  defp price_sonnet!(catalog, pricing \\ @pricing) do
+  # The app's prices for the model every test agent runs on, over
+  # whatever else the models' config holds.
+  defp price_sonnet!(models, pricing \\ @pricing) do
     Application.put_env(
       :clementine,
       :models,
-      Keyword.put(catalog, :claude_sonnet,
-        provider: :anthropic,
-        id: "claude-sonnet-5",
-        pricing: pricing
-      )
+      Map.put(models || %{}, "claude-sonnet-5", prices: pricing)
     )
   end
 
@@ -108,8 +116,8 @@ defmodule Clementine.Runs.CostTest do
   defp usd(micros), do: %Cost{currency: "USD", micros: micros}
 
   describe "a run's cost" do
-    test "is the sum of the costs frozen on its model calls", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "is the sum of the costs frozen on its model calls", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Lookup, "Find the forecast", subject: {"ticket", "t-1"})
       expect_turn(call("tu_1", "lookup", %{"query" => "forecast"}))
       # 1,000 × 3.00 + 100 × 15.00 = 4,500.
@@ -119,7 +127,9 @@ defmodule Clementine.Runs.CostTest do
       assert [first, second] = model_calls(run.id)
 
       assert %{
-               "alias" => "claude_sonnet",
+               "provider" => "anthropic",
+               "model" => "claude-sonnet-5",
+               "alias" => nil,
                "cost" => %{"currency" => "USD", "micros" => @cached_micros}
              } = first.payload
 
@@ -128,30 +138,30 @@ defmodule Clementine.Runs.CostTest do
     end
 
     test "is frozen: a price changed afterwards reprices nothing; Cost.of reprices on request",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+         %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Echo, "Hi")
       expect_turn(answer("Hello."))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
       assert Runs.cost(run.id) == usd(@cached_micros)
 
-      price_sonnet!(catalog, Keyword.put(@pricing, :output, 30.0))
+      price_sonnet!(models, Keyword.put(@pricing, :output, 30.0))
       assert Runs.cost(run.id) == usd(@cached_micros)
 
       # Today's prices, from what the trace kept: 50 × 15.00 more.
       [%{payload: payload}] = model_calls(run.id)
 
-      assert Cost.of(Usage.from_map(payload["usage"]), payload["alias"]) ==
+      assert Cost.of(Usage.from_map(payload["usage"]), payload["model"]) ==
                usd(@cached_micros + 750)
     end
 
-    test "is nil, not zero, for a host that sets no prices", %{catalog: catalog} do
-      Application.put_env(:clementine, :models, catalog)
+    test "is nil, not zero, for a host that sets no prices", %{models: models} do
+      Application.put_env(:clementine, :models, models)
       {:ok, run} = Runs.start(Echo, "Hi", subject: {"ticket", "t-unpriced"})
       expect_turn(answer("Hello."))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
 
-      assert [%{payload: %{"alias" => "claude_sonnet", "cost" => nil}}] = model_calls(run.id)
+      assert [%{payload: %{"model" => "claude-sonnet-5", "cost" => nil}}] = model_calls(run.id)
       assert Runs.cost(run.id) == nil
       assert Runs.subject_cost({"ticket", "t-unpriced"}) == nil
 
@@ -160,8 +170,8 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(idle.id) == nil
     end
 
-    test "is nil when one of its calls ran unpriced: never an undercount", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "is nil when one of its calls ran unpriced: never an undercount", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Approval, "Tell the team")
       expect_turn(call("tu_1", "send_note", %{"text" => "hi"}))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
@@ -169,7 +179,7 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(run.id) == usd(@cached_micros)
 
       # The host drops the price while the run waits; its next call is unpriced.
-      Application.put_env(:clementine, :models, catalog)
+      Application.put_env(:clementine, :models, models)
       assert :ok = Runs.resume(run.id, {:approved, %{by: "alice"}})
       expect_turn(answer("Sent."))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
@@ -178,9 +188,9 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(run.id) == nil
     end
 
-    test "is zero for a run that called no model, where the catalog has prices",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "is zero for a run that called no model, where a model has prices",
+         %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Echo, "Hi")
       assert {:ok, _} = Runs.cancel(run.id)
 
@@ -205,8 +215,8 @@ defmodule Clementine.Runs.CostTest do
     end
 
     test "is charged for its own calls; children: true adds every run below it",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+         %{models: models} do
+      price_sonnet!(models)
       subject = {"ticket", "t-delegates"}
       {:ok, parent} = Runs.start(Planner, "Plan the launch", subject: subject)
       expect_turn(ask("tu_1", "test_echo", "Say the plan."))
@@ -245,8 +255,8 @@ defmodule Clementine.Runs.CostTest do
     end
 
     test "costs nothing itself; its turns are its children and its subject's runs",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+         %{models: models} do
+      price_sonnet!(models)
       subject = {"conversation", "c-cost"}
       {:ok, loop} = Runs.start_loop(Thread, %{"agent" => "test_chat"}, subject: subject)
 
@@ -304,8 +314,8 @@ defmodule Clementine.Runs.CostTest do
     end
 
     test "is nil when the node died in its first call, which only the heartbeat counted",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+         %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Echo, "Hi", subject: {"ticket", "t-dead"})
       dead_executor!(run, %{"input_tokens" => 200_000, "output_tokens" => 4_000})
 
@@ -319,8 +329,8 @@ defmodule Clementine.Runs.CostTest do
     end
 
     test "is nil when the node died in a later call; a live run is nil while it lags",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+         %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Lookup, "Find it", subject: {"ticket", "t-later"})
       expect_turn(call("tu_1", "lookup", %{"query" => "it"}))
       test = self()
@@ -346,8 +356,8 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(run.id) == nil
     end
 
-    test "is nil when a resumed run's node died mid-call", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "is nil when a resumed run's node died mid-call", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Approval, "Tell the team")
       expect_turn(call("tu_1", "send_note", %{"text" => "hi"}))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
@@ -366,8 +376,8 @@ defmodule Clementine.Runs.CostTest do
     end
 
     test "is priced from the trace when a resumed run died before its first heartbeat",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+         %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Approval, "Tell the team")
       expect_turn(call("tu_1", "send_note", %{"text" => "hi"}))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
@@ -391,8 +401,8 @@ defmodule Clementine.Runs.CostTest do
   end
 
   describe "a run whose trace is whole is priced" do
-    test "across a drain's requeue: both executions' calls", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "across a drain's requeue: both executions' calls", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Lookup, "Look it up")
       worker = self()
 
@@ -413,8 +423,8 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(run.id) == usd(3 * @cached_micros)
     end
 
-    test "across a paused turn and its continuation", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "across a paused turn and its continuation", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Echo, "Think it through")
 
       expect_turn([
@@ -429,8 +439,8 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(run.id) == usd(2 * @cached_micros)
     end
 
-    test "across a park and its resume", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "across a park and its resume", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Approval, "Tell the team")
       expect_turn(call("tu_1", "send_note", %{"text" => "hi"}))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
@@ -444,8 +454,8 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(run.id) == usd(2 * @cached_micros)
     end
 
-    test "with a call a cancel cut off, at what its stream reported", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "with a call a cancel cut off, at what its stream reported", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Echo, "Tell me a long story")
       id = run.id
 
@@ -469,8 +479,8 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(id) == usd(3_015)
     end
 
-    test "with a call a provider error ended, at what its stream reported", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "with a call a provider error ended, at what its stream reported", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Echo, "Hi")
 
       expect_turn([
@@ -490,15 +500,15 @@ defmodule Clementine.Runs.CostTest do
 
     setup do
       start_supervised!(
-        {Clementine, repo: TestRepo, agents: [Echo, Outer, Middle, Terse], host: Ledger}
+        {Clementine, repo: TestRepo, agents: [Echo, Outer, Middle, Terse, Hourly], host: Ledger}
       )
 
       :ok
     end
 
     test "children: true counts grandchildren; each level's own cost is its own",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+         %{models: models} do
+      price_sonnet!(models)
       {:ok, outer} = Runs.start(Outer, "Plan", subject: {"ticket", "t-tree"})
       expect_turn(ask("tu_1", "test_cost_middle", "Ask the echo."))
       assert :ok = perform_job(Worker, %{"run_id" => outer.id})
@@ -523,26 +533,47 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.subject_cost({"ticket", "t-tree"}) == usd(5 * @cached_micros)
     end
 
-    test "a facts-only trace keeps the cost", %{catalog: catalog} do
-      price_sonnet!(catalog)
+    test "a facts-only trace keeps the cost", %{models: models} do
+      price_sonnet!(models)
       {:ok, run} = Runs.start(Terse, "Hi")
       expect_turn(answer("Hello."))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
 
       assert [%{payload: payload}] = model_calls(run.id)
       refute Map.has_key?(payload, "content")
-      assert %{"alias" => "claude_sonnet", "cost" => %{"micros" => @cached_micros}} = payload
+      assert %{"model" => "claude-sonnet-5", "cost" => %{"micros" => @cached_micros}} = payload
       assert Runs.cost(run.id) == usd(@cached_micros)
     end
 
-    test "costs in two currencies have no total", %{catalog: catalog} do
+    test "an agent that writes for an hour is charged the one-hour write rate",
+         %{models: models} do
+      price_sonnet!(
+        models,
+        Keyword.put(@pricing, :cache_write, five_minutes: 3.75, one_hour: 6.0)
+      )
+
+      {:ok, minutes} = Runs.start(Echo, "Hi")
+      expect_turn(answer("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => minutes.id})
+
+      {:ok, hour} = Runs.start(Hourly, "Hi")
+      expect_turn(answer("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => hour.id})
+
+      # The same call, its 400 written tokens at 6.00 in place of 3.75:
+      # 900 micro-dollars more.
+      assert Runs.cost(minutes.id) == usd(@cached_micros)
+      assert Runs.cost(hour.id) == usd(@cached_micros + 900)
+    end
+
+    test "costs in two currencies have no total", %{models: models} do
       subject = {"ticket", "t-currencies"}
-      price_sonnet!(catalog)
+      price_sonnet!(models)
       {:ok, first} = Runs.start(Echo, "Hi", subject: subject)
       expect_turn(answer("Hello."))
       assert :ok = perform_job(Worker, %{"run_id" => first.id})
 
-      price_sonnet!(catalog, Keyword.put(@pricing, :currency, "EUR"))
+      price_sonnet!(models, Keyword.put(@pricing, :currency, "EUR"))
       {:ok, second} = Runs.start(Echo, "Again", subject: subject)
       expect_turn(answer("Hello again."))
       assert :ok = perform_job(Worker, %{"run_id" => second.id})
@@ -553,8 +584,8 @@ defmodule Clementine.Runs.CostTest do
     end
 
     test "a purge takes the cost with the trace; a host's ledger keeps it",
-         %{catalog: catalog} do
-      price_sonnet!(catalog)
+         %{models: models} do
+      price_sonnet!(models)
       subject = {"ticket", "t-purged"}
       {:ok, run} = Runs.start(Echo, "Hi", subject: subject)
       expect_turn(answer("Hello."))

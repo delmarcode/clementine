@@ -22,7 +22,7 @@ defmodule Clementine.DeferredToolsTest do
     @moduledoc false
     use Clementine.Agent,
       key: "deferred_support",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Help.",
       tools: [Clementine.Test.Tools.Echo],
       deferred: [Clementine.Test.Tools.GatedDeploy]
@@ -33,14 +33,14 @@ defmodule Clementine.DeferredToolsTest do
       assert %Clementine.Agent{tools: [Echo], deferred: [GatedDeploy]} = Support.agent(nil)
 
       assert %Clementine.Agent{deferred: [Add]} =
-               Clementine.Agent.new(model: :claude_sonnet, tools: [Echo], deferred: [Add])
+               Clementine.Agent.new(model: "claude-sonnet-5", tools: [Echo], deferred: [Add])
 
-      assert %Clementine.Agent{deferred: []} = Clementine.Agent.new(model: :claude_sonnet)
+      assert %Clementine.Agent{deferred: []} = Clementine.Agent.new(model: "claude-sonnet-5")
     end
 
     test "refuses a tool in both tools: and deferred:" do
       assert_raise ArgumentError, ~r/tools: or deferred:, not both.*Echo/, fn ->
-        Clementine.Agent.new(model: :claude_sonnet, tools: [Echo, Add], deferred: [Echo])
+        Clementine.Agent.new(model: "claude-sonnet-5", tools: [Echo, Add], deferred: [Echo])
       end
     end
   end
@@ -70,7 +70,7 @@ defmodule Clementine.DeferredToolsTest do
     test "a tool an agent/1 put in both lists goes once, up front" do
       # agent/1 may update the struct directly, past new/1's check.
       agent = %{
-        Clementine.Agent.new(model: :claude_sonnet, tools: [Echo, Add])
+        Clementine.Agent.new(model: "claude-sonnet-5", tools: [Echo, Add])
         | deferred: [Add, GatedDeploy, GatedDeploy]
       }
 
@@ -260,7 +260,7 @@ defmodule Clementine.DeferredToolsTest do
   defp rollout(opts) do
     agent =
       Clementine.Agent.new(
-        model: :claude_sonnet,
+        model: "claude-sonnet-5",
         instructions: "test",
         tools: Keyword.fetch!(opts, :tools),
         deferred: Keyword.get(opts, :deferred, [])

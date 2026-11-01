@@ -14,7 +14,7 @@ defmodule Clementine.FacadeTest do
 
   defp agent(opts \\ []) do
     Clementine.Agent.new(
-      Keyword.merge([model: :claude_sonnet, instructions: "test", tools: []], opts)
+      Keyword.merge([model: "claude-sonnet-5", instructions: "test", tools: []], opts)
     )
   end
 

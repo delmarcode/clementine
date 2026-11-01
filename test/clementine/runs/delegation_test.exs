@@ -24,7 +24,7 @@ defmodule Clementine.Runs.DelegationTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_delegate_grader",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Grade the essay.",
       output_schema: %{
         "type" => "object",
@@ -42,7 +42,7 @@ defmodule Clementine.Runs.DelegationTest do
     use Clementine.Agent,
       key: "test_concierge",
       turn: true,
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Help travellers.",
       delegates: [Clementine.RunsCase.Echo]
 
@@ -54,7 +54,7 @@ defmodule Clementine.Runs.DelegationTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_ping",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Serve.",
       delegates: [Clementine.Runs.DelegationTest.Pong]
   end
@@ -63,7 +63,7 @@ defmodule Clementine.Runs.DelegationTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_pong",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Return.",
       delegates: [Clementine.Runs.DelegationTest.Ping]
   end
@@ -72,7 +72,7 @@ defmodule Clementine.Runs.DelegationTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_narcissus",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Ask yourself.",
       delegates: [Clementine.Runs.DelegationTest.Narcissus]
   end
@@ -81,7 +81,7 @@ defmodule Clementine.Runs.DelegationTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_delegate_head",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Have essays graded.",
       delegates: [Grader]
   end

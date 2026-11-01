@@ -81,7 +81,7 @@ defmodule Clementine.ToolPolicyTest do
 
   defmodule Researcher do
     @moduledoc false
-    use Clementine.Agent, key: "researcher", model: :claude_sonnet, instructions: "Research."
+    use Clementine.Agent, key: "researcher", model: "claude-sonnet-5", instructions: "Research."
   end
 
   @failed "Denied: the tool's policy check failed."
@@ -89,7 +89,7 @@ defmodule Clementine.ToolPolicyTest do
   defp agent(opts) do
     Clementine.Agent.new(
       Keyword.merge(
-        [model: :claude_sonnet, instructions: "Help.", tools: [Echo, Refund, Lookup]],
+        [model: "claude-sonnet-5", instructions: "Help.", tools: [Echo, Refund, Lookup]],
         opts
       )
     )

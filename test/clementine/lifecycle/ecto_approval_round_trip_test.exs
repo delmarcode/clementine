@@ -22,7 +22,7 @@ defmodule Clementine.Lifecycle.EctoApprovalRoundTripTest do
   defp build_run(run_row) do
     agent =
       Clementine.Agent.new(
-        model: :claude_sonnet,
+        model: "claude-sonnet-5",
         instructions: "test agent",
         tools: [GatedDeploy, SafeEcho]
       )

@@ -42,7 +42,7 @@ defmodule Clementine.Runs.LoopsTest do
 
   defmodule Tidy do
     @moduledoc "An agent that holds a resource per execution and releases it after."
-    use Clementine.Agent, key: "test_tidy", model: :claude_sonnet, instructions: "Tidy."
+    use Clementine.Agent, key: "test_tidy", model: "claude-sonnet-5", instructions: "Tidy."
 
     @impl true
     def after_execution(run, context) do

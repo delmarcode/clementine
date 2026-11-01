@@ -89,7 +89,7 @@ defmodule Clementine.RunnerTest do
 
   defp agent(opts) do
     Clementine.Agent.new(
-      Keyword.merge([model: :claude_sonnet, instructions: "test agent", tools: []], opts)
+      Keyword.merge([model: "claude-sonnet-5", instructions: "test agent", tools: []], opts)
     )
   end
 

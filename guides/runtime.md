@@ -69,7 +69,7 @@ An agent is a module with a stable key, the string its run rows store:
 defmodule MyApp.Agents.Weather do
   use Clementine.Agent,
     key: "weather",
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "Answer questions about the weather in a few sentences.",
     tools: [],
     defaults: [max_iterations: 10, max_duration: :timer.minutes(5)]
@@ -86,7 +86,7 @@ defmodule MyApp.Agents.Triage do
   @impl true
   def agent(run) do
     Clementine.Agent.new(
-      model: :claude_sonnet,
+      model: "claude-sonnet-5-5",
       instructions: "Triage this ticket: #{inspect(run.subject)}"
     )
   end
@@ -104,7 +104,7 @@ defmodule MyApp.Agents.Chat do
   use Clementine.Agent,
     key: "chat",
     turn: true,
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "You are a helpful assistant. Be brief."
 
   @impl true
@@ -208,7 +208,7 @@ agents it may ask with `delegates:` (`Clementine.Delegation`):
 defmodule MyApp.Agents.Planner do
   use Clementine.Agent,
     key: "planner",
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "Plan the launch. Ask the researcher for facts you lack.",
     delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
 end
@@ -273,8 +273,8 @@ fail as `:incompatible_checkpoint`.
 
 ## Models that bind their thinking
 
-Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and every
-later Claude model bind each thinking block to the conversation it was
+Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5 (their
+sheets say `thinking: [binding: :prefix]`) bind each thinking block to the conversation it was
 produced in: the system prompt, the tools as a set, and every message
 before it. The API accepts a replayed block only while all of that is
 unchanged, and only in the order its conversation produced it. On an
@@ -318,19 +318,18 @@ What Clementine does about it, without any option:
   thinking had to go, and leave the system message before the next
   prompt. It goes as the text `(no reply)` instead, which is what the
   turn showed, and the model reads that as what it said then.
-- **A model id Clementine cannot read** (a deployment name behind
-  `:anthropic_base_url`, say) is checked as above, but its system
-  messages join `system` and `tools`: mid-conversation system messages
-  exist on some models and platforms only (not Claude Sonnet 5, not
-  Microsoft Foundry). A skill load then costs the earlier turns' thinking
-  once, where a misplaced system message would fail every request.
+- **Both are facts of the model's sheet, not of its id.**
+  `thinking.binding: :prefix` turns the check on, and
+  `features.mid_conversation_system` sends a system message in place;
+  elsewhere it joins `system` and `tools` (Claude Sonnet 5 takes none in
+  place). A model Clementine does not ship says both in its declaration
+  (`docs/MODELS.md`), and defaults to neither.
 - **It shows the text written between tool calls.** Claude Fable 5.1,
   Mythos 5.1, Opus 5.5, Sonnet 5.5, and Fable 5 can write a short
   progress update before a tool call. It comes back as a thinking block
   of its own, empty under the default display. Ask for the text with
-  `reasoning: [thinking: :adaptive, display: :updates]`, or, on Sonnet
-  5.5 with up-front thinking off, `reasoning: [thinking:
-  :between_tools]`. It streams as `:thinking_delta` events, whose
+  `display: :updates` on the agent, or, on Sonnet 5.5 with up-front
+  thinking off, `thinking: :between_tools`. It streams as `:thinking_delta` events, whose
   `index` tells one update from the next, and is stored in the turn's
   thinking blocks; render a non-empty one as a status line. Haiku 5.5
   writes none.
@@ -362,7 +361,7 @@ def history(run) do
 end
 ```
 
-`reasoning: [thinking: :adaptive, prefix_mismatch: :error]` asks the API
+`provider_options: [prefix_mismatch: :error]` on the agent asks the API
 to refuse an invalid replay on any account (`:drop_block` asks it to drop
 the blocks instead, a stopgap). Either sends the
 `thinking-binding-controls-2026-08-01` beta, and Clementine logs what a
@@ -411,14 +410,14 @@ Clementine.Runs.trace(run.id)
 #=> [
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 1, kind: :execution,
 #=>     payload: %{"provider" => "anthropic", "model" => "claude-sonnet-5",
-#=>                "alias" => "claude_sonnet", "tools" => ["lookup"], "deferred" => [],
+#=>                "alias" => nil, "tools" => ["lookup"], "deferred" => [],
 #=>                "agent_fingerprint" => "33e5…", "instructions" => "…", "resumed" => false}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 2, kind: :model_call,
 #=>     payload: %{"iteration" => 1, "stop_reason" => "tool_use", "duration_ms" => 812,
 #=>                "usage" => %{"input_tokens" => 1204, "output_tokens" => 38,
 #=>                             "cache_read_tokens" => 1100, "cache_write_tokens" => 96},
 #=>                "provider" => "anthropic", "model" => "claude-sonnet-5",
-#=>                "alias" => "claude_sonnet", "cost" => %{"currency" => "USD", "micros" => 1284},
+#=>                "alias" => nil, "cost" => %{"currency" => "USD", "micros" => 1284},
 #=>                "content" => […]}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 3, kind: :tool_call,
 #=>     payload: %{"name" => "lookup", "args" => %{"query" => "…"}, "result" => "…",
@@ -432,8 +431,9 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 
 - An `:execution` entry opens each execution: when the run starts, and
   again, `"resumed" => true`, when it resumes after an approval or a
-  delegation, under the next epoch. It names the provider, the
-  provider's model id, and the alias the agent named. `"tools"` names every tool offered,
+  delegation, under the next epoch. It names the platform the
+  model's requests go to (`"provider"`) and the model's id; `"alias"`
+  is always `nil`, and leaves with trace version 6. `"tools"` names every tool offered,
   `"deferred"` the ones among them the model loads through tool search,
   `"skills"` the skills it may load, and `"delegates"` the agents it may
   ask. Its `"agent_fingerprint"` is a sha256 over the system prompt, the
@@ -444,9 +444,9 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 - A `:model_call` entry records each call to the model, a call cut off
   by a cancel included, with the usage it had reported (its cache reads
   and writes show whether the call found the prompt cache warm), the
-  provider, model, and alias it ran on, and its cost at that alias's prices then (`nil`
+  provider and model it ran on, and its cost at the model's prices then (`nil`
   without prices; `Clementine.Runs.cost/2` sums a run's, and
-  `docs/MODELS.md` has the `pricing:` key). A `:tool_call`
+  `docs/MODELS.md` has the `prices:` fact). A `:tool_call`
   entry records each tool call started, with the arguments it ran with
   (and `"unknown" => true` beside its `"name"` when the model asked for a
   tool the agent does not offer) and the decision it waited on (`"approval" => %{"verdict" => "approved",

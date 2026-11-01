@@ -24,7 +24,7 @@ defmodule Clementine.Runs.HistoryTest do
     use Clementine.Agent,
       key: "test_skill_chat",
       turn: true,
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Chat.",
       skills: [Notes]
 
