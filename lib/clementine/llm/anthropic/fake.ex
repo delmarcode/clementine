@@ -96,24 +96,29 @@ defmodule Clementine.LLM.Anthropic.Fake do
     end
   end
 
+  # Consecutive system messages are judged together (the API's
+  # mid-conversation system messages doc): a run of them must follow a
+  # user message, and be last or be followed by an assistant message.
   defp check_system_messages(messages) do
-    last = length(messages) - 1
+    roles = Enum.map(messages, & &1["role"])
 
-    messages
+    roles
     |> Enum.with_index()
+    |> Enum.chunk_by(fn {role, _index} -> role == "system" end)
     |> Enum.find_value(:ok, fn
-      {%{"role" => "system"}, index} ->
-        before = index > 0 and Enum.at(messages, index - 1)["role"] == "user"
-        later = index == last or Enum.at(messages, index + 1)["role"] == "assistant"
+      [{"system", first} | _] = run ->
+        {_role, last} = List.last(run)
+        before = first > 0 and Enum.at(roles, first - 1) == "user"
+        later = last == length(roles) - 1 or Enum.at(roles, last + 1) == "assistant"
 
         unless before and later do
           refuse(
-            "messages.#{index}: a system message must follow a user message and be " <>
+            "messages.#{first}: a system message must follow a user message and be " <>
               "the last message or be followed by an assistant message"
           )
         end
 
-      _message ->
+      _run ->
         nil
     end)
   end

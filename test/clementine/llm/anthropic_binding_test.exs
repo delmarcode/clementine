@@ -19,7 +19,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
   alias Clementine.LLM.Anthropic.{Binding, Fake}
   alias Clementine.LLM.Message
   alias Clementine.LLM.Message.{AssistantMessage, Content, SystemMessage, UserMessage}
-  alias Clementine.Test.Tools.{Echo, SafeEcho}
+  alias Clementine.Test.Tools.{Echo, SafeEcho, SafePush}
 
   setup :set_mox_from_context
   setup :verify_on_exit!
@@ -51,6 +51,14 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
     @impl true
     def body(_context), do: "Keep notes short."
+  end
+
+  defmodule Drafts do
+    @moduledoc false
+    use Clementine.Skill, name: "drafts", description: "Draft text.", tools: [SafePush]
+
+    @impl true
+    def body(_context), do: "Draft plainly."
   end
 
   defp agent(opts \\ []) do
@@ -275,6 +283,30 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
       # Turn one's three calls, then this turn's first: nothing dropped.
       assert length(sent_thinking()) == 4
+    end
+
+    test "two skills loaded in one batch add their tools in consecutive system messages" do
+      agent = agent(skills: [Notes, Drafts])
+
+      thread =
+        turn!(agent, [], "Note and draft.", [
+          [
+            {:tool_use, "toolu_1", "use_skill", %{"name" => "notes"}},
+            {:tool_use, "toolu_2", "use_skill", %{"name" => "drafts"}}
+          ],
+          [{:thinking, "Both loaded."}, {:text, "Ready."}]
+        ])
+
+      assert ["notes", "drafts"] = for(%SystemMessage{skill: skill} <- thread, do: skill)
+
+      # A system message followed by a user message is refused.
+      misplaced = thread ++ [UserMessage.new("Hi")]
+      i = Enum.find_index(misplaced, &match?(%SystemMessage{}, &1))
+      {before, [system | rest]} = Enum.split(misplaced, i)
+      broken = before ++ [system, UserMessage.new("Interjection") | rest]
+
+      assert {:error, {:api_error, 400, _}} =
+               Fake.check(:sonnet_55, "Be brief.", broken, [Echo, SafeEcho, SafePush], [])
     end
 
     test "on a model that does not bind, the skill's tools go in the tool list" do
