@@ -432,8 +432,13 @@ defmodule Clementine.LLM.AnthropicBindingTest do
       {before, [system | rest]} = Enum.split(misplaced, i)
       broken = before ++ [system, UserMessage.new("Interjection") | rest]
 
-      assert {:error, {:api_error, 400, _}} =
-               Fake.check(:sonnet_55, "Be brief.", broken, [Echo, SafeEcho, SafePush], [])
+      # Lenient, so the placement check answers, not the dropped thinking.
+      assert {:error, {:api_error, 400, %{"error" => %{"message" => message}}}} =
+               Fake.check(:sonnet_55, "Be brief.", broken, [Echo, SafeEcho, SafePush], [],
+                 strict: false
+               )
+
+      assert message =~ "a system message must follow a user message"
     end
 
     test "on a model that does not bind, the skill's tools go in the tool list" do
