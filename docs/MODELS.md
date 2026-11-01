@@ -226,9 +226,10 @@ every provider. Keyword/map forms unlock provider-specific controls:
 | Provider | Wire fields | Accepted keys | Values |
 |---|---|---|---|
 | `:anthropic` | `thinking`, `output_config` | `effort` | `low medium high xhigh max` |
-| | | `thinking` | `adaptive enabled disabled` |
+| | | `thinking` | `adaptive enabled disabled between_tools` |
 | | | `budget_tokens` | positive integer (implies `thinking: :enabled`) |
-| | | `display` | `summarized omitted` |
+| | | `display` | `summarized omitted updates` (`updates` sends its beta) |
+| | | `prefix_mismatch` | `error drop_block` (sends the binding-controls beta) |
 | `:openai` | `reasoning` | `effort` | `none minimal low medium high xhigh` |
 | | | `summary`, `generate_summary` | `auto concise detailed` |
 | `:openrouter` | `reasoning` | `effort` | `none minimal low medium high xhigh max` |
@@ -237,8 +238,13 @@ every provider. Keyword/map forms unlock provider-specific controls:
 | `:bedrock`, `:vertex`, `:openai_compatible` | `reasoning_effort` | `effort` | `none minimal low medium high xhigh` |
 
 Key names, values, and contradictory combinations (enabled thinking
-without a budget, a budget with adaptive thinking, display without
-thinking) are rejected at boot. Whether a *specific model* accepts a
+without a budget, a budget with adaptive thinking, display or
+`prefix_mismatch` without adaptive or enabled thinking, anything beside
+`between_tools`) are rejected at boot. `between_tools` is Claude Sonnet
+5.5's lowest setting, at effort `high` or below; `display: :updates`
+returns the text 5.5-generation models write between tool calls. On
+models that bind their thinking, see the runtime guide's
+[Models that bind their thinking](../guides/runtime.md#models-that-bind-their-thinking). Whether a *specific model* accepts a
 specific value (`budget_tokens` on adaptive-only Claude models, `effort`
 on models that predate it, `reasoning_effort` on a model without a
 reasoning mode) is the provider API's call — Clementine keeps no per-model

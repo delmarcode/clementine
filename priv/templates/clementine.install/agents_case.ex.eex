@@ -56,6 +56,20 @@ defmodule <%= @app_module %>.AgentsCase do
     end)
   end
 
+  @doc """
+  Scripts the model's next turn as a model that binds its thinking
+  (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) would answer it,
+  and fails it as the API would when the request replays thinking after
+  an edited history. `script` is `Clementine.LLM.Anthropic.Fake`'s: say
+  `[{:thinking, "..."}, {:text, "Sunny."}]`. The agent's model must be
+  an Anthropic one.
+  """
+  def expect_claude_turn(script) when is_list(script) do
+    Mox.expect(<%= @agents %>.LLMMock, :stream, fn model, system, messages, tools, opts ->
+      Clementine.LLM.Anthropic.Fake.stream(model, system, messages, tools, opts, script)
+    end)
+  end
+
   @doc "A model turn that answers with `text` and ends the run."
   def text_events(text) do
     [

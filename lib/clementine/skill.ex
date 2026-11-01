@@ -8,7 +8,12 @@ defmodule Clementine.Skill do
   description of a `use_skill` tool. When it loads one, it reads the
   skill's body as that call's result, and the skill's tools join the
   ones it may call from its next turn on. The system prompt never
-  changes: a load sends the tool list again, once, and nothing else.
+  changes, and neither does the request's tool list: the load is
+  recorded after its result as a `Clementine.LLM.Message.SystemMessage`
+  naming the skill and carrying its tools, which a model that binds its
+  thinking receives as inline tool definitions (others get the tools in
+  the list). A later turn of the thread that replays that message has
+  the skill loaded from the start.
 
   Two forms, as agents have two. A skill written in code:
 

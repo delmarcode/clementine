@@ -56,6 +56,25 @@ defmodule Clementine.LLM.Anthropic do
   `maxLength` are refused. A model without structured outputs refuses
   the request.
 
+  ## Models that bind their thinking
+
+  Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and later models
+  accept a replayed thinking block only after the exact system prompt,
+  tools, and messages it was produced after. On those models each
+  response carries a `binding` (`Clementine.LLM.Message.AssistantMessage`),
+  and a replay sends a turn's thinking only while its binding still
+  holds, so an edited history costs that reasoning and is never refused.
+  A `Clementine.LLM.Message.SystemMessage` goes as a mid-conversation
+  `role: "system"` message, its tools as inline definitions, and the
+  tools it adds stay out of `tools`; on other models its text joins the
+  system prompt and its tools join `tools`. The runtime guide's "Models
+  that bind their thinking" has the whole policy.
+
+  Beta headers follow the body: `thinking-display-updates-2026-08-18`
+  for `display: :updates`, `thinking-binding-controls-2026-08-01` for
+  `prefix_mismatch:`, and `inline-tools-2026-09-15` when a system message
+  adds a tool.
+
   ## Prompt caching
 
   Every request carries two cache breakpoints unless the alias sets

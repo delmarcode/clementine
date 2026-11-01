@@ -71,6 +71,7 @@ lib/
 │   ├── loop.ex, thread.ex, loop/  # The loop behaviour, the thread controller, the pure loop core
 │   ├── skill.ex, delegation.ex, engine_tool.ex   # skills:, delegates:, use_skill and delegate
 │   ├── output_schema.ex           # output_schema: decoding and checking
+│   ├── history.ex                 # Stepped windows over a thread's messages
 │   ├── trace.ex, trace/           # A run's trace and its recorder
 │   ├── event.ex, events.ex, events/, run_view.ex   # Stamped events, sinks, the live-view fold
 │   ├── telemetry.ex, telemetry/

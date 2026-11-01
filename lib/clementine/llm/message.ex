@@ -608,10 +608,10 @@ defmodule Clementine.LLM.Message do
     inline tool definition. Elsewhere its text joins the system prompt
     and its tools are offered as ordinary tools.
 
-    Place one after a user message (a prompt or tool results), never
-    between a tool call and its result; the model answers after it.
-    `skill` names the skill whose load added the tools, when a skill did
-    (`Clementine.Skill`).
+    The engine records one after a skill load's result, naming the skill
+    in `skill` (`Clementine.Skill`). The API takes one only after a user
+    message (a prompt or tool results) and before the model's answer:
+    store it with the turn that returned it, and replay it where it was.
     """
 
     @type t :: %__MODULE__{

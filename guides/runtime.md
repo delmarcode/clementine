@@ -271,6 +271,82 @@ child they ran during a rolling deploy would leave its parent waiting
 until a new node's reaper resumes it, and a parent they claimed would
 fail as `:incompatible_checkpoint`.
 
+## Models that bind their thinking
+
+Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and every later Claude
+model bind each thinking block to the conversation it was produced in:
+the system prompt, the tools as a set, and every message before it. The
+API accepts a replayed block only while all of that is unchanged, and
+only in the order its conversation produced it. On an account created on
+or after 2026-08-31 a replay after any change is a 400; on an older one
+the stale reasoning reaches the model and is billed. A conversation
+breaks the rule when its app rebuilds the system prompt every turn,
+deploys a tool, slides a window over the history, or replays turns in an
+order other than the one the model saw.
+
+What Clementine does about it, without any option:
+
+- **It checks before it sends.** Each turn from one of these models is
+  stored with a `binding`, a digest of the request it answered as sent
+  (`Clementine.LLM.Message.AssistantMessage`). On replay a turn keeps its
+  thinking only while that digest holds; otherwise it goes without it,
+  as does every turn after it. Text and tool calls always go. So a
+  changed system prompt, tool list, or history start costs the earlier
+  turns' reasoning once, and the request is never refused: the turns
+  produced after the change bind to it and keep theirs.
+- **Its own edits are append-only.** A skill load offers the skill's
+  tools in a `Clementine.LLM.Message.SystemMessage` after the load's
+  result, sent as a mid-conversation system message with inline tool
+  definitions (the `inline-tools-2026-09-15` beta), and the request's
+  `tools` stay as the first request sent them. A later turn of the
+  thread reads the loaded skills back from that message, so their tools
+  stay callable. Models that do not bind get the skill's tools in
+  `tools`, as before.
+- **It shows the text written between tool calls.** These models return
+  the notes they write between tool calls as thinking blocks, empty
+  under the default display. Ask for them with
+  `reasoning: [thinking: :adaptive, display: :updates]`, or, on Sonnet
+  5.5 with thinking off, `reasoning: [thinking: :between_tools]`. Their
+  text streams as `:thinking_delta` events and is stored in the turn's
+  thinking blocks; render a non-empty one as a status line.
+
+What the app does:
+
+- **Store every message a turn returns, and replay them in the order the
+  model saw them**: each turn's prompt, then `result.messages`, system
+  messages included. A message that arrives while a turn runs belongs
+  after that turn's reply, wherever its row sorts. A history sorted any
+  other way reorders turns, which costs their thinking and the prompt
+  cache on every turn.
+- **Trim a long thread in steps**, with `Clementine.History.window/2`.
+  A window of the last N messages moves every turn, so no turn keeps its
+  thinking and the cached prefix never matches. `window(messages, max:
+  100)` holds its start while the thread grows by fifty messages, then
+  moves by fifty at once.
+- **Keep the agent's instructions and tools stable within a thread.**
+  A change is never refused, and costs the earlier reasoning once.
+
+```elixir
+@impl true
+def history(run) do
+  run.subject_id
+  |> MyApp.Chat.messages()
+  |> Clementine.History.window(max: 100)
+end
+```
+
+`reasoning: [thinking: :adaptive, prefix_mismatch: :error]` asks the API
+to refuse an invalid replay on any account (`:drop_block` asks it to drop
+the blocks instead, a stopgap). Either sends the
+`thinking-binding-controls-2026-08-01` beta, and Clementine logs what a
+response reports it dropped. Neither is needed with the check above;
+`:error` is useful against a live model in an eval, to prove nothing is
+dropped. Sonnet 5.5 refuses both with `thinking: :between_tools`.
+
+In tests, script the model with `Clementine.LLM.Anthropic.Fake` on one of
+these models: it refuses an invalid replay as the API does, so a test of
+a thread fails on an edit the API would refuse.
+
 ## The trace
 
 Every run records what it did, and `Clementine.Runs.trace/1` reads it
