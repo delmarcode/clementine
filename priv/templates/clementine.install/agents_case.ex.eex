@@ -26,6 +26,7 @@ defmodule <%= @app_module %>.AgentsCase do
 
   use ExUnit.CaseTemplate
 
+  alias Clementine.LLM.Anthropic.Fake
   alias Ecto.Adapters.SQL.Sandbox
 
   using do
@@ -66,7 +67,7 @@ defmodule <%= @app_module %>.AgentsCase do
   """
   def expect_claude_turn(script) when is_list(script) do
     Mox.expect(<%= @agents %>.LLMMock, :stream, fn model, system, messages, tools, opts ->
-      Clementine.LLM.Anthropic.Fake.stream(model, system, messages, tools, opts, script)
+      Fake.stream(model, system, messages, tools, opts, script)
     end)
   end
 
