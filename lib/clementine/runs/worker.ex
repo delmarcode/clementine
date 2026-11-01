@@ -24,7 +24,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     require Logger
 
     alias Clementine.Lifecycle.{Facts, Protocol}
-    alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
+    alias Clementine.LLM.Message.{AssistantMessage, SystemMessage, ToolResultMessage, UserMessage}
     alias Clementine.Runs.{AgentRun, CancelRelay, Config, Courier, Delegations, DrainNotifier}
     alias Clementine.Runs.Lifecycle
 
@@ -316,6 +316,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     defp message?(%UserMessage{}), do: true
     defp message?(%AssistantMessage{}), do: true
     defp message?(%ToolResultMessage{}), do: true
+    defp message?(%SystemMessage{}), do: true
     defp message?(_other), do: false
 
     defp exports?(nil, _function, _arity), do: false
