@@ -608,7 +608,7 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   whose `raw["output"]` is the text the model wrote. There is no retry
   inside the run; retry from a loop or your own code.
 
-## Refusals and cut-off answers
+## Refusals, cut-off answers, and empty ones
 
 - A run whose final turn the provider refused fails with
   `Clementine.Error` code `:refused`; one whose final answer was cut off
@@ -623,6 +623,10 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   prompt out of `history/1`.
 - On `:truncated`, raise the model's `max_tokens` or ask for less.
   Nothing completes a cut-off answer.
+- A final turn that wrote no text completes with `stop_reason: "empty"`
+  and `output: ""` (Claude ends empty most after tool results). An
+  agent whose answer is its tool calls is done; a chat shows that the
+  assistant did not reply, never silence.
 - A thread's `"on_failure": "retry"` repeats a refused turn and its
   tools' effects. Keep `"surface"` for turns whose tools are not safe
   to repeat.

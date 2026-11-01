@@ -59,11 +59,18 @@ defmodule Clementine.LLM.Anthropic.Messages do
     end
   end
 
-  # A turn with nothing left to send (a trimmed search, or thinking
-  # dropped from a turn that had only thinking) goes out entirely: the
-  # API refuses an empty assistant message.
-  defp encode_nonempty(%AssistantMessage{content: []}), do: []
-  defp encode_nonempty(message), do: [encode(message)]
+  # An empty text block never goes: the API refuses one anywhere in the
+  # history ("text content blocks must be non-empty"), and Clementine
+  # stored a turn of no blocks as one before it stopped writing them. A
+  # turn with nothing left to send (a trimmed search, thinking dropped
+  # from a turn that had only thinking, or that one empty block) goes out
+  # entirely: the API refuses an empty assistant message.
+  defp encode_nonempty(%AssistantMessage{content: content} = message) do
+    case Enum.reject(content, &match?(%Content.Text{text: ""}, &1)) do
+      [] -> []
+      content -> [encode(%{message | content: content})]
+    end
+  end
 
   defp replayable(%Content.ServerToolUse{name: "tool_search_tool_" <> _}, nil), do: []
 

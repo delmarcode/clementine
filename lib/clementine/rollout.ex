@@ -1195,7 +1195,7 @@ defmodule Clementine.Rollout do
                  input_message: exec.input_message,
                  messages: Enum.drop(exec.messages, exec.prefix_len),
                  output: output,
-                 stop_reason: response.stop_reason,
+                 stop_reason: completed_stop_reason(output, response.stop_reason),
                  usage: exec.usage
                )}
             )
@@ -1230,6 +1230,15 @@ defmodule Clementine.Rollout do
       do: messages,
       else: messages ++ [turn]
   end
+
+  # A final turn that wrote no text (Claude's empty end_turn, which it
+  # sends most after tool results) completes as "empty": an agent whose
+  # answer is its tool calls is done, and one whose answer is its text
+  # said nothing, which the host must not show as a reply.
+  defp completed_stop_reason(output, stop_reason) when is_binary(output),
+    do: if(String.trim(output) == "", do: "empty", else: stop_reason)
+
+  defp completed_stop_reason(_decoded, stop_reason), do: stop_reason
 
   # The output is the final turn's text, the paused turn's included. An
   # agent with an output_schema answers in JSON: the output is the decoded

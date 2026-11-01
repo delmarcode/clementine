@@ -227,15 +227,15 @@ defmodule Clementine.LLM.AnthropicFakeTest do
   end
 
   describe "the API's refusals" do
-    test "an empty text block anywhere in the history" do
-      history = [
-        UserMessage.new("Hi"),
-        AssistantMessage.new([Content.text("")]),
-        UserMessage.new("Again?")
-      ]
+    test "an empty text block anywhere the encoder sends one" do
+      history = [%UserMessage{content: [Content.text("Hi"), Content.text("")]}]
 
       assert {:error, {:api_error, 400, body}} = Fake.check(:priced, nil, history, [])
-      assert body["error"]["message"] =~ "messages.1.content.0.text"
+      assert body["error"]["message"] =~ "messages.0.content.1.text"
+
+      # A stored assistant turn's empty block never goes.
+      history = [UserMessage.new("Hi"), AssistantMessage.new([Content.text("")])]
+      assert :ok = Fake.check(:priced, nil, history ++ [UserMessage.new("Again?")], [])
     end
 
     test "an empty message anywhere but last; the encoder never sends an empty assistant one" do

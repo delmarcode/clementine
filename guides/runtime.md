@@ -198,16 +198,18 @@ text, or, for an agent with `output_schema:`, the decoded answer
   cannot listen (Postgres behind a transaction pooler) leaves the run to
   find the flag at its next step.
 
-## Refusals and cut-off answers
+## Refusals, cut-off answers, and empty ones
 
 A run whose final turn the provider refused, or cut off, fails. It never
-completes, so no app reads a refusal or half an answer as the answer:
+completes, so no app reads a refusal or half an answer as the answer. A
+final turn that wrote nothing completes, and says so:
 
 | The final turn | The run | `error.code` |
 |----------------|---------|--------------|
 | Anthropic's `stop_reason: "refusal"`; OpenAI's refusal content, or its content filter | `failed` | `:refused` |
 | `"max_tokens"` (OpenAI's `max_output_tokens`), `"model_context_window_exceeded"`, an OpenAI response left incomplete | `failed` | `:truncated` |
-| `"end_turn"`, `"stop_sequence"` | `completed` | |
+| `"end_turn"`, `"stop_sequence"` | `completed`, with that `stop_reason` | |
+| No text: an empty `"end_turn"`, which Claude sends most after tool results | `completed`, `stop_reason: "empty"`, `output: ""` | |
 
 - The error is `kind: :rollout` and not retryable: the same request
   mostly gets the same answer. `run_finished/2` receives
@@ -223,7 +225,13 @@ completes, so no app reads a refusal or half an answer as the answer:
   turn (`"pause_turn"`) goes back to the provider and continues.
 - A completed run names its final turn's stop reason:
   `Result.Completed`'s `stop_reason`, and `result["stop_reason"]` on the
-  row.
+  row. An empty answer completes because an agent whose answer is its
+  tool calls (a screener's submission, an email reply sent through a
+  tool) is done; one whose answer is its text said nothing.
+- No history holds an empty message or an empty text block, which the
+  API refuses on every later turn: an empty final turn is no message,
+  and a turn stored as one empty text block (as Clementine stored a turn
+  of no blocks before) replays without it.
 - A failed turn returns no messages, so a host that stores a thread's
   turns from `Result.Completed` stores nothing of it. Anthropic's advice
   after a refusal is to drop the turn that drew it, since the same
@@ -256,7 +264,10 @@ What each kind of agent does with it:
   assistant declining, not as a crash, and take down the text the turn
   streamed before it: the provider stopped on it. Show a cut-off answer
   as cut off; the streamed text is all there is of it, so store it
-  yourself if the app keeps a record of what the user read.
+  yourself if the app keeps a record of what the user read. On
+  `stop_reason: "empty"`, show that the assistant did not reply (with a
+  way to ask again), never silence; the turn's tool calls, if any, are
+  in `messages` as usual.
   `"on_failure": "retry"` runs a refused or cut-off turn again, which
   is likely refused or cut off again, and repeats what its tools did (a
   sent email): keep it for turns whose tools are safe to repeat.

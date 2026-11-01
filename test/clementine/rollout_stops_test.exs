@@ -170,13 +170,13 @@ defmodule Clementine.RolloutStopsTest do
   end
 
   describe "a turn of no blocks" do
-    test "after the tools' results completes with no message, and the thread replays valid" do
+    test "after the tools' results completes empty, stores no message, and the thread replays valid" do
       script([
         {[{:tool_use, "toolu_1", "echo", %{"message" => "hi"}}], []},
         {[], []}
       ])
 
-      assert {:ok, %Result.Completed{output: "", stop_reason: "end_turn"} = completed} =
+      assert {:ok, %Result.Completed{output: "", stop_reason: "empty"} = completed} =
                Clementine.run(agent(), "Echo, and say nothing.")
 
       assert [%AssistantMessage{}, %ToolResultMessage{}] = completed.messages
@@ -206,15 +206,42 @@ defmodule Clementine.RolloutStopsTest do
                Clementine.run(agent(), "Something else, then.", messages: thread)
     end
 
-    test "the strict fake refuses a history holding an empty text block, as the API does" do
-      thread = [UserMessage.new("Hi"), AssistantMessage.new([Content.text("")])]
-      script([{[{:text, "Hello."}], []}])
+    test "cut off at max_tokens inside a thinking block that never closed fails :truncated" do
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:content_block_start, 0, :thinking},
+          {:thinking_delta, 0, "Weighing the record"},
+          {:message_delta, %{"stop_reason" => "max_tokens"},
+           %{"input_tokens" => 10, "output_tokens" => 4096}}
+        ]
+      end)
 
-      assert {:error, %Result.Failed{error: error}} =
+      assert {:error, %Result.Failed{error: %Error{code: :truncated}}} =
+               Clementine.run(agent(), "Think hard.")
+    end
+
+    test "a turn stored as one empty text block replays without it, which the API accepts" do
+      # How Clementine stored a turn of no blocks before it stopped
+      # writing them; the strict fake refuses the block, as the API does.
+      thread = [UserMessage.new("Hi"), AssistantMessage.new([Content.text("")])]
+      test = self()
+
+      expect(Clementine.LLM.MockClient, :stream, fn model, system, messages, tools, opts ->
+        send(test, {:request, messages})
+        Fake.stream(model, system, messages, tools, opts, [{:text, "Hello."}])
+      end)
+
+      assert {:ok, %Result.Completed{output: "Hello."}} =
                Clementine.run(agent(), "Again?", messages: thread)
 
-      assert %Error{code: :invalid_request} = error
-      assert error.message =~ "messages.1.content.0.text: text content blocks must be non-empty"
+      assert_received {:request, [_hi, %AssistantMessage{}, %UserMessage{}]}
+    end
+
+    test "a final turn of only whitespace completes empty too" do
+      script([{[{:text, "\n\n"}], []}])
+
+      assert {:ok, %Result.Completed{output: "\n\n", stop_reason: "empty"}} =
+               Clementine.run(agent(), "Say nothing.")
     end
   end
 

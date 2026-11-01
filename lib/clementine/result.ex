@@ -23,7 +23,11 @@ defmodule Clementine.Result do
     `stop_reason` is the final turn's, as the provider client normalized
     it: `"end_turn"`, `"stop_sequence"`, an OpenAI-compatible server's
     own reason, or `nil` when the stream named none (a scripted one,
-    say). A final turn the provider refused or cut
+    say). It is `"empty"` when the final turn wrote no text (Claude's
+    empty `end_turn`, most often after tool results), and `output` is
+    `""`: an agent whose answer is its tool calls is done, and a chat
+    must show that the assistant did not reply, never silence. A final
+    turn the provider refused or cut
     off never completes: the run fails `:refused` or `:truncated`
     (`Clementine.Error.stopped/1`).
     """
