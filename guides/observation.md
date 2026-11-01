@@ -232,8 +232,18 @@ Execution and lifecycle are also instrumented with `:telemetry` events —
 `[:clementine, :rollout | :llm | :tool, ...]` around the engine and
 `[:clementine, :run, :claimed | :heartbeat | :suspended | :resumed |
 :finished | :requeued | :lease_lost | :reaped]` across the run
-lifecycle. Engine events name the run's agent, provider, model, and
-alias, and run events its agent. `Clementine.Telemetry` documents every
-event and ships `metrics/0`, the one list of counters, sums, and
-distributions every app exports to Prometheus (or LiveDashboard);
-`Clementine.Telemetry.Logger` is a ready-made dev/debug handler.
+lifecycle. Engine events name the run's agent, the model's vendor
+(`provider`), where its requests went (`platform`), and the model's id
+(`model`), and run events its agent. The same four label every engine
+series, so "all Claude Sonnet 5.5 calls, wherever they ran" is one
+`sum by (model)`, and `platform` tells the Claude API from Bedrock where
+their prices differ. `Clementine.Telemetry` documents every event and
+ships `metrics/0`, the one list of counters, sums, and distributions
+every app exports to Prometheus (or LiveDashboard);
+`Clementine.Telemetry.Logger` is a ready-made dev/debug handler, whose
+lines carry the same four.
+
+Each model call's cost rides `[:clementine, :llm, :usage]` and `:stop`
+as `cost_micros`, priced at the model's sheet (or the app's override)
+when the call ended, at the tier its own prompt reached; the trace
+freezes the same number (`docs/MODELS.md`, "Prices").

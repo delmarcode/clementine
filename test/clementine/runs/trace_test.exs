@@ -301,7 +301,7 @@ defmodule Clementine.Runs.TraceTest do
       assert {:agent_run_trace, :payload} in hits
     end
 
-    test "a model call's provider, model, tokens, cost, duration, and stop reason; no alias" do
+    test "a model call's provider, platform, model, TTL, tokens, cost, duration, stop reason" do
       {:ok, run} = Runs.start(Lookup, "Find the forecast", subject: {"ticket", "t-1"})
       expect_turn(tool_events("tu_1", "lookup", %{"query" => "forecast"}))
       expect_turn(text_events("Sunny."))
@@ -319,8 +319,9 @@ defmodule Clementine.Runs.TraceTest do
       assert %{
                kind: "execution",
                provider: "anthropic",
+               platform: "anthropic",
                model: "claude-sonnet-5",
-               alias: nil,
+               cache_ttl: nil,
                agent_fingerprint: <<_::binary-size(64)>>,
                input_tokens: nil,
                tool_name: nil
@@ -328,18 +329,21 @@ defmodule Clementine.Runs.TraceTest do
 
       refute Map.has_key?(execution.payload, "model")
 
+      # Each call at Claude Sonnet 5's list prices: 10 in at $2 and 5 out
+      # at $10 per million are 70 micros.
       for {model_call, stop_reason} <- [{call, "tool_use"}, {final, "end_turn"}] do
         assert %{
                  kind: "model_call",
                  provider: "anthropic",
+                 platform: "anthropic",
                  model: "claude-sonnet-5",
-                 alias: nil,
+                 cache_ttl: "five_minutes",
                  input_tokens: 10,
                  output_tokens: 5,
                  cache_read_tokens: 0,
                  cache_write_tokens: 0,
-                 cost_micros: nil,
-                 currency: nil,
+                 cost_micros: 70,
+                 currency: "USD",
                  duration_ms: duration,
                  stop_reason: ^stop_reason,
                  agent_fingerprint: nil
@@ -361,7 +365,8 @@ defmodule Clementine.Runs.TraceTest do
                duration_ms: duration,
                approval_verdict: nil,
                policy_verdict: nil,
-               provider: nil
+               provider: nil,
+               platform: nil
              } = tool
 
       assert is_integer(duration)

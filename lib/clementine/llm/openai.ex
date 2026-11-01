@@ -329,7 +329,8 @@ defmodule Clementine.LLM.OpenAI do
     }
   end
 
-  defp usage_meta(body), do: %{provider: :openai, model: Map.get(body, "model")}
+  defp usage_meta(body),
+    do: %{provider: :openai, platform: :openai, model: Map.get(body, "model")}
 
   defp refused?(output) do
     Enum.any?(output, fn

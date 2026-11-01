@@ -3,9 +3,9 @@ defmodule Clementine.Runs.CostTest do
   Cost on the durable runtime: each trace `model_call` freezes its call's
   cost at the prices of the moment, `Runs.cost/2` sums a run's (and, with
   `children: true`, those of every run below it), and
-  `Runs.subject_cost/1` a subject's. A host that sets no prices gets
-  `nil`, never zero. The rates are illustrative, not anyone's current
-  prices.
+  `Runs.subject_cost/1` a subject's. A model without prices costs `nil`,
+  never zero. The `@pricing` rates are illustrative, an app's override of
+  the sheet's list prices.
   """
 
   use Clementine.RunsCase
@@ -53,6 +53,16 @@ defmodule Clementine.Runs.CostTest do
       cache: [ttl: :one_hour]
   end
 
+  defmodule Declared do
+    @moduledoc false
+    # A model the app declares without prices. Built at run time, since
+    # the declaration is the test's config.
+    use Clementine.Agent, key: "test_cost_declared"
+
+    @impl true
+    def agent(_run), do: Clementine.Agent.new(model: "my-qwen", instructions: "Answer.")
+  end
+
   defmodule Ledger do
     @moduledoc false
     # A host that keeps spend past a purge: it copies the run's cost from
@@ -79,7 +89,7 @@ defmodule Clementine.Runs.CostTest do
   end
 
   # The app's prices for the model every test agent runs on, over
-  # whatever else the models' config holds.
+  # whatever else the models' config holds; `nil` unprices it.
   defp price_sonnet!(models, pricing \\ @pricing) do
     Application.put_env(
       :clementine,
@@ -128,10 +138,13 @@ defmodule Clementine.Runs.CostTest do
 
       assert %{
                "provider" => "anthropic",
+               "platform" => "anthropic",
                "model" => "claude-sonnet-5",
-               "alias" => nil,
+               "cache_ttl" => "five_minutes",
                "cost" => %{"currency" => "USD", "micros" => @cached_micros}
              } = first.payload
+
+      refute Map.has_key?(first.payload, "alias")
 
       assert %{"cost" => %{"currency" => "USD", "micros" => 4_500}} = second.payload
       assert Runs.cost(run.id) == usd(@cached_micros + 4_500)
@@ -151,12 +164,24 @@ defmodule Clementine.Runs.CostTest do
       # Today's prices, from what the trace kept: 50 × 15.00 more.
       [%{payload: payload}] = model_calls(run.id)
 
-      assert Cost.of(Usage.from_map(payload["usage"]), payload["model"]) ==
-               usd(@cached_micros + 750)
+      assert Cost.of(Usage.from_map(payload["usage"]), payload["model"],
+               platform: payload["platform"],
+               cache_ttl: payload["cache_ttl"]
+             ) == usd(@cached_micros + 750)
     end
 
-    test "is nil, not zero, for a host that sets no prices", %{models: models} do
+    test "is priced at the sheet's list prices for a host that sets none", %{models: models} do
       Application.put_env(:clementine, :models, models)
+      {:ok, run} = Runs.start(Echo, "Hi")
+      expect_turn(answer("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => run.id})
+
+      # Claude Sonnet 5: 100 × 2.00 + 1,500 × 0.20 + 400 × 2.50 + 50 × 10.00.
+      assert Runs.cost(run.id) == usd(200 + 300 + 1_000 + 500)
+    end
+
+    test "is nil, not zero, for a model without prices", %{models: models} do
+      price_sonnet!(models, nil)
       {:ok, run} = Runs.start(Echo, "Hi", subject: {"ticket", "t-unpriced"})
       expect_turn(answer("Hello."))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
@@ -166,6 +191,12 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.subject_cost({"ticket", "t-unpriced"}) == nil
 
       # Nothing priced at all: even a run that called no model has no cost.
+      Application.put_env(
+        :clementine,
+        :models,
+        Map.new(Clementine.Models.list(), &{&1.id, [prices: nil]})
+      )
+
       {:ok, idle} = Runs.start(Echo, "Hi")
       assert Runs.cost(idle.id) == nil
     end
@@ -179,7 +210,7 @@ defmodule Clementine.Runs.CostTest do
       assert Runs.cost(run.id) == usd(@cached_micros)
 
       # The host drops the price while the run waits; its next call is unpriced.
-      Application.put_env(:clementine, :models, models)
+      price_sonnet!(models, nil)
       assert :ok = Runs.resume(run.id, {:approved, %{by: "alice"}})
       expect_turn(answer("Sent."))
       assert :ok = perform_job(Worker, %{"run_id" => run.id})
@@ -500,7 +531,8 @@ defmodule Clementine.Runs.CostTest do
 
     setup do
       start_supervised!(
-        {Clementine, repo: TestRepo, agents: [Echo, Outer, Middle, Terse, Hourly], host: Ledger}
+        {Clementine,
+         repo: TestRepo, agents: [Echo, Outer, Middle, Terse, Hourly, Declared], host: Ledger}
       )
 
       :ok
@@ -564,6 +596,56 @@ defmodule Clementine.Runs.CostTest do
       # 900 micro-dollars more.
       assert Runs.cost(minutes.id) == usd(@cached_micros)
       assert Runs.cost(hour.id) == usd(@cached_micros + 900)
+
+      # Each entry records the TTL its writes were priced at, so a reprice
+      # charges the hour's writes at the hour's rate, not the model's
+      # default.
+      for {run, ttl, micros} <- [
+            {minutes, "five_minutes", @cached_micros},
+            {hour, "one_hour", @cached_micros + 900}
+          ] do
+        assert [%{payload: %{"cache_ttl" => ^ttl} = payload}] = model_calls(run.id)
+
+        assert Cost.of(payload["usage"], payload["model"],
+                 platform: payload["platform"],
+                 cache_ttl: payload["cache_ttl"]
+               ) == usd(micros)
+      end
+    end
+
+    test "a run on a declared model without prices costs nil", %{models: models} do
+      Application.put_env(
+        :clementine,
+        :models,
+        Map.put(models || %{}, "my-qwen",
+          vendor: :qwen,
+          context: 32_768,
+          max_output: 8_192,
+          platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+        )
+      )
+
+      subject = {"ticket", "t-declared"}
+      {:ok, run} = Runs.start(Declared, "Hi", subject: subject)
+      expect_turn(answer("Hello."))
+      assert :ok = perform_job(Worker, %{"run_id" => run.id})
+      assert %AgentRun{status: "completed"} = Runs.get(run.id)
+
+      assert [
+               %{
+                 payload: %{
+                   "provider" => "qwen",
+                   "platform" => "openai_compatible",
+                   "model" => "my-qwen",
+                   "cache_ttl" => nil,
+                   "cost" => nil,
+                   "usage" => %{"input_tokens" => 2_000}
+                 }
+               }
+             ] = model_calls(run.id)
+
+      assert Runs.cost(run.id) == nil
+      assert Runs.subject_cost(subject) == nil
     end
 
     test "costs in two currencies have no total", %{models: models} do

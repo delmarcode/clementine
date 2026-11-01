@@ -142,16 +142,17 @@ defmodule Clementine.TraceTest do
       assert fingerprint == Trace.fingerprint("claude-sonnet-5", "Trace me.", [SafeEcho])
       assert fingerprint =~ ~r/\A[0-9a-f]{64}\z/
 
-      # The model that priced the call; it has no prices here, so no cost.
-      # No model has an alias now that models are named by id.
+      # The model that priced the call, at its sheet's list prices: 5 in
+      # at $2 and 2 out at $10 per million are 30 micros.
       assert %{
                "iteration" => 1,
                "stop_reason" => "tool_use",
                "usage" => %{"input_tokens" => 5, "output_tokens" => 2},
                "provider" => "anthropic",
+               "platform" => "anthropic",
                "model" => "claude-sonnet-5",
-               "alias" => nil,
-               "cost" => nil,
+               "cache_ttl" => "five_minutes",
+               "cost" => %{"currency" => "USD", "micros" => 30},
                "content" => [
                  %{
                    "type" => "tool_use",
@@ -855,8 +856,18 @@ defmodule Clementine.TraceTest do
       assert payload["approval"] == %{"verdict" => "approved", "by" => "{:user, 7}"}
     end
 
-    test "a model call on a model without prices has no cost, and no alias" do
-      model = Trace.resolve_model("claude-sonnet-5")
+    test "a model call on a model without prices has no cost; it names vendor and platform" do
+      # A model an app declares on OpenRouter, with no prices, as
+      # resolve_model/2 resolves it (Clementine.CostTest resolves one): its
+      # vendor is the provider, and OpenRouter where it ran.
+      model = %{
+        provider: :deepseek,
+        platform: :openrouter,
+        id: "deepseek/deepseek-v3.2",
+        cache_ttl: nil,
+        pricing: nil
+      }
+
       usage = %Clementine.Usage{input_tokens: 100, output_tokens: 10}
       assert Clementine.Cost.of(usage, model) == nil
 
@@ -868,34 +879,40 @@ defmodule Clementine.TraceTest do
         )
 
       assert %{
-               "provider" => "anthropic",
-               "model" => "claude-sonnet-5",
-               "alias" => nil,
+               "provider" => "deepseek",
+               "platform" => "openrouter",
+               "model" => "deepseek/deepseek-v3.2",
+               "cache_ttl" => nil,
                "cost" => nil,
                "usage" => %{"input_tokens" => 100}
              } = payload
+
+      refute Map.has_key?(payload, "alias")
     end
 
     test "an id no sheet holds resolves as written, with no provider or prices" do
-      assert %{provider: nil, id: "no-such-model", alias: nil, pricing: nil, cache: nil} =
-               Trace.resolve_model("no-such-model")
+      nothing = %{provider: nil, platform: nil, cache_ttl: nil, pricing: nil}
+      assert Map.put(nothing, :id, "no-such-model") == Trace.resolve_model("no-such-model")
 
       # Choices the sheet refuses resolve the same way: the request fails
       # where it must, never the record of it.
-      assert %{provider: nil, id: "claude-sonnet-5", alias: nil, pricing: nil, cache: nil} =
+      assert Map.put(nothing, :id, "claude-sonnet-5") ==
                Trace.resolve_model("claude-sonnet-5", max_tokens: 10_000_000)
 
       # A name that is not an id at all (an alias of old) keeps no id.
-      assert %{provider: nil, id: nil, alias: nil, pricing: nil} =
-               Trace.resolve_model(:claude_sonnet)
+      assert Map.put(nothing, :id, nil) == Trace.resolve_model(:claude_sonnet)
 
       assert %{
                provider: :anthropic,
+               platform: :anthropic,
                id: "claude-sonnet-5",
-               alias: nil,
-               pricing: nil,
-               cache: %{enabled: true, ttl: :five_minutes}
+               cache_ttl: :five_minutes,
+               pricing: %Clementine.LLM.Pricing{input: 2_000_000, cache_write: 2_500_000}
              } = Trace.resolve_model("claude-sonnet-5")
+
+      # An agent's own TTL is the one its writes are priced at.
+      assert %{cache_ttl: :one_hour, pricing: %{cache_write: 4_000_000}} =
+               Trace.resolve_model("claude-sonnet-5", cache: [ttl: :one_hour])
 
       # Its execution's fingerprint hashes the id as written, so two such
       # ids fingerprint apart, and apart from a model a sheet holds.
@@ -907,8 +924,8 @@ defmodule Clementine.TraceTest do
 
       assert %{
                "provider" => nil,
+               "platform" => nil,
                "model" => "no-such-model",
-               "alias" => nil,
                "agent_fingerprint" => ^gone
              } =
                Trace.execution(
@@ -986,7 +1003,7 @@ defmodule Clementine.TraceTest do
       end
     end
 
-    test "every fact column is filled by some kind, but alias" do
+    test "every fact column is filled by some kind" do
       filled =
         for {kind, payload} <- recorded(),
             {column, value} <- elem(Trace.to_row(kind, payload), 0),
@@ -994,9 +1011,8 @@ defmodule Clementine.TraceTest do
             into: MapSet.new(),
             do: column
 
-      # Models are named by id now, so nothing fills alias; its column
-      # goes with trace version 6 (OPS-190).
-      assert filled == MapSet.new(Trace.columns() -- [:alias])
+      assert filled == MapSet.new(Trace.columns())
+      refute :alias in Trace.columns()
     end
 
     test "a name the agent does not offer stays in the payload, never in tool_name" do
@@ -1040,8 +1056,9 @@ defmodule Clementine.TraceTest do
       assert %{
                iteration: 2,
                provider: "anthropic",
+               platform: "anthropic",
                model: "claude-sonnet-5",
-               alias: nil,
+               cache_ttl: "five_minutes",
                input_tokens: 1204,
                output_tokens: 38,
                cache_read_tokens: 0,

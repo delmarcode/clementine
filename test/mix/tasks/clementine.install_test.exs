@@ -9,8 +9,8 @@ defmodule Mix.Tasks.Clementine.InstallTest do
       [migration] = migrations(igniter)
       migration = content(igniter, migration)
       assert migration =~ "defmodule MyApp.Repo.Migrations.AddClementine"
-      assert migration =~ "def up, do: Clementine.Migration.up(version: 5)"
-      assert migration =~ "def down, do: Clementine.Migration.down(version: 5)"
+      assert migration =~ "def up, do: Clementine.Migration.up(version: 6)"
+      assert migration =~ "def down, do: Clementine.Migration.down(version: 6)"
 
       agents_case = content(igniter, "test/support/agents_case.ex")
 

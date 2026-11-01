@@ -6,8 +6,8 @@ defmodule Clementine.Telemetry.MetricsTest do
   against real runs on the runtime and in process. Every metric in the
   list exports, every label is bounded (an atom, a string, or a number;
   `""` where the writer had no value), and the engine's series name the
-  agent, provider, and model, with `alias` empty now that models are
-  named by id. The same runs, scraped through
+  agent, the provider (the model's vendor), the platform, and the model,
+  and no alias. The same runs, scraped through
   PromEx's two stores (TelemetryMetricsPrometheus.Core and Peep), export
   the same series.
   """
@@ -55,13 +55,11 @@ defmodule Clementine.Telemetry.MetricsTest do
 
   @moduletag runtime: false
   @subject {"conversation", "metrics-1"}
-  # `alias` is never filled now that models are named by id; it exports
-  # as "" until OPS-190 removes it.
   @identity %{
     agent_key: "test_lookup",
     provider: :anthropic,
-    model: "claude-sonnet-5",
-    alias: ""
+    platform: :anthropic,
+    model: "claude-sonnet-5"
   }
 
   setup do
@@ -251,7 +249,7 @@ defmodule Clementine.Telemetry.MetricsTest do
     # loop judged stale.
     Clementine.LLM.ProviderUsage.openai(
       %{"input_tokens" => 1, "input_tokens_details" => %{"cached_tokens" => 5}},
-      %{provider: :openai, model: "gpt-5"}
+      %{provider: :openai, platform: :openai, model: "gpt-5"}
     )
 
     stale = %Facts{
@@ -299,8 +297,9 @@ defmodule Clementine.Telemetry.MetricsTest do
              "#{name} labels #{label} with #{inspect(value)}"
     end
 
-    # The engine's series name the agent, the provider, and the model,
-    # with the alias empty; every metered call counts once, by how it ended.
+    # The engine's series name the agent, the vendor, the platform, and
+    # the model, and no alias; every metered call counts once, by how it
+    # ended.
     lookup = @identity
     stopped = Map.put(lookup, :outcome, :stop)
 
@@ -361,8 +360,14 @@ defmodule Clementine.Telemetry.MetricsTest do
              series(exports, "clementine_rollout_exceptions_total")
            )
 
-    assert {%{in_process | model: "claude-sonnet-5-5", alias: ""}, 1} in sum_by(
+    assert {%{in_process | model: "claude-sonnet-5-5"}, 1} in sum_by(
              series(exports, "clementine_llm_thinking_dropped_total")
+           )
+
+    # A usage report that undercounts names the wire whose convention
+    # differs, and the vendor.
+    assert {%{provider: :openai, platform: :openai}, 1} in sum_by(
+             series(exports, "clementine_llm_usage_clamped_total")
            )
 
     # The agent's id labels nothing.
@@ -521,18 +526,18 @@ defmodule Clementine.Telemetry.MetricsTest do
   end
 
   test "a label nothing filled exports as an empty string, never nil, on every metric" do
-    # An id no sheet holds resolves to no provider, keeping its id; no
-    # model fills the alias now; and a direct tool batch names nothing.
+    # An id no sheet holds resolves to no provider and no platform,
+    # keeping its id; and a direct tool batch names nothing.
     unknown = Clementine.Trace.resolve_model("not-a-model")
 
     unknown = %{
       agent_key: nil,
       provider: unknown.provider,
-      model: unknown.id,
-      alias: unknown.alias
+      platform: unknown.platform,
+      model: unknown.id
     }
 
-    nothing = %{agent_key: nil, provider: nil, model: nil, alias: nil}
+    nothing = %{agent_key: nil, provider: nil, platform: nil, model: nil}
 
     for metadata <- [unknown, nothing],
         metric <- Clementine.Telemetry.metrics(),
@@ -548,11 +553,20 @@ defmodule Clementine.Telemetry.MetricsTest do
         &(Enum.join(&1.name, "_") == "clementine_llm_input_tokens_total")
       )
 
-    assert %{agent_key: "", provider: "", model: "not-a-model", alias: "", outcome: ""} =
+    assert %{agent_key: "", provider: "", platform: "", model: "not-a-model", outcome: ""} =
              tokens.tag_values.(unknown)
 
-    assert %{agent_key: "", provider: "", model: "", alias: "", outcome: ""} =
+    assert %{agent_key: "", provider: "", platform: "", model: "", outcome: ""} =
              tokens.tag_values.(nothing)
+
+    # No series is labeled alias, and every engine series is labeled
+    # platform.
+    for metric <- Clementine.Telemetry.metrics() do
+      refute :alias in metric.tags, "#{inspect(metric.name)} is labeled alias"
+
+      if :model in metric.tags,
+        do: assert(:platform in metric.tags, "#{inspect(metric.name)} lacks platform")
+    end
   end
 
   test "the error labels are closed: every provider error's code, else other" do

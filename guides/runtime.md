@@ -9,7 +9,7 @@ reaches every host as a dependency bump.
 The host keeps three things:
 
 - a child after Oban in its supervision tree;
-- one migration calling `Clementine.Migration.up(version: 5)`;
+- one migration calling `Clementine.Migration.up(version: 6)`;
 - `use Clementine.Agent` modules.
 
 `mix clementine.install` writes them (plus the config and a test case),
@@ -52,16 +52,16 @@ loop inbox and the run trace beside it:
 defmodule MyApp.Repo.Migrations.AddClementine do
   use Ecto.Migration
 
-  def up, do: Clementine.Migration.up(version: 5)
-  def down, do: Clementine.Migration.down(version: 5)
+  def up, do: Clementine.Migration.up(version: 6)
+  def down, do: Clementine.Migration.down(version: 6)
 end
 ```
 
 Each version's DDL is frozen in `Clementine.Migration`, and each stamps
 its number on the table. The runtime checks the stamp as it starts and
 refuses to start against a table behind the code's version, naming the
-migration to write: a host on version 4 adds one calling
-`Clementine.Migration.up(from: 4, version: 5)`.
+migration to write: a host on version 5 adds one calling
+`Clementine.Migration.up(from: 5, version: 6)`.
 
 An agent is a module with a stable key, the string its run rows store:
 
@@ -409,15 +409,16 @@ back, oldest first, as `Clementine.Trace.Entry` structs:
 Clementine.Runs.trace(run.id)
 #=> [
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 1, kind: :execution,
-#=>     payload: %{"provider" => "anthropic", "model" => "claude-sonnet-5",
-#=>                "alias" => nil, "tools" => ["lookup"], "deferred" => [],
+#=>     payload: %{"provider" => "anthropic", "platform" => "anthropic",
+#=>                "model" => "claude-sonnet-5", "tools" => ["lookup"], "deferred" => [],
 #=>                "agent_fingerprint" => "33e5…", "instructions" => "…", "resumed" => false}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 2, kind: :model_call,
 #=>     payload: %{"iteration" => 1, "stop_reason" => "tool_use", "duration_ms" => 812,
 #=>                "usage" => %{"input_tokens" => 1204, "output_tokens" => 38,
 #=>                             "cache_read_tokens" => 1100, "cache_write_tokens" => 96},
-#=>                "provider" => "anthropic", "model" => "claude-sonnet-5",
-#=>                "alias" => nil, "cost" => %{"currency" => "USD", "micros" => 1284},
+#=>                "provider" => "anthropic", "platform" => "anthropic",
+#=>                "model" => "claude-sonnet-5", "cache_ttl" => "five_minutes",
+#=>                "cost" => %{"currency" => "USD", "micros" => 1284},
 #=>                "content" => […]}},
 #=>   %Clementine.Trace.Entry{epoch: 1, seq: 3, kind: :tool_call,
 #=>     payload: %{"name" => "lookup", "args" => %{"query" => "…"}, "result" => "…",
@@ -431,9 +432,9 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 
 - An `:execution` entry opens each execution: when the run starts, and
   again, `"resumed" => true`, when it resumes after an approval or a
-  delegation, under the next epoch. It names the platform the
-  model's requests go to (`"provider"`) and the model's id; `"alias"`
-  is always `nil`, and leaves with trace version 6. `"tools"` names every tool offered,
+  delegation, under the next epoch. It names the model's vendor
+  (`"provider"`), the platform its requests go to (`"platform"`), and
+  its id (`"model"`). `"tools"` names every tool offered,
   `"deferred"` the ones among them the model loads through tool search,
   `"skills"` the skills it may load, and `"delegates"` the agents it may
   ask. Its `"agent_fingerprint"` is a sha256 over the system prompt, the
@@ -444,9 +445,11 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 - A `:model_call` entry records each call to the model, a call cut off
   by a cancel included, with the usage it had reported (its cache reads
   and writes show whether the call found the prompt cache warm), the
-  provider and model it ran on, and its cost at the model's prices then (`nil`
-  without prices; `Clementine.Runs.cost/2` sums a run's, and
-  `docs/MODELS.md` has the `prices:` fact). A `:tool_call`
+  provider, platform, and model it ran on, the cache TTL its writes were
+  priced at (`"cache_ttl"`), and its cost at the model's prices then, at
+  the tier its prompt reached (`nil` without prices;
+  `Clementine.Runs.cost/2` sums a run's, and `docs/MODELS.md` has the
+  `prices:` fact). A `:tool_call`
   entry records each tool call started, with the arguments it ran with
   (and `"unknown" => true` beside its `"name"` when the model asked for a
   tool the agent does not offer) and the decision it waited on (`"approval" => %{"verdict" => "approved",
@@ -484,9 +487,10 @@ tools_called = for %{kind: :tool_call, payload: %{"name" => name}} <- Clementine
 ## The warehouse
 
 Every Clementine app has the same tables, so one warehouse model can
-compare them all: tokens by app, agent, provider, and model, and cost,
-which is directional, since each app prices calls at its own configured
-rates. Every column of the tables holds facts or content, and a
+compare them all: tokens by app, agent, provider, platform, and model,
+and cost, which is directional: each call is frozen at the prices in
+force in its app, the sheet's list prices or the app's override, and two
+apps on one model may price it apart. Every column of the tables holds facts or content, and a
 warehouse copy keeps only the facts:
 
 - **Leave out** `Clementine.Migration.content_columns/0`: `agent_runs`'
@@ -499,9 +503,10 @@ warehouse copy keeps only the facts:
 - **Keep** the rest, `Clementine.Migration.fact_columns/0`: ids, keys,
   statuses, timestamps, `agent_runs.usage` (a run's tokens), and the
   trace's fact columns. Each model call's row holds its `iteration`,
-  `provider`, `model`, `alias`, `input_tokens`, `output_tokens`,
-  `cache_read_tokens`, `cache_write_tokens`, `cost_micros`, `currency`,
-  `duration_ms`, and `stop_reason`; each tool call's holds its
+  `provider` (the model's vendor), `platform`, `model`, `cache_ttl`,
+  `input_tokens`, `output_tokens`, `cache_read_tokens`,
+  `cache_write_tokens`, `cost_micros`, `currency`, `duration_ms`, and
+  `stop_reason`; each tool call's holds its
   `iteration`, `tool_use_id`, `tool_name`, `is_error`, `killed`,
   `duration_ms`, `approval_verdict`, `policy_verdict`, and
   `policy_failed`. A skill load's row holds its `skill_name`, and a
@@ -784,7 +789,7 @@ would leave old nodes failing on the missing column.
    end
    ```
 
-   Any later version arrives the same way, `up(from: 4, version: 5)`.
+   Any later version arrives the same way, `up(from: 5, version: 6)`.
 7. Keep `RunWorker` for one deploy, reduced to a forwarder. Jobs queued
    before the switch name it, and so do jobs the old nodes requeued while
    they drained; without it they fail, and the reaper interrupts their

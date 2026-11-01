@@ -450,7 +450,8 @@ defmodule Clementine.LLM.ChatCompletions do
     policy
   end
 
-  defp usage_meta(%Policy{} = policy), do: %{provider: policy.platform, model: policy.model.id}
+  defp usage_meta(%Policy{} = policy),
+    do: %{provider: policy.model.vendor, platform: policy.platform, model: policy.model.id}
 
   defp parse_response(%{"choices" => [choice | _]} = body, usage_meta) do
     message = Map.get(choice, "message", %{})

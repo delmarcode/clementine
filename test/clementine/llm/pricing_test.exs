@@ -1,8 +1,9 @@
 defmodule Clementine.LLM.PricingTest do
   @moduledoc """
   A model's `prices:` fact: what a priced model must say, checked at boot,
-  and the cache write rate picked by the TTL the agent writes with. The
-  rates are illustrative, not anyone's current prices.
+  its tier, the cache write rate picked by the TTL the call is billed at,
+  and the list prices the shipped sheets carry. The `@card` rates are
+  illustrative; the shipped ones are the vendors', read 2026-11-01.
   """
 
   use ExUnit.Case, async: false
@@ -12,8 +13,8 @@ defmodule Clementine.LLM.PricingTest do
 
   defmodule HourAgent do
     @moduledoc false
-    # Writes its cache for an hour: built at compile time, when no model
-    # has prices, and checked again at boot against the app's.
+    # Writes its cache for an hour: built at compile time against the
+    # shipped prices, and checked again at boot against the app's.
     use Clementine.Agent,
       key: "test_pricing_hour",
       model: "claude-sonnet-5",
@@ -120,60 +121,299 @@ defmodule Clementine.LLM.PricingTest do
     end
   end
 
-  describe "of/1" do
-    test "picks the cache write rate for the TTL the resolved model writes with" do
-      {:ok, pricing} = Pricing.validate(@card)
+  describe "validate/1: a tier" do
+    @haiku [
+      currency: "USD",
+      input: 0.10,
+      output: 0.50,
+      cache_read: 0.01,
+      cache_write: [five_minutes: 0.125, one_hour: 0.20],
+      over: [
+        prompt_tokens: 100_000,
+        input: 0.50,
+        output: 2.50,
+        cache_read: 0.05,
+        cache_write: [five_minutes: 0.625, one_hour: 1.00]
+      ]
+    ]
 
-      assert %Pricing{cache_write: 3_750_000} =
-               Pricing.of(%{pricing: pricing, cache: %{ttl: :five_minutes}})
+    test "holds the prompt length and the tier's own four rates" do
+      assert {:ok,
+              %Pricing{
+                input: 100_000,
+                over: %{
+                  prompt_tokens: 100_000,
+                  input: 500_000,
+                  output: 2_500_000,
+                  cache_read: 50_000,
+                  cache_write: %{five_minutes: 625_000, one_hour: 1_000_000}
+                }
+              }} = Pricing.validate(@haiku)
 
-      assert %Pricing{cache_write: 6_000_000} =
-               Pricing.of(%{pricing: pricing, cache: %{ttl: :one_hour}})
+      assert {:ok, %Pricing{over: nil}} = Pricing.validate(Keyword.delete(@haiku, :over))
+    end
+
+    test "a tier names every rate, a positive prompt length, and nothing else" do
+      tier = @haiku[:over]
+
+      assert {:error, message} =
+               Pricing.validate(Keyword.put(@haiku, :over, Keyword.delete(tier, :cache_read)))
+
+      assert message =~ "over: missing [:cache_read]"
+
+      assert {:error, message} =
+               Pricing.validate(Keyword.put(@haiku, :over, Keyword.delete(tier, :prompt_tokens)))
+
+      assert message =~ "over: missing [:prompt_tokens]"
+
+      for bad <- [0, -1, 100_000.0, "100k"] do
+        assert {:error, message} =
+                 Pricing.validate(
+                   Keyword.put(@haiku, :over, Keyword.put(tier, :prompt_tokens, bad))
+                 )
+
+        assert message =~ "over: prompt_tokens must be a positive integer"
+      end
+
+      assert {:error, message} =
+               Pricing.validate(Keyword.put(@haiku, :over, Keyword.put(tier, :currency, "USD")))
+
+      assert message =~ "over: unknown keys [:currency]"
+
+      assert {:error, message} = Pricing.validate(Keyword.put(@haiku, :over, 2.5))
+      assert message =~ "over: expected a keyword list"
+    end
+
+    test "a tier's rates are held to six decimal places, as the base rates are" do
+      tier = Keyword.put(@haiku[:over], :output, 2.5000004)
+      assert {:error, message} = Pricing.validate(Keyword.put(@haiku, :over, tier))
+      assert message =~ "over: output 2.5000004 is finer than six decimal places"
+    end
+
+    test "a tier prices writes the way the base rates do, for the same TTLs" do
+      tier = @haiku[:over]
+
+      assert {:error, message} =
+               Pricing.validate(
+                 Keyword.put(@haiku, :over, Keyword.put(tier, :cache_write, five_minutes: 0.625))
+               )
+
+      assert message =~ "over: cache_write names TTLs [:five_minutes]"
+
+      assert {:error, message} =
+               Pricing.validate(
+                 Keyword.put(@haiku, :over, Keyword.put(tier, :cache_write, 0.625))
+               )
+
+      assert message =~ "a tier prices writes the same way"
+
+      one_rate = Keyword.put(@haiku, :cache_write, 0.125)
+
+      assert {:ok, %Pricing{cache_write: 125_000, over: %{cache_write: 625_000}}} =
+               Pricing.validate(
+                 Keyword.put(one_rate, :over, Keyword.put(tier, :cache_write, 0.625))
+               )
+    end
+  end
+
+  describe "at_ttl/2 and billed_ttl/2" do
+    test "picks the cache write rate for the call's TTL, in the base rates and the tier" do
+      {:ok, pricing} =
+        Pricing.validate(
+          Keyword.put(@card, :over,
+            prompt_tokens: 200_000,
+            input: 6.0,
+            output: 22.5,
+            cache_read: 0.6,
+            cache_write: [five_minutes: 7.5, one_hour: 12.0]
+          )
+        )
+
+      assert %Pricing{cache_write: 3_750_000, over: %{cache_write: 7_500_000}} =
+               Pricing.at_ttl(pricing, :five_minutes)
+
+      assert %Pricing{cache_write: 6_000_000, over: %{cache_write: 12_000_000}} =
+               Pricing.at_ttl(pricing, :one_hour)
+
+      # A TTL the prices name no rate for has no price, never a guess.
+      assert Pricing.at_ttl(pricing, :thirty_minutes) == nil
+      assert Pricing.at_ttl(pricing, nil) == nil
+      assert Pricing.at_ttl(nil, :five_minutes) == nil
     end
 
     test "a single cache write rate holds whatever the TTL, or with none" do
       {:ok, pricing} = Pricing.validate(Keyword.put(@card, :cache_write, 3.75))
 
       for ttl <- [:five_minutes, :one_hour, nil] do
-        assert %Pricing{cache_write: 3_750_000} =
-                 Pricing.of(%{pricing: pricing, cache: %{ttl: ttl}})
+        assert %Pricing{cache_write: 3_750_000} = Pricing.at_ttl(pricing, ttl)
       end
     end
 
-    test "an id is priced at the model's default caching; an agent's TTL picks its own rate" do
+    test "a call is billed at its agent's TTL, or with caching off at the model's shortest" do
+      sonnet = Models.get!("claude-sonnet-5-5")
+      assert Pricing.billed_ttl(sonnet, :one_hour) == :one_hour
+      assert Pricing.billed_ttl(sonnet, nil) == :five_minutes
+      assert Pricing.billed_ttl(Models.get!("gpt-6.1-sol"), nil) == :thirty_minutes
+      assert Pricing.billed_ttl(Models.get!("gpt-5.5"), nil) == nil
+    end
+  end
+
+  describe "of/2" do
+    test "an id is priced at its sheet's list prices, at the model's shortest TTL" do
+      put_models(nil)
+
+      # Claude Sonnet 5.5: $2 in, $10 out, $0.10 cache hits (0.05x), and
+      # writes at $2.50 for five minutes or $4 for an hour.
+      assert %Pricing{
+               currency: "USD",
+               input: 2_000_000,
+               output: 10_000_000,
+               cache_read: 100_000,
+               cache_write: 2_500_000,
+               over: nil,
+               source: "https://platform.claude.com/docs/en/about-claude/pricing",
+               read: ~D[2026-11-01]
+             } = Pricing.of("claude-sonnet-5-5")
+
+      assert %Pricing{cache_write: 4_000_000} =
+               Pricing.of("claude-sonnet-5-5", cache_ttl: :one_hour)
+
+      # As a trace entry stores them: strings.
+      assert %Pricing{cache_write: 4_000_000} =
+               Pricing.of("claude-sonnet-5-5", platform: "anthropic", cache_ttl: "one_hour")
+    end
+
+    test "an override's prices win, and a resolved agent's TTL picks its own rate" do
       put_models(%{"claude-sonnet-5" => [prices: @card]})
 
-      # Claude's shortest TTL, five minutes, is the default.
-      assert %Pricing{cache_write: 3_750_000} = Pricing.of("claude-sonnet-5")
+      assert %Pricing{input: 3_000_000, cache_write: 3_750_000} = Pricing.of("claude-sonnet-5")
 
       agent = Agent.new(model: "claude-sonnet-5", cache: [ttl: :one_hour])
 
-      assert %Pricing{cache_write: 6_000_000} =
-               Pricing.of(Trace.resolve_model(agent.model, Agent.policy(agent)))
+      assert %{cache_ttl: :one_hour, pricing: %Pricing{cache_write: 6_000_000}} =
+               Trace.resolve_model(agent.model, Agent.policy(agent))
     end
 
-    test "nil for a model without prices and an id no sheet holds" do
-      put_models(%{"claude-sonnet-5" => [prices: @one_rate]})
+    test "the platform is the model's default unless named; one it is not served on has none" do
+      put_models(nil)
 
-      assert Pricing.of("claude-sonnet-5-5") == nil
-      assert Pricing.of("gpt-6.1-sol") == nil
+      assert Pricing.of("claude-opus-5-5", platform: :anthropic) == Pricing.of("claude-opus-5-5")
+      assert %Pricing{} = Pricing.of("claude-opus-5-5", platform: :bedrock)
+      assert Pricing.of("claude-opus-5-5", platform: :openai) == nil
+      assert Pricing.of("claude-opus-5-5", platform: "nowhere") == nil
+      assert Pricing.of("claude-opus-5-5", cache_ttl: :twelve_hours) == nil
+      assert Pricing.of("claude-opus-5-5", cache_ttl: "forever") == nil
+    end
+
+    test "nil for a declared model without prices, an id no sheet holds, and an atom" do
+      put_models(%{
+        "my-qwen" => [
+          vendor: :qwen,
+          context: 32_768,
+          max_output: 8_192,
+          platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+        ],
+        "claude-sonnet-5" => [prices: nil]
+      })
+
+      assert Pricing.of("my-qwen") == nil
+      assert Pricing.of("claude-sonnet-5") == nil
       assert Pricing.of("not-a-model") == nil
       assert Pricing.of(:claude_sonnet) == nil
     end
   end
 
+  describe "the shipped sheets" do
+    test "every sheet carries list prices in USD, with the page and the day they were read" do
+      put_models(nil)
+
+      for model <- Models.list() do
+        assert %Pricing{currency: "USD", source: source, read: ~D[2026-11-01]} = model.prices,
+               "#{model.id} ships no prices"
+
+        assert source in [
+                 "https://platform.claude.com/docs/en/about-claude/pricing",
+                 "https://developers.openai.com/api/docs/pricing"
+               ]
+      end
+    end
+
+    test "each sheet prices exactly the TTLs its model offers" do
+      put_models(nil)
+
+      for model <- Models.list() do
+        assert Enum.sort(Pricing.priced_ttls(model.prices)) == Enum.sort(model.cache.ttls),
+               "#{model.id} prices other TTLs than it offers"
+      end
+    end
+
+    test "an override that narrows a model's TTLs keeps its shipped prices" do
+      put_models(%{"claude-sonnet-5" => [cache: [ttls: [:five_minutes]]]})
+
+      assert :ok = Models.validate_config!()
+      assert %Pricing{cache_write: 2_500_000} = Pricing.of("claude-sonnet-5")
+    end
+
+    test "each model's cache hit rate is its own, never derived from its input rate" do
+      put_models(nil)
+
+      read = fn id -> Models.get!(id).prices.cache_read / Models.get!(id).prices.input end
+
+      assert read.("claude-fable-5-1") == 0.025
+      assert read.("claude-opus-5-5") == 0.05
+      assert read.("claude-sonnet-5-5") == 0.05
+      assert read.("claude-sonnet-5") == 0.1
+      assert read.("claude-haiku-5-5") == 0.1
+      assert read.("gpt-6.1-terra") == 0.05
+      assert read.("gpt-6-astra") == 0.1
+    end
+
+    test "Haiku 5.5 and the GPT-6 family carry their tiers; no other model has one" do
+      put_models(nil)
+
+      tiers =
+        for %{prices: %Pricing{over: %{prompt_tokens: line}}, id: id} <- Models.list(),
+            into: %{},
+            do: {id, line}
+
+      assert tiers == %{
+               "claude-haiku-5-5" => 100_000,
+               "gpt-6.1-terra" => 272_000,
+               "gpt-6.1-sol" => 272_000,
+               "gpt-6-luna" => 272_000,
+               "gpt-6-astra" => 272_000,
+               "gpt-5.6-sol" => 272_000,
+               "gpt-5.5" => 272_000,
+               "gpt-5.5-pro" => 272_000
+             }
+
+      assert %{
+               input: 500_000,
+               output: 2_500_000,
+               cache_read: 50_000,
+               cache_write: %{five_minutes: 625_000, one_hour: 1_000_000}
+             } = Models.get!("claude-haiku-5-5").prices.over
+
+      assert %{
+               input: 20_000_000,
+               output: 75_000_000,
+               cache_read: 2_000_000,
+               cache_write: %{thirty_minutes: 25_000_000, twelve_hours: 50_000_000}
+             } = Models.get!("gpt-6-astra").prices.over
+    end
+  end
+
   describe "at boot" do
-    test "a priced override validates, and the model carries the prices" do
+    test "a priced override validates, and replaces the sheet's prices whole" do
       put_models(%{"claude-sonnet-5" => [prices: @one_rate]})
 
       assert :ok = Models.validate_config!()
 
-      assert %{prices: %Pricing{currency: "USD", cache_write: 3_750_000}} =
+      assert %{prices: %Pricing{currency: "USD", cache_write: 3_750_000, source: nil}} =
                Models.get!("claude-sonnet-5")
 
-      assert %{pricing: %Pricing{currency: "USD"}} = Trace.resolve_model("claude-sonnet-5")
-      assert %{prices: nil} = Models.get!("claude-sonnet-5-5")
-      assert %{pricing: nil} = Trace.resolve_model("gpt-6.1-sol")
+      assert %{pricing: %Pricing{input: 3_000_000}} = Trace.resolve_model("claude-sonnet-5")
+      assert %{prices: %Pricing{input: 2_000_000}} = Models.get!("claude-sonnet-5-5")
     end
 
     test "a declared model takes prices like a shipped one" do
@@ -206,6 +446,10 @@ defmodule Clementine.LLM.PricingTest do
 
       assert error.message =~ ~s(Invalid :clementine, :models entry "claude-sonnet-5")
       assert error.message =~ "missing [:output]"
+
+      tier = Keyword.put(@card, :over, prompt_tokens: 1_000, input: 1, output: 1, cache_read: 1)
+      error = boot_error(%{"claude-sonnet-5" => [prices: tier]})
+      assert error.message =~ "over: missing [:cache_write]"
     end
 
     test "a per-TTL cache_write without the rate for the agent's TTL fails the agent" do
@@ -230,7 +474,7 @@ defmodule Clementine.LLM.PricingTest do
       assert message =~ "names no rate for :one_hour"
     end
 
-    test "GPT-5.6 and later write for thirty minutes, wherever served; caching off, none" do
+    test "GPT-5.6 and later write for thirty minutes, wherever served; caching off, the same" do
       card = [
         currency: "USD",
         input: 2.0,
@@ -257,19 +501,25 @@ defmodule Clementine.LLM.PricingTest do
 
       # The first-party client sends the longer TTL, so it is billed at it;
       # the Chat Completions client sends none, so Bedrock refuses it.
-      assert %Pricing{cache_write: 5_000_000} =
-               Pricing.of(Trace.resolve_model("gpt-5.6-sol", cache: [ttl: :twelve_hours]))
+      assert %{pricing: %Pricing{cache_write: 5_000_000}} =
+               Trace.resolve_model("gpt-5.6-sol", cache: [ttl: :twelve_hours])
 
       assert {:error, message} = Policy.resolve("openai.gpt-5.6", cache: [ttl: :twelve_hours])
       assert message =~ "is not sent on :bedrock"
 
+      # With caching off a write the provider makes on its own is billed at
+      # the shortest TTL, so a per-TTL price list serves it too.
       for id <- ["gpt-5.6-sol", "openai.gpt-5.6"] do
-        assert {:error, message} = Policy.resolve(id, cache: false)
-        assert message =~ "give one cache_write rate"
+        assert {:ok, _policy} = Policy.resolve(id, cache: false)
+
+        assert %{cache_ttl: :thirty_minutes, pricing: %Pricing{cache_write: 2_500_000}} =
+                 Trace.resolve_model(id, cache: false)
       end
+
+      assert %Clementine.Agent{} = Agent.new(model: "claude-haiku-5-5", cache: false)
     end
 
-    test "a per-TTL cache_write on a model whose writes carry no TTL fails the agent" do
+    test "a per-TTL cache_write on a model that offers no TTL fails the agent and boot" do
       put_models(%{
         "qwen.qwen3-235b-a22b-2507-v1:0" => [
           vendor: :qwen,
@@ -301,10 +551,9 @@ defmodule Clementine.LLM.PricingTest do
       end
     end
 
-    test "priced models in two currencies fail: their costs would not add up" do
+    test "priced models in two currencies fail, the shipped USD sheets among them" do
       error =
         boot_error(%{
-          "claude-sonnet-5" => [prices: @one_rate],
           "gpt-6.1-sol" => [
             prices: [currency: "EUR", input: 1, output: 8, cache_read: 0.1, cache_write: 1]
           ]
@@ -312,25 +561,18 @@ defmodule Clementine.LLM.PricingTest do
 
       assert error.message =~ "every priced model names one currency"
       assert error.message =~ ~s("USD")
-      assert error.message =~ ~s("EUR")
+      assert error.message =~ ~s("EUR" on "gpt-6.1-sol")
+      assert error.message =~ "Clementine's sheets are priced in USD"
     end
 
     test "the models' currency is the one the priced ones name, or nil" do
-      plain = [
-        vendor: :qwen,
-        context: 32_768,
-        max_output: 8_192,
-        platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
-      ]
-
-      put_models(%{"my-qwen" => plain, "claude-sonnet-5" => [prices: @one_rate]})
+      # No models config at all, as an app that sets none has: the sheets'.
+      put_models(nil)
       assert Pricing.currency() == "USD"
 
-      put_models(%{"my-qwen" => plain})
-      assert Pricing.currency() == nil
-
-      # No models config at all, as an app that sets none has.
-      put_models(nil)
+      # An app that unprices every model has none.
+      put_models(Map.new(Models.list(), &{&1.id, [prices: nil]}))
+      assert :ok = Models.validate_config!()
       assert Pricing.currency() == nil
     end
   end

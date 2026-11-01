@@ -12,7 +12,8 @@ defmodule Clementine.LLM.ProviderUsage do
   # uncached input never goes negative, and `[:clementine, :llm,
   # :usage_clamped]` says so: a provider that changed its convention
   # shows up there instead of being undercounted quietly. `meta`
-  # (`%{provider: atom, model: String.t()}`) is that event's metadata.
+  # (`%{provider: atom, platform: atom, model: String.t()}`: the vendor, the
+  # wire, the model) is that event's metadata.
 
   @doc """
   The Messages API's usage. Its `input_tokens` is only what came after
@@ -98,7 +99,7 @@ defmodule Clementine.LLM.ProviderUsage do
       :telemetry.execute(
         [:clementine, :llm, :usage_clamped],
         %{input_tokens: reported, cache_read_tokens: read, cache_write_tokens: write},
-        Map.merge(%{provider: nil, model: nil}, meta)
+        Map.merge(%{provider: nil, platform: nil, model: nil}, meta)
       )
     end
 

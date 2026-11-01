@@ -2036,7 +2036,7 @@ defmodule Clementine.Rollout do
   # ran: bounded values, fixed in code, that metrics may tag by
   # (`Clementine.Telemetry`).
   defp identity(%Execution{agent_key: agent_key, resolved: model}) do
-    %{agent_key: agent_key, provider: model.provider, model: model.id, alias: model.alias}
+    %{agent_key: agent_key, provider: model.provider, platform: model.platform, model: model.id}
   end
 
   defp record(%Execution{recorder: nil}, _kind, _payload), do: :ok

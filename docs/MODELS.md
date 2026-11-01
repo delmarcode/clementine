@@ -84,6 +84,9 @@ Clementine.Models.get!("claude-sonnet-5-5")
 #=>   rejects: [:temperature, :top_p, :top_k, :prefill, :forced_tool_choice, :budget_tokens],
 #=>   features: %{tool_search: true, structured_outputs: true, mid_conversation_system: true},
 #=>   cache: %{min_prefix: 512, ttls: [:five_minutes, :one_hour]},
+#=>   prices: %Clementine.LLM.Pricing{currency: "USD", input: 2_000_000, output: 10_000_000,
+#=>             cache_read: 100_000, cache_write: %{five_minutes: 2_500_000, one_hour: 4_000_000},
+#=>             over: nil, source: "https://platform.claude.com/docs/en/about-claude/pricing", ...},
 #=>   platforms: [anthropic: %{...}, bedrock: %{id: "anthropic.claude-sonnet-5-5", lifecycle: :partner}, ...],
 #=>   source: "https://platform.claude.com/docs/en/models/sonnet-5-5/overview", read: ~D[2026-11-01]
 #=> }
@@ -380,37 +383,46 @@ and Vertex AI's [open models](https://docs.cloud.google.com/vertex-ai/generative
 
 ## Prices
 
-Clementine turns usage into money only at prices a model's sheet
-carries. Its shipped sheets carry none yet: an app gives a model its
-prices as an override, copied from the provider's price page with where
-and when it read them. A model with `prices:` has a cost on every call;
-one without has `nil`, never zero.
+Every shipped sheet carries its vendor's list prices, per million
+tokens in USD, with the page they were read from and the day
+(`prices.source`, `prices.read`): the Claude API's on Anthropic's sheets,
+OpenAI's Standard tier on OpenAI's. A call costs what its model's prices
+say in this app when the call ends, and that cost is frozen in its
+trace entry. An app that pays something else overrides `prices:`: a
+negotiated rate, Bedrock and Google Cloud (which price Claude
+themselves, regional endpoints 10% higher), OpenAI's Batch or Flex, or
+US-only inference. A model the app declares carries its own prices, or
+none and costs `nil`, never zero.
 
 ```elixir
-# Illustrative numbers, not anyone's current prices.
 config :clementine, :models, %{
-  "claude-sonnet-5" => [
+  "claude-opus-5-5" => [
     prices: [
       currency: "USD",
-      input: 3.00,
-      output: 15.00,
-      cache_read: 0.30,
-      cache_write: [five_minutes: 3.75, one_hour: 6.00],
-      source: "https://platform.claude.com/docs/en/about-claude/pricing",
-      read: ~D[2026-11-01]
+      input: 3.60,
+      output: 18.00,
+      cache_read: 0.18,
+      cache_write: [five_minutes: 4.50, one_hour: 7.20],
+      source: "contract 2026-10",
+      read: ~D[2026-10-15]
     ]
   ]
 }
 ```
 
+An override replaces `prices` whole: it names every rate, and its own
+tier or none. `Clementine.Models.get!(id).prices` shows what a model is
+priced at.
+
 | Key | Meaning |
 |---|---|
-| `currency` | An ISO 4217 code, `"USD"`. Every priced model names the same one, so costs add up. |
+| `currency` | An ISO 4217 code, `"USD"`. Every priced model, shipped and the app's, names the same one, so costs add up: an app that pays in another prices every model it runs in it, and sets `prices: nil` on the rest. |
 | `input` | Uncached input. |
 | `output` | Output, reasoning included. |
-| `cache_read` | Input read from the provider's prompt cache. |
+| `cache_read` | Input read from the provider's prompt cache. The sheet's own rate: 0.025x input on Fable and Mythos 5.1, 0.05x on Opus and Sonnet 5.5 and GPT-6.1 Terra, 0.1x on most others. Never derive it from `input`. |
 | `cache_write` | Input written to it: one rate, or a rate per cache TTL. |
-| `source`, `read` | Where the numbers came from, and when (optional). |
+| `over` | A tier: `prompt_tokens`, and the four rates a call whose prompt is over it pays (below). |
+| `source`, `read` | Where the numbers came from, and when (optional on an override). |
 
 - **The unit.** Every rate is in `currency` per million tokens, as price
   pages state it, to six decimal places at most; integers and floats both
@@ -419,39 +431,83 @@ config :clementine, :models, %{
   model: a call charged for only some of its tokens is an undercount
   nobody would see. Write `0` for what the provider does not charge (a
   server you host), and the input rate where it bills a cache write as
-  plain input.
+  plain input (OpenAI before GPT-5.6).
 - **Cache writes by TTL.** Where a provider charges more to keep a cache
-  entry longer, give `cache_write` a rate per TTL, as the price page
-  lists them, and the TTL the agent writes with (its `cache:` choice, see
-  "Prompt caching" above, or the model's shortest) picks one:
+  entry longer, `cache_write` has a rate per TTL, as the price page lists
+  them, and the TTL the call writes with picks one: the agent's `cache:`
+  TTL (see "Prompt caching" above), or with caching off the model's
+  shortest, which is what a write the provider makes on its own lives
+  for.
 
   The TTLs are the model's sheet's on its platform (`cache.ttls`):
   `:five_minutes` and `:one_hour` on Claude, `:thirty_minutes` and
   `:twelve_hours` on OpenAI's GPT-5.6 and later; a model that offers
   none takes one rate.
 
-  A per-TTL `cache_write` without the rate for an agent's TTL, or naming
-  a TTL the model does not offer, fails the build and boot.
+  A per-TTL `cache_write` an app writes without the rate for an agent's
+  TTL, or naming a TTL the model does not offer, fails the build and
+  boot.
 
-**How a call is priced.** `input_tokens` counts every input token, cached
-or not, and the cache reads and writes are parts of it
-(`Clementine.Usage`). A call costs its uncached input (`input_tokens`
-less both cache counts) at `input`, its cache reads at `cache_read`, its
-cache writes at `cache_write`, and its output at `output`, summed exactly
-and rounded once, half up, to the micro-unit. A cost is a
+### Tiers
+
+Some models bill more once a prompt is over a length. `over:` holds that
+second set of rates:
+
+```elixir
+# Claude Haiku 5.5's sheet.
+prices: [
+  currency: "USD", input: 0.10, output: 0.50, cache_read: 0.01,
+  cache_write: [five_minutes: 0.125, one_hour: 0.20],
+  over: [prompt_tokens: 100_000, input: 0.50, output: 2.50, cache_read: 0.05,
+         cache_write: [five_minutes: 0.625, one_hour: 1.00]],
+  source: "https://platform.claude.com/docs/en/about-claude/pricing", read: ~D[2026-11-01]
+]
+```
+
+A call whose prompt is over `prompt_tokens` pays the tier's rates for
+every token it burned, output included; one at the line or under pays
+the base rates. Its prompt is every input token it sent, cache reads and
+writes included (`usage.input_tokens`), which is how both vendors count
+it: Anthropic's "prompt length counts all of its input tokens, including
+cache reads and cache writes", and OpenAI's `input_tokens` holds the
+cached ones. Each call is priced on its own, so a run's summed usage is
+not a call's: price each call, as the trace and telemetry do, and sum
+the costs.
+
+The tiers the shipped sheets carry, read 2026-11-01:
+
+| Model | Over | The tier |
+|---|---|---|
+| `claude-haiku-5-5` | 100,000 prompt tokens | 5x every rate |
+| `gpt-6.1-terra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.5`, `gpt-5.5-pro` | 272,000 input tokens | 2x input, cache reads, and writes; 1.5x output |
+
+Every other Claude 4.6 and later model bills its whole 1M window at one
+rate, the older Claude models have 200,000-token windows, and OpenAI
+lists no long rates for GPT-5.4 mini, GPT-5, or GPT-4.1.
+
+### How a call is priced
+
+`input_tokens` counts every input token, cached or not, and the cache
+reads and writes are parts of it (`Clementine.Usage`). A call costs its
+uncached input (`input_tokens` less both cache counts) at `input`, its
+cache reads at `cache_read`, its cache writes at `cache_write`, and its
+output at `output`, each the tier's when its prompt is over the line,
+summed exactly and rounded once, half up, to the micro-unit. A cost is a
 `%Clementine.Cost{currency: "USD", micros: 1_284}`: integer millionths of
 the currency, here $0.001284.
 
-**Where costs show.**
+### Where costs show
 
-- Each trace `:model_call` entry records the provider, model id, and
-  alias it ran on (`"provider"`, `"model"`, and `"alias"`, now always `nil`)
-  and its cost (`"cost"`), frozen when the call ended, at the prices the model had
-  then. A price you change applies to calls from then on and never
-  reprices history. On the runtime these are columns of
-  `agent_run_trace` of their own (`cost_micros`, `currency`, and the
-  token counts beside them), so a warehouse keeps them without the
-  conversation (`Clementine.Migration`, "What a warehouse may keep").
+- Each trace `:model_call` entry records the model's vendor
+  (`"provider"`), where it ran (`"platform"`), its id (`"model"`), the
+  TTL its writes were priced at (`"cache_ttl"`), and its cost (`"cost"`),
+  frozen when the call ended, at the prices the model had then. A price
+  you change applies to calls from then on and never reprices history.
+  On the runtime these are columns of `agent_run_trace` of their own
+  (`provider`, `platform`, `model`, `cache_ttl`, `cost_micros`,
+  `currency`, and the token counts beside them), so a warehouse keeps
+  them without the conversation (`Clementine.Migration`, "What a
+  warehouse may keep").
 - `Clementine.Runs.cost(run_id)` sums a run's own calls;
   `Clementine.Runs.cost(run_id, children: true)` adds every run below it
   (its delegates, a loop's turns and theirs);
@@ -470,23 +526,26 @@ the currency, here $0.001284.
   however the call ended (`outcome`: `stop`, `aborted`, or `error`);
   `:stop`, and `:exception` for a call a provider error ended, carry it
   too. `Clementine.Telemetry.metrics/0` sums it by agent, provider,
-  model, alias (empty), outcome, and currency as
+  platform, model, outcome, and currency as
   `clementine_llm_cost_micros_total`.
-- `Clementine.Cost.of(usage, model_id)` prices any usage at today's prices,
-  at the model's shortest cache TTL:
-  an in-process run's `result.usage`, or a trace entry's usage to reprice
-  it.
+- `Clementine.Cost.of(usage, model_id, platform: ..., cache_ttl: ...)`
+  prices one call's usage at today's prices: a trace entry's, to reprice
+  it, with the platform and TTL the entry records (both default to the
+  model's: its default platform, the only one a request goes to until
+  `Clementine.Platform`, and its shortest TTL).
 
-**What four rates do not cover.** A price that depends on more than the
-token counts is not modeled, and the cost is the plain rate: Anthropic's
-US-only inference (`inference_geo`) and fast mode, a model with higher
-prices above a prompt length (Claude Haiku 5.5 over 100,000 tokens),
-regional pricing on Bedrock and Vertex (price the model at its region's
+**What the rates do not cover.** A price that depends on more than the
+call's tokens and prompt length is not modeled, and the cost is the
+list rate: Anthropic's US-only inference (`inference_geo`, 1.1x) and fast
+mode, OpenAI's Batch, Flex, fast mode, and regional processing, regional
+pricing on Bedrock and Google Cloud (price the model at its region's
 rates), per-use server tool fees such as web search, and OpenRouter's
 routing: it serves one model id from whichever of its upstream providers
 it picks, at that provider's price, and reports what it charged in the
 response's `usage.cost`, which Clementine does not read. Price an
-OpenRouter model at the rate you expect to pay.
+OpenRouter model at the rate you expect to pay. OpenAI's GPT-5.5 page
+says its long rates apply "for the full session"; Clementine applies
+them to each request over the line, as the GPT-6 pages say.
 
 ## Adding a whole new provider
 

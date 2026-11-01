@@ -17,7 +17,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
              agents: [MyApp.Agents.Weather],
              host: MyApp.Agents.Host}
 
-      * one migration calling `Clementine.Migration.up(version: 5)`;
+      * one migration calling `Clementine.Migration.up(version: 6)`;
       * `use Clementine.Agent` modules, listed in `agents:`.
 
     The optional `host:` module implements `Clementine.Host`: who may

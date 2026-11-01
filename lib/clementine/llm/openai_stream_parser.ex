@@ -26,7 +26,8 @@ defmodule Clementine.LLM.OpenAIStreamParser do
     %State{}
   end
 
-  defp usage_meta(response), do: %{provider: :openai, model: Map.get(response, "model")}
+  defp usage_meta(response),
+    do: %{provider: :openai, platform: :openai, model: Map.get(response, "model")}
 
   def parse(%State{buffer: buffer} = state, data) when is_binary(data) do
     full_data = buffer <> data

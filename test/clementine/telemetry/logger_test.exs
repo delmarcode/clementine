@@ -56,7 +56,7 @@ defmodule Clementine.Telemetry.LoggerTest do
       assert log =~ "max_iterations=30"
     end
 
-    test "rollout start logs the agent, the provider, and the model" do
+    test "rollout start logs the agent, the vendor, the platform, and the model" do
       TelemetryLogger.install()
 
       log =
@@ -66,16 +66,20 @@ defmodule Clementine.Telemetry.LoggerTest do
             %{system_time: System.system_time()},
             %{
               agent_key: "triage",
-              provider: :openai,
-              model: "gpt-5",
-              alias: nil,
+              provider: :deepseek,
+              platform: :openrouter,
+              model: "deepseek/deepseek-v3.2",
               tool_count: 0,
               max_iterations: 10
             }
           )
         end)
 
-      assert log =~ "[Clementine] Rollout started agent=triage provider=openai model=gpt-5"
+      assert log =~
+               "[Clementine] Rollout started agent=triage provider=deepseek platform=openrouter " <>
+                 "model=deepseek/deepseek-v3.2"
+
+      refute log =~ "alias"
 
       handlers = :telemetry.list_handlers([:clementine, :rollout, :start])
       assert Enum.any?(handlers, fn h -> h.id == "clementine-logger" end)

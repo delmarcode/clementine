@@ -12,6 +12,11 @@ defmodule Clementine.Telemetry.Logger do
   verdicts — log at `:error`/`:warning` regardless of the configured
   level.
 
+  Rollout, LLM, and tool lines name what ran, as their events do
+  (`Clementine.Telemetry`, "What a run names"): `agent=` (the agent key),
+  `provider=` (the model's vendor), `platform=` (where its requests
+  went), and `model=` (its id), each left out when the event has none.
+
   ## Usage
 
       # In your application.ex start/2:
@@ -291,7 +296,7 @@ defmodule Clementine.Telemetry.Logger do
   # The agent and the model a rollout, llm, or tool event names; a key the
   # event does not carry (a tool batch run outside a rollout) is left out.
   defp identity(metadata) do
-    [agent: :agent_key, provider: :provider, model: :model]
+    [agent: :agent_key, provider: :provider, platform: :platform, model: :model]
     |> Enum.flat_map(fn {label, key} ->
       case Map.get(metadata, key) do
         nil -> []

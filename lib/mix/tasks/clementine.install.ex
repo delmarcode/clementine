@@ -20,9 +20,9 @@ defmodule Mix.Tasks.Clementine.Install.Docs do
       * `{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []}`
         in your application's children, right after Oban
       * a migration that builds `agent_runs` with
-        `Clementine.Migration.up(version: 5)`
-      * the `agents` Oban queue, Clementine's provider key, a model alias,
-        and the `run_id` logger metadata key in `config/config.exs`
+        `Clementine.Migration.up(version: 6)`
+      * the `agents` Oban queue, Clementine's provider key, and the `run_id`
+        logger metadata key in `config/config.exs`
       * `MyApp.Agents.LLMMock` as Clementine's model client in
         `config/test.exs`, so no test reaches a real provider
       * `MyApp.AgentsCase` in `test/support/agents_case.ex`: the SQL
