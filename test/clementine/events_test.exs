@@ -39,11 +39,14 @@ defmodule Clementine.EventsTest do
   end
 
   describe "the taxonomy" do
+    # The RFC's set, plus :thinking_delta (OPS-191): the text a model
+    # shows of its thinking, such as its progress updates.
     test "is the closed execution-event set from the RFC" do
       assert Enum.sort(Event.types()) ==
                Enum.sort([
                  :iteration_start,
                  :text_delta,
+                 :thinking_delta,
                  :tool_use_start,
                  :tool_input_delta,
                  :tool_result,

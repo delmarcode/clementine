@@ -116,6 +116,19 @@ defmodule Clementine.LLM.Message do
             }
     end
 
+    defmodule ToolAddition do
+      @moduledoc """
+      A tool offered partway through a conversation, inside a
+      `Clementine.LLM.Message.SystemMessage`: the definition the provider
+      is sent (`"name"`, `"description"`, `"input_schema"`), kept as it
+      was sent so a replay sends it again byte for byte.
+      """
+      @enforce_keys [:definition]
+      defstruct [:definition]
+
+      @type t :: %__MODULE__{definition: Content.json_object()}
+    end
+
     @type text :: Text.t()
     @type tool_use :: ToolUse.t()
     @type tool_result :: ToolResult.t()
@@ -123,6 +136,7 @@ defmodule Clementine.LLM.Message do
     @type redacted_thinking :: RedactedThinking.t()
     @type server_tool_use :: ServerToolUse.t()
     @type server_tool_result :: ServerToolResult.t()
+    @type tool_addition :: ToolAddition.t()
     @type t ::
             text()
             | tool_use()
@@ -131,6 +145,7 @@ defmodule Clementine.LLM.Message do
             | redacted_thinking()
             | server_tool_use()
             | server_tool_result()
+            | tool_addition()
     @type json_object :: %{String.t() => json_value()}
 
     @doc "Creates a text content block"
@@ -199,6 +214,7 @@ defmodule Clementine.LLM.Message do
     def valid?(%RedactedThinking{}), do: true
     def valid?(%ServerToolUse{}), do: true
     def valid?(%ServerToolResult{}), do: true
+    def valid?(%ToolAddition{}), do: true
     def valid?(_other), do: false
 
     @doc """
@@ -253,6 +269,11 @@ defmodule Clementine.LLM.Message do
         "block_type" => block_type,
         "content" => content
       }
+    end
+
+    def to_map(%ToolAddition{definition: definition}) do
+      validate_json_object!(definition, "tool_addition.definition")
+      %{"type" => "tool_addition", "definition" => definition}
     end
 
     @doc """
@@ -332,6 +353,13 @@ defmodule Clementine.LLM.Message do
             fetch_binary!(data, "block_type", "server tool result block_type"),
             content
           )
+
+        "tool_addition" ->
+          validate_keys!(data, ["type", "definition"], "tool_addition content")
+
+          %ToolAddition{
+            definition: fetch_json_object!(data, "definition", "tool_addition.definition")
+          }
 
         _other ->
           raise ArgumentError, "unknown content type: #{inspect(type)}"
@@ -477,14 +505,26 @@ defmodule Clementine.LLM.Message do
   end
 
   defmodule AssistantMessage do
-    @moduledoc "Represents an assistant message"
+    @moduledoc """
+    Represents an assistant message.
+
+    `binding` is set on a turn from a model that binds its thinking to
+    the conversation before it (Claude Fable 5.1, Opus 5.5, Sonnet 5.5,
+    Haiku 5.5, and later): a digest of the system prompt, tools, and
+    messages the turn was produced after, as Clementine sent them. When
+    the turn is replayed, Clementine sends its thinking blocks only if
+    the same digest still holds, so an edited history costs that
+    reasoning instead of failing the request. Store it with the message
+    (`Clementine.LLM.Message.to_map/1` does); it is nil everywhere else.
+    """
 
     @type t :: %__MODULE__{
             role: :assistant,
-            content: [Content.t()]
+            content: [Content.t()],
+            binding: String.t() | nil
           }
 
-    defstruct role: :assistant, content: []
+    defstruct role: :assistant, content: [], binding: nil
 
     @doc "Creates an assistant message from content blocks"
     def new(content) when is_list(content) do
@@ -555,22 +595,85 @@ defmodule Clementine.LLM.Message do
     end
   end
 
+  defmodule SystemMessage do
+    @moduledoc """
+    An operator message partway through a conversation: instructions
+    that become true at that point, and tools offered from that point on.
+
+    A conversation on a model that binds its thinking to what came before
+    it keeps its system prompt and tool list as the first turn sent them,
+    and appends a change here instead: editing either would void every
+    earlier turn's reasoning. On those models a system message goes as a
+    `role: "system"` message, with each `Content.ToolAddition` as an
+    inline tool definition. Elsewhere its text joins the system prompt
+    and its tools are offered as ordinary tools.
+
+    Place one after a user message (a prompt or tool results), never
+    between a tool call and its result; the model answers after it.
+    `skill` names the skill whose load added the tools, when a skill did
+    (`Clementine.Skill`).
+    """
+
+    @type t :: %__MODULE__{
+            role: :system,
+            content: [Content.Text.t() | Content.ToolAddition.t()],
+            skill: String.t() | nil
+          }
+
+    defstruct role: :system, content: [], skill: nil
+
+    @doc "Creates a system message from text, or from text and tool-addition blocks."
+    def new(content, opts \\ [])
+
+    def new(content, opts) when is_binary(content), do: new([Content.text(content)], opts)
+
+    def new(content, opts) when is_list(content) do
+      Enum.each(content, fn
+        %Content.Text{} ->
+          :ok
+
+        %Content.ToolAddition{} ->
+          :ok
+
+        other ->
+          raise ArgumentError, "expected text or tool_addition content, got: #{inspect(other)}"
+      end)
+
+      %__MODULE__{content: content, skill: Keyword.get(opts, :skill)}
+    end
+
+    @doc "The message's text, its blocks joined."
+    def get_text(%__MODULE__{content: content}), do: Content.join_text(content)
+
+    @doc "The tool definitions the message adds."
+    def tool_definitions(%__MODULE__{content: content}) do
+      for %Content.ToolAddition{definition: definition} <- content, do: definition
+    end
+  end
+
   @type message ::
           UserMessage.t()
           | AssistantMessage.t()
           | ToolResultMessage.t()
+          | SystemMessage.t()
 
   @doc """
   Converts a message struct into a JSON-safe, string-keyed map.
 
   The map carries an explicit `"kind"` discriminator (`"user"`, `"assistant"`,
-  or `"tool_result"`) because `UserMessage` and `ToolResultMessage` both use
+  `"tool_result"`, or `"system"`) because `UserMessage` and `ToolResultMessage` both use
   `role: :user`, so `role` alone cannot reconstruct the struct.
 
   `UserMessage.content` may be a plain string or a list of content blocks; both
   forms are preserved (a string stays a string, a list stays a list of tagged
   block maps). The result survives a `Jason.encode!/1`/`Jason.decode!/1` round
   trip and storage in Postgres `jsonb` or Oban args.
+
+  An assistant message's `binding` and a system message's `skill` are kept
+  when set. Store every message a run returns, system messages included,
+  and replay them in the order the model saw them: a conversation on a
+  model that binds its thinking keeps that reasoning only while the
+  history it replays is the one it sent.
 
   Maps include `"version"` for durable storage. `"role"` is derived from
   `"kind"` and validated when decoding. Unknown fields are rejected so version 1
@@ -590,13 +693,24 @@ defmodule Clementine.LLM.Message do
     }
   end
 
-  def to_map(%AssistantMessage{role: :assistant, content: content}) do
+  def to_map(%AssistantMessage{role: :assistant, content: content} = message) do
     %{
       "version" => @serialized_version,
       "kind" => "assistant",
       "role" => "assistant",
       "content" => Enum.map(content, &Content.to_map/1)
     }
+    |> put_present("binding", message.binding)
+  end
+
+  def to_map(%SystemMessage{role: :system, content: content} = message) do
+    %{
+      "version" => @serialized_version,
+      "kind" => "system",
+      "role" => "system",
+      "content" => Enum.map(content, &Content.to_map/1)
+    }
+    |> put_present("skill", message.skill)
   end
 
   def to_map(%ToolResultMessage{role: :user, content: content}) do
@@ -628,7 +742,18 @@ defmodule Clementine.LLM.Message do
 
       "assistant" ->
         validate_role!(data, "assistant")
-        %AssistantMessage{content: decode_content_list!(data, "assistant")}
+
+        %AssistantMessage{
+          content: decode_content_list!(data, "assistant"),
+          binding: optional_binary!(data, "binding")
+        }
+
+      "system" ->
+        validate_role!(data, "system")
+
+        data
+        |> decode_content_list!("system")
+        |> SystemMessage.new(skill: optional_binary!(data, "skill"))
 
       "tool_result" ->
         validate_role!(data, "user")
@@ -654,8 +779,26 @@ defmodule Clementine.LLM.Message do
           "unsupported message serialization version: #{inspect(version)}"
   end
 
-  defp validate_message_keys!(map) do
-    allowed_keys = ["version", "kind", "role", "content"]
+  defp put_present(map, _key, nil), do: map
+  defp put_present(map, key, value), do: Map.put(map, key, value)
+
+  defp optional_binary!(data, key) do
+    case Map.get(data, key) do
+      value when is_binary(value) or is_nil(value) ->
+        value
+
+      other ->
+        raise ArgumentError, "expected message #{key} to be a string, got: #{inspect(other)}"
+    end
+  end
+
+  defp validate_message_keys!(%{"kind" => kind} = map) do
+    allowed_keys =
+      case kind do
+        "assistant" -> ["version", "kind", "role", "content", "binding"]
+        "system" -> ["version", "kind", "role", "content", "skill"]
+        _kind -> ["version", "kind", "role", "content"]
+      end
 
     case Map.keys(map) -- allowed_keys do
       [] ->

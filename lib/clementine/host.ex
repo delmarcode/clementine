@@ -240,7 +240,7 @@ defmodule Clementine.Host do
 
   @doc """
   One execution event of a running run: a `Clementine.Event` whose `type`
-  is `:iteration_start`, `:text_delta`, `:tool_use_start`,
+  is `:iteration_start`, `:text_delta`, `:thinking_delta`, `:tool_use_start`,
   `:tool_input_delta`, `:tool_result`, `:approval_requested`,
   `:usage_delta`, or `:error`, with its `payload`. Use it to stream a run
   to a UI, typically with a PubSub broadcast.

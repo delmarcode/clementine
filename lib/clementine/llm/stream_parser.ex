@@ -236,6 +236,7 @@ defmodule Clementine.LLM.StreamParser do
 
   # Convert parsed SSE events to our event format
   defp convert_event("message_start", %{"message" => message}) do
+    Clementine.LLM.Anthropic.Binding.report(message)
     [{:message_start, message}]
   end
 
@@ -374,12 +375,17 @@ defmodule Clementine.LLM.StreamParser do
               open_tool_ids: [],
               stop_reason: nil,
               usage: %{},
-              error: nil
+              error: nil,
+              binding: nil
 
     @doc "Creates a new accumulator"
     def new, do: %__MODULE__{}
 
     @doc "Processes an event and returns updated accumulator"
+    # The client's own event: the digest of the request this response
+    # answers (`Clementine.LLM.Anthropic.Binding`).
+    def process(%__MODULE__{} = acc, {:binding, binding}), do: %{acc | binding: binding}
+
     def process(%__MODULE__{} = acc, {:text_delta, text}) do
       %{acc | text: acc.text <> text}
     end
@@ -579,7 +585,8 @@ defmodule Clementine.LLM.StreamParser do
       %Response{
         content: content,
         stop_reason: acc.stop_reason,
-        usage: acc.usage
+        usage: acc.usage,
+        binding: acc.binding
       }
     end
   end

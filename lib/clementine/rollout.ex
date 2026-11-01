@@ -76,7 +76,7 @@ defmodule Clementine.Rollout do
   """
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
-  alias Clementine.LLM.Message.{Content, ToolResultMessage}
+  alias Clementine.LLM.Message.{Content, SystemMessage, ToolResultMessage}
 
   alias Clementine.{
     ApprovalRequest,
@@ -193,6 +193,7 @@ defmodule Clementine.Rollout do
       :agent_key,
       :system,
       :tools,
+      :base_tools,
       :deferred,
       :output_schema,
       :context,
@@ -323,6 +324,7 @@ defmodule Clementine.Rollout do
       agent_key: agent_key(rollout),
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
+      base_tools: Keyword.get(config, :tools, []),
       deferred: Keyword.get(config, :deferred, []),
       output_schema: Keyword.get(config, :output_schema),
       skills: Keyword.get(config, :skills, []),
@@ -471,8 +473,19 @@ defmodule Clementine.Rollout do
     end
   end
 
-  # Fresh start: history, then the materialized input message.
+  # Fresh start: history, then the materialized input message. A skill an
+  # earlier turn of the thread loaded stays loaded: its tools are in the
+  # history the model reads (`SystemMessage`), so they stay callable.
   defp restore(%Execution{} = exec, nil, rollout) do
+    exec =
+      for %SystemMessage{skill: name} <- rollout.messages,
+          is_binary(name),
+          name not in exec.loaded_skills,
+          %Skill{} = skill <- [Enum.find(exec.skills, &(&1.name == name))],
+          reduce: exec do
+        exec -> put_skill(exec, skill)
+      end
+
     {:ok, %{exec | messages: rollout.messages ++ [exec.input_message]}}
   end
 
@@ -1105,6 +1118,13 @@ defmodule Clementine.Rollout do
   defp forward_stream_event(exec, {:text_delta, text}),
     do: emit_event(exec, :text_delta, %{content: text})
 
+  # Thinking with text to show: a progress update between tool calls, or
+  # a reasoning summary. Empty deltas (omitted display) are not events.
+  defp forward_stream_event(_exec, {:thinking_delta, ""}), do: :ok
+
+  defp forward_stream_event(exec, {:thinking_delta, text}),
+    do: emit_event(exec, :thinking_delta, %{content: text})
+
   defp forward_stream_event(exec, {:tool_use_start, id, name}),
     do: emit_event(exec, :tool_use_start, %{tool_use_id: id, name: name})
 
@@ -1129,7 +1149,7 @@ defmodule Clementine.Rollout do
   # joins the paused turn's message, so history holds the turn as one
   # assistant message and the output is the whole turn's text.
   defp act(%Execution{} = exec, response) do
-    exec = %{exec | messages: append_turn(exec, response.content), paused?: false}
+    exec = %{exec | messages: append_turn(exec, response), paused?: false}
 
     cond do
       LLM.tool_use?(response) ->
@@ -1158,13 +1178,16 @@ defmodule Clementine.Rollout do
     end
   end
 
-  defp append_turn(%Execution{paused?: true, messages: messages}, content) do
+  # The paused turn keeps its binding: the continuation answered a request
+  # that ended with the turn itself, and the joined turn replays after
+  # what the paused one did.
+  defp append_turn(%Execution{paused?: true, messages: messages}, response) do
     %AssistantMessage{} = paused = List.last(messages)
-    List.replace_at(messages, -1, %{paused | content: paused.content ++ content})
+    List.replace_at(messages, -1, %{paused | content: paused.content ++ response.content})
   end
 
-  defp append_turn(%Execution{messages: messages}, content) do
-    messages ++ [AssistantMessage.new(content)]
+  defp append_turn(%Execution{messages: messages}, response) do
+    messages ++ [%{AssistantMessage.new(response.content) | binding: response.binding}]
   end
 
   # The output is the final turn's text, the paused turn's included. An
@@ -1702,7 +1725,64 @@ defmodule Clementine.Rollout do
         Content.tool_result(tool_use.id, result.content, result.is_error)
       end)
 
-    boundary(%{exec | messages: exec.messages ++ [%ToolResultMessage{content: result_content}]})
+    messages = exec.messages ++ [%ToolResultMessage{content: result_content}]
+    boundary(%{exec | messages: messages ++ skill_tools_added(exec)})
+  end
+
+  # A skill the batch loaded offers its tools in a system message after
+  # the results: the history says when they joined, so the request's tool
+  # list never changes (a model that binds its thinking would void every
+  # earlier turn's if it did), and a later turn of the thread reads them
+  # back (`restore/3`). One message per skill that brought a tool nothing
+  # offered before it, derived from the loaded skills, so a resume that
+  # finishes the batch adds the same ones.
+  defp skill_tools_added(%Execution{} = exec) do
+    known =
+      Enum.map(exec.base_tools, &Tool.to_schema(&1).name) ++
+        for(
+          %SystemMessage{} = m <- exec.messages,
+          d <- SystemMessage.tool_definitions(m),
+          do: d["name"]
+        )
+
+    announced = for %SystemMessage{skill: name} <- exec.messages, is_binary(name), do: name
+
+    {messages, _known} =
+      exec.loaded_skills
+      |> Enum.reject(&(&1 in announced))
+      |> Enum.flat_map_reduce(known, fn name, known ->
+        %Skill{} = skill = Enum.find(exec.skills, &(&1.name == name))
+
+        definitions =
+          skill.tools |> Enum.map(&definition/1) |> Enum.reject(&(&1["name"] in known))
+
+        case definitions do
+          [] ->
+            {[], known}
+
+          definitions ->
+            blocks = Enum.map(definitions, &%Content.ToolAddition{definition: &1})
+
+            {[SystemMessage.new(blocks, skill: name)],
+             known ++ Enum.map(definitions, & &1["name"])}
+        end
+      end)
+
+    messages
+  end
+
+  # A tool as the provider is sent it, in plain JSON so it stores and
+  # replays unchanged.
+  defp definition(tool) do
+    schema = Tool.to_schema(tool)
+
+    %{
+      "name" => schema.name,
+      "description" => schema.description,
+      "input_schema" => schema.input_schema
+    }
+    |> Jason.encode!()
+    |> Jason.decode!()
   end
 
   # The suspension body: everything the rollout knows and nothing it does

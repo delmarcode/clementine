@@ -461,13 +461,16 @@ defmodule Clementine.AgentServer do
           %Clementine.LLM.Message.AssistantMessage{} ->
             :ok
 
+          %Clementine.LLM.Message.SystemMessage{} ->
+            :ok
+
           %Clementine.LLM.Message.ToolResultMessage{} ->
             :ok
 
           other ->
             raise ArgumentError,
                   ":history elements must be message structs " <>
-                    "(UserMessage, AssistantMessage, or ToolResultMessage), got: #{inspect(other)}"
+                    "(UserMessage, AssistantMessage, ToolResultMessage, or SystemMessage), got: #{inspect(other)}"
         end)
       end
 

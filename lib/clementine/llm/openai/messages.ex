@@ -1,7 +1,13 @@
 defmodule Clementine.LLM.OpenAI.Messages do
   @moduledoc false
 
-  alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
+  alias Clementine.LLM.Message.{
+    AssistantMessage,
+    Content,
+    SystemMessage,
+    ToolResultMessage,
+    UserMessage
+  }
 
   def encode_all(messages) when is_list(messages) do
     Enum.flat_map(messages, &encode/1)
@@ -17,6 +23,16 @@ defmodule Clementine.LLM.OpenAI.Messages do
 
   def encode(%AssistantMessage{content: content}) when is_list(content) do
     encode_content_blocks("assistant", content)
+  end
+
+  # A system message's text goes where it was said; the tools it adds
+  # are already among the request's (the engine offers a loaded skill's),
+  # and this provider binds nothing to the history, so they need no more.
+  def encode(%SystemMessage{} = message) do
+    case SystemMessage.get_text(message) do
+      "" -> []
+      text -> [%{"type" => "message", "role" => "developer", "content" => text}]
+    end
   end
 
   def encode(%ToolResultMessage{content: content}) do

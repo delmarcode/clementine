@@ -18,10 +18,17 @@ defmodule Clementine.LLM.Reasoning do
     `:generate_summary` (`auto concise detailed`).
   - `:anthropic` — `%{"thinking" => ..., "output_config" => ...}` on the
     Messages API body. Keys: `:effort` (`low medium high xhigh max`) →
-    `output_config.effort`; `:thinking` (`adaptive enabled disabled`) →
-    `thinking.type`; `:budget_tokens` (positive integer, implies
-    `thinking: :enabled`) → `thinking.budget_tokens`; `:display`
-    (`summarized omitted`) → `thinking.display`.
+    `output_config.effort`; `:thinking`
+    (`adaptive enabled disabled between_tools`) → `thinking.type`;
+    `:budget_tokens` (positive integer, implies `thinking: :enabled`) →
+    `thinking.budget_tokens`; `:display` (`summarized omitted updates`) →
+    `thinking.display`; `:prefix_mismatch` (`error drop_block`) →
+    `thinking.block_binding.prefix_mismatch_behavior`. `:display` and
+    `:prefix_mismatch` need `thinking: :adaptive` or `:enabled`, and
+    `between_tools` takes neither, as the API requires. `display:
+    :updates` and `:prefix_mismatch` send their beta headers
+    (`Clementine.LLM.Anthropic`). The guide's "Models that bind their
+    thinking" section says when to use each.
   - `:openrouter` — `%{"reasoning" => ...}`, OpenRouter's unified
     reasoning object, normalized across the models it fronts (DeepSeek,
     Qwen, GLM, ...). Keys: `:effort`
@@ -51,10 +58,11 @@ defmodule Clementine.LLM.Reasoning do
   @openai_reasoning_efforts ~w(none minimal low medium high xhigh)
   @openai_reasoning_summaries ~w(auto concise detailed)
 
-  @anthropic_reasoning_keys ~w(effort thinking budget_tokens display)
+  @anthropic_reasoning_keys ~w(effort thinking budget_tokens display prefix_mismatch)
   @anthropic_reasoning_efforts ~w(low medium high xhigh max)
-  @anthropic_thinking_types ~w(adaptive enabled disabled)
-  @anthropic_thinking_displays ~w(summarized omitted)
+  @anthropic_thinking_types ~w(adaptive enabled disabled between_tools)
+  @anthropic_thinking_displays ~w(summarized omitted updates)
+  @anthropic_prefix_mismatches ~w(error drop_block)
 
   @openrouter_reasoning_keys ~w(effort max_tokens exclude enabled)
   @openrouter_reasoning_efforts ~w(none minimal low medium high xhigh max)
@@ -231,6 +239,14 @@ defmodule Clementine.LLM.Reasoning do
     validate_enum_value("Anthropic reasoning display", value, @anthropic_thinking_displays)
   end
 
+  defp validate_anthropic_reasoning_value("prefix_mismatch", value) do
+    validate_enum_value(
+      "Anthropic reasoning prefix_mismatch",
+      value,
+      @anthropic_prefix_mismatches
+    )
+  end
+
   defp validate_anthropic_reasoning_value("budget_tokens", value)
        when is_integer(value) and value > 0 do
     {:ok, value}
@@ -242,45 +258,69 @@ defmodule Clementine.LLM.Reasoning do
   end
 
   # A missing thinking type with a budget means enabled: budget_tokens only
-  # exists inside the wire's enabled thinking object.
+  # exists inside the wire's enabled thinking object. `between_tools`
+  # (Claude Sonnet 5.5's lowest setting) takes no other thinking field.
   defp anthropic_thinking_field(normalized) do
     thinking = Map.get(normalized, "thinking")
     budget = Map.get(normalized, "budget_tokens")
     display = Map.get(normalized, "display")
+    prefix_mismatch = Map.get(normalized, "prefix_mismatch")
+    extras? = display != nil or prefix_mismatch != nil
 
     case {thinking, budget} do
-      {nil, nil} when display != nil ->
-        {:error, anthropic_display_error()}
+      {nil, nil} when extras? ->
+        {:error, anthropic_extras_error()}
 
       {nil, nil} ->
         {:ok, nil}
 
       {"adaptive", nil} ->
-        {:ok, put_thinking_display(%{"type" => "adaptive"}, display)}
+        {:ok, put_thinking_extras(%{"type" => "adaptive"}, display, prefix_mismatch)}
 
-      {"disabled", nil} when display != nil ->
-        {:error, anthropic_display_error()}
+      {"disabled", nil} when extras? ->
+        {:error, anthropic_extras_error()}
 
       {"disabled", nil} ->
         {:ok, %{"type" => "disabled"}}
+
+      {"between_tools", nil} when extras? ->
+        {:error,
+         ~s(Anthropic reasoning thinking "between_tools" takes no display or prefix_mismatch)}
+
+      {"between_tools", nil} ->
+        {:ok, %{"type" => "between_tools"}}
 
       {"enabled", nil} ->
         {:error, ~s(Anthropic reasoning thinking "enabled" requires budget_tokens)}
 
       {thinking, budget} when thinking in [nil, "enabled"] ->
-        {:ok, put_thinking_display(%{"type" => "enabled", "budget_tokens" => budget}, display)}
+        {:ok,
+         put_thinking_extras(
+           %{"type" => "enabled", "budget_tokens" => budget},
+           display,
+           prefix_mismatch
+         )}
 
       {_thinking, _budget} ->
         {:error, ~s(Anthropic reasoning budget_tokens is only supported with thinking "enabled")}
     end
   end
 
-  defp anthropic_display_error do
-    ~s(Anthropic reasoning display requires thinking "adaptive" or "enabled")
+  defp anthropic_extras_error do
+    ~s(Anthropic reasoning display and prefix_mismatch require thinking "adaptive" or "enabled")
   end
 
-  defp put_thinking_display(thinking, nil), do: thinking
-  defp put_thinking_display(thinking, display), do: Map.put(thinking, "display", display)
+  defp put_thinking_extras(thinking, display, prefix_mismatch) do
+    thinking
+    |> put_present("display", display)
+    |> put_present(
+      "block_binding",
+      prefix_mismatch && %{"prefix_mismatch_behavior" => prefix_mismatch}
+    )
+  end
+
+  defp put_present(map, _key, nil), do: map
+  defp put_present(map, key, value), do: Map.put(map, key, value)
 
   ## OpenRouter
 
