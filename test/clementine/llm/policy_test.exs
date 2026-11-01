@@ -209,6 +209,30 @@ defmodule Clementine.LLM.PolicyTest do
       def history(_run), do: []
     end
 
+    test "boot checks credentials with the agent's own choices, not the defaults" do
+      # Priced at one hour only: an agent that writes at one hour is
+      # valid, and the credential check must not re-resolve it at five
+      # minutes.
+      put_models(%{
+        "claude-sonnet-5" => [
+          prices: [
+            currency: "USD",
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.2,
+            cache_write: [one_hour: 4.0]
+          ]
+        ]
+      })
+
+      agent =
+        compile_agent("policy_one_hour", ~s(model: "claude-sonnet-5", cache: [ttl: :one_hour]))
+
+      Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
+      Application.put_env(:clementine, :anthropic_api_key, {:system, "UNSET_IN_TESTS"})
+      assert %{agents: %{"policy_one_hour" => ^agent}} = boot([agent])
+    end
+
     test "an agent module written by hand, without use, boots" do
       Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
       assert %{agents: %{"policy_hand_written" => HandWritten}} = boot([HandWritten])

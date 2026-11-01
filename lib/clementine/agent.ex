@@ -546,15 +546,18 @@ defmodule Clementine.Agent do
   # the app's config, as boot does for every agent in `agents:`.
   @spec check_declared(module()) :: :ok | {:error, String.t()}
   def check_declared(module) do
-    case declared(module) do
-      {nil, _policy} ->
-        :ok
+    with {:ok, _policy} <- resolve_declared(module), do: :ok
+  end
 
-      {model, policy} ->
-        case Clementine.LLM.Policy.resolve(model, policy) do
-          {:ok, _policy} -> :ok
-          {:error, message} -> {:error, message}
-        end
+  @doc false
+  # The module's declared model and choices, resolved against the sheet:
+  # `{:ok, nil}` for a module that declares no model.
+  @spec resolve_declared(module()) ::
+          {:ok, Clementine.LLM.Policy.t() | nil} | {:error, String.t()}
+  def resolve_declared(module) do
+    case declared(module) do
+      {nil, _policy} -> {:ok, nil}
+      {model, policy} -> Clementine.LLM.Policy.resolve(model, policy)
     end
   end
 

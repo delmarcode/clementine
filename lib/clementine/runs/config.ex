@@ -113,8 +113,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # error ends the run that reaches it.
     defp check_model!(module, key) do
       if agent?(module) do
-        with :ok <- Clementine.Agent.check_declared(module),
-             :ok <- credentials(declared_model(module)) do
+        with {:ok, policy} <- Clementine.Agent.resolve_declared(module),
+             :ok <- credentials(policy) do
           :ok
         else
           {:error, message} ->
@@ -123,22 +123,16 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp declared_model(module) do
-      if function_exported?(module, :__model__, 0), do: module.__model__()
-    end
-
-    # Only for the provider clients Clementine routes to; a test's mock
-    # client needs no key.
+    # The platform the agent's model goes to, with the agent's own
+    # choices, has a credential configured. Only for the provider clients
+    # Clementine routes to; a test's mock client needs no key.
     defp credentials(nil), do: :ok
 
-    defp credentials(model) do
+    defp credentials(policy) do
       if Application.get_env(:clementine, :llm_client, Clementine.LLM.Router) ==
-           Clementine.LLM.Router do
-        policy = Clementine.LLM.Policy.resolve!(model)
-        Clementine.LLM.Router.credential(policy)
-      else
-        :ok
-      end
+           Clementine.LLM.Router,
+         do: Clementine.LLM.Router.credential(policy),
+         else: :ok
     end
 
     @doc "True for a `use Clementine.Agent` module."
