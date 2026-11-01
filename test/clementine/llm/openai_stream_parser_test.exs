@@ -114,6 +114,23 @@ defmodule Clementine.LLM.OpenAIStreamParserTest do
              ])
   end
 
+  test "an incomplete response's unfinished call is no tool use: the turn stops on its cut" do
+    unfinished = %{"type" => "function_call", "call_id" => "call_1", "name" => "echo"}
+
+    assert [{:message_delta, %{"stop_reason" => "max_tokens"}, _usage}, {:message_stop}] =
+             parse_all([
+               sse("response.output_item.added", %{"output_index" => 0, "item" => unfinished}),
+               sse("response.incomplete", %{
+                 "response" => %{
+                   "status" => "incomplete",
+                   "incomplete_details" => %{"reason" => "max_output_tokens"},
+                   "output" => [unfinished]
+                 }
+               })
+             ])
+             |> Enum.reject(&match?({:tool_use_start, _, _}, &1))
+  end
+
   test "any other incomplete response stops with incomplete, which fails a final turn" do
     for reason <- ["max_messages", "steered", nil] do
       response = %{"status" => "incomplete", "incomplete_details" => %{"reason" => reason}}

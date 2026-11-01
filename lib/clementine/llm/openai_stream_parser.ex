@@ -207,12 +207,20 @@ defmodule Clementine.LLM.OpenAIStreamParser do
   end
 
   # Cut off: what streamed is the turn, and nothing more arrives. A call
-  # still open has no complete arguments, so none is replayed.
+  # still open has no complete arguments, so none is replayed, and the
+  # turn stops on its cut unless a call closed before it: an unfinished
+  # call in the response's output is no tool use.
   defp convert_event("response.incomplete", %{"response" => response}, state) do
     usage = ProviderUsage.openai(Map.get(response, "usage"), usage_meta(response))
 
-    {[{:message_delta, %{"stop_reason" => stop_reason(response, state)}, usage}, {:message_stop}],
-     state}
+    stop_reason =
+      cond do
+        MapSet.size(state.closed_calls) > 0 -> "tool_use"
+        state.refused -> "refusal"
+        true -> incomplete_reason(response)
+      end
+
+    {[{:message_delta, %{"stop_reason" => stop_reason}, usage}, {:message_stop}], state}
   end
 
   defp convert_event("response.failed", %{"response" => response}, state) do
