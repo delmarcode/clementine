@@ -479,10 +479,14 @@ the currency, here $0.001284.
 
 **Where costs show.**
 
-- Each trace `:model_call` entry records the alias it ran on (`"alias"`)
-  and its cost (`"cost"`), frozen when the call ended, at the prices the
-  alias had then. A price you change applies to calls from then on and
-  never reprices history.
+- Each trace `:model_call` entry records the provider, model id, and
+  alias it ran on (`"provider"`, `"model"`, `"alias"`) and its cost
+  (`"cost"`), frozen when the call ended, at the prices the alias had
+  then. A price you change applies to calls from then on and never
+  reprices history. On the runtime these are columns of
+  `agent_run_trace` of their own (`cost_micros`, `currency`, and the
+  token counts beside them), so a warehouse keeps them without the
+  conversation (`Clementine.Migration`, "What a warehouse may keep").
 - `Clementine.Runs.cost(run_id)` sums a run's own calls;
   `Clementine.Runs.cost(run_id, children: true)` adds every run below it
   (its delegates, a loop's turns and theirs);

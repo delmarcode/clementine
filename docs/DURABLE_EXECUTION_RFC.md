@@ -9,7 +9,7 @@
 > rows are named tests. How an app uses it does not. The library now
 > ships the durable runtime this RFC asks each host to assemble:
 > `{Clementine, ...}` and `Clementine.Runs` own the `agent_runs` table
-> (built by `Clementine.Migration`, now at version 4, with a lane index
+> (built by `Clementine.Migration`, now at version 5, with a lane index
 > in place of the single-active-run index), its worker, the reaper, and
 > the drain, and the app writes agent modules and an optional
 > `Clementine.Host`. The protocol core, the Ecto adapter, and the

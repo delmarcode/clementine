@@ -69,7 +69,7 @@ mix clementine.gen.agent Weather  # an agent, a tool, and a test that runs them
 
 - `{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: []}`
   in the application's children, right after Oban;
-- a migration calling `Clementine.Migration.up(version: 4)`, which builds
+- a migration calling `Clementine.Migration.up(version: 5)`, which builds
   `agent_runs`, the loop inbox `agent_run_inbox`, and the run trace
   `agent_run_trace`;
 - config: an `agents` Oban queue, `anthropic_api_key: {:system,
@@ -82,7 +82,7 @@ mix clementine.gen.agent Weather  # an agent, a tool, and a test that runs them
 for it, and a test that runs the two end to end against the scripted
 model, and lists the agent in the child's `agents:`. Running either task
 again changes nothing. A table on an earlier version moves up with a new
-migration (`Clementine.Migration.up(from: 3, version: 4)`); the runtime
+migration (`Clementine.Migration.up(from: 4, version: 5)`); the runtime
 refuses to start against a table behind it, and names the migration to
 write.
 

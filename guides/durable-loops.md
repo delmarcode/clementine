@@ -35,7 +35,7 @@ This guide wires a conversation thread end to end: the controller, the
 child spec, starting and feeding, cancellation, and what the runtime does
 underneath; the judge and watcher shapes and the local script path close
 it out. It assumes the [runtime guide](runtime.md)'s setup (the child
-after Oban, the migration at version 4, a turn agent for the thread).
+after Oban, the migration at version 5, a turn agent for the thread).
 The operations story (telemetry, paging signals, and the loop doctor) is
 [its own guide](loop-operations.md).
 

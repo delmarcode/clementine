@@ -22,7 +22,8 @@ defmodule Clementine.Cost do
 
   - Each trace `model_call` entry freezes its call's cost under `"cost"`,
     priced by the call's model at the prices configured when it ran
-    (`Clementine.Trace`). Changing a price never reprices history.
+    (`Clementine.Trace`), and stored in `agent_run_trace`'s `cost_micros`
+    and `currency` columns. Changing a price never reprices history.
   - `Clementine.Runs.cost/2` sums a run's frozen costs (`children: true`
     adds every run it started, down the tree), and
     `Clementine.Runs.subject_cost/1` every run on a subject: `nil` while a
@@ -68,11 +69,14 @@ defmodule Clementine.Cost do
   @doc """
   Prices `usage` (a `Clementine.Usage` or a usage map) at the prices the
   catalog configures for `model` now. `model` is an alias, a
-  `{provider, id}` reference, or an alias as a trace entry records it (a
-  string). `nil` for a model without prices, or one the catalog does not
-  hold.
+  `{provider, id}` reference, an alias as a trace entry records it (a
+  string), or a model `ModelRegistry.resolve!/1` resolved. `nil` for a
+  model without prices, or one the catalog does not hold.
   """
-  @spec of(Usage.t() | map(), ModelRegistry.model_ref() | String.t() | nil) :: t() | nil
+  @spec of(
+          Usage.t() | map(),
+          ModelRegistry.model_ref() | ModelRegistry.resolved_model() | String.t() | nil
+        ) :: t() | nil
   def of(usage, model) when is_binary(model) do
     of(usage, String.to_existing_atom(model))
   rescue

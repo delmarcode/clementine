@@ -243,6 +243,157 @@ defmodule Clementine.Runs.TraceTest do
     assert Runs.trace(run.id) == []
   end
 
+  describe "the columns" do
+    # Text a person, the model, a tool, or the app produced, which only
+    # content columns may hold.
+    @canary "Kq7canary"
+
+    test "hold no text a person, the model, a tool, or the app produced; content columns do" do
+      {:ok, loop} =
+        Runs.start_loop(Thread, %{"agent" => "test_chat"},
+          subject: @subject,
+          metadata: %{"note" => @canary}
+        )
+
+      {:ok, :appended} =
+        Runs.send(loop.id, %{"prompt" => "Tell the #{@canary} team", "id" => "m1"},
+          dedup_key: "<m1.#{@canary}@mail.example.com>"
+        )
+
+      # The inbox holds the message until a step drains it.
+      refute_canary_in_facts()
+      assert {:agent_run_inbox, :payload} in content_canaries()
+      assert {:agent_run_inbox, :dedup_key} in content_canaries()
+
+      assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+      {:ok, turn} = Runs.child(loop.id, {:turn, "m1"})
+
+      # A tool the agent does not offer, named by the model; then a gated
+      # call an approver allows; then the answer.
+      expect_turn(tool_events("tu_1", "zzz_#{@canary}", %{"x" => @canary}))
+      expect_turn(tool_events("tu_2", "send_note", %{"text" => @canary}))
+      assert :ok = perform_job(Worker, %{"run_id" => turn.id})
+      assert :ok = Runs.resume(turn.id, {:approved, %{by: "#{@canary}-approver"}})
+      expect_turn(text_events("Told the #{@canary} team."))
+      assert :ok = perform_job(Worker, %{"run_id" => turn.id})
+      assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+
+      assert [_, _, unknown, _, _, approved, _] = Runs.trace(turn.id)
+
+      # The name the model asked for reads back as it always did, from the
+      # payload, and its tool_name column stays null.
+      assert %{
+               "name" => "zzz_" <> @canary,
+               "unknown" => true,
+               "is_error" => true,
+               "args" => %{"x" => @canary}
+             } = unknown.payload
+
+      assert %{"name" => "send_note", "approval" => %{"by" => "Kq7canary-approver"}} =
+               approved.payload
+
+      refute_canary_in_facts()
+      hits = content_canaries()
+
+      for column <- [:input, :result, :metadata, :suspension],
+          do: assert({:agent_runs, column} in hits)
+
+      assert {:agent_run_trace, :payload} in hits
+    end
+
+    test "a model call's provider, model, alias, tokens, cost, duration, and stop reason" do
+      {:ok, run} = Runs.start(Lookup, "Find the forecast", subject: {"ticket", "t-1"})
+      expect_turn(tool_events("tu_1", "lookup", %{"query" => "forecast"}))
+      expect_turn(text_events("Sunny."))
+      assert :ok = perform_job(Worker, %{"run_id" => run.id})
+
+      assert [execution, call, tool, final] =
+               TestRepo.all(
+                 from(t in "agent_run_trace",
+                   where: t.run_id == type(^run.id, Ecto.UUID),
+                   order_by: t.id,
+                   select: map(t, ^[:kind, :payload | Clementine.Trace.columns()])
+                 )
+               )
+
+      assert %{
+               kind: "execution",
+               provider: "anthropic",
+               model: "claude-sonnet-5",
+               alias: "claude_sonnet",
+               agent_fingerprint: <<_::binary-size(64)>>,
+               input_tokens: nil,
+               tool_name: nil
+             } = execution
+
+      refute Map.has_key?(execution.payload, "model")
+
+      for {model_call, stop_reason} <- [{call, "tool_use"}, {final, "end_turn"}] do
+        assert %{
+                 kind: "model_call",
+                 provider: "anthropic",
+                 model: "claude-sonnet-5",
+                 alias: "claude_sonnet",
+                 input_tokens: 10,
+                 output_tokens: 5,
+                 cache_read_tokens: 0,
+                 cache_write_tokens: 0,
+                 cost_micros: nil,
+                 currency: nil,
+                 duration_ms: duration,
+                 stop_reason: ^stop_reason,
+                 agent_fingerprint: nil
+               } = model_call
+
+        assert is_integer(duration)
+        assert Map.keys(model_call.payload) == ["content"]
+      end
+
+      assert [1, 2] = [call.iteration, final.iteration]
+
+      assert %{
+               kind: "tool_call",
+               iteration: 1,
+               tool_use_id: "tu_1",
+               tool_name: "lookup",
+               is_error: false,
+               killed: false,
+               duration_ms: duration,
+               approval_verdict: nil,
+               policy_verdict: nil,
+               provider: nil
+             } = tool
+
+      assert is_integer(duration)
+
+      assert Map.keys(tool.payload) |> Enum.sort() == ["args", "result"]
+    end
+  end
+
+  defp refute_canary_in_facts do
+    for {table, columns} <- Clementine.Migration.fact_columns(), column <- columns do
+      assert canaries(table, column) == 0, "#{table}.#{column} holds content"
+    end
+  end
+
+  defp content_canaries do
+    for {table, columns} <- Clementine.Migration.content_columns(),
+        column <- columns,
+        canaries(table, column) > 0,
+        do: {table, column}
+  end
+
+  # How many rows of `table` hold the canary in `column`, as text.
+  defp canaries(table, column) do
+    %{rows: [[count]]} =
+      TestRepo.query!(
+        "SELECT count(*) FROM #{table} WHERE #{column}::text LIKE $1",
+        ["%#{@canary}%"]
+      )
+
+    count
+  end
+
   test "trace/1 of a run that does not exist, or by a malformed id, is empty" do
     assert Runs.trace(Ecto.UUID.generate()) == []
     assert Runs.trace("not-a-uuid") == []
