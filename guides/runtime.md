@@ -271,6 +271,135 @@ child they ran during a rolling deploy would leave its parent waiting
 until a new node's reaper resumes it, and a parent they claimed would
 fail as `:incompatible_checkpoint`.
 
+## Models that bind their thinking
+
+Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and every
+later Claude model bind each thinking block to the conversation it was
+produced in: the system prompt, the tools as a set, and every message
+before it. The API accepts a replayed block only while all of that is
+unchanged, and only in the order its conversation produced it. On an
+account created on or after 2026-08-31 a replay after any change is a
+400 (on Mythos 5.1, on every account); on an older one the stale
+reasoning reaches the model and is billed. A conversation breaks the
+rule when its app rebuilds the system prompt every turn, deploys a tool,
+slides a window over the history, or replays turns in an order other
+than the one the model saw.
+
+What Clementine does about it, without any option:
+
+- **It checks before it sends.** Each turn from one of these models is
+  stored with a `binding`, a digest of the request it answered as sent
+  (`Clementine.LLM.Message.AssistantMessage`). On replay a turn keeps its
+  thinking only while that digest holds; otherwise it goes without it,
+  as does every turn after it. A turn with no binding (stored before
+  bindings, or produced by an older model) goes without its thinking
+  too. Text and tool calls always go. So a changed system prompt, tool
+  list, or history start costs the earlier turns' reasoning, and the
+  request is never refused: the turns produced after the change bind to
+  it and keep theirs.
+- **It reports what it dropped.** A call that sends earlier turns
+  without their thinking emits `[:clementine, :llm, :thinking_dropped]`
+  (counts and the first turn's index, never content), counted in
+  `clementine_llm_thinking_dropped_total`, and logs a warning. A change
+  reports once, since the next turn is produced after it. An app whose
+  every turn reports a drop is replaying its threads out of order, and
+  loses its reasoning and its prompt cache on every turn.
+- **Its own edits are append-only.** A skill load offers the skill's
+  tools in a `Clementine.LLM.Message.SystemMessage` after the load's
+  result, sent as a mid-conversation system message with inline tool
+  definitions (the `inline-tools-2026-09-15` beta), and the request's
+  `tools` stay as the first request sent them. A later turn of the
+  thread reads the loaded skills back from that message, so their tools
+  stay callable. Models that do not bind get the skill's tools in
+  `tools`, as before.
+- **A turn of thinking alone stays sendable.** The API takes a system
+  message only before an assistant turn or at the end. A turn that held
+  nothing but thinking, right after a skill load, would vanish once its
+  thinking had to go, and leave the system message before the next
+  prompt. It goes as the text `(no reply)` instead, which is what the
+  turn showed, and the model reads that as what it said then.
+- **A model id Clementine cannot read** (a deployment name behind
+  `:anthropic_base_url`, say) is checked as above, but its system
+  messages join `system` and `tools`: mid-conversation system messages
+  exist on some models and platforms only (not Claude Sonnet 5, not
+  Microsoft Foundry). A skill load then costs the earlier turns' thinking
+  once, where a misplaced system message would fail every request.
+- **It shows the text written between tool calls.** Claude Fable 5.1,
+  Mythos 5.1, Opus 5.5, Sonnet 5.5, and Fable 5 can write a short
+  progress update before a tool call. It comes back as a thinking block
+  of its own, empty under the default display. Ask for the text with
+  `reasoning: [thinking: :adaptive, display: :updates]`, or, on Sonnet
+  5.5 with up-front thinking off, `reasoning: [thinking:
+  :between_tools]`. It streams as `:thinking_delta` events, whose
+  `index` tells one update from the next, and is stored in the turn's
+  thinking blocks; render a non-empty one as a status line. Haiku 5.5
+  writes none.
+
+What the app does:
+
+- **Store every message a turn returns, and replay them in the order the
+  model saw them**: each turn's prompt, then `result.messages`, system
+  messages included. A message that arrives while a turn runs belongs
+  after that turn's reply, wherever its row sorts. A history sorted any
+  other way reorders turns, which costs their thinking and the prompt
+  cache on every turn. Keep system messages out of what people see:
+  they are instructions to the model.
+- **Trim a long thread in steps**, with `Clementine.History.window/2`.
+  A window of the last N messages moves every turn, so no turn keeps its
+  thinking and the cached prefix never matches. `window(messages, max:
+  100)` holds its start while the thread grows by fifty messages, then
+  moves by fifty at once. It carries the system messages before its
+  start along, so a skill loaded long ago stays loaded.
+- **Keep the agent's instructions and tools stable within a thread.**
+  A change is never refused, and costs the earlier reasoning once.
+
+```elixir
+@impl true
+def history(run) do
+  run.subject_id
+  |> MyApp.Chat.messages()
+  |> Clementine.History.window(max: 100)
+end
+```
+
+`reasoning: [thinking: :adaptive, prefix_mismatch: :error]` asks the API
+to refuse an invalid replay on any account (`:drop_block` asks it to drop
+the blocks instead, a stopgap). Either sends the
+`thinking-binding-controls-2026-08-01` beta, and Clementine logs what a
+response reports it dropped. Neither is needed with the check above, and
+neither shows what Clementine dropped: Clementine removes stale thinking
+before the request leaves, so the API never sees it. `:error` catches
+only what Clementine's check cannot see, such as thinking moved in from
+another conversation; Clementine's own drops are the telemetry event
+above. Sonnet 5.5 and Haiku 5.5 take either value only with `thinking:
+:adaptive`, and Sonnet 5.5 refuses both with `thinking: :between_tools`.
+
+In tests, script the model with `Clementine.LLM.Anthropic.Fake` on one of
+these models; the installer's `expect_claude_turn/2` uses it. It is
+strict by default: a turn whose request sent an earlier turn without its
+thinking fails, naming the first such message. So a test that runs a
+thread turn by turn, storing each turn as the app does, fails on a
+reordered or trimmed history, a rebuilt system prompt, or a lost
+binding, none of which the API would refuse. Pass `strict: false` for a
+turn that changes the thread on purpose (a window's step, new
+instructions); the fake then refuses only what the API refuses.
+
+```elixir
+test "each turn replays the thread as the model saw it" do
+  thread = MyApp.Chat.start_thread!()
+
+  expect_claude_turn([{:thinking, "Hm."}, {:text, "Hello."}])
+  MyApp.Chat.send!(thread, "Hi")
+
+  expect_claude_turn([{:thinking, "Hm."}, {:text, "Sure."}])
+  MyApp.Chat.send!(thread, "Can you help?")
+
+  # Fails if history/1 reorders, trims, or rebuilds what earlier turns sent.
+  expect_claude_turn([{:text, "Done."}])
+  MyApp.Chat.send!(thread, "Thanks")
+end
+```
+
 ## The trace
 
 Every run records what it did, and `Clementine.Runs.trace/1` reads it
@@ -566,7 +695,11 @@ assert %{status: "completed"} = Clementine.Runs.get(run.id)
 
 `mix clementine.install` writes the mock, makes it the `llm_client` in
 `config/test.exs`, and writes `MyApp.AgentsCase`, whose `expect_turn/1`,
-`text_events/1`, and `tool_events/3` script turns like this one.
+`text_events/1`, and `tool_events/3` script turns like this one. Its
+`expect_claude_turn/2` scripts a turn through
+`Clementine.LLM.Anthropic.Fake`, which fails a turn whose replayed
+history lost the model's earlier reasoning
+([Models that bind their thinking](#models-that-bind-their-thinking)).
 The runtime's own suite proves the concurrency claims against Postgres in
 Clementine's CI: the conformance suite on `agent_runs`, the resume racing
 a sweep, a burst that outgrows the queue, the reaper, and the drain.

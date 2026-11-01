@@ -4,8 +4,33 @@ defmodule Clementine.Runs.HistoryTest do
   import Ecto.Query, only: [from: 2]
 
   alias Clementine.LLM.Message
-  alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
+  alias Clementine.LLM.Message.{AssistantMessage, SystemMessage, ToolResultMessage, UserMessage}
   alias Clementine.Result
+
+  defmodule Notes do
+    @moduledoc false
+    use Clementine.Skill,
+      name: "notes",
+      description: "Take notes.",
+      tools: [Clementine.Test.Tools.SafeEcho]
+
+    @impl true
+    def body(_context), do: "Keep notes short."
+  end
+
+  defmodule SkillChat do
+    @moduledoc false
+    # A turn agent with a skill, whose history is the run's metadata.
+    use Clementine.Agent,
+      key: "test_skill_chat",
+      turn: true,
+      model: :claude_sonnet,
+      instructions: "Chat.",
+      skills: [Notes]
+
+    @impl true
+    def history(run), do: Enum.map(Map.get(run.metadata, "history", []), &Message.from_map/1)
+  end
 
   setup do
     Process.register(self(), :clementine_runs_test)
@@ -92,6 +117,39 @@ defmodule Clementine.Runs.HistoryTest do
                          %AssistantMessage{}
                        ]
                      }}
+  end
+
+  @tag runtime: false
+  test "a turn after a skill load replays the load's system message, and the skill stays loaded" do
+    start_supervised!(
+      {Clementine, repo: TestRepo, agents: [SkillChat], host: Clementine.RunsCase.Host}
+    )
+
+    {:ok, first} = Runs.start(SkillChat, "Load notes", subject: {"ticket", "t-1"})
+    expect_turn(tool_events("toolu_1", "use_skill", %{"name" => "notes"}))
+    expect_turn(text_events("Loaded."))
+    assert :ok = perform_job(Worker, %{"run_id" => first.id})
+
+    assert_received {:run_finished, _run, %Result.Completed{} = result}
+    thread = [result.input_message | result.messages]
+    assert [%SystemMessage{skill: "notes"}] = for(%SystemMessage{} = m <- thread, do: m)
+
+    # The app stored the turn as it returned it; the next turn's history
+    # holds the system message, and the worker starts it.
+    {:ok, second} =
+      Runs.start(SkillChat, "Note this",
+        subject: {"ticket", "t-1"},
+        metadata: %{"history" => Enum.map(thread, &Message.to_map/1)}
+      )
+
+    expect(Clementine.LLM.MockClient, :stream, fn _model, _system, messages, tools, _opts ->
+      assert messages == thread ++ [UserMessage.new("Note this")]
+      assert "safe_echo" in Enum.map(tools, &Clementine.Tool.to_schema(&1).name)
+      text_events("Noted.")
+    end)
+
+    assert :ok = perform_job(Worker, %{"run_id" => second.id})
+    assert_received {:run_finished, %{id: id}, %Result.Completed{}} when id == second.id
   end
 
   test "history that is not a list of messages cancels the run as unstartable" do

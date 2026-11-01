@@ -56,6 +56,29 @@ defmodule Clementine.LLM.Anthropic do
   `maxLength` are refused. A model without structured outputs refuses
   the request.
 
+  ## Models that bind their thinking
+
+  Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and
+  later models accept a replayed thinking block only after the exact
+  system prompt, tools, and messages it was produced after. On those
+  models each response carries a `binding`
+  (`Clementine.LLM.Message.AssistantMessage`), and a replay sends a
+  turn's thinking only while its binding still holds (a turn without
+  one goes without its thinking), so an edited history costs that
+  reasoning and is never refused; the engine reports it as
+  `[:clementine, :llm, :thinking_dropped]`. A
+  `Clementine.LLM.Message.SystemMessage` goes as a mid-conversation
+  `role: "system"` message, its tools as inline definitions, and the
+  tools it adds stay out of `tools`; on other models, and on a model id
+  Clementine cannot read (checked all the same), its text joins the
+  system prompt and its tools join `tools`. The runtime guide's "Models
+  that bind their thinking" has the whole policy.
+
+  Beta headers follow the body: `thinking-display-updates-2026-08-18`
+  for `display: :updates`, `thinking-binding-controls-2026-08-01` for
+  `prefix_mismatch:`, and `inline-tools-2026-09-15` when a system message
+  adds a tool.
+
   ## Prompt caching
 
   Every request carries two cache breakpoints unless the alias sets
@@ -74,7 +97,8 @@ defmodule Clementine.LLM.Anthropic do
   @behaviour Clementine.LLM.ClientBehaviour
 
   alias Clementine.LLM.ModelRegistry
-  alias Clementine.LLM.Anthropic.{Messages, Tools}
+  alias Clementine.LLM.Anthropic.{Binding, Messages, Tools}
+  alias Clementine.LLM.Message.SystemMessage
   alias Clementine.LLM.{Cache, ProviderStream, ProviderUsage}
   alias Clementine.LLM.Reasoning
   alias Clementine.LLM.Response
@@ -90,13 +114,16 @@ defmodule Clementine.LLM.Anthropic do
   """
   @impl true
   def call(model, system, messages, tools, opts \\ []) do
-    body = build_body(model, system, messages, tools, opts)
-    headers = build_headers()
+    {body, binding, dropped} = request(model, system, messages, tools, opts)
+    Binding.log_dropped(dropped, inspect(model))
+    headers = build_headers(body)
 
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
 
-    do_call_with_retry(body, headers, max_attempts, 1)
+    with {:ok, response} <- do_call_with_retry(body, headers, max_attempts, 1) do
+      {:ok, %{response | binding: binding}}
+    end
   end
 
   defp do_call_with_retry(body, headers, max_attempts, attempt) do
@@ -157,8 +184,9 @@ defmodule Clementine.LLM.Anthropic do
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
-    body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
-    headers = build_headers()
+    {body, binding, dropped} = request(model, system, messages, tools, opts)
+    body = Map.put(body, "stream", true)
+    headers = build_headers(body)
     # A runner caps this to the execution deadline's remaining budget. It
     # bounds the whole streaming call, not one attempt: per-attempt receive
     # timeout and retry backoff draw down the same window, and retries stop
@@ -166,9 +194,19 @@ defmodule Clementine.LLM.Anthropic do
     receive_timeout = Keyword.get(opts, :receive_timeout, 300_000)
     budget_ends = System.monotonic_time(:millisecond) + receive_timeout
 
-    ProviderStream.new(StreamParser, fn parent, ref ->
-      do_stream_request(body, headers, parent, ref, budget_ends)
-    end)
+    stream =
+      ProviderStream.new(StreamParser, fn parent, ref ->
+        do_stream_request(body, headers, parent, ref, budget_ends)
+      end)
+
+    # The turn this request produces is bound to it: the binding leads the
+    # stream, and the accumulator sets it on the response. What the
+    # request sent without its thinking follows, for the engine to report
+    # (`[:clementine, :llm, :thinking_dropped]`).
+    case Binding.events(binding, dropped) do
+      [] -> stream
+      events -> Stream.concat(events, stream)
+    end
   end
 
   defp do_stream_request(body, headers, parent, ref, budget_ends) do
@@ -281,10 +319,17 @@ defmodule Clementine.LLM.Anthropic do
     Application.get_env(:clementine, :anthropic_base_url, "https://api.anthropic.com/v1/messages")
   end
 
-  # Build the request body
-  defp build_body(model, system, messages, tools, opts) do
+  @doc false
+  # The Messages API body for a request, the binding of the turn it
+  # produces (nil on a model that does not bind its thinking), and what
+  # it sent without its thinking (`Binding.encode/3`). The real client
+  # and `Clementine.LLM.Anthropic.Fake` both build requests here, so a
+  # test sees exactly what the API would.
+  def request(model, system, messages, tools, opts) do
     resolved = resolve_model(model)
     model_id = resolved.id
+    binds? = Binding.binds?(model_id)
+    inline? = Binding.inline_system?(model_id)
 
     max_tokens =
       Keyword.get(
@@ -293,20 +338,78 @@ defmodule Clementine.LLM.Anthropic do
         Keyword.get(resolved.defaults, :max_tokens, @default_max_tokens)
       )
 
+    {system, tools, added} = arrange(inline?, system, messages, tools || [])
+
     encoded_tools =
-      if tools != nil and tools != [], do: Tools.encode_all(tools, deferred(model_id, opts))
+      case Tools.encode_all(tools, deferred(model_id, opts)) ++ added do
+        [] -> nil
+        encoded -> encoded
+      end
 
-    body = %{
-      "model" => model_id,
-      "max_tokens" => max_tokens,
-      "messages" => Messages.encode_all(messages, tool_search: loadable(encoded_tools))
-    }
+    # A system message folded into `system` and `tools` sends nothing
+    # where it stands.
+    replay = fn
+      %SystemMessage{} when not inline? -> []
+      message -> Messages.encode_replay(message, tool_search: loadable(encoded_tools))
+    end
 
-    body
-    |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
-    |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
-    |> put_prompt(system, encoded_tools, resolved.cache)
+    {encoded_messages, binding, dropped} =
+      if binds? do
+        Binding.encode(messages, Binding.start(system, encoded_tools), replay)
+      else
+        {Enum.flat_map(messages, replay), nil, nil}
+      end
+
+    body =
+      %{"model" => model_id, "max_tokens" => max_tokens, "messages" => encoded_messages}
+      |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
+      |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
+      |> put_prompt(system, encoded_tools, resolved.cache)
+
+    {body, binding, dropped}
   end
+
+  # A conversation on a model known to bind its thinking keeps its
+  # system messages in place, and a tool one of them adds goes inline
+  # there, not in `tools`: the request's tools stay as the first turn
+  # sent them. Elsewhere (older models, and ids Clementine cannot read:
+  # `Binding.inline_system?/1`) a system message's text joins the system
+  # prompt, and the tools it adds join the request's (the engine already
+  # offers a loaded skill's).
+  defp arrange(true, system, messages, tools) do
+    added = MapSet.new(added_definitions(messages), & &1["name"])
+    {system, Enum.reject(tools, &(tool_name(&1) in added)), []}
+  end
+
+  defp arrange(false, system, messages, tools) do
+    system_messages = Enum.filter(messages, &match?(%SystemMessage{}, &1))
+    names = MapSet.new(tools, &tool_name/1)
+
+    added =
+      system_messages
+      |> added_definitions()
+      |> Enum.reject(&(&1["name"] in names))
+      |> Enum.uniq_by(& &1["name"])
+
+    texts =
+      for message <- system_messages, text = SystemMessage.get_text(message), text != "", do: text
+
+    system =
+      case Enum.reject([system | texts], &(&1 in [nil, ""])) do
+        [] -> system
+        parts -> Enum.join(parts, "\n\n")
+      end
+
+    {system, tools, added}
+  end
+
+  defp added_definitions(messages) do
+    for %SystemMessage{} = message <- messages,
+        definition <- SystemMessage.tool_definitions(message),
+        do: definition
+  end
+
+  defp tool_name(tool), do: Clementine.Tool.to_schema(tool).name
 
   # The system prompt and tools, with the cache breakpoints when caching
   # is on: one at the end of the stable prefix (the system prompt, or the
@@ -393,12 +496,42 @@ defmodule Clementine.LLM.Anthropic do
     Map.update(body, "output_config", %{"format" => format}, &Map.put(&1, "format", format))
   end
 
-  defp build_headers do
-    [
+  defp build_headers(body) do
+    headers = [
       {"x-api-key", get_api_key()},
       {"anthropic-version", @anthropic_version},
       {"content-type", "application/json"}
     ]
+
+    case betas(body) do
+      [] -> headers
+      betas -> headers ++ [{"anthropic-beta", Enum.join(betas, ",")}]
+    end
+  end
+
+  @doc false
+  # The beta headers a body needs, read off the body itself so a field
+  # never goes without the header that admits it.
+  def betas(body) do
+    thinking = Map.get(body, "thinking", %{})
+
+    [
+      {Map.has_key?(thinking, "block_binding"), "thinking-binding-controls-2026-08-01"},
+      {thinking["display"] == "updates", "thinking-display-updates-2026-08-18"},
+      {inline_tools?(body["messages"]), "inline-tools-2026-09-15"}
+    ]
+    |> Enum.filter(&elem(&1, 0))
+    |> Enum.map(&elem(&1, 1))
+  end
+
+  defp inline_tools?(messages) do
+    Enum.any?(messages || [], fn
+      %{"role" => "system", "content" => content} when is_list(content) ->
+        Enum.any?(content, &(&1["type"] == "tool_addition"))
+
+      _message ->
+        false
+    end)
   end
 
   defp get_api_key do
@@ -428,6 +561,8 @@ defmodule Clementine.LLM.Anthropic do
   end
 
   defp parse_response(%{"content" => content, "stop_reason" => stop_reason} = body) do
+    Binding.report(body)
+
     %Response{
       content: Enum.flat_map(content, &parse_content_block/1),
       stop_reason: stop_reason,

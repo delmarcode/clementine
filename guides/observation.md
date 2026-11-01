@@ -51,7 +51,7 @@ end
 Pass it to the runner (`events: MyApp.ClementineEvents` in the worker from
 [Durable Execution](durable-execution.md)). Each `Clementine.Event`
 carries `run_ref`, `epoch`, `seq`, a `type` from the closed taxonomy
-(`:iteration_start`, `:text_delta`, `:tool_use_start`,
+(`:iteration_start`, `:text_delta`, `:thinking_delta`, `:tool_use_start`,
 `:tool_input_delta`, `:tool_result`, `:approval_requested`,
 `:usage_delta`, `:error`), and a `payload`.
 

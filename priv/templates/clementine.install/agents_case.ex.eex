@@ -26,6 +26,7 @@ defmodule <%= @app_module %>.AgentsCase do
 
   use ExUnit.CaseTemplate
 
+  alias Clementine.LLM.Anthropic.Fake
   alias Ecto.Adapters.SQL.Sandbox
 
   using do
@@ -53,6 +54,27 @@ defmodule <%= @app_module %>.AgentsCase do
   def expect_turn(events) when is_list(events) do
     Mox.expect(<%= @agents %>.LLMMock, :stream, fn _model, _system, _messages, _tools, _opts ->
       events
+    end)
+  end
+
+  @doc """
+  Scripts the model's next turn as a model that binds its thinking
+  (Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) would
+  answer it.
+  `script` is `Clementine.LLM.Anthropic.Fake`'s: say
+  `[{:thinking, "..."}, {:text, "Sunny."}]`. The agent's model must be
+  an Anthropic one.
+
+  The turn fails when the history the agent replays lost an earlier
+  turn's thinking: a reordered or trimmed thread, a rebuilt system
+  prompt, a turn stored without its binding. Run a thread's turns
+  through it, storing each as the app does, and a replay that would
+  cost the model its reasoning fails the test. Pass `strict: false`
+  for the turn of a test that changes the thread on purpose.
+  """
+  def expect_claude_turn(script, opts \\ []) when is_list(script) do
+    Mox.expect(<%= @agents %>.LLMMock, :stream, fn model, system, messages, tools, request ->
+      Fake.stream(model, system, messages, tools, request, script, opts)
     end)
   end
 

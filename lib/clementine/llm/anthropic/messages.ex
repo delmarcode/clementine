@@ -1,7 +1,13 @@
 defmodule Clementine.LLM.Anthropic.Messages do
   @moduledoc false
 
-  alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
+  alias Clementine.LLM.Message.{
+    AssistantMessage,
+    Content,
+    SystemMessage,
+    ToolResultMessage,
+    UserMessage
+  }
 
   def encode(%UserMessage{content: content}) when is_binary(content) do
     %{"role" => "user", "content" => content}
@@ -19,33 +25,45 @@ defmodule Clementine.LLM.Anthropic.Messages do
     %{"role" => "user", "content" => Enum.map(content, &encode_content/1)}
   end
 
+  def encode(%SystemMessage{content: content}) do
+    %{"role" => "system", "content" => Enum.map(content, &encode_content/1)}
+  end
+
   # `tool_search:` says what this request's tool search can load: the
   # names of its tools, or nil when it carries no search tool. History
   # replays a past search only as far as the request can honour it — the
   # API refuses a reference to a tool the request lacks, and a search
   # block without the search tool — so a thread whose tool left the
   # request (a deploy, an actor agent/1 offers less, a model without tool
-  # search) keeps working. That edits the replayed turn, which may cost
-  # its thinking blocks on models that check them. Without the option,
+  # search) keeps working. Only a changed tool list trims a search, and
+  # that change has already voided the turn's thinking on a model that
+  # binds it (`Clementine.LLM.Anthropic.Binding`). Without the option,
   # history replays as stored.
   def encode_all(messages, opts \\ []) when is_list(messages) do
-    case Keyword.fetch(opts, :tool_search) do
-      :error ->
-        Enum.map(messages, &encode/1)
+    Enum.flat_map(messages, &encode_replay(&1, opts))
+  end
 
-      {:ok, loadable} ->
-        Enum.flat_map(messages, fn
-          %AssistantMessage{content: content} = message ->
-            case Enum.flat_map(content, &replayable(&1, loadable)) do
-              [] -> []
-              content -> [encode(%{message | content: content})]
-            end
+  @doc false
+  # One message as the request sends it: none, when a trimmed search
+  # leaves an assistant turn empty.
+  def encode_replay(message, opts) do
+    case {message, Keyword.fetch(opts, :tool_search)} do
+      {%AssistantMessage{content: content} = message, {:ok, loadable}} ->
+        encode_nonempty(%{message | content: Enum.flat_map(content, &replayable(&1, loadable))})
 
-          message ->
-            [encode(message)]
-        end)
+      {%AssistantMessage{} = message, :error} ->
+        encode_nonempty(message)
+
+      {message, _search} ->
+        [encode(message)]
     end
   end
+
+  # A turn with nothing left to send (a trimmed search, or thinking
+  # dropped from a turn that had only thinking) goes out entirely: the
+  # API refuses an empty assistant message.
+  defp encode_nonempty(%AssistantMessage{content: []}), do: []
+  defp encode_nonempty(message), do: [encode(message)]
 
   defp replayable(%Content.ServerToolUse{name: "tool_search_tool_" <> _}, nil), do: []
 
@@ -133,6 +151,15 @@ defmodule Clementine.LLM.Anthropic.Messages do
   # references from history to keep the tools it loaded in context.
   defp encode_content(%Content.ServerToolUse{id: id, name: name, input: input}) do
     %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
+  end
+
+  # Inline, so the request's tools never change: a tool listed there for
+  # the first time would void every earlier turn's thinking.
+  defp encode_content(%Content.ToolAddition{definition: definition}) do
+    %{
+      "type" => "tool_addition",
+      "tool" => %{"type" => "tool_definition", "definition" => definition}
+    }
   end
 
   defp encode_content(%Content.ServerToolResult{} = result) do

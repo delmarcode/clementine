@@ -378,6 +378,27 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{input_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer}` (as reported)
   - Metadata: `%{provider: atom, model: String.t() | nil}`
 
+  ### `[:clementine, :llm, :thinking_dropped]`
+
+  Emitted before an Anthropic call that sends earlier turns without
+  their thinking, on a model that binds its thinking to the
+  conversation before it (Claude Fable 5.1, Mythos 5.1, Opus 5.5,
+  Sonnet 5.5, Haiku 5.5, and later): the system prompt, the tools, or
+  the history before those turns is not what they were produced after.
+  The request goes through; the model loses that reasoning, and the
+  prompt cache restarts there. A change reports once: a turn already
+  sent without its thinking when a later turn of the history was
+  produced is not counted again. An app whose every turn reports one
+  replays its threads in another order than the model saw them (the
+  runtime guide's "Models that bind their thinking"). Clementine also
+  logs it as a warning.
+
+  - Measurements: `%{turns: integer, blocks: integer}` — the turns sent
+    without their thinking, and the thinking blocks left out
+  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, first_index: integer}`
+    — `first_index` is the first such turn's place in the request's
+    messages (the history, then the prompt). Never content.
+
   ## Tool Events
 
   ### `[:clementine, :tool, :start]`
@@ -442,6 +463,7 @@ defmodule Clementine.Telemetry do
   | `clementine_llm_cost_micros_total` | sum | `:llm :usage` | + `outcome`, `currency` |
   | `clementine_llm_duration_milliseconds` | distribution | `:llm :stop` | |
   | `clementine_llm_exceptions_total` | counter | `:llm :exception` | + `error_code` |
+  | `clementine_llm_thinking_dropped_total` | counter | `:llm :thinking_dropped` | |
   | `clementine_tool_calls_total` | counter | `:tool :stop` | + `tool`, `result` |
   | `clementine_tool_duration_milliseconds` | distribution | `:tool :stop` | + `tool` |
   | `clementine_tool_exceptions_total`, `clementine_tool_input_repaired_total` | counter | `:tool :exception`, `:tool :input_repaired` | + `tool` |
@@ -658,6 +680,16 @@ defmodule Clementine.Telemetry do
             measurement: &one/1,
             description: "Model calls that failed, by error code: a provider error, or a raise."
           ] ++ labels(@identity ++ [:error_code], &error_code_labels/1)
+        ),
+        counter(
+          [:clementine, :llm, :thinking_dropped, :total],
+          [
+            event_name: [:clementine, :llm, :thinking_dropped],
+            measurement: &one/1,
+            description:
+              "Model calls that sent earlier turns without their thinking, because the " <>
+                "history before them changed since they were produced."
+          ] ++ labels(@identity)
         ),
         counter(
           [:clementine, :llm, :usage_clamped, :total],

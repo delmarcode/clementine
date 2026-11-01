@@ -18,7 +18,9 @@ defmodule Clementine.LLM.StreamParser do
 
   - `{:message_start, message_data}` - Message metadata
   - `{:text_delta, text}` - Text content chunk
-  - `{:thinking_delta, text}` - Thinking content chunk (reasoning-enabled models)
+  - `{:thinking_delta, index, text}` - Thinking content chunk of the block at
+    `index` (reasoning-enabled models); each progress update a model writes
+    between tool calls is a block of its own
   - `{:signature_delta, signature}` - Thinking block signature chunk
   - `{:redacted_thinking, data}` - Complete encrypted thinking block
   - `{:tool_use_start, id, name}` - Start of tool use
@@ -43,7 +45,7 @@ defmodule Clementine.LLM.StreamParser do
   @type event ::
           {:message_start, map()}
           | {:text_delta, String.t()}
-          | {:thinking_delta, String.t()}
+          | {:thinking_delta, non_neg_integer(), String.t()}
           | {:signature_delta, String.t()}
           | {:redacted_thinking, String.t()}
           | {:tool_use_start, String.t(), String.t()}
@@ -236,6 +238,7 @@ defmodule Clementine.LLM.StreamParser do
 
   # Convert parsed SSE events to our event format
   defp convert_event("message_start", %{"message" => message}) do
+    Clementine.LLM.Anthropic.Binding.report(message)
     [{:message_start, message}]
   end
 
@@ -295,10 +298,10 @@ defmodule Clementine.LLM.StreamParser do
   end
 
   defp convert_event("content_block_delta", %{
-         "index" => _index,
+         "index" => index,
          "delta" => %{"type" => "thinking_delta", "thinking" => text}
        }) do
-    [{:thinking_delta, text}]
+    [{:thinking_delta, index, text}]
   end
 
   defp convert_event("content_block_delta", %{
@@ -374,12 +377,17 @@ defmodule Clementine.LLM.StreamParser do
               open_tool_ids: [],
               stop_reason: nil,
               usage: %{},
-              error: nil
+              error: nil,
+              binding: nil
 
     @doc "Creates a new accumulator"
     def new, do: %__MODULE__{}
 
     @doc "Processes an event and returns updated accumulator"
+    # The client's own event: the digest of the request this response
+    # answers (`Clementine.LLM.Anthropic.Binding`).
+    def process(%__MODULE__{} = acc, {:binding, binding}), do: %{acc | binding: binding}
+
     def process(%__MODULE__{} = acc, {:text_delta, text}) do
       %{acc | text: acc.text <> text}
     end
@@ -392,11 +400,11 @@ defmodule Clementine.LLM.StreamParser do
       close_text(acc)
     end
 
-    def process(%__MODULE__{current_thinking: nil} = acc, {:thinking_delta, _} = event) do
+    def process(%__MODULE__{current_thinking: nil} = acc, {:thinking_delta, _, _} = event) do
       process(%{close_text(acc) | current_thinking: %{thinking: "", signature: nil}}, event)
     end
 
-    def process(%__MODULE__{current_thinking: current} = acc, {:thinking_delta, text}) do
+    def process(%__MODULE__{current_thinking: current} = acc, {:thinking_delta, _index, text}) do
       %{acc | current_thinking: %{current | thinking: current.thinking <> text}}
     end
 
@@ -579,7 +587,8 @@ defmodule Clementine.LLM.StreamParser do
       %Response{
         content: content,
         stop_reason: acc.stop_reason,
-        usage: acc.usage
+        usage: acc.usage,
+        binding: acc.binding
       }
     end
   end

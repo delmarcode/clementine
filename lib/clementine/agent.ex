@@ -62,9 +62,10 @@ defmodule Clementine.Agent do
   it runs like any other, and `approval:`, `retry:`, and the tool context
   apply unchanged. A provider without tool search gets deferred tools as
   ordinary tools. A tool that leaves the list drops out of the earlier
-  searches a thread's history replays, so the thread keeps working; that
-  edits the replayed history, which restarts the prompt cache and may
-  void earlier thinking on models that verify it.
+  searches a thread's history replays, so the thread keeps working; the
+  changed list restarts the prompt cache and, on a model that binds its
+  thinking, costs the earlier turns' thinking once (the runtime guide's
+  "Models that bind their thinking").
 
   ## Structured output
 
@@ -277,9 +278,13 @@ defmodule Clementine.Agent do
 
   @doc """
   The conversation before `run`'s prompt, oldest first, as
-  `Clementine.LLM.Message` structs: `UserMessage`, `AssistantMessage`, and
-  `ToolResultMessage`. The model sees them, then the prompt. Leave the
-  prompt itself out.
+  `Clementine.LLM.Message` structs: `UserMessage`, `AssistantMessage`,
+  `ToolResultMessage`, and the `SystemMessage`s a skill load records.
+  The model sees them, then the prompt. Leave the prompt itself out.
+  Return them in the order the model saw them, and trim a long thread
+  with `Clementine.History.window/2`: on a model that binds its thinking,
+  a reordered or freshly trimmed history costs the earlier turns'
+  reasoning.
 
   The messages are the app's data: store what a run said in
   `c:Clementine.Host.run_finished/2` (`Result.Completed` carries the

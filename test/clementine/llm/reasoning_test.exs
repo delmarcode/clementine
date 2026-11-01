@@ -159,8 +159,56 @@ defmodule Clementine.LLM.ReasoningTest do
                Reasoning.to_provider_config(:anthropic, thinking: :disabled, budget_tokens: 1024)
     end
 
+    test "between_tools, the updates display, and the prefix_mismatch behavior" do
+      assert {:ok,
+              %{
+                "thinking" => %{"type" => "between_tools"},
+                "output_config" => %{"effort" => "high"}
+              }} =
+               Reasoning.to_provider_config(:anthropic, thinking: :between_tools, effort: :high)
+
+      assert {:ok, %{"thinking" => %{"type" => "adaptive", "display" => "updates"}}} =
+               Reasoning.to_provider_config(:anthropic, thinking: :adaptive, display: :updates)
+
+      assert {:ok,
+              %{
+                "thinking" => %{
+                  "type" => "adaptive",
+                  "block_binding" => %{"prefix_mismatch_behavior" => "error"}
+                }
+              }} =
+               Reasoning.to_provider_config(:anthropic,
+                 thinking: :adaptive,
+                 prefix_mismatch: :error
+               )
+
+      between =
+        ~s(Anthropic reasoning thinking "between_tools" takes no display or prefix_mismatch)
+
+      assert {:error, ^between} =
+               Reasoning.to_provider_config(:anthropic,
+                 thinking: :between_tools,
+                 display: :updates
+               )
+
+      assert {:error, ^between} =
+               Reasoning.to_provider_config(:anthropic,
+                 thinking: :between_tools,
+                 prefix_mismatch: :drop_block
+               )
+
+      assert {:error, "unsupported Anthropic reasoning prefix_mismatch \"warn\"" <> _} =
+               Reasoning.to_provider_config(:anthropic,
+                 thinking: :adaptive,
+                 prefix_mismatch: :warn
+               )
+
+      assert {:error, _} = Reasoning.to_provider_config(:anthropic, prefix_mismatch: :error)
+    end
+
     test "rejects display without thinking" do
-      message = ~s(Anthropic reasoning display requires thinking "adaptive" or "enabled")
+      message =
+        ~s(Anthropic reasoning display and prefix_mismatch require thinking "adaptive" or "enabled")
 
       assert {:error, ^message} =
                Reasoning.to_provider_config(:anthropic, display: :summarized)

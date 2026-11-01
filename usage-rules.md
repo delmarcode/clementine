@@ -149,9 +149,19 @@ end
 - A turn agent with no `history/1` fails the build. A task agent may
   define one too; it defaults to `[]`.
 - Return `Clementine.LLM.Message` structs: `UserMessage`,
-  `AssistantMessage`, and `ToolResultMessage`. Anything else cancels the
-  run as unstartable. Leave out the run's own prompt; where the cutoff
-  falls is the app's rule.
+  `AssistantMessage`, `ToolResultMessage`, and `SystemMessage`. Anything
+  else cancels the run as unstartable. Leave out the run's own prompt;
+  where the cutoff falls is the app's rule.
+- Replay the thread in the order the model saw it: each turn's prompt,
+  then every message the turn returned. Never sort by when rows were
+  written: a message that arrived during a turn goes after its reply.
+- Trim with `Clementine.History.window(messages, max: n)`, never "the
+  last n messages": a window that moves every turn voids the thinking
+  of Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5
+  and misses the prompt cache on every turn. Clementine drops thinking
+  whose conversation changed, so an edit is never refused; it costs
+  reasoning, and emits `[:clementine, :llm, :thinking_dropped]` (guide:
+  "Models that bind their thinking").
 - The conversation is the app's data, in its own table. Store each
   finished turn in `run_finished/2`: `result.input_message` (unless the
   app stored the user's message when it arrived) and `result.messages`,
@@ -612,6 +622,25 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   :one_hour]` for an Anthropic model whose runs often wait between steps
   (approvals, slow replies). `docs/MODELS.md` has what each provider
   takes.
+
+## Models that bind their thinking
+
+- Store `AssistantMessage.binding` and `SystemMessage`s with the turn
+  (`to_map/1` does), and hide system messages from what people see.
+  Keep an agent's instructions and tools stable within a thread.
+- A thread whose every turn emits `[:clementine, :llm, :thinking_dropped]`
+  (`clementine_llm_thinking_dropped_total`) is replayed out of order.
+- For the text Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, and
+  Fable 5 write between tool calls, set
+  `reasoning: [thinking: :adaptive, display: :updates]` (or
+  `thinking: :between_tools` on Sonnet 5.5), render `:thinking_delta`
+  events (a new `index` is a new update), and show non-empty thinking
+  blocks of stored turns.
+- Test threads turn by turn with `Clementine.LLM.Anthropic.Fake` (the
+  installer's `expect_claude_turn/2`). It fails a turn whose request
+  lost an earlier turn's thinking; pass `strict: false` only for a turn
+  that changes the thread on purpose. Never set
+  `prefix_mismatch: :drop_block` by default.
 
 ## Never
 
