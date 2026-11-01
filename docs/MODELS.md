@@ -303,13 +303,16 @@ the answer, and the engine checks it as always (one markdown fence
 around the JSON is tolerated). Try an agent with tools and an
 `output_schema:` against a new server before relying on `:native`.
 
-A refusal and a cut-off answer explain themselves on every provider:
-the refusal text is the turn's text with stop reason `"refusal"` (an
+A refusal and a cut-off answer read the same on every provider: the
+refusal text is the turn's text with stop reason `"refusal"` (an
 OpenAI refusal content part or `response.refusal.delta`, a Chat
-Completions `refusal`), and an answer that ran out of output tokens
-stops with `"max_tokens"` (OpenAI's `response.incomplete` with
-`max_output_tokens`, Chat Completions' `length`). A schema agent's
-`:invalid_output` error says which.
+Completions `refusal`), a content filter's stop is `"content_filter"`,
+and an answer that ran out of output tokens stops with `"max_tokens"`
+(OpenAI's `response.incomplete` with `max_output_tokens`, Chat
+Completions' `length`); any other incomplete OpenAI response stops with
+`"incomplete"`. A final turn that stops on any of them fails the run,
+`:refused` or `:truncated` (`Clementine.Error.stopped/1`), before a
+schema agent's answer is decoded.
 
 ## Prompt caching
 

@@ -17,7 +17,9 @@ defmodule Clementine.OutputSchema do
   refuses or runs out of tokens, and an OpenAI-compatible server may not
   constrain at all (nor is it asked to, for a model whose catalog entry
   sets `structured_output: :instructions`; see `Clementine.LLM.ChatCompletions`). An answer that is not JSON, or does not match, fails
-  the run with a `Clementine.Error` of code `:invalid_output`.
+  the run with a `Clementine.Error` of code `:invalid_output`. A final
+  turn the provider refused or cut off fails the run before it is
+  decoded, `:refused` or `:truncated` (`Clementine.Error.stopped/1`).
 
   The check covers the schema's structure: `type`, `properties`,
   `required`, `additionalProperties`, `items`, `enum`, `const`, `anyOf`,
