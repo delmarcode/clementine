@@ -608,6 +608,25 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   whose `raw["output"]` is the text the model wrote. There is no retry
   inside the run; retry from a loop or your own code.
 
+## Refusals and cut-off answers
+
+- A run whose final turn the provider refused fails with
+  `Clementine.Error` code `:refused`; one whose final answer was cut off
+  (`max_tokens`, the context window) fails `:truncated`. Neither is
+  retryable. A completed run's `stop_reason` is `"end_turn"` or
+  `"stop_sequence"` (`run.result["stop_reason"]`).
+- Never read a failed run as "nothing found" or "nothing to do". An
+  extractor or a screener records the work as incomplete, with the
+  code, and sends a refusal to a person.
+- In a chat, show `:refused` as the assistant declining, not a crash,
+  and take down the text it streamed before it. Leave the refused
+  prompt out of `history/1`.
+- On `:truncated`, raise the model's `max_tokens` or ask for less.
+  Nothing completes a cut-off answer.
+- A thread's `"on_failure": "retry"` repeats a refused turn and its
+  tools' effects. Keep `"surface"` for turns whose tools are not safe
+  to repeat.
+
 ## Prompt caching
 
 - Caching is on, with no code: every client sends what its provider
@@ -638,9 +657,9 @@ use Clementine.Agent, key: "grader", model: :claude_sonnet, instructions: "...",
   blocks of stored turns.
 - Test threads turn by turn with `Clementine.LLM.Anthropic.Fake` (the
   installer's `expect_claude_turn/2`). It fails a turn whose request
-  lost an earlier turn's thinking; pass `strict: false` only for a turn
-  that changes the thread on purpose. Never set
-  `prefix_mismatch: :drop_block` by default.
+  lost an earlier turn's thinking, or holds an empty text block; pass
+  `strict: false` only for a turn that changes the thread on purpose.
+  Never set `prefix_mismatch: :drop_block` by default.
 
 ## Never
 
@@ -694,7 +713,11 @@ loop's step with `perform_job(Clementine.Runs.StepWorker, %{"run_id" =>
 loop.id})` (a thread's first step runs `init/1`; the next starts the
 turn a `send/3` asked for, which `Runs.child/2` then finds). Script the
 model with `MyApp.AgentsCase`'s `expect_turn/1`, `text_events/1`, and
-`tool_events/3`. Every host callback, `run_event/2`
+`tool_events/3`, or `expect_claude_turn/2`, whose options script what a
+real response carries: `stop_reason: "refusal"` (or `"max_tokens"`,
+`"pause_turn"`), `usage:` with cache tokens, and `api_errors: [529]`;
+a `{:error, "overloaded_error"}` step ends the turn mid-stream. Test
+each agent's refusal and cut-off answer this way. Every host callback, `run_event/2`
 included, has returned by the time `perform_job/2` does, so a test that
 subscribed first finds the broadcasts in its mailbox.
 

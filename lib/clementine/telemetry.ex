@@ -70,6 +70,8 @@ defmodule Clementine.Telemetry do
   ### `[:clementine, :rollout, :stop]`
 
   Emitted when the engine returns a non-error branch of its closed set.
+  `:success` is a final answer: a final turn the provider refused or cut
+  off is an error (`:refused`, `:truncated`), never a success.
 
   - Measurements: `%{duration: native_time, iterations: integer}`
   - Metadata: `%{agent_key, provider, model, alias, status: :success | :suspended | :cancelled | :drained | :lost_lease}`
@@ -83,11 +85,13 @@ defmodule Clementine.Telemetry do
 
   - Measurements: `%{duration: native_time, iterations: integer}` —
     `iterations` is absent on a genuine raise
-  - Metadata: `%{agent_key, provider, model, alias, kind: atom, reason: term, error_kind: Clementine.Error.kind()}` —
+  - Metadata: `%{agent_key, provider, model, alias, kind: atom, reason: term, error_kind: Clementine.Error.kind(), error_code: atom}` —
     a returned error carries `kind: :error, reason: %Clementine.Error{}`,
-    and its `kind` as `error_kind`; a raise carries the raise's `kind`,
-    `reason`, and `stacktrace`, and `error_kind: :runtime`, the kind the
-    runner's rescue gives it
+    and its `kind` and `code` as `error_kind` and `error_code` (`:refused`
+    and `:truncated` for a final turn the provider refused or cut off,
+    `Clementine.Error.stopped/1`); a raise carries the raise's `kind`,
+    `reason`, and `stacktrace`, and `error_kind: :runtime` and
+    `error_code: :exception`, what the runner's rescue gives it
 
   ## Run Events
 
@@ -468,7 +472,7 @@ defmodule Clementine.Telemetry do
   | `clementine_tool_duration_milliseconds` | distribution | `:tool :stop` | + `tool` |
   | `clementine_tool_exceptions_total`, `clementine_tool_input_repaired_total` | counter | `:tool :exception`, `:tool :input_repaired` | + `tool` |
   | `clementine_rollout_stops_total`, `clementine_rollout_duration_milliseconds`, `clementine_rollout_iterations` | counter, distributions | `:rollout :stop` | + `status` |
-  | `clementine_rollout_exceptions_total` | counter | `:rollout :exception` | + `kind`, `error_kind` |
+  | `clementine_rollout_exceptions_total` | counter | `:rollout :exception` | + `kind`, `error_kind`, `error_code` |
 
   Every metered call counts once in the call, token, and cost series,
   however it ended: `outcome` is `stop`, `aborted` (a runner signal cut
@@ -483,10 +487,16 @@ defmodule Clementine.Telemetry do
   `Clementine.Error.normalize/2` gives a provider's error (`auth`,
   `not_found`, `timeout`, `rate_limited`, `overloaded`,
   `invalid_request`, `provider_unavailable`, `network`, `exception`,
-  `unknown`), else `other`; `error_kind` is `Clementine.Error`'s `kind`
-  (`provider`, `tool`, `rollout`, `runtime`), else `other`. An error's
-  `code` is any atom an app's tool or host sets, so the rollout series
-  labels by `kind` alone.
+  `unknown`) or the engine's own rollout errors (`refused`, `truncated`,
+  `max_iterations`, `deadline_exceeded`, `invalid_output`,
+  `invalid_output_schema`, `invalid_skills`, `invalid_delegates`,
+  `incompatible_checkpoint`, `invalid_resume_payload`), else `other`: an
+  error's `code` is any atom an app's tool or host sets. `error_kind` is
+  `Clementine.Error`'s `kind` (`provider`, `tool`, `rollout`,
+  `runtime`), else `other`. A run whose final turn the provider refused
+  counts in `clementine_rollout_exceptions_total{error_code="refused"}`,
+  and one it cut off in `{error_code="truncated"}`; neither counts as
+  `clementine_rollout_stops_total{status="success"}`.
 
   The run metrics are labeled `agent_key`:
 
@@ -578,9 +588,10 @@ defmodule Clementine.Telemetry do
   @stop_reasons ~w(end_turn tool_use max_tokens stop_sequence pause_turn refusal
                    model_context_window_exceeded content_filter incomplete)
 
-  # The codes Clementine.Error.normalize/2 gives a provider's error, and
-  # :exception for a raise. Error's `code` is any atom (a passthrough
-  # error keeps an app's own), so anything else is labeled "other".
+  # The codes Clementine.Error.normalize/2 gives a provider's error,
+  # :exception for a raise, and the codes of the errors the engine itself
+  # returns. Error's `code` is any atom (a passthrough error keeps an
+  # app's own), so anything else is labeled "other".
   @error_codes [
     :auth,
     :not_found,
@@ -591,7 +602,17 @@ defmodule Clementine.Telemetry do
     :provider_unavailable,
     :network,
     :exception,
-    :unknown
+    :unknown,
+    :refused,
+    :truncated,
+    :max_iterations,
+    :deadline_exceeded,
+    :invalid_output,
+    :invalid_output_schema,
+    :invalid_skills,
+    :invalid_delegates,
+    :incompatible_checkpoint,
+    :invalid_resume_payload
   ]
 
   @error_kinds [:provider, :tool, :rollout, :runtime]
@@ -779,8 +800,8 @@ defmodule Clementine.Telemetry do
           measurement: &one/1,
           description:
             "Executions that returned an error or raised, by the raise's kind and the " <>
-              "error's kind."
-        ] ++ labels(@identity ++ [:kind, :error_kind], &error_kind_labels/1)
+              "error's kind and code."
+        ] ++ labels(@identity ++ [:kind, :error_kind, :error_code], &error_labels/1)
       )
     ]
   end
@@ -989,8 +1010,10 @@ defmodule Clementine.Telemetry do
     Map.update(metadata, :error_code, nil, &bounded(&1, @error_codes))
   end
 
-  defp error_kind_labels(metadata) do
-    Map.update(metadata, :error_kind, nil, &bounded(&1, @error_kinds))
+  defp error_labels(metadata) do
+    metadata
+    |> Map.update(:error_kind, nil, &bounded(&1, @error_kinds))
+    |> error_code_labels()
   end
 
   defp bounded(nil, _set), do: nil

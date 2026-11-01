@@ -249,12 +249,16 @@ defmodule Clementine.LLM.OpenAIStreamParser do
 
   @doc false
   # The stop reason a finished response's status gives (`call/5` reads it
-  # too): "max_tokens" for one cut off at max_output_tokens.
+  # too): "max_tokens" for one cut off at max_output_tokens,
+  # "content_filter" for one a content filter stopped, and "incomplete"
+  # for any other incomplete response (max_messages, steered, one
+  # OpenAI adds later). Each fails a final turn (Clementine.Error.stopped/1):
+  # an incomplete response is never a whole answer.
   def incomplete_reason(%{"status" => "incomplete"} = response) do
     case get_in(response, ["incomplete_details", "reason"]) do
       "max_output_tokens" -> "max_tokens"
-      reason when is_binary(reason) -> reason
-      _ -> "incomplete"
+      "content_filter" -> "content_filter"
+      _other -> "incomplete"
     end
   end
 

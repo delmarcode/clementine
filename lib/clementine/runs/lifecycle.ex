@@ -227,7 +227,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     @doc false
     # The Result a terminal row records: the output a completed run
-    # stored, the error, the cancel reason, the interrupt reason, and the
+    # stored and its final turn's stop reason, the error, the cancel reason, the interrupt reason, and the
     # usage. Reads of a child's end that did not carry its Result (the
     # loop sweep's synthesized completion, a delegating parent's resume)
     # rebuild it here.
@@ -238,7 +238,13 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
       case facts.status do
         :completed ->
-          Result.completed(output: row.result && row.result["output"], usage: usage)
+          result = row.result || %{}
+
+          Result.completed(
+            output: result["output"],
+            stop_reason: result["stop_reason"],
+            usage: usage
+          )
 
         :failed ->
           Result.failed(facts.error || %Clementine.Error{message: "child failed"}, usage)
@@ -254,8 +260,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
-    defp store_output(repo, %Result.Completed{output: output}, run) do
-      result = %{"output" => output}
+    defp store_output(repo, %Result.Completed{output: output, stop_reason: reason}, run) do
+      result = %{"output" => output, "stop_reason" => reason}
       {1, _} = repo.update_all(from(r in AgentRun, where: r.id == ^run.id), set: [result: result])
       %{run | result: result}
     end

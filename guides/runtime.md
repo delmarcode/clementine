@@ -198,6 +198,79 @@ text, or, for an agent with `output_schema:`, the decoded answer
   cannot listen (Postgres behind a transaction pooler) leaves the run to
   find the flag at its next step.
 
+## Refusals and cut-off answers
+
+A run whose final turn the provider refused, or cut off, fails. It never
+completes, so no app reads a refusal or half an answer as the answer:
+
+| The final turn | The run | `error.code` |
+|----------------|---------|--------------|
+| Anthropic's `stop_reason: "refusal"`; OpenAI's refusal content, or its content filter | `failed` | `:refused` |
+| `"max_tokens"` (OpenAI's `max_output_tokens`), `"model_context_window_exceeded"`, an OpenAI response left incomplete | `failed` | `:truncated` |
+| `"end_turn"`, `"stop_sequence"` | `completed` | |
+
+- The error is `kind: :rollout` and not retryable: the same request
+  mostly gets the same answer. `run_finished/2` receives
+  `%Result.Failed{error: %Clementine.Error{code: :refused}}`, the row says
+  `status: "failed"` and `error["code"] == "refused"`, a loop hears the
+  `Result.Failed`, and `clementine_rollout_exceptions_total` counts it
+  by `error_code`, never as `clementine_rollout_stops_total{status="success"}`.
+  The trace's last `:model_call` keeps the stop reason, and, under
+  `trace: :content`, what the model wrote before it stopped.
+- Only a final answer is judged. A turn that calls tools runs them
+  whatever it stopped on, except a refused one, which runs none: the
+  provider stopped the turn, a tool call it began included. A paused
+  turn (`"pause_turn"`) goes back to the provider and continues.
+- A completed run names its final turn's stop reason:
+  `Result.Completed`'s `stop_reason`, and `result["stop_reason"]` on the
+  row.
+- A failed turn returns no messages, so a host that stores a thread's
+  turns from `Result.Completed` stores nothing of it. Anthropic's advice
+  after a refusal is to drop the turn that drew it, since the same
+  conversation will likely be refused again: leave the refused prompt
+  out of `history/1`. Two user messages in a row are valid on every
+  provider, so keeping it is never an error, only a likely second
+  refusal.
+- There is no switch that completes a cut-off answer. Raise the model's
+  `max_tokens` (its catalog entry's `defaults:`), or ask for less. An
+  app that wants what the model wrote before the cut reads the streamed
+  text, or the trace's last `:model_call` content.
+
+What each kind of agent does with it:
+
+- **A task whose answer is its tool calls** (yakky's screener, which
+  submits an assessment through a tool). The run fails; the tool calls
+  before the final turn stand. Keep the path for a run that ends
+  without its submission: the screen fails closed and goes to a person.
+  Name the code to staff, since a refusal and a cut-off answer need
+  different fixes.
+- **An extractor** (revy's, which records statements through a tool and
+  ignores its final text). A failed run means the packet was not read
+  to the end, never that it documents nothing. Record the extraction as
+  incomplete with the code: a refusal goes to a person, a cut-off answer
+  is retried with a larger `max_tokens` or a smaller packet. Statements
+  recorded before the failure are partial evidence; never conclude an
+  absence from them.
+- **A chat turn** (yakky's patient assistant, Meli). The turn fails and
+  the thread moves on (`on_failure: "surface"`). Show a refusal as the
+  assistant declining, not as a crash, and take down the text the turn
+  streamed before it: the provider stopped on it. Show a cut-off answer
+  as cut off; the streamed text is all there is of it, so store it
+  yourself if the app keeps a record of what the user read.
+  `"on_failure": "retry"` runs a refused or cut-off turn again, which
+  is likely refused or cut off again, and repeats what its tools did (a
+  sent email): keep it for turns whose tools are safe to repeat.
+
+In tests, script the stop through the Anthropic fake
+(`expect_claude_turn/2`):
+
+<!-- guide-sample: parse-only -->
+```elixir
+expect_claude_turn([{:text, "I can't help with"}], stop_reason: "refusal")
+assert :ok = perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})
+assert %{status: "failed", error: %{"code" => "refused"}} = Clementine.Runs.get(run.id)
+```
+
 ## Asking other agents
 
 An agent that needs another agent's answer before it goes on lists the
@@ -699,7 +772,23 @@ assert %{status: "completed"} = Clementine.Runs.get(run.id)
 `expect_claude_turn/2` scripts a turn through
 `Clementine.LLM.Anthropic.Fake`, which fails a turn whose replayed
 history lost the model's earlier reasoning
-([Models that bind their thinking](#models-that-bind-their-thinking)).
+([Models that bind their thinking](#models-that-bind-their-thinking))
+or holds what the API refuses (an empty text block). Its options script
+the rest of a real response: `stop_reason:` (`"refusal"`,
+`"max_tokens"`, `"pause_turn"`, ...), `usage:` in the API's keys, cache
+tokens included, which reach the token and cost series as a real
+response's would, and `api_errors:`, the 429s and 529s the client
+retries before the answer, or a status it gives up on. A
+`{:error, "overloaded_error"}` step ends the turn mid-stream.
+
+<!-- guide-sample: parse-only -->
+```elixir
+expect_claude_turn([{:text, "Sunny."}],
+  usage: [input_tokens: 40, cache_read_input_tokens: 900],
+  api_errors: [529]
+)
+```
+
 The runtime's own suite proves the concurrency claims against Postgres in
 Clementine's CI: the conformance suite on `agent_runs`, the resume racing
 a sweep, a burst that outgrows the queue, the reaper, and the drain.

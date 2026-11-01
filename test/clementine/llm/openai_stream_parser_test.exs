@@ -114,6 +114,16 @@ defmodule Clementine.LLM.OpenAIStreamParserTest do
              ])
   end
 
+  test "any other incomplete response stops with incomplete, which fails a final turn" do
+    for reason <- ["max_messages", "steered", nil] do
+      response = %{"status" => "incomplete", "incomplete_details" => %{"reason" => reason}}
+      assert Clementine.LLM.OpenAIStreamParser.incomplete_reason(response) == "incomplete"
+    end
+
+    assert Clementine.LLM.OpenAIStreamParser.incomplete_reason(%{"status" => "completed"}) ==
+             "end_turn"
+  end
+
   test "a failed response is an error, not an empty answer" do
     error = %{"code" => "server_error", "message" => "The model failed."}
 

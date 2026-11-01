@@ -575,17 +575,14 @@ defmodule Clementine.LLM.StreamParser do
     @doc """
     Returns the accumulated response as a Response struct: the finished
     blocks in the order they streamed, then any text still open. A call
-    or thinking block whose stop never arrived is left out.
+    or thinking block whose stop never arrived is left out. A turn of no
+    blocks (one refused before it wrote anything, say) has no content,
+    never an empty text block, which the API refuses in a replayed
+    history.
     """
     def to_response(%__MODULE__{} = acc) do
-      content =
-        case Enum.reverse(close_text(acc).blocks) do
-          [] -> [Content.text("")]
-          content -> content
-        end
-
       %Response{
-        content: content,
+        content: Enum.reverse(close_text(acc).blocks),
         stop_reason: acc.stop_reason,
         usage: acc.usage,
         binding: acc.binding
