@@ -99,9 +99,15 @@ defmodule Clementine.LLM.Policy do
   for the model `id` names, or explains what the model's facts refuse.
   """
   @spec resolve(String.t() | Model.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
-  def resolve(model, opts \\ [])
+  def resolve(model, opts \\ []), do: resolve(model, opts, prices: true)
 
-  def resolve(%Model{} = model, opts) when is_list(opts) do
+  @doc false
+  # `prices: false` leaves out the check that the model's per-TTL prices
+  # name the agent's TTL: for an agent built before the runtime fills its
+  # `cache:` from its module's `use` (`Clementine.Agent.new/1`).
+  @spec resolve(String.t() | Model.t(), keyword(), keyword()) ::
+          {:ok, t()} | {:error, String.t()}
+  def resolve(%Model{} = model, opts, checks) when is_list(opts) do
     opts = Keyword.take(opts, @keys)
 
     with :ok <- servable(model),
@@ -113,7 +119,7 @@ defmodule Clementine.LLM.Policy do
          {:ok, max_tokens} <- max_tokens(model, opts[:max_tokens]),
          {:ok, display} <- display(model, opts[:display], thinking, provider_options),
          {:ok, cache} <- cache(model, opts[:cache]),
-         :ok <- priced(model, cache) do
+         :ok <- priced(model, cache, Keyword.get(checks, :prices, true)) do
       {:ok,
        %__MODULE__{
          model: model,
@@ -130,8 +136,8 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  def resolve(id, opts) when is_list(opts) do
-    with {:ok, model} <- Models.fetch(id), do: resolve(model, opts)
+  def resolve(id, opts, checks) when is_list(opts) do
+    with {:ok, model} <- Models.fetch(id), do: resolve(model, opts, checks)
   end
 
   @doc "As `resolve/2`, raising `ArgumentError`."
@@ -411,7 +417,9 @@ defmodule Clementine.LLM.Policy do
     do: "on #{inspect(platform)} it offers #{inspect(ttls)}"
 
   # A price per cache TTL names the rate for the TTL the agent writes at.
-  defp priced(model, cache) do
+  defp priced(_model, _cache, false), do: :ok
+
+  defp priced(model, cache, true) do
     case Pricing.validate_for_model(%{pricing: model.prices, cache: cache}) do
       :ok -> :ok
       {:error, message} -> {:error, "prices: #{message}"}

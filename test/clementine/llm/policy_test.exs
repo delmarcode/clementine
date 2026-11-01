@@ -233,6 +233,62 @@ defmodule Clementine.LLM.PolicyTest do
       assert %{agents: %{"policy_one_hour" => ^agent}} = boot([agent])
     end
 
+    test "an agent/1 that leaves cache: to its use is priced at the declared TTL" do
+      put_models(%{
+        "claude-sonnet-5" => [
+          prices: [
+            currency: "USD",
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.2,
+            cache_write: [one_hour: 4.0]
+          ]
+        ]
+      })
+
+      module = Module.concat(__MODULE__, "Dynamic#{System.unique_integer([:positive])}")
+
+      Code.compile_string("""
+      defmodule #{inspect(module)} do
+        use Clementine.Agent, key: "policy_dynamic", model: "claude-sonnet-5", cache: [ttl: :one_hour]
+
+        @impl true
+        def agent(_run), do: Clementine.Agent.new(model: __model__(), instructions: "Go.")
+      end
+      """)
+
+      # agent/1 builds without the declared cache:, and the claim fills it.
+      built = module.agent(nil)
+      assert %Clementine.Agent{cache: nil} = built
+
+      assert %Clementine.Agent{cache: [ttl: :one_hour]} =
+               Clementine.Agent.declared!(module, built)
+
+      # The default TTL has no price, so an agent that keeps it is still
+      # refused where it runs: at the claim, and on every request.
+      assert {:error, message} = Policy.resolve("claude-sonnet-5")
+      assert message =~ "names no rate for :five_minutes"
+
+      assert_raise ArgumentError, ~r/names no rate for :five_minutes/, fn ->
+        Clementine.Agent.new(model: "claude-sonnet-5", cache: true)
+      end
+
+      plain = Module.concat(__MODULE__, "Plain#{System.unique_integer([:positive])}")
+
+      Code.compile_string("""
+      defmodule #{inspect(plain)} do
+        use Clementine.Agent, key: "policy_plain"
+
+        @impl true
+        def agent(_run), do: Clementine.Agent.new(model: "claude-sonnet-5", instructions: "Go.")
+      end
+      """)
+
+      assert_raise ArgumentError, ~r/names no rate for :five_minutes/, fn ->
+        Clementine.Agent.declared!(plain, plain.agent(nil))
+      end
+    end
+
     test "an agent module written by hand, without use, boots" do
       Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
       assert %{agents: %{"policy_hand_written" => HandWritten}} = boot([HandWritten])

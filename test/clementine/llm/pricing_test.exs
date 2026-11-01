@@ -290,8 +290,14 @@ defmodule Clementine.LLM.PricingTest do
       assert message =~ ~s("qwen.qwen3-235b-a22b-2507-v1:0": prices:)
       assert message =~ "give one cache_write rate"
 
+      # An agent that sets its caching is refused at build; boot refuses
+      # the price list itself, which no agent's TTL could use.
       assert_raise ArgumentError, ~r/give one cache_write rate/, fn ->
-        Agent.new(model: "qwen.qwen3-235b-a22b-2507-v1:0")
+        Agent.new(model: "qwen.qwen3-235b-a22b-2507-v1:0", cache: true)
+      end
+
+      assert_raise ArgumentError, ~r/the model does not offer/, fn ->
+        Clementine.Models.validate_config!()
       end
     end
 

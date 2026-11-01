@@ -497,7 +497,10 @@ defmodule Clementine.Agent do
   def new(opts) when is_list(opts) do
     agent = struct!(__MODULE__, opts)
     Clementine.Trace.validate_fidelity!(agent.trace)
-    check_model!(agent)
+    # An agent that leaves `cache:` to its module's `use` is priced at the
+    # TTL the runtime fills in (`declared!/2`), so its prices are checked
+    # there, at boot, and on every request, not against the default here.
+    check_model!(agent, prices: agent.cache != nil)
 
     case Enum.filter(agent.deferred, &(&1 in agent.tools)) do
       [] ->
@@ -538,7 +541,7 @@ defmodule Clementine.Agent do
               "none: give one (model: \"claude-sonnet-5-5\")"
     end
 
-    check_model!(agent)
+    check_model!(agent, prices: true)
   end
 
   @doc false
@@ -572,10 +575,10 @@ defmodule Clementine.Agent do
   # An agent without a model is one the runtime completes from its
   # module (`declared!/2`); one with a model is checked now, so a typo or
   # a choice its sheet refuses fails the build.
-  defp check_model!(%__MODULE__{model: nil} = agent), do: agent
+  defp check_model!(%__MODULE__{model: nil} = agent, _checks), do: agent
 
-  defp check_model!(%__MODULE__{model: model} = agent) do
-    case Clementine.LLM.Policy.resolve(model, policy(agent)) do
+  defp check_model!(%__MODULE__{model: model} = agent, checks) do
+    case Clementine.LLM.Policy.resolve(model, policy(agent), checks) do
       {:ok, _policy} -> agent
       {:error, message} -> raise ArgumentError, "Clementine.Agent: " <> message
     end
