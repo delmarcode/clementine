@@ -88,7 +88,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
              module: controller(config, row),
              args: row.input || %{},
              policy: row.loop_policy || %{},
-             envelope: row.envelope
+             envelope: row.envelope,
+             agent_key: row.agent_key
            }}
 
         %AgentRun{} ->
@@ -257,7 +258,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
            :ok <- consume(config, commit),
            :ok <- mark_dead(config, commit),
            :ok <- insert_appends(config, commit),
-           :ok <- cancel_children(commit),
+           :ok <- cancel_children(config, commit),
            {:ok, children} <- spawn_children(config, row, commit),
            {:ok, timers} <- schedule_timers(config, row, commit),
            :ok <- retire_timers(config, row, commit),
@@ -585,20 +586,26 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # child the commit's envelope holds with its ref: the step core
     # retires a spawn of its own drain instead of cancelling it (the
     # per-tag rule), so a missing ref is a core bug, never a race.
-    defp cancel_children(%StepCommit{cancel_children: []}), do: :ok
+    defp cancel_children(_config, %StepCommit{cancel_children: []}), do: :ok
 
-    defp cancel_children(%StepCommit{cancel_children: tag_keys} = commit) do
+    defp cancel_children(%Config{repo: repo}, %StepCommit{cancel_children: tag_keys} = commit) do
       stored = StepCommit.envelope(commit)
       reason = cancel_reason(commit)
 
-      Enum.reduce_while(tag_keys, :ok, fn tag_key, :ok ->
-        ref =
+      refs =
+        Enum.map(tag_keys, fn tag_key ->
           (stored && Map.get(stored.children, tag_key)) ||
             raise ArgumentError,
                   "cancel for #{inspect(tag_key)} names no committed child: the step core " <>
                     "cancels committed children only and retires a spawn of its own drain"
+        end)
 
-        case Protocol.request_cancel(Lifecycle, ref, reason) do
+      # Each child's key names it on the end its cancel writes.
+      keys =
+        Map.new(repo.all(from(r in AgentRun, where: r.id in ^refs, select: {r.id, r.agent_key})))
+
+      Enum.reduce_while(refs, :ok, fn ref, :ok ->
+        case Protocol.request_cancel(Lifecycle, ref, reason, nil, agent_key: keys[ref]) do
           {:ok, _} -> {:cont, :ok}
           {:error, :already_terminal} -> {:cont, :ok}
           {:error, :not_found} -> {:cont, :ok}

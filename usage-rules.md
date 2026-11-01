@@ -23,6 +23,13 @@ the drain at shutdown.
 Triage` adds an agent with a tool and a test. Never copy a worker, a
 lifecycle, or a reaper into the app.
 
+Metrics are `Clementine.Telemetry.metrics/0`: pass it whole to the
+app's reporter (a PromEx plugin's `Event.build/2`, or
+`TelemetryMetricsPrometheus`), and never hand-copy Clementine's metric
+definitions into the app. Its series are labeled by agent key, provider,
+model, and alias, and keep the bare `clementine_` names every app
+exports.
+
 ## Subject, actor, turn, lane
 
 - A run's **subject** is what it is about: `subject: {"ticket", ticket.id}`,

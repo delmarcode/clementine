@@ -63,6 +63,7 @@ defmodule Clementine.Lifecycle.Protocol do
     executor = Keyword.fetch!(opts, :executor)
     ctx = Keyword.get(opts, :ctx)
     max_duration = Keyword.get(opts, :max_duration)
+    agent_key = Keyword.get(opts, :agent_key)
 
     with {:ok, %Facts{} = facts} <- lifecycle.fetch(run_ref, ctx) do
       case facts.status do
@@ -84,7 +85,11 @@ defmodule Clementine.Lifecycle.Protocol do
 
           case lifecycle.apply(transition, ctx) do
             {:ok, %Facts{} = claimed} ->
-              emit(:claimed, %{epoch: claimed.epoch}, %{run_ref: run_ref, executor_id: executor})
+              emit(:claimed, %{epoch: claimed.epoch}, %{
+                run_ref: run_ref,
+                executor_id: executor,
+                agent_key: agent_key
+              })
 
               {:ok,
                %Lease{
@@ -95,7 +100,8 @@ defmodule Clementine.Lifecycle.Protocol do
                  resume: lease_resume(facts),
                  lifecycle: lifecycle,
                  ctx: ctx,
-                 claimed_at: claimed.heartbeat_at
+                 claimed_at: claimed.heartbeat_at,
+                 agent_key: agent_key
                }}
 
             {:error, :stale} ->
@@ -367,7 +373,8 @@ defmodule Clementine.Lifecycle.Protocol do
       {:ok, cancelled_facts} ->
         emit_finished(lease.run_ref, lease.epoch, result,
           claimed_at: lease.claimed_at,
-          finished_at: cancelled_facts.finished_at
+          finished_at: cancelled_facts.finished_at,
+          agent_key: lease.agent_key
         )
 
         {:cancelled, cancelled_facts}
@@ -404,8 +411,11 @@ defmodule Clementine.Lifecycle.Protocol do
   Approval payloads are normative: `{:approved, meta}` | `{:denied, meta}`.
   `{:until, _}` resumes carry `:elapsed`; `{:external, _}` payloads are
   host-defined.
+
+  `agent_key:` names the run's agent on the `:resumed` event, for a
+  caller that holds the run's row, as for `interrupt/5`.
   """
-  @spec resume(module(), ResumeToken.t(), term(), term()) ::
+  @spec resume(module(), ResumeToken.t(), term(), term(), keyword()) ::
           {:ok, Facts.t()}
           | {:error,
              :stale_reference
@@ -414,13 +424,13 @@ defmodule Clementine.Lifecycle.Protocol do
              | :wrong_reference_type
              | :not_found
              | term()}
-  def resume(lifecycle, %ResumeToken{} = token, payload, ctx \\ nil) do
-    do_resume(lifecycle, token, payload, ctx, 3)
+  def resume(lifecycle, %ResumeToken{} = token, payload, ctx \\ nil, opts \\ []) do
+    do_resume(lifecycle, token, payload, ctx, Keyword.get(opts, :agent_key), 3)
   end
 
-  defp do_resume(_lifecycle, _token, _payload, _ctx, 0), do: {:error, :conflict}
+  defp do_resume(_lifecycle, _token, _payload, _ctx, _agent_key, 0), do: {:error, :conflict}
 
-  defp do_resume(lifecycle, %ResumeToken{} = token, payload, ctx, attempts) do
+  defp do_resume(lifecycle, %ResumeToken{} = token, payload, ctx, agent_key, attempts) do
     with {:ok, %Facts{} = facts} <- lifecycle.fetch(token.run_ref, ctx) do
       cond do
         facts.status in [:queued, :running] ->
@@ -452,11 +462,16 @@ defmodule Clementine.Lifecycle.Protocol do
 
           case lifecycle.apply(transition, ctx) do
             {:ok, resumed} ->
-              emit(:resumed, %{}, %{run_ref: token.run_ref, epoch: resumed.epoch})
+              emit(:resumed, %{}, %{
+                run_ref: token.run_ref,
+                epoch: resumed.epoch,
+                agent_key: agent_key
+              })
+
               {:ok, resumed}
 
             {:error, :stale} ->
-              do_resume(lifecycle, token, payload, ctx, attempts - 1)
+              do_resume(lifecycle, token, payload, ctx, agent_key, attempts - 1)
 
             {:error, reason} ->
               {:error, reason}
@@ -489,18 +504,23 @@ defmodule Clementine.Lifecycle.Protocol do
   loop-owned — a kind-aware flag plus wake whose cascade cancels children
   first and finishes last. A terminal run answers `:already_terminal`
   whatever its kind: dead ends have nothing left to protect.
+
+  `agent_key:` names the run's agent on the `:finished` event a direct
+  cancel writes, for a caller that holds the run's row, as for
+  `interrupt/5`.
   """
-  @spec request_cancel(module(), term(), term(), term()) ::
+  @spec request_cancel(module(), term(), term(), term(), keyword()) ::
           {:ok, :flagged}
           | {:ok, :finished}
           | {:error, :already_terminal | :loop_run | :not_found | term()}
-  def request_cancel(lifecycle, run_ref, reason, ctx \\ nil) do
-    do_request_cancel(lifecycle, run_ref, reason, ctx, 3)
+  def request_cancel(lifecycle, run_ref, reason, ctx \\ nil, opts \\ []) do
+    do_request_cancel(lifecycle, run_ref, reason, ctx, Keyword.get(opts, :agent_key), 3)
   end
 
-  defp do_request_cancel(_lifecycle, _run_ref, _reason, _ctx, 0), do: {:error, :conflict}
+  defp do_request_cancel(_lifecycle, _run_ref, _reason, _ctx, _agent_key, 0),
+    do: {:error, :conflict}
 
-  defp do_request_cancel(lifecycle, run_ref, reason, ctx, attempts) do
+  defp do_request_cancel(lifecycle, run_ref, reason, ctx, agent_key, attempts) do
     with {:ok, %Facts{} = facts} <- lifecycle.fetch(run_ref, ctx) do
       cond do
         Facts.terminal?(facts) ->
@@ -518,9 +538,14 @@ defmodule Clementine.Lifecycle.Protocol do
           }
 
           case lifecycle.apply(transition, ctx) do
-            {:ok, _} -> {:ok, :flagged}
-            {:error, :stale} -> do_request_cancel(lifecycle, run_ref, reason, ctx, attempts - 1)
-            {:error, other} -> {:error, other}
+            {:ok, _} ->
+              {:ok, :flagged}
+
+            {:error, :stale} ->
+              do_request_cancel(lifecycle, run_ref, reason, ctx, agent_key, attempts - 1)
+
+            {:error, other} ->
+              {:error, other}
           end
 
         facts.status in [:queued, :waiting] ->
@@ -546,13 +571,14 @@ defmodule Clementine.Lifecycle.Protocol do
               # a duration from.
               emit_finished(run_ref, facts.epoch, result,
                 claimed_at: nil,
-                finished_at: cancelled_facts.finished_at
+                finished_at: cancelled_facts.finished_at,
+                agent_key: agent_key
               )
 
               {:ok, :finished}
 
             {:error, :stale} ->
-              do_request_cancel(lifecycle, run_ref, reason, ctx, attempts - 1)
+              do_request_cancel(lifecycle, run_ref, reason, ctx, agent_key, attempts - 1)
 
             {:error, other} ->
               {:error, other}
@@ -603,7 +629,8 @@ defmodule Clementine.Lifecycle.Protocol do
       {:ok, facts} ->
         emit_finished(lease.run_ref, lease.epoch, result,
           claimed_at: lease.claimed_at,
-          finished_at: facts.finished_at
+          finished_at: facts.finished_at,
+          agent_key: lease.agent_key
         )
 
         {:ok, facts}
@@ -641,10 +668,13 @@ defmodule Clementine.Lifecycle.Protocol do
   match a stale-fetched terminal snapshot and rewrite a dead-end status,
   firing a second projection. Dead-end enforcement is this module's job,
   not the caller's pre-filtering.
+
+  `agent_key:` names the run's agent on the `:reaped` event, for a
+  caller that read it with the facts.
   """
-  @spec interrupt(module(), Facts.t(), InterruptReason.t(), term()) ::
+  @spec interrupt(module(), Facts.t(), InterruptReason.t(), term(), keyword()) ::
           {:ok, Facts.t()} | {:error, :already_terminal | :stale} | {:error, term()}
-  def interrupt(lifecycle, %Facts{} = facts, %InterruptReason{} = reason, ctx \\ nil) do
+  def interrupt(lifecycle, %Facts{} = facts, %InterruptReason{} = reason, ctx \\ nil, opts \\ []) do
     if Facts.terminal?(facts) do
       {:error, :already_terminal}
     else
@@ -660,7 +690,13 @@ defmodule Clementine.Lifecycle.Protocol do
 
       case apply_with_retry(lifecycle, transition, ctx) do
         {:ok, reaped} ->
-          emit(:reaped, %{}, %{run_ref: facts.ref, epoch: facts.epoch, code: reason.code})
+          emit(:reaped, %{}, %{
+            run_ref: facts.ref,
+            epoch: facts.epoch,
+            agent_key: Keyword.get(opts, :agent_key),
+            code: reason.code
+          })
+
           {:ok, reaped}
 
         {:error, _} = error ->
@@ -695,7 +731,10 @@ defmodule Clementine.Lifecycle.Protocol do
   def requeue(%Lease{} = lease, reason, opts) when is_list(opts) do
     case lease.lifecycle.fetch(lease.run_ref, lease.ctx) do
       {:ok, %Facts{status: :running, epoch: epoch} = facts} when epoch == lease.epoch ->
-        do_requeue(lease.lifecycle, facts, reason, lease.ctx, Keyword.get(opts, :trace, []))
+        do_requeue(lease.lifecycle, facts, reason, lease.ctx,
+          trace: Keyword.get(opts, :trace, []),
+          agent_key: lease.agent_key
+        )
 
       {:ok, %Facts{}} ->
         emit(:lease_lost, %{}, lease_metadata(lease))
@@ -711,26 +750,29 @@ defmodule Clementine.Lifecycle.Protocol do
   as an interrupt, when policy opts in, guarded by the exact observed
   facts. Only `running` runs are requeueable — anything else (including a
   stale-fetched terminal snapshot) is refused with a clean error, for the
-  same reason `interrupt/4` refuses terminal facts.
+  same reason `interrupt/4` refuses terminal facts. `agent_key:` names
+  the run's agent on the `:requeued` event, as for `interrupt/5`.
   """
   def requeue(lifecycle, %Facts{} = facts, reason), do: requeue(lifecycle, facts, reason, nil)
 
-  @spec requeue(module(), Facts.t(), term(), term()) ::
+  @spec requeue(module(), Facts.t(), term(), term(), keyword()) ::
           {:ok, Facts.t()}
           | {:error, :effects_present | {:not_requeueable, Facts.status()} | :stale | term()}
-  def requeue(lifecycle, %Facts{status: :running} = facts, reason, ctx) do
-    do_requeue(lifecycle, facts, reason, ctx, [])
+  def requeue(lifecycle, facts, reason, ctx, opts \\ [])
+
+  def requeue(lifecycle, %Facts{status: :running} = facts, reason, ctx, opts) do
+    do_requeue(lifecycle, facts, reason, ctx, agent_key: Keyword.get(opts, :agent_key))
   end
 
-  def requeue(_lifecycle, %Facts{} = facts, _reason, _ctx) do
+  def requeue(_lifecycle, %Facts{} = facts, _reason, _ctx, _opts) do
     {:error, {:not_requeueable, facts.status}}
   end
 
-  defp do_requeue(_lifecycle, %Facts{effects?: true}, _reason, _ctx, _trace) do
+  defp do_requeue(_lifecycle, %Facts{effects?: true}, _reason, _ctx, _opts) do
     {:error, :effects_present}
   end
 
-  defp do_requeue(lifecycle, %Facts{} = facts, reason, ctx, trace) do
+  defp do_requeue(lifecycle, %Facts{} = facts, reason, ctx, opts) do
     transition = %Transition{
       op: :requeue,
       run_ref: facts.ref,
@@ -743,12 +785,18 @@ defmodule Clementine.Lifecycle.Protocol do
         heartbeat_at: nil
       },
       meta: %{reason: reason},
-      trace: trace
+      trace: Keyword.get(opts, :trace, [])
     }
 
     case lifecycle.apply(transition, ctx) do
       {:ok, requeued} ->
-        emit(:requeued, %{}, %{run_ref: facts.ref, epoch: facts.epoch, reason: reason})
+        emit(:requeued, %{}, %{
+          run_ref: facts.ref,
+          epoch: facts.epoch,
+          agent_key: Keyword.get(opts, :agent_key),
+          reason: reason
+        })
+
         {:ok, requeued}
 
       {:error, _} = error ->
@@ -788,13 +836,14 @@ defmodule Clementine.Lifecycle.Protocol do
     emit(:finished, %{duration: duration}, %{
       run_ref: run_ref,
       epoch: epoch,
+      agent_key: Keyword.get(stamps, :agent_key),
       terminal: Result.status(result),
       usage: Result.usage(result)
     })
   end
 
-  defp lease_metadata(%Lease{run_ref: run_ref, epoch: epoch}) do
-    %{run_ref: run_ref, epoch: epoch}
+  defp lease_metadata(%Lease{run_ref: run_ref, epoch: epoch, agent_key: agent_key}) do
+    %{run_ref: run_ref, epoch: epoch, agent_key: agent_key}
   end
 
   defp expect(%Facts{status: status, epoch: epoch}), do: %{status: status, epoch: epoch}

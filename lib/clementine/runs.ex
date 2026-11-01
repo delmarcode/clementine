@@ -490,7 +490,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
            :ok <- refuse_loop(row),
            {:ok, token} <- waiting_token(row),
            :ok <- authorize_resume(host, row, decision),
-           {:ok, _facts} <- Protocol.resume(Lifecycle, token, decision) do
+           {:ok, _facts} <-
+             Protocol.resume(Lifecycle, token, decision, nil, agent_key: row.agent_key) do
         Worker.re_enqueue!(id)
       else
         {:error, reason} -> repo.rollback(reason)
@@ -581,7 +582,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       reason = %{"code" => "cancelled"}
 
       with {:ok, id} <- cast_id(run_id) do
-        case Protocol.request_cancel(Lifecycle, id, reason) do
+        # The run's key names it on the end a direct cancel writes; the
+        # protocol reads the run's facts, never the key.
+        agent_key = repo.one(from(r in AgentRun, where: r.id == ^id, select: r.agent_key))
+
+        case Protocol.request_cancel(Lifecycle, id, reason, nil, agent_key: agent_key) do
           {:error, :loop_run} -> Loops.cancel(id, reason)
           other -> other
         end

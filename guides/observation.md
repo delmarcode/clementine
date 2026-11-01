@@ -232,6 +232,8 @@ Execution and lifecycle are also instrumented with `:telemetry` events —
 `[:clementine, :rollout | :llm | :tool, ...]` around the engine and
 `[:clementine, :run, :claimed | :heartbeat | :suspended | :resumed |
 :finished | :requeued | :lease_lost | :reaped]` across the run
-lifecycle. `Clementine.Telemetry` documents every event and ships
-`metrics/0` definitions for `telemetry_metrics` reporters;
+lifecycle. Engine events name the run's agent, provider, model, and
+alias, and run events its agent. `Clementine.Telemetry` documents every
+event and ships `metrics/0`, the one list of counters, sums, and
+distributions every app exports to Prometheus (or LiveDashboard);
 `Clementine.Telemetry.Logger` is a ready-made dev/debug handler.
