@@ -442,9 +442,11 @@ What Clementine does about it, without any option:
   turn showed, and the model reads that as what it said then.
 - **Both are facts of the model's sheet, not of its id.**
   `thinking.binding: :prefix` turns the check on, and
-  `features.mid_conversation_system` sends a system message in place;
-  elsewhere it joins `system` and `tools` (Claude Sonnet 5 takes none in
-  place). A model Clementine does not ship says both in its declaration
+  `features.mid_conversation_system` sends a system message in place,
+  with its tools defined inside it where `features.inline_tools` (the
+  Claude API) and in `tools` where not (Bedrock); elsewhere it joins
+  `system` and `tools` (Claude Sonnet 5 takes none in place, nor does
+  Foundry). A model Clementine does not ship says both in its declaration
   (`docs/MODELS.md`), and defaults to neither.
 - **It shows the text written between tool calls.** Claude Fable 5.1,
   Mythos 5.1, Opus 5.5, Sonnet 5.5, and Fable 5 can write a short

@@ -9,22 +9,15 @@ defmodule Clementine.LLM.AnthropicRetryTest do
   setup do
     bypass = Bypass.open()
 
-    prev_url = Application.get_env(:clementine, :anthropic_base_url)
     prev_retry = Application.get_env(:clementine, :retry)
 
-    Application.put_env(
-      :clementine,
-      :anthropic_base_url,
-      "http://localhost:#{bypass.port}/v1/messages"
+    Clementine.TestPlatforms.put(
+      anthropic: [api_key: "test-anthropic-key", base_url: "http://localhost:#{bypass.port}"]
     )
 
     Application.put_env(:clementine, :retry, max_attempts: 3, base_delay: 0, max_delay: 0)
 
     on_exit(fn ->
-      if prev_url,
-        do: Application.put_env(:clementine, :anthropic_base_url, prev_url),
-        else: Application.delete_env(:clementine, :anthropic_base_url)
-
       if prev_retry,
         do: Application.put_env(:clementine, :retry, prev_retry),
         else: Application.delete_env(:clementine, :retry)

@@ -218,9 +218,8 @@ defmodule Clementine.LLM.Pricing do
   its prices name no rate for.
 
   - `:platform` — where the call ran: an atom, or its name as a trace
-    entry stores it (`"anthropic"`). Default the model's default
-    platform (`Clementine.Models.default_platform/1`), the only one a
-    request goes to until `Clementine.Platform` arrives (OPS-195).
+    entry stores it (`"bedrock"`). Default the model's default
+    platform (`Clementine.Models.default_platform/1`).
   - `:cache_ttl` — the TTL the call's writes are billed at, an atom or
     its name, as a trace `:model_call` entry records it: any TTL the
     prices name, so an entry written at a TTL the app has since dropped

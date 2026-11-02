@@ -81,9 +81,14 @@ defmodule Clementine do
   ## Configuration
 
       # config/config.exs
-      config :clementine,
-        anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
-        openai_api_key: {:system, "OPENAI_API_KEY"}
+      config :clementine, :platforms,
+        anthropic: [api_key: {:system, "ANTHROPIC_API_KEY"}],
+        openai: [api_key: {:system, "OPENAI_API_KEY"}]
+
+  Each platform a model is served on (the Claude API, OpenAI, Bedrock,
+  Foundry, OpenRouter, an OpenAI-compatible server) has its endpoint and
+  credential there (`Clementine.Platform`), and an agent picks one with
+  `platform:`.
 
   An agent names its model by the vendor's id (`"claude-sonnet-5-5"`).
   Clementine ships a fact sheet for each current Anthropic and OpenAI
@@ -92,8 +97,8 @@ defmodule Clementine do
   id to facts (`docs/MODELS.md`). Open models and fine-tunes served over
   the OpenAI-compatible Chat Completions dialect (OpenRouter, AWS
   Bedrock, GCP Vertex, Tinker, self-hosted vLLM) route through
-  `Clementine.LLM.ChatCompletions`; see that module for endpoint and
-  credential configuration. `:retry` tunes provider retries.
+  `Clementine.LLM.ChatCompletions`; `Clementine.Platform` has every
+  platform's endpoint and credential. `:retry` tunes provider retries.
   """
 
   alias Clementine.{AgentServer, Events, Result, Rollout, Run, Runner}

@@ -11,6 +11,7 @@ defmodule Clementine.Application do
     # config :clementine, :models. Each agent's own model and choices are
     # checked when it is built, and again at the child spec's start.
     Clementine.Models.validate_config!()
+    Clementine.Platform.validate_config!()
 
     # What is ending only warns, and never stops the start: sheets read
     # long ago, and the dates of the models the app offers. Each agent's

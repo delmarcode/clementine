@@ -305,7 +305,7 @@ defmodule Clementine.AgentPolicyTest do
           vendor: :acme,
           context: 32_000,
           max_output: 8_000,
-          platforms: [openai_compatible: [base_url: "http://localhost:1/v1"]]
+          platforms: [openai_compatible: []]
         ]
       })
 
@@ -386,7 +386,7 @@ defmodule Clementine.AgentPolicyTest do
           vendor: :qwen,
           context: 32_000,
           max_output: 8_000,
-          platforms: [openai_compatible: [base_url: "http://localhost:1/v1"]]
+          platforms: [openai_compatible: []]
         ]
       })
 

@@ -46,7 +46,7 @@ Configure an API key:
 # config/config.exs
 import Config
 
-config :clementine, anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}
+config :clementine, :platforms, anthropic: [api_key: {:system, "ANTHROPIC_API_KEY"}]
 ```
 
 An agent names its model by the vendor's id (`"claude-sonnet-5-5"`).

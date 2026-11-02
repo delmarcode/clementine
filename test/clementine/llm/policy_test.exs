@@ -11,12 +11,12 @@ defmodule Clementine.LLM.PolicyTest do
   setup do
     models = Application.get_env(:clementine, :models)
     client = Application.get_env(:clementine, :llm_client)
-    key = Application.get_env(:clementine, :anthropic_api_key)
+    platforms = Application.get_env(:clementine, :platforms)
 
     on_exit(fn ->
       Application.put_env(:clementine, :models, models)
       Application.put_env(:clementine, :llm_client, client)
-      Application.put_env(:clementine, :anthropic_api_key, key)
+      Application.put_env(:clementine, :platforms, platforms)
     end)
 
     :ok
@@ -88,17 +88,21 @@ defmodule Clementine.LLM.PolicyTest do
         ]
       })
 
-      assert refused("phi-4-azure") =~ "none of which Clementine can send to"
+      assert refused("phi-4-azure") =~ "none of which Clementine can send a :microsoft model to"
 
       # Credentials are checked for the clients Clementine routes to, by
       # their presence in config: {:system, "VAR"} passes unresolved.
       Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
-      Application.put_env(:clementine, :anthropic_api_key, {:system, "UNSET_IN_TESTS"})
+
+      Application.put_env(:clementine, :platforms,
+        anthropic: [api_key: {:system, "UNSET_IN_TESTS"}]
+      )
+
       assert boot([Sonnet])
 
-      Application.delete_env(:clementine, :anthropic_api_key)
+      Application.put_env(:clementine, :platforms, [])
       error = assert_raise ArgumentError, fn -> boot([Sonnet]) end
-      assert error.message =~ "anthropic_api_key: is not set"
+      assert error.message =~ "anthropic: [api_key: ...] is not set"
     end
 
     test "thinking the model refuses names what it takes instead" do
@@ -234,7 +238,11 @@ defmodule Clementine.LLM.PolicyTest do
         compile_agent("policy_one_hour", ~s(model: "claude-sonnet-5", cache: [ttl: :one_hour]))
 
       Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
-      Application.put_env(:clementine, :anthropic_api_key, {:system, "UNSET_IN_TESTS"})
+
+      Application.put_env(:clementine, :platforms,
+        anthropic: [api_key: {:system, "UNSET_IN_TESTS"}]
+      )
+
       assert %{agents: %{"policy_one_hour" => ^agent}} = boot([agent])
     end
 

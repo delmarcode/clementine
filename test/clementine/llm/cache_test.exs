@@ -97,7 +97,7 @@ defmodule Clementine.LLM.CacheTest do
       vendor: :qwen,
       context: 32_768,
       max_output: 8_192,
-      platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+      platforms: [openai_compatible: []]
     ],
     # Claude behind a proxy, under the id the proxy takes.
     "proxy/claude-sonnet-5" => [
@@ -105,7 +105,7 @@ defmodule Clementine.LLM.CacheTest do
       context: 1_000_000,
       max_output: 128_000,
       cache: @markers,
-      platforms: [openai_compatible: [id: "claude-sonnet-5", base_url: "http://proxy/v1"]]
+      platforms: [openai_compatible: [id: "claude-sonnet-5"]]
     ]
   }
 

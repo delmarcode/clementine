@@ -10,7 +10,8 @@ self-hosted server), under `config :clementine, :models`.
 
 The code: `Clementine.Model` (the sheet), `Clementine.Models` (the read
 side, and the merge of an app's config), `Clementine.Models.Anthropic`
-and `Clementine.Models.OpenAI` (the sheets), `Clementine.LLM.Policy` (an
+and `Clementine.Models.OpenAI` (the sheets), `Clementine.Platform` (where
+a model is served: endpoints and credentials), `Clementine.LLM.Policy` (an
 agent's choices checked against a sheet), `Clementine.LLM.Reasoning`
 (the choices on each wire), `Clementine.LLM.Router`, the three
 clients (`Clementine.LLM.Anthropic`, `Clementine.LLM.OpenAI`,
@@ -70,6 +71,7 @@ request.
 | Choice | Default | Checked against the sheet |
 |---|---|---|
 | `model` | required (here or on `use`) | a shipped sheet or a declaration |
+| `platform` | the vendor's own (`:anthropic`, `:openai`), else the first the model lists that Clementine can send to | the model's `platforms`; boot checks its credentials ([Platforms and credentials](#platforms-and-credentials)) |
 | `max_tokens` | `min(16_000, max_output)`: thinking counts toward it, so 8,192 is too low on a thinking model | `max_output` |
 | `effort` | the model's `default_effort`, sent explicitly, so a vendor's recalibrated default never moves an agent | `thinking.efforts`, and `thinking.max_effort` for the thinking setting |
 | `thinking` | `:adaptive` where the model takes it, else the model's own default | `thinking.types`; a refusal names what to use instead |
@@ -87,9 +89,10 @@ one that always thinks (Opus 5.5, Fable 5.1), naming a lower effort or
 `:between_tools`; send `prompt_cache_options` only where the sheet's
 TTLs are OpenAI's; send `defer_loading` only where
 `features.tool_search`; check thinking bindings only where
-`thinking.binding == :prefix`; send a skill's tools in a
+`thinking.binding == :prefix`; send a skill's load as a
 mid-conversation system message only where
-`features.mid_conversation_system`; send `response_format` on Chat
+`features.mid_conversation_system`, and its tools defined inside it only
+where `features.inline_tools` too; send `response_format` on Chat
 Completions only where `features.structured_outputs`.
 
 ## The sheets
@@ -106,7 +109,7 @@ Clementine.Models.get!("claude-sonnet-5-5")
 #=>               max_effort: %{between_tools: :high}, binding: :prefix, display: :omitted},
 #=>   rejects: [:temperature, :top_p, :top_k, :prefill, :forced_tool_choice, :budget_tokens],
 #=>   features: %{tool_search: true, structured_outputs: true, mid_conversation_system: true,
-#=>               streaming: true},
+#=>               inline_tools: true, streaming: true},
 #=>   cache: %{min_prefix: 512, ttls: [:five_minutes, :one_hour]},
 #=>   prices: %Clementine.LLM.Pricing{currency: "USD", input: 2_000_000, output: 10_000_000,
 #=>             cache_read: 100_000, cache_write: %{five_minutes: 2_500_000, one_hour: 4_000_000},
@@ -137,19 +140,17 @@ The read side:
 - `for_platform/2`: a model's facts on one platform, with that
   platform's id (`Clementine.Model.platform_id/1`) and deltas.
 
-A request goes to the vendor's own platform (`:anthropic`, `:openai`),
-or, for a model an app declares, the first platform it lists that
-Clementine can send to: `:openrouter`, `:bedrock`, `:vertex`, or
-`:openai_compatible`. The `bedrock`, `vertex`, `foundry`, and
-`claude_on_aws` entries on Claude sheets are facts for now; an agent
-picks a platform when `Clementine.Platform` arrives. Their ids follow
-one scheme, the endpoint each platform's Messages client will send to:
-`bedrock:` is Bedrock's Messages endpoint (`anthropic.<id>`), so a
-model Bedrock serves only through InvokeModel (Opus 4.6, Sonnet 4.6,
-the 4.5 snapshots, older) has no entry; `vertex:` is the dateless id
-from the 4.6 generation on and `<alias>@<date>` before it; `foundry:`
-is the default deployment name, and takes no mid-conversation system
-messages; `claude_on_aws:` is the Claude API's id.
+A request goes to the agent's `platform:`, else the vendor's own
+(`:anthropic`, `:openai`), else, for a model an app declares, the first
+platform it lists that Clementine can send to. The platform entries on
+Claude sheets follow one scheme, the endpoint each platform's Messages
+client sends to: `bedrock:` is Bedrock's Messages endpoint
+(`anthropic.<id>`), so a model Bedrock serves only through InvokeModel
+(Opus 4.6, Sonnet 4.6, the 4.5 snapshots, older) has no entry;
+`foundry:` is the default deployment name, and takes no mid-conversation
+system messages; `vertex:` is the dateless id from the 4.6 generation on
+and `<alias>@<date>` before it, and `claude_on_aws:` the Claude API's
+id, both facts no request reaches until OPS-199.
 
 ## Boot, build, and the clock
 
@@ -269,18 +270,13 @@ config :clementine, :models, %{
     platforms: [openrouter: []]
   ],
 
-  # Declaration: a fine-tune on an OpenAI-compatible server.
+  # Declaration: a fine-tune on a platform the app names (`tinker:`
+  # under config :clementine, :platforms, below).
   "qwen3-triage-ft" => [
     vendor: :qwen,
     context: 128_000,
     max_output: 16_000,
-    platforms: [
-      openai_compatible: [
-        id: "tinker://run:train:0/sampler_weights/000080",
-        base_url: "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
-        api_key: {:system, "TINKER_API_KEY"}
-      ]
-    ]
+    platforms: [tinker: [id: "tinker://run:train:0/sampler_weights/000080"]]
   ]
 }
 ```
@@ -300,10 +296,14 @@ whose clients send the schema as given, an agent with an
   [:adaptive], efforts: [...]]`, and `default_effort:` if it has one.
 - A Claude model Clementine lacks (5.1 or later):
   `thinking: [binding: :prefix]`, and
-  `features: [mid_conversation_system: true]` where its platform takes
-  them, and `features: [structured_outputs: true]`, or an agent with an
+  `features: [mid_conversation_system: true, inline_tools: true]`, and
+  `features: [structured_outputs: true]`, or an agent with an
   `output_schema:` is refused on `:anthropic`. Better, declare it
   `based_on:` the sheet it succeeds (below), which carries all of these.
+  What a platform never takes stays off there whatever a declaration
+  says (`Clementine.Platform.withheld/1`): the same declaration sends
+  inline tools on `:anthropic`, a skill's tools in `tools` on Bedrock,
+  and folds the load into the system prompt on Foundry.
 - An OpenAI model Clementine lacks, on `:openai`: its efforts and
   default, `cache: [min_prefix: 1024, ttls: [:thirty_minutes,
   :twelve_hours]]` from GPT-5.6 on, and `features: [structured_outputs:
@@ -321,12 +321,9 @@ whose clients send the schema as given, an agent with an
   way to call a tool: leave `structured_outputs` off.
 
 A platform entry takes `id:` (default: the model's id), `features:` and
-`cache:` deltas, `lifecycle: :partner` (the platform sets its own
-retirement dates), and, on the Chat Completions platforms, `base_url:`
-and `api_key:` over the platform's app config. Those two are a stopgap
-until platforms own their endpoints and credentials (OPS-195): prefer
-`{:system, "VAR"}` to a literal key, which `inspect/2` on the model
-redacts but which still sits in config.
+`cache:` deltas, and `lifecycle: :partner` (the platform sets its own
+retirement dates). Endpoints and credentials are the platform's, never
+the model's.
 
 ### A new model the day it ships
 
@@ -368,20 +365,111 @@ something new; a vendor's new one waits for a Clementine release.
 
 ## Platforms and credentials
 
-| Platform | Client | App config |
-|---|---|---|
-| `:anthropic` | Messages | `anthropic_api_key`; `anthropic_base_url` overrides the endpoint |
-| `:openai` | Responses | `openai_api_key`; `openai_base_url` |
-| `:openrouter` | Chat Completions | `openrouter_api_key`; `openrouter_base_url` (default `https://openrouter.ai/api/v1`). Ids are OpenRouter's `vendor/model` slugs |
-| `:bedrock` | Chat Completions, for the open models Bedrock serves over it | `bedrock_api_key` (a Bedrock API key as a bearer token; no SigV4), `bedrock_region` or `bedrock_base_url` |
-| `:vertex` | Chat Completions, for Vertex MaaS open models | `vertex_access_token` (usually `{MyApp.GcpAuth, :access_token, []}`: tokens expire hourly), `vertex_project` and `vertex_region`, or `vertex_base_url` |
-| `:openai_compatible` | Chat Completions, any other server | `openai_compatible_base_url` and an optional `openai_compatible_api_key`, or `base_url:`/`api_key:` on the model's platform entry |
+A platform is where a model is served: an endpoint, a credential, the
+id the model goes by there, and what the model cannot do there
+(`Clementine.Platform`). The app configures each platform it sends to,
+never on a model:
+
+```elixir
+config :clementine, :platforms,
+  anthropic: [api_key: {:system, "ANTHROPIC_API_KEY"}],
+  openai: [api_key: {:system, "OPENAI_API_KEY"}],
+  bedrock: [region: "us-east-1", api_key: {MyApp.Bedrock, :token, []}],
+  foundry: [
+    resource: "myapp-prod",
+    api_key: {:system, "ANTHROPIC_FOUNDRY_API_KEY"},
+    # Foundry's model field is the deployment name an admin chose; it
+    # defaults to the model id.
+    deployments: %{"claude-sonnet-5-5" => "sonnet-chat"}
+  ],
+  tinker: [
+    protocol: :chat_completions,
+    base_url: "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
+    api_key: {:system, "TINKER_API_KEY"}
+  ]
+```
+
+An agent moves to another platform with one line, and nothing else
+changes: its requests, its trace's and metrics' `platform`, and the
+platform `Clementine.Cost.of/3` takes all follow it.
+
+```elixir
+use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", platform: :bedrock
+```
+
+| Platform | Wire | Endpoint | Credential | Model id |
+|---|---|---|---|---|
+| `:anthropic` | Messages | `https://api.anthropic.com/v1/messages` | `api_key:`, sent as `x-api-key` | the vendor id |
+| `:openai` | Responses | `https://api.openai.com/v1/responses` | `api_key:`, a bearer | the vendor id |
+| `:bedrock` | Messages for Claude; Chat Completions for the open models it serves | `https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages`; `.../v1/chat/completions` on the same host | `api_key:`, an Amazon Bedrock API key: `x-api-key` on Messages, a bearer on Chat Completions | `anthropic.<id>` for Claude |
+| `:foundry` | Messages, Claude only | `https://{resource}.services.ai.azure.com/anthropic/v1/messages` | `api_key:`, sent as `api-key`, or `access_token:`, a Microsoft Entra ID token sent as a bearer | the deployment name (`deployments:`), default the model id |
+| `:openrouter` | Chat Completions | `https://openrouter.ai/api/v1/chat/completions` | `api_key:`, a bearer | OpenRouter's `vendor/model` slug |
+| `:vertex` | Chat Completions, for the open models Vertex serves | built from `project:` and `region:` | `access_token:`, an OAuth token | `publisher/model` |
+| `:openai_compatible` | Chat Completions | `base_url:` | an optional `api_key:` | the server's |
+| an app's own name | `protocol: :chat_completions` or `:messages` | `base_url:` | an optional `api_key:` | the server's |
+
+Every Messages platform takes `anthropic-version: 2023-06-01` and the
+Claude API's body. Where a platform speaks two wires, the model's vendor
+picks one. `base_url:` replaces a default endpoint: on Messages it is
+the part before `/v1/messages`, on Responses and Chat Completions the
+part before `/responses` or `/chat/completions`, and on Bedrock the
+Mantle host both wires share. Bedrock takes `region:` or `base_url:`,
+Foundry `resource:` or `base_url:`, Vertex `project:` and `region:` or
+`base_url:`.
 
 A credential is a literal string, `{:system, "ENV_VAR"}`, or
-`{module, function, args}` resolved per request. Boot checks that the
-platform an agent's model goes to has one configured (not resolved:
-`{:system, ...}` passes before the variable is set), except under a
-test's mock client.
+`{module, function, args}` called on every request. A short-lived one
+takes the last form, with a function that caches the token and mints a
+new one before it expires: an Amazon Bedrock short-term API key lasts
+12 hours at most (AWS's `aws-bedrock-token-generator` mints them), a
+Microsoft Entra ID token and a Google OAuth token about an hour. Boot
+checks that the platform each agent's model goes to is configured with
+its credential (present, not resolved: `{:system, ...}` passes before
+the variable is set), except under a test's mock client. The app config
+keys these replaced (`anthropic_api_key`, `anthropic_base_url`,
+`openai_api_key`, `bedrock_region`, `vertex_access_token`, ...) fail
+boot, naming their place under `:platforms`.
+
+**Not built.** Bedrock and Foundry are reached with bearer credentials
+only: AWS SigV4 signing, Bedrock's InvokeModel and Converse APIs (and
+their ARN-versioned ids), and IAM role assumption are not built, so
+Bedrock serves what its Messages endpoint serves (Claude Opus 4.7 and
+later, and Haiku 4.5). Claude on Vertex and Claude Platform on AWS
+arrive with OPS-199.
+
+**What a platform withholds** is in the model's facts on it
+(`Clementine.Models.for_platform/2`), which the clients read. What a
+platform never takes, on any model, is the platform's
+(`Clementine.Platform.withheld/1`), set off over any sheet or
+declaration; what one model lacks on one platform is its sheet's entry
+for that platform.
+
+- Foundry has no mid-conversation system messages (Anthropic's platform
+  table, read 2026-11-01), so a skill's load folds into the system
+  prompt and `tools` there.
+- Bedrock and Vertex take mid-conversation system messages, but
+  Anthropic's mid-conversation system messages page documents a tool
+  defined inside one (the `inline-tools-2026-09-15` beta) on the Claude
+  API only. A skill's tools therefore join `tools` there
+  (`inline_tools: false`), which costs the cache and, on a model that
+  binds its thinking, the earlier turns' thinking at the load, as on
+  Foundry. `[:clementine, :llm, :thinking_dropped]` reports that drop
+  with `cause: :fold`, and Clementine logs it at info rather than as a
+  warning. Bedrock documents tool changes by reference
+  (`mid-conversation-tool-changes-2026-07-01`), which Clementine does
+  not send.
+- Neither Bedrock nor Foundry has server-side `fallbacks`, the Models
+  API, or Message Batches, none of which Clementine sends. Foundry's
+  deployments hosted on Azure also refuse code execution, Agent Skills,
+  and the Files API, which Clementine does not send either.
+
+**Prices.** A call costs its model's prices wherever it runs. Foundry
+bills at the Claude API's rates. Bedrock prices Claude itself, and
+Anthropic's pricing page defers to AWS's: its regional endpoints cost
+10% more than its global ones. An app that runs a model on Bedrock and
+pays something else overrides that model's `prices:`; one price per
+model holds across platforms, so the same model on two platforms at
+two prices is not modeled.
 
 ## Adopting a new model
 
@@ -796,8 +884,7 @@ the currency, here $0.001284.
 - `Clementine.Cost.of(usage, model_id, platform: ..., cache_ttl: ...)`
   prices one call's usage at today's prices: a trace entry's, to reprice
   it, with the platform and TTL the entry records (both default to the
-  model's: its default platform, the only one a request goes to until
-  `Clementine.Platform`, and its shortest TTL).
+  model's: its default platform and its shortest TTL).
 
 **What the rates do not cover.** A price that depends on more than the
 call's tokens and prompt length is not modeled, and the cost is the
@@ -822,8 +909,10 @@ provider is another OpenAI-compatible endpoint, which a declaration on
    `lib/clementine/llm/`, streaming through `Clementine.LLM.ProviderStream`
    with a parser that emits the shared event tuples, and resolving each
    request's choices with `Clementine.LLM.Policy.resolve!/2`.
-2. Add the platform to `Clementine.Model`'s platforms and served list,
-   and map it to the client in `Clementine.LLM.Router`.
+2. Add the platform to `Clementine.Model`'s platforms and to
+   `Clementine.Platform` (its config keys, endpoint, credential header,
+   and the wire each vendor takes there), and map the wire to the client
+   in `Clementine.LLM.Router`.
 3. Translate the policy to its wire in `Clementine.LLM.Reasoning`, and
    give its own options a schema in `Clementine.LLM.Policy`.
 4. Normalize the provider's usage into `Clementine.Usage`'s keys

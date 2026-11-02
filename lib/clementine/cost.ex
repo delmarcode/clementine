@@ -104,10 +104,8 @@ defmodule Clementine.Cost do
   for a model without prices, an id no sheet holds, or a platform or TTL
   the model's prices do not cover.
 
-  - `:platform` — where the call ran. Default the model's default
-    platform (`Clementine.Models.default_platform/1`): until
-    `Clementine.Platform` arrives (OPS-195), the only one a request goes
-    to.
+  - `:platform` — where the call ran (`Clementine.Platform`). Default
+    the model's default platform (`Clementine.Models.default_platform/1`).
   - `:cache_ttl` — the TTL the call's writes were billed at. Default the
     model's shortest.
 

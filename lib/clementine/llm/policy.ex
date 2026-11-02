@@ -6,6 +6,12 @@ defmodule Clementine.LLM.Policy do
   The choices are the agent's (`Clementine.Agent`), or a direct
   `Clementine.LLM.call/5`'s opts:
 
+  - `platform`: where the request goes, one of the platforms the model's
+    sheet lists that Clementine can send to (`Clementine.Platform`).
+    Default the vendor's own (`:anthropic`, `:openai`), else the first
+    the model lists. The model's facts on that platform
+    (`Clementine.Models.for_platform/2`) are what every other choice is
+    checked against.
   - `max_tokens`: the output ceiling of one response, thinking included.
     Default `min(16_000, model.max_output)`; over `max_output` is an
     error.
@@ -39,7 +45,7 @@ defmodule Clementine.LLM.Policy do
   `Clementine.LLM.call/5` may still use it. An agent with an
   `output_schema:` is refused on a model whose sheet has no structured
   outputs (`features.structured_outputs: false`) where the request goes
-  to Anthropic or OpenAI, whose clients send the schema whatever the
+  over Messages or Responses, whose clients send the schema whatever the
   sheet says. A Chat Completions platform instead withholds
   `response_format` for such a model and the engine checks the answer,
   so a declared model there keeps its output schema.
@@ -55,19 +61,21 @@ defmodule Clementine.LLM.Policy do
   boots; the vendor's own error ends the run that reaches it.
   """
 
-  alias Clementine.{Model, Models}
+  alias Clementine.{Model, Models, Platform}
   alias Clementine.LLM.Pricing
 
-  @keys [:max_tokens, :effort, :thinking, :display, :cache, :provider_options]
+  @keys [:platform, :max_tokens, :effort, :thinking, :display, :cache, :provider_options]
   @default_max_tokens 16_000
   @displays [:omitted, :summarized, :updates]
 
+  # What one wire takes and no other does: Messages (Claude, wherever it
+  # runs), Responses (OpenAI), and OpenRouter's Chat Completions.
   @provider_options %{
-    anthropic: [
+    messages: [
       budget_tokens: [type: :pos_integer],
       prefix_mismatch: [type: {:in, [:error, :drop_block]}]
     ],
-    openai: [
+    responses: [
       summary: [type: {:in, [:auto, :concise, :detailed]}]
     ],
     openrouter: [
@@ -77,10 +85,11 @@ defmodule Clementine.LLM.Policy do
     ]
   }
 
-  @enforce_keys [:model, :platform]
+  @enforce_keys [:model, :platform, :protocol]
   defstruct [
     :model,
     :platform,
+    :protocol,
     :max_tokens,
     :effort,
     :thinking,
@@ -91,13 +100,15 @@ defmodule Clementine.LLM.Policy do
 
   @typedoc """
   A request's resolved choices: the model's facts on the platform it goes
-  to, and every choice with its default filled in. `cache` is whether
+  to, the wire it takes there (`Clementine.Platform.protocol/2`), and
+  every choice with its default filled in. `cache` is whether
   hints go, the TTL writes are billed at (`nil` where none is sent), and
   whether `cache_control` markers carry it.
   """
   @type t :: %__MODULE__{
           model: Model.t(),
           platform: atom(),
+          protocol: Clementine.Platform.protocol(),
           max_tokens: pos_integer(),
           effort: Model.effort() | nil,
           thinking: Model.thinking_type(),
@@ -131,11 +142,12 @@ defmodule Clementine.LLM.Policy do
     unset = if partial?, do: unset(opts), else: []
 
     with :ok <- servable(model),
-         {:ok, platform} <- platform(model),
+         {:ok, platform, protocol} <- platform(model, opts[:platform]),
          {:ok, model} <- Models.for_platform(model, platform),
          :ok <- streams(model, Keyword.get(checks, :stream, true)),
-         :ok <- structured(model, platform, Keyword.get(checks, :output_schema, false)),
-         {:ok, provider_options} <- provider_options(model, platform, opts[:provider_options]),
+         :ok <- structured(model, protocol, Keyword.get(checks, :output_schema, false)),
+         {:ok, provider_options} <-
+           provider_options(model, {protocol, platform}, opts[:provider_options]),
          {:ok, thinking} <- thinking(model, opts[:thinking], provider_options, partial?),
          {:ok, effort} <- effort(model, opts[:effort], thinking, unset),
          {:ok, max_tokens} <- max_tokens(model, opts[:max_tokens]),
@@ -147,6 +159,7 @@ defmodule Clementine.LLM.Policy do
        %__MODULE__{
          model: model,
          platform: platform,
+         protocol: protocol,
          max_tokens: max_tokens,
          effort: effort,
          thinking: thinking,
@@ -190,15 +203,15 @@ defmodule Clementine.LLM.Policy do
 
   # The Messages and Responses clients send an output schema as given; a
   # model without structured outputs answers it with a 400.
-  defp structured(%Model{features: %{structured_outputs: false}}, platform, true)
-       when platform in [:anthropic, :openai] do
+  defp structured(%Model{features: %{structured_outputs: false}} = model, protocol, true)
+       when protocol in [:messages, :responses] do
     {:error,
-     "has no structured outputs, and an output_schema: goes to #{inspect(platform)} as " <>
-       "given; pick a model whose sheet has them (features.structured_outputs), or leave " <>
-       "output_schema: out and read the answer as text"}
+     "has no structured outputs on #{inspect(model.platform)}, and an output_schema: goes " <>
+       "there as given; pick a model whose sheet has them (features.structured_outputs), or " <>
+       "leave output_schema: out and read the answer as text"}
   end
 
-  defp structured(_model, _platform, _schema?), do: :ok
+  defp structured(_model, _protocol, _schema?), do: :ok
 
   # A retired sheet is a fact of this Clementine release, not a date
   # passing: the vendor no longer serves it.
@@ -213,22 +226,47 @@ defmodule Clementine.LLM.Policy do
 
   defp servable(%Model{}), do: :ok
 
-  defp platform(model) do
+  defp platform(model, nil) do
     case Models.default_platform(model) do
       nil ->
         {:error,
          "is served on #{inspect(Keyword.keys(model.platforms))}, none of which Clementine " <>
-           "can send to (#{inspect(Model.served())})"}
+           "can send a #{inspect(model.vendor)} model to"}
 
       platform ->
-        {:ok, platform}
+        platform(model, platform)
     end
   end
 
-  defp provider_options(_model, _platform, nil), do: {:ok, []}
+  defp platform(model, platform) when is_atom(platform) do
+    with :ok <- served_on(model, platform),
+         {:ok, protocol} <- Platform.protocol(platform, model.vendor) do
+      {:ok, platform, protocol}
+    else
+      {:error, message} -> {:error, "platform: #{message}"}
+    end
+  end
 
-  defp provider_options(model, platform, options) when is_list(options) do
-    case Map.fetch(@provider_options, platform) do
+  defp platform(_model, other) do
+    {:error,
+     "platform: takes a platform's name, an atom such as :bedrock, got: #{inspect(other)}"}
+  end
+
+  defp served_on(model, platform) do
+    if Keyword.has_key?(model.platforms, platform),
+      do: :ok,
+      else:
+        {:error,
+         "#{inspect(platform)} does not serve it; its sheet lists " <>
+           inspect(Keyword.keys(model.platforms))}
+  end
+
+  defp provider_options(_model, _wire, nil), do: {:ok, []}
+
+  defp provider_options(model, {protocol, platform}, options) when is_list(options) do
+    wire = if protocol == :chat_completions, do: platform, else: protocol
+
+    case Map.fetch(@provider_options, wire) do
       :error when options == [] ->
         {:ok, []}
 
@@ -246,7 +284,7 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp provider_options(_model, _platform, other) do
+  defp provider_options(_model, _wire, other) do
     {:error, "provider_options: expected a keyword list, got: #{inspect(other)}"}
   end
 
@@ -512,8 +550,8 @@ defmodule Clementine.LLM.Policy do
   # models on OpenRouter or Bedrock write for the platform's default), so
   # a longer one would be billed but never asked for.
   defp unsent?(%Model{platform: platform, cache: %{ttls: [default | _]}} = model, ttl) do
-    platform not in [:anthropic, :openai] and Model.cache_mechanism(model.cache.ttls) == :options and
-      ttl != default
+    Platform.protocol(platform, model.vendor) == {:ok, :chat_completions} and
+      Model.cache_mechanism(model.cache.ttls) == :options and ttl != default
   end
 
   defp markers?(ttls), do: Model.cache_mechanism(ttls) == :markers

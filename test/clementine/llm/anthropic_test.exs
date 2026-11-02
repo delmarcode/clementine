@@ -12,23 +12,13 @@ defmodule Clementine.LLM.AnthropicTest do
   setup do
     bypass = Bypass.open()
 
-    prev_url = Application.get_env(:clementine, :anthropic_base_url)
-    prev_key = Application.get_env(:clementine, :anthropic_api_key)
     prev_models = Application.get_env(:clementine, :models)
 
-    Application.put_env(
-      :clementine,
-      :anthropic_base_url,
-      "http://localhost:#{bypass.port}/v1/messages"
+    Clementine.TestPlatforms.put(
+      anthropic: [api_key: "test-anthropic-key", base_url: "http://localhost:#{bypass.port}"]
     )
 
-    Application.put_env(:clementine, :anthropic_api_key, "test-anthropic-key")
-
-    on_exit(fn ->
-      restore_env(:anthropic_base_url, prev_url)
-      restore_env(:anthropic_api_key, prev_key)
-      restore_env(:models, prev_models)
-    end)
+    on_exit(fn -> restore_env(:models, prev_models) end)
 
     %{bypass: bypass}
   end
@@ -172,7 +162,7 @@ defmodule Clementine.LLM.AnthropicTest do
         call.("claude-sonnet-9", [])
       end
 
-      assert_raise ArgumentError, ~r/goes to :openai, not :anthropic/, fn ->
+      assert_raise ArgumentError, ~r/goes to :openai over :responses, not Messages/, fn ->
         call.("gpt-6.1-sol", [])
       end
     end

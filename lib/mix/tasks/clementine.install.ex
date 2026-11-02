@@ -162,7 +162,7 @@ if Code.ensure_loaded?(Igniter) do
       |> Igniter.Project.Config.configure_new(
         "config.exs",
         :clementine,
-        [:anthropic_api_key],
+        [:platforms, :anthropic, :api_key],
         {:code, Sourceror.parse_string!(~s|{:system, "ANTHROPIC_API_KEY"}|)}
       )
       # Clementine's worker tags its logs with the run, and the formatter

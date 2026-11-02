@@ -2,7 +2,9 @@ defmodule Clementine.LLM.OpenAI do
   @moduledoc """
   OpenAI Responses API client.
 
-  Supports synchronous and streaming requests, including tool calls. A
+  Supports synchronous and streaming requests, including tool calls,
+  to the `:openai` platform (`config :clementine, :platforms, openai:
+  [api_key: ...]`, `Clementine.Platform`). A
   refusal is the turn's text, with stop reason `"refusal"`; a response
   cut off at `max_output_tokens` stops with `"max_tokens"`; one that ends
   `response.failed` is an error.
@@ -33,7 +35,7 @@ defmodule Clementine.LLM.OpenAI do
 
   @behaviour Clementine.LLM.ClientBehaviour
 
-  alias Clementine.Model
+  alias Clementine.{Model, Platform}
   alias Clementine.LLM.{Cache, Policy, ProviderUsage}
   alias Clementine.LLM.Message.Content
   alias Clementine.LLM.Reasoning
@@ -198,9 +200,7 @@ defmodule Clementine.LLM.OpenAI do
     max(budget_ends - System.monotonic_time(:millisecond), 0)
   end
 
-  defp base_url do
-    Application.get_env(:clementine, :openai_base_url, "https://api.openai.com/v1/responses")
-  end
+  defp base_url, do: :openai |> Platform.fetch!() |> Platform.url(:responses)
 
   defp calculate_backoff(attempt) do
     retry_opts = Application.get_env(:clementine, :retry, [])
@@ -215,8 +215,10 @@ defmodule Clementine.LLM.OpenAI do
     schema? = Keyword.get(opts, :output_schema) != nil
     policy = Policy.resolve!(model, opts, [output_schema: schema?] ++ checks)
 
-    if policy.platform != :openai do
-      raise ArgumentError, "#{inspect(model)} goes to #{inspect(policy.platform)}, not :openai"
+    if policy.protocol != :responses do
+      raise ArgumentError,
+            "#{inspect(model)} goes to #{inspect(policy.platform)} over " <>
+              "#{inspect(policy.protocol)}, not Responses"
     end
 
     body =
@@ -282,27 +284,9 @@ defmodule Clementine.LLM.OpenAI do
   end
 
   defp build_headers do
-    [
-      {"authorization", "Bearer #{get_api_key()}"},
-      {"content-type", "application/json"}
-    ]
+    Platform.auth_headers(Platform.fetch!(:openai), :responses) ++
+      [{"content-type", "application/json"}]
   end
-
-  defp get_api_key do
-    key = resolve_api_key(Application.get_env(:clementine, :openai_api_key))
-
-    case key do
-      key when is_binary(key) and key != "" ->
-        key
-
-      _ ->
-        raise "Missing :openai_api_key configuration for :clementine"
-    end
-  end
-
-  defp resolve_api_key({:system, env_var}) when is_binary(env_var), do: System.get_env(env_var)
-  defp resolve_api_key(key) when is_binary(key), do: key
-  defp resolve_api_key(_), do: nil
 
   defp format_messages(messages) do
     Messages.encode_all(messages)

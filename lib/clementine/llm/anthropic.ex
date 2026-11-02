@@ -1,16 +1,30 @@
 defmodule Clementine.LLM.Anthropic do
   @moduledoc """
-  Anthropic API client for Claude models.
+  The Messages API client: Claude on every platform that serves it over
+  Messages, synchronous and streaming.
 
-  This module provides direct HTTP communication with Anthropic's Messages API,
-  supporting both synchronous and streaming requests.
+  ## Platforms
 
-  ## Configuration
+  The request's platform (`Clementine.Platform`) gives the URL, the
+  credential header, and the id the model goes by there:
 
-  Configure the API key in your config:
+  - `:anthropic`: `https://api.anthropic.com/v1/messages`, `x-api-key`,
+    the vendor id.
+  - `:bedrock`: `https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages`,
+    an Amazon Bedrock API key in `x-api-key`, `anthropic.<id>`.
+  - `:foundry`: `https://{resource}.services.ai.azure.com/anthropic/v1/messages`,
+    `api-key` (or an Entra ID token as a bearer), the deployment name.
+  - an app-named platform with `protocol: :messages` (a proxy):
+    its `base_url:` and an optional `x-api-key`.
 
-      config :clementine,
-        anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}  # or a literal string
+  Each takes `anthropic-version: 2023-06-01` and the same body. What the
+  model cannot do there is in its facts on that platform
+  (`Clementine.Models.for_platform/2`), which the request reads: Foundry
+  takes no mid-conversation system messages, so a skill's load folds
+  into the system prompt and `tools`, and Bedrock takes no tool defined
+  inside one, so a skill's tools join `tools` there.
+
+      config :clementine, :platforms, anthropic: [api_key: {:system, "ANTHROPIC_API_KEY"}]
 
   ## Models
 
@@ -62,18 +76,20 @@ defmodule Clementine.LLM.Anthropic do
   turn's thinking only while its binding still holds (a turn without
   one goes without its thinking), so an edited history costs that
   reasoning and is never refused; the engine reports it as
-  `[:clementine, :llm, :thinking_dropped]`. Where the sheet has
-  `features.mid_conversation_system`, a
+  `[:clementine, :llm, :thinking_dropped]`. Where the model's facts on
+  its platform have `features.mid_conversation_system`, a
   `Clementine.LLM.Message.SystemMessage` goes as a mid-conversation
-  `role: "system"` message, its tools as inline definitions, and the
-  tools it adds stay out of `tools`; elsewhere its text joins the
-  system prompt and its tools join `tools`. The runtime guide's "Models
-  that bind their thinking" has the whole policy.
+  `role: "system"` message. With `features.inline_tools` too, its tools
+  go in it as inline definitions and stay out of `tools`; without
+  (Bedrock), only its text goes there, and its tools join `tools`.
+  Elsewhere its text joins the system prompt and its tools join
+  `tools`. The runtime guide's "Models that bind their thinking" has
+  the whole policy.
 
   Beta headers follow the body: `thinking-display-updates-2026-08-18`
   for `display: :updates`, `thinking-binding-controls-2026-08-01` for
   `prefix_mismatch:`, and `inline-tools-2026-09-15` when a system message
-  adds a tool.
+  defines a tool inline.
 
   ## Prompt caching
 
@@ -92,7 +108,7 @@ defmodule Clementine.LLM.Anthropic do
 
   @behaviour Clementine.LLM.ClientBehaviour
 
-  alias Clementine.Model
+  alias Clementine.Platform
   alias Clementine.LLM.Anthropic.{Binding, Messages, Tools}
   alias Clementine.LLM.Message.SystemMessage
   alias Clementine.LLM.{Cache, Policy, ProviderStream, ProviderUsage}
@@ -109,33 +125,33 @@ defmodule Clementine.LLM.Anthropic do
   """
   @impl true
   def call(model, system, messages, tools, opts \\ []) do
-    {body, binding, dropped} = request(model, system, messages, tools, opts, stream: false)
+    {policy, body, binding, dropped} = build(model, system, messages, tools, opts, stream: false)
     Binding.log_dropped(dropped, inspect(model))
-    headers = build_headers(body)
+    {url, headers} = endpoint(policy, body)
 
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
 
-    with {:ok, response} <- do_call_with_retry(body, headers, max_attempts, 1) do
+    with {:ok, response} <- do_call_with_retry(url, body, headers, max_attempts, 1) do
       {:ok, %{response | binding: binding}}
     end
   end
 
-  defp do_call_with_retry(body, headers, max_attempts, attempt) do
-    case Req.post(base_url(), json: body, headers: headers, receive_timeout: 120_000) do
+  defp do_call_with_retry(url, body, headers, max_attempts, attempt) do
+    case Req.post(url, json: body, headers: headers, receive_timeout: 120_000) do
       {:ok, %{status: 200, body: resp_body}} ->
         {:ok, parse_response(resp_body)}
 
       {:ok, %{status: status}} when status in [429, 529] and attempt < max_attempts ->
         retry_sleep(calculate_backoff(attempt))
-        do_call_with_retry(body, headers, max_attempts, attempt + 1)
+        do_call_with_retry(url, body, headers, max_attempts, attempt + 1)
 
       {:ok, %{status: status, body: resp_body}} ->
         {:error, {:api_error, status, resp_body}}
 
       {:error, _reason} when attempt < max_attempts ->
         retry_sleep(calculate_backoff(attempt))
-        do_call_with_retry(body, headers, max_attempts, attempt + 1)
+        do_call_with_retry(url, body, headers, max_attempts, attempt + 1)
 
       {:error, reason} ->
         {:error, {:request_failed, reason}}
@@ -187,9 +203,9 @@ defmodule Clementine.LLM.Anthropic do
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
-    {body, binding, dropped} = request(model, system, messages, tools, opts)
+    {policy, body, binding, dropped} = build(model, system, messages, tools, opts)
     body = Map.put(body, "stream", true)
-    headers = build_headers(body)
+    {url, headers} = endpoint(policy, body)
     # A runner caps this to the execution deadline's remaining budget. It
     # bounds the whole streaming call, not one attempt: per-attempt receive
     # timeout and retry backoff draw down the same window, and retries stop
@@ -199,7 +215,7 @@ defmodule Clementine.LLM.Anthropic do
 
     stream =
       ProviderStream.new(StreamParser, fn parent, ref ->
-        do_stream_request(body, headers, parent, ref, budget_ends)
+        do_stream_request(url, body, headers, parent, ref, budget_ends)
       end)
 
     # The turn this request produces is bound to it: the binding leads the
@@ -212,13 +228,13 @@ defmodule Clementine.LLM.Anthropic do
     end
   end
 
-  defp do_stream_request(body, headers, parent, ref, budget_ends) do
+  defp do_stream_request(url, body, headers, parent, ref, budget_ends) do
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
-    do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, 1)
+    do_stream_request(url, body, headers, parent, ref, budget_ends, max_attempts, 1)
   end
 
-  defp do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, attempt) do
+  defp do_stream_request(url, body, headers, parent, ref, budget_ends, max_attempts, attempt) do
     # Track whether the into callback sent any data to the parent.
     # For 429/529 the callback fires with the error body (not real SSE),
     # which the parser ignores, so those retries are always safe.
@@ -234,7 +250,7 @@ defmodule Clementine.LLM.Anthropic do
     end
 
     result =
-      Req.post(base_url(),
+      Req.post(url,
         json: body,
         headers: headers,
         into: callback,
@@ -251,6 +267,7 @@ defmodule Clementine.LLM.Anthropic do
         # HTTP-level rate limit / overload. Any data that flowed through the
         # callback was the JSON error body, not SSE events — safe to retry.
         retry_stream(
+          url,
           body,
           headers,
           parent,
@@ -268,6 +285,7 @@ defmodule Clementine.LLM.Anthropic do
         if :atomics.get(data_sent, 1) == 0 do
           # No data was streamed — connection failed before any response.
           retry_stream(
+            url,
             body,
             headers,
             parent,
@@ -302,24 +320,20 @@ defmodule Clementine.LLM.Anthropic do
   # backoff sleep is capped to what remains, and a spent budget sends the
   # failure instead of retrying — a runner-capped stream must not outlive
   # its deadline by sleeping.
-  defp retry_stream(body, headers, parent, ref, budget_ends, max_attempts, attempt, fail_message) do
+  defp retry_stream(url, body, headers, parent, ref, budget_ends, max_attempts, attempt, fail) do
     remaining = remaining_budget(budget_ends)
 
     if remaining > 0 do
       send(parent, {ref, :retry_reset})
       retry_wait(attempt, remaining)
-      do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, attempt + 1)
+      do_stream_request(url, body, headers, parent, ref, budget_ends, max_attempts, attempt + 1)
     else
-      send(parent, {ref, fail_message})
+      send(parent, {ref, fail})
     end
   end
 
   defp remaining_budget(budget_ends) do
     max(budget_ends - System.monotonic_time(:millisecond), 0)
-  end
-
-  defp base_url do
-    Application.get_env(:clementine, :anthropic_base_url, "https://api.anthropic.com/v1/messages")
   end
 
   @doc false
@@ -329,13 +343,18 @@ defmodule Clementine.LLM.Anthropic do
   # and `Clementine.LLM.Anthropic.Fake` both build requests here, so a
   # test sees exactly what the API would.
   def request(model, system, messages, tools, opts, checks \\ [stream: true]) do
+    {_policy, body, binding, dropped} = build(model, system, messages, tools, opts, checks)
+    {body, binding, dropped}
+  end
+
+  defp build(model, system, messages, tools, opts, checks \\ [stream: true]) do
     schema? = Keyword.get(opts, :output_schema) != nil
     policy = policy!(model, opts, [output_schema: schema?] ++ checks)
     facts = policy.model
     binds? = facts.thinking.binding == :prefix
-    inline? = facts.features.mid_conversation_system
+    placement = placement(facts.features)
 
-    {system, tools, added} = arrange(inline?, system, messages, tools || [])
+    {system, tools, added} = arrange(placement, system, messages, tools || [])
 
     # A model without tool search gets its deferred tools as ordinary
     # tools, as every other provider does, rather than a request the API
@@ -349,22 +368,26 @@ defmodule Clementine.LLM.Anthropic do
       end
 
     # A system message folded into `system` and `tools` sends nothing
-    # where it stands.
+    # where it stands; one whose tools joined `tools` sends its text.
     replay = fn
-      %SystemMessage{} when not inline? -> []
+      %SystemMessage{} when placement == :fold -> []
+      %SystemMessage{} = message when placement == :text -> text_only(message)
       message -> Messages.encode_replay(message, tool_search: loadable(encoded_tools))
     end
 
     {encoded_messages, binding, dropped} =
       if binds? do
-        Binding.encode(messages, Binding.start(system, encoded_tools), replay)
+        {encoded, binding, dropped} =
+          Binding.encode(messages, Binding.start(system, encoded_tools), replay)
+
+        {encoded, binding, with_cause(dropped, placement, messages)}
       else
         {Enum.flat_map(messages, replay), nil, nil}
       end
 
     body =
       %{
-        "model" => Model.platform_id(facts),
+        "model" => Platform.model_id(policy.platform, facts),
         "max_tokens" => policy.max_tokens,
         "messages" => encoded_messages
       }
@@ -372,31 +395,39 @@ defmodule Clementine.LLM.Anthropic do
       |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
       |> put_prompt(system, encoded_tools, policy.cache)
 
-    {body, binding, dropped}
+    {policy, body, binding, dropped}
   end
 
-  # A model that takes mid-conversation system messages keeps them in
-  # place, and a tool one of them adds goes inline there, not in `tools`:
-  # the request's tools stay as the first turn sent them. Elsewhere a
-  # system message's text joins the system prompt, and the tools it adds
-  # join the request's (the engine already offers a loaded skill's).
-  defp arrange(true, system, messages, tools) do
+  # Where a system message goes on the model's platform: in place with
+  # the tools it adds defined inline (`:inline`), in place with its text
+  # only and its tools in `tools` (`:text`: Bedrock, which documents
+  # mid-conversation system messages but the inline tool definition on
+  # the Claude API only), or folded into `system` and `tools` (`:fold`:
+  # Foundry, and a model that takes none in place).
+  defp placement(%{mid_conversation_system: false}), do: :fold
+  defp placement(%{inline_tools: true}), do: :inline
+  defp placement(_features), do: :text
+
+  # Inline, a tool a system message adds goes in that message, not in
+  # `tools`: the request's tools stay as the first turn sent them.
+  # Otherwise the tools it adds join the request's (the engine already
+  # offers a loaded skill's), and folded, its text joins the system
+  # prompt too.
+  defp arrange(:inline, system, messages, tools) do
     added = MapSet.new(added_definitions(messages), & &1["name"])
     {system, Enum.reject(tools, &(tool_name(&1) in added)), []}
   end
 
-  defp arrange(false, system, messages, tools) do
-    system_messages = Enum.filter(messages, &match?(%SystemMessage{}, &1))
-    names = MapSet.new(tools, &tool_name/1)
+  defp arrange(:text, system, messages, tools) do
+    {system, tools, added_tools(messages, tools)}
+  end
 
-    added =
-      system_messages
-      |> added_definitions()
-      |> Enum.reject(&(&1["name"] in names))
-      |> Enum.uniq_by(& &1["name"])
-
+  defp arrange(:fold, system, messages, tools) do
     texts =
-      for message <- system_messages, text = SystemMessage.get_text(message), text != "", do: text
+      for %SystemMessage{} = message <- messages,
+          text = SystemMessage.get_text(message),
+          text != "",
+          do: text
 
     system =
       case Enum.reject([system | texts], &(&1 in [nil, ""])) do
@@ -404,7 +435,52 @@ defmodule Clementine.LLM.Anthropic do
         parts -> Enum.join(parts, "\n\n")
       end
 
-    {system, tools, added}
+    {system, tools, added_tools(messages, tools)}
+  end
+
+  # The definitions system messages add that the request's tools lack.
+  defp added_tools(messages, tools) do
+    names = MapSet.new(tools, &tool_name/1)
+
+    messages
+    |> added_definitions()
+    |> Enum.reject(&(&1["name"] in names))
+    |> Enum.uniq_by(& &1["name"])
+  end
+
+  # Why a request sends earlier turns without their thinking: `:fold`
+  # when a system message after every one of them changed the prefix
+  # because the platform takes it no other way (its tools joined `tools`,
+  # or its text joined `system`), which would have dropped them whatever
+  # else changed; `:history` otherwise.
+  defp with_cause(nil, _placement, _messages), do: nil
+
+  defp with_cause(%{last_index: last} = dropped, placement, messages) do
+    folded? =
+      messages
+      |> Enum.with_index()
+      |> Enum.any?(fn {message, index} -> index > last and folds?(placement, message) end)
+
+    Map.put(dropped, :cause, if(folded?, do: :fold, else: :history))
+  end
+
+  defp folds?(:inline, _message), do: false
+
+  defp folds?(:text, %SystemMessage{} = message),
+    do: SystemMessage.tool_definitions(message) != []
+
+  defp folds?(:fold, %SystemMessage{} = message),
+    do: SystemMessage.tool_definitions(message) != [] or SystemMessage.get_text(message) != ""
+
+  defp folds?(_placement, _message), do: false
+
+  # A system message without the tools it adds, or nothing when it
+  # added tools and said nothing.
+  defp text_only(%SystemMessage{content: content} = message) do
+    case Enum.reject(content, &match?(%Clementine.LLM.Message.Content.ToolAddition{}, &1)) do
+      [] -> []
+      text -> [Messages.encode(%{message | content: text})]
+    end
   end
 
   defp added_definitions(messages) do
@@ -488,17 +564,24 @@ defmodule Clementine.LLM.Anthropic do
     Map.update(body, "output_config", %{"format" => format}, &Map.put(&1, "format", format))
   end
 
-  defp build_headers(body) do
-    headers = [
-      {"x-api-key", get_api_key()},
-      {"anthropic-version", @anthropic_version},
-      {"content-type", "application/json"}
-    ]
+  # The URL and headers a body goes with on its platform. Every platform
+  # this client sends to takes the model in the body and the version in
+  # a header; one that takes either in the URL or the body (Vertex,
+  # OPS-199) adds its clause here.
+  defp endpoint(%Policy{platform: name}, body) do
+    platform = Platform.fetch!(name)
 
-    case betas(body) do
-      [] -> headers
-      betas -> headers ++ [{"anthropic-beta", Enum.join(betas, ",")}]
-    end
+    headers =
+      Platform.auth_headers(platform, :messages) ++
+        [{"anthropic-version", @anthropic_version}, {"content-type", "application/json"}]
+
+    headers =
+      case betas(body) do
+        [] -> headers
+        betas -> headers ++ [{"anthropic-beta", Enum.join(betas, ",")}]
+      end
+
+    {Platform.url(platform, :messages), headers}
   end
 
   @doc false
@@ -519,37 +602,23 @@ defmodule Clementine.LLM.Anthropic do
   defp inline_tools?(messages) do
     Enum.any?(messages || [], fn
       %{"role" => "system", "content" => content} when is_list(content) ->
-        Enum.any?(content, &(&1["type"] == "tool_addition"))
+        Enum.any?(content, &match?(%{"tool" => %{"type" => "tool_definition"}}, &1))
 
       _message ->
         false
     end)
   end
 
-  defp get_api_key do
-    key = resolve_api_key(Application.get_env(:clementine, :anthropic_api_key))
-
-    case key do
-      key when is_binary(key) and key != "" ->
-        key
-
-      _ ->
-        raise "Missing :anthropic_api_key configuration for :clementine"
-    end
-  end
-
-  defp resolve_api_key({:system, env_var}) when is_binary(env_var), do: System.get_env(env_var)
-  defp resolve_api_key(key) when is_binary(key), do: key
-  defp resolve_api_key(_), do: nil
-
-  # The agent's choices, checked against the model's sheet; a model
-  # Anthropic's client cannot serve is refused before anything is sent.
+  # The agent's choices, checked against the model's sheet; a request
+  # whose platform does not take it over Messages is refused before
+  # anything is sent.
   defp policy!(model, opts, checks) do
     policy = Policy.resolve!(model, opts, checks)
 
-    if policy.platform != :anthropic do
+    if policy.protocol != :messages do
       raise ArgumentError,
-            "#{inspect(model)} goes to #{inspect(policy.platform)}, not :anthropic"
+            "#{inspect(model)} goes to #{inspect(policy.platform)} over " <>
+              "#{inspect(policy.protocol)}, not Messages"
     end
 
     policy

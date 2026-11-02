@@ -49,8 +49,14 @@ defmodule Clementine.Model do
   - `features`: `tool_search` (deferred tools go with `defer_loading`),
     `structured_outputs`, `mid_conversation_system` (a skill's load
     goes inline as a system message rather than folding into `system`
-    and `tools`), and `streaming` (default `true`; an agent's runs
-    always stream, so one on a model that does not is refused).
+    and `tools`), `inline_tools` (with `mid_conversation_system`, the
+    tools a skill's load adds go inline in that message, as
+    `tool_addition` definitions under the `inline-tools-2026-09-15`
+    beta, rather than joining `tools`; a platform that never takes one
+    withholds it whatever the sheet says, `Clementine.Platform.withheld/1`),
+    and `streaming` (default
+    `true`; an agent's runs always stream, so one on a model that does
+    not is refused).
   - `cache`: `min_prefix`, the fewest tokens a cached prefix holds
     (`nil` where the vendor states none), and
     `ttls`, the cache lifetimes it offers, shortest first. Which TTLs
@@ -66,10 +72,9 @@ defmodule Clementine.Model do
     there and how its facts differ there: `[anthropic: [id: ...],
     bedrock: [id: "anthropic.claude-...", lifecycle: :partner], ...]`.
     `:partner` marks a platform that sets its own retirement dates. A
-    declared model's `openrouter`, `bedrock`, `vertex`, or
-    `openai_compatible` entry may carry `base_url:` and `api_key:` until
-    platforms own their endpoints (OPS-195); `inspect/2` redacts a
-    literal key.
+    platform is one Clementine ships (`platforms/0`) or one the app names
+    under `config :clementine, :platforms` (`Clementine.Platform`), which
+    holds its endpoint and credential.
   - `source` and `read`: the page the sheet was read from, and when.
 
   `platform` is set only on a sheet `Clementine.Models.for_platform/2`
@@ -161,6 +166,7 @@ defmodule Clementine.Model do
             tool_search: boolean(),
             structured_outputs: boolean(),
             mid_conversation_system: boolean(),
+            inline_tools: boolean(),
             streaming: boolean()
           },
           cache: %{min_prefix: non_neg_integer() | nil, ttls: [ttl()]},
@@ -213,6 +219,7 @@ defmodule Clementine.Model do
         tool_search: [type: :boolean],
         structured_outputs: [type: :boolean],
         mid_conversation_system: [type: :boolean],
+        inline_tools: [type: :boolean],
         streaming: [type: :boolean]
       ]
     ],
@@ -230,6 +237,19 @@ defmodule Clementine.Model do
     read: [type: @date, default: nil]
   ]
 
+  # The keys of a platform's own config (`Clementine.Platform`), which a
+  # model's platform entry does not take.
+  @platform_config_keys [
+    :base_url,
+    :api_key,
+    :access_token,
+    :region,
+    :resource,
+    :project,
+    :deployments,
+    :protocol
+  ]
+
   @platform_schema [
     id: [type: :string],
     lifecycle: [type: {:in, [:partner, nil]}, default: nil],
@@ -240,6 +260,7 @@ defmodule Clementine.Model do
         tool_search: [type: :boolean],
         structured_outputs: [type: :boolean],
         mid_conversation_system: [type: :boolean],
+        inline_tools: [type: :boolean],
         streaming: [type: :boolean]
       ]
     ],
@@ -250,9 +271,7 @@ defmodule Clementine.Model do
         min_prefix: [type: {:or, [:non_neg_integer, nil]}],
         ttls: [type: {:list, {:in, @ttls}}]
       ]
-    ],
-    base_url: [type: :string],
-    api_key: [type: {:custom, __MODULE__, :validate_credential, []}]
+    ]
   ]
 
   @lifecycle_defaults %{
@@ -277,16 +296,10 @@ defmodule Clementine.Model do
     tool_search: false,
     structured_outputs: false,
     mid_conversation_system: false,
+    inline_tools: false,
     streaming: true
   }
   @cache_defaults %{min_prefix: nil, ttls: []}
-
-  # The platforms a request can go to before `Clementine.Platform`
-  # (OPS-195): each has a client. The rest are facts a sheet carries.
-  @served [:anthropic, :openai, :openrouter, :bedrock, :vertex, :openai_compatible]
-
-  # Only these may carry an endpoint on the sheet, until platforms do.
-  @endpoint_platforms [:openrouter, :bedrock, :vertex, :openai_compatible]
 
   @doc "The platforms a sheet may name."
   @spec platforms() :: [platform()]
@@ -304,18 +317,13 @@ defmodule Clementine.Model do
   @spec ttls() :: [ttl()]
   def ttls, do: @ttls
 
-  @doc false
-  # The platforms a request can reach today, in the order a model's
-  # default is picked among them.
-  @spec served() :: [platform()]
-  def served, do: @served
-
   @doc """
   Builds a sheet from its keyword form, or explains what is wrong with it.
   """
   @spec new(keyword()) :: {:ok, t()} | {:error, String.t()}
   def new(sheet) when is_list(sheet) do
-    with {:ok, opts} <- validate(sheet, @schema),
+    with :ok <- keyword_shapes(sheet),
+         {:ok, opts} <- validate(sheet, @schema),
          {:ok, platforms} <- platforms_of(opts),
          model = build(opts, platforms),
          :ok <- consistent(model) do
@@ -328,6 +336,28 @@ defmodule Clementine.Model do
 
   def new(other),
     do: {:error, "expected a keyword list of facts, got: #{inspect(redact(other))}"}
+
+  # NimbleOptions raises on a sheet that is not a keyword list, and
+  # quotes a `platforms:` that is not one; either may hold a key an app
+  # left there. Both are named by their shape only.
+  defp keyword_shapes(sheet) do
+    cond do
+      not Keyword.keyword?(sheet) ->
+        {:error, "expected a keyword list of facts, got a list that is not one"}
+
+      (platforms = Keyword.get(sheet, :platforms)) != nil and
+          not (is_list(platforms) and Keyword.keyword?(platforms)) ->
+        {:error,
+         "platforms: expected a keyword list from platform to its entry (anthropic: []), got " <>
+           if(is_list(platforms),
+             do: "a list that is not one",
+             else: Clementine.Platform.shape(platforms)
+           )}
+
+      true ->
+        :ok
+    end
+  end
 
   @doc "As `new/1`, raising `ArgumentError`."
   @spec new!(keyword()) :: t()
@@ -382,46 +412,14 @@ defmodule Clementine.Model do
   def cache_mechanism([ttl | _rest]) when ttl in @option_ttls, do: :options
 
   @doc false
-  # `term` with every literal `api_key:` replaced, for an error message.
+  # `term` with every credential (`api_key:`, `access_token:`) redacted,
+  # whatever its shape, for an error message. A sheet holds none; one
+  # put there by mistake is still never printed.
   @spec redact(term()) :: term()
-  def redact({:api_key, key}) when is_binary(key), do: {:api_key, "**redacted**"}
-  def redact(list) when is_list(list), do: Enum.map(list, &redact/1)
-  def redact(%{__struct__: _} = struct), do: struct
+  defdelegate redact(term), to: Clementine.Platform
 
-  def redact(map) when is_map(map),
-    do: Map.new(map, fn {key, value} -> redact({key, value}) end)
-
-  def redact({key, value}), do: {key, redact(value)}
-  def redact(other), do: other
-
-  # `message` with every literal `api_key:` in `term` replaced.
-  defp scrub(message, term) do
-    term
-    |> literal_keys()
-    |> Enum.reduce(message, &String.replace(&2, &1, "**redacted**"))
-  end
-
-  defp literal_keys({:api_key, key}) when is_binary(key) and key != "", do: [key]
-  defp literal_keys(list) when is_list(list), do: Enum.flat_map(list, &literal_keys/1)
-  defp literal_keys(%{__struct__: _}), do: []
-  defp literal_keys(map) when is_map(map), do: Enum.flat_map(map, &literal_keys/1)
-  defp literal_keys({_key, value}), do: literal_keys(value)
-  defp literal_keys(_other), do: []
-
-  @doc false
-  @spec validate_credential(term()) :: {:ok, term()} | {:error, String.t()}
-  def validate_credential(key) when is_binary(key), do: {:ok, key}
-  def validate_credential({:system, env} = key) when is_binary(env), do: {:ok, key}
-
-  def validate_credential({module, function, args} = key)
-      when is_atom(module) and is_atom(function) and is_list(args),
-      do: {:ok, key}
-
-  def validate_credential(other) do
-    {:error,
-     ~s(expected a string, {:system, "ENV_VAR"}, or {module, function, args}, got: ) <>
-       inspect(other)}
-  end
+  # `message` with every credential string in `term` replaced.
+  defp scrub(message, term), do: Clementine.Platform.scrub(message, term)
 
   defp validate(opts, schema) do
     case NimbleOptions.validate(opts, schema) do
@@ -437,9 +435,10 @@ defmodule Clementine.Model do
       platforms == [] ->
         {:error, "platforms: names none; a model is served somewhere"}
 
-      (unknown = Keyword.keys(platforms) -- @platforms) != [] ->
+      (unknown = Enum.reject(Keyword.keys(platforms), &known_platform?/1)) != [] ->
         {:error,
-         "platforms: names #{inspect(unknown)}, which Clementine does not know; it knows " <>
+         "platforms: names #{inspect(unknown)}, which Clementine does not ship and " <>
+           "config :clementine, :platforms does not name; Clementine ships " <>
            inspect(@platforms)}
 
       true ->
@@ -457,9 +456,14 @@ defmodule Clementine.Model do
     end
   end
 
+  # Shipped sheets name only shipped platforms, so building them at
+  # compile time never reads the app's config.
+  defp known_platform?(name), do: name in @platforms or Clementine.Platform.app_named?(name)
+
   defp platform_entry(name, entry) when is_list(entry) do
-    with {:ok, validated} <- validate(entry, @platform_schema),
-         :ok <- endpoint_allowed(name, validated) do
+    with :ok <- keyword_entry(entry),
+         :ok <- no_platform_config(name, entry),
+         {:ok, validated} <- validate(entry, @platform_schema) do
       {:ok,
        validated
        |> Map.new()
@@ -471,17 +475,37 @@ defmodule Clementine.Model do
   defp platform_entry(_name, other),
     do:
       {:error,
-       "expected a keyword list (id:, lifecycle:, features:, cache:), got: " <>
-         inspect(redact(other))}
+       "expected a keyword list (id:, lifecycle:, features:, cache:), got " <>
+         Clementine.Platform.shape(other)}
 
-  defp endpoint_allowed(name, entry) do
-    if name not in @endpoint_platforms and
-         (Keyword.has_key?(entry, :base_url) or Keyword.has_key?(entry, :api_key)) do
-      {:error,
-       "base_url: and api_key: go only on #{inspect(@endpoint_platforms)}; " <>
-         "#{inspect(name)} takes its endpoint from app config"}
-    else
-      :ok
+  defp keyword_entry(entry) do
+    if Keyword.keyword?(entry),
+      do: :ok,
+      else:
+        {:error,
+         "expected a keyword list (id:, lifecycle:, features:, cache:), got a list that is " <>
+           "not one"}
+  end
+
+  # Where a model's platform entry once took an endpoint or a credential
+  # (`base_url:`, `api_key:`), the platform's own config now holds it.
+  defp no_platform_config(name, entry) do
+    case Enum.filter(Keyword.keys(entry), &(&1 in @platform_config_keys)) do
+      [] ->
+        :ok
+
+      keys ->
+        place =
+          if name in @platforms,
+            do: "config :clementine, :platforms, #{name}: [...]",
+            else:
+              "config :clementine, :platforms, #{name}: [protocol: :chat_completions or " <>
+                ":messages, base_url: ..., api_key: ...], an app-named platform"
+
+        {:error,
+         "#{Enum.map_join(keys, ", ", &"#{&1}:")} no longer go on a model's platform entry, " <>
+           "which takes only id:, lifecycle:, features:, and cache:; the endpoint and " <>
+           "credential go under #{place} (Clementine.Platform)"}
     end
   end
 
@@ -544,22 +568,4 @@ defmodule Clementine.Model do
 
   defp bad_cap?({type, effort}, thinking),
     do: type not in thinking.types or effort not in thinking.efforts
-end
-
-defimpl Inspect, for: Clementine.Model do
-  # A declared model's platform entry may hold a literal API key until
-  # platforms own their credentials (OPS-195); inspecting the model, or a
-  # policy or error that carries it, never prints it.
-  def inspect(%Clementine.Model{} = model, opts) do
-    platforms =
-      Enum.map(model.platforms, fn
-        {name, %{api_key: key} = entry} when is_binary(key) ->
-          {name, %{entry | api_key: "**redacted**"}}
-
-        other ->
-          other
-      end)
-
-    Inspect.Any.inspect(%{model | platforms: platforms}, opts)
-  end
 end
