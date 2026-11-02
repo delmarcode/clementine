@@ -159,6 +159,7 @@ defmodule Clementine.Rollout do
 
     [
       model: agent.model,
+      policy: Clementine.Agent.policy(agent),
       system: agent.instructions,
       tools: agent.tools ++ deferred,
       deferred: deferred,
@@ -184,12 +185,14 @@ defmodule Clementine.Rollout do
     # `loaded_skills` the names of those loaded, in load order, and
     # `delegates` the agent modules it may ask. `authorize_tool` answers
     # for `{:policy, term}` tools (nil: they gate like :required).
-    # `resolved` is `model` resolved once for the execution
-    # (`Trace.resolve_model/1`), and `agent_key` the run's agent key: every
+    # `policy` is the agent's choices for its model, sent with every
+    # request; `resolved` is `model` resolved once for the execution
+    # (`Trace.resolve_model/2`), and `agent_key` the run's agent key: every
     # trace entry and telemetry event of the execution names both.
     defstruct [
       :model,
       :resolved,
+      :policy,
       :agent_key,
       :system,
       :tools,
@@ -317,10 +320,12 @@ defmodule Clementine.Rollout do
     input_message = UserMessage.new(rollout.input)
 
     model = Keyword.fetch!(config, :model)
+    policy = Keyword.fetch!(config, :policy)
 
     exec = %Execution{
       model: model,
-      resolved: Trace.resolve_model(model),
+      policy: policy,
+      resolved: Trace.resolve_model(model, policy),
       agent_key: agent_key(rollout),
       system: Keyword.get(config, :system),
       tools: Keyword.get(config, :tools, []),
@@ -1974,7 +1979,8 @@ defmodule Clementine.Rollout do
   end
 
   defp request_opts(%Execution{} = exec) do
-    deferred_opts(exec.deferred) ++
+    exec.policy ++
+      deferred_opts(exec.deferred) ++
       output_schema_opts(exec.output_schema) ++ cache_key_opts(LLM.Cache.key(exec.context))
   end
 

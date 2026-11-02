@@ -1,6 +1,7 @@
 defmodule Clementine.Cost do
   @moduledoc """
-  What tokens cost, in the currency the catalog's prices name.
+  What tokens cost, in the currency the models' prices name
+  (`Clementine.LLM.Pricing`).
 
   A cost is an integer count of micro-units: millionths of the currency,
   so `%Clementine.Cost{currency: "USD", micros: 1_250}` is $0.00125.
@@ -8,7 +9,7 @@ defmodule Clementine.Cost do
   jsonb, and a host's `bigint` column unchanged; a float would drift as
   costs add up, and `Decimal` comes only with the optional Ecto deps.
 
-  `price/2` is the pure function from `Clementine.Usage` and an alias's
+  `price/2` is the pure function from `Clementine.Usage` and a model's
   prices (`Clementine.LLM.Pricing`) to a cost. It charges each part of the
   usage at its own rate: uncached input (`input_tokens` less the cache
   reads and writes, which are parts of it), cache reads, cache writes,
@@ -35,7 +36,7 @@ defmodule Clementine.Cost do
     `result.usage`, or a trace entry's usage to reprice it.
   """
 
-  alias Clementine.LLM.{ModelRegistry, Pricing}
+  alias Clementine.LLM.Pricing
   alias Clementine.Usage
 
   @enforce_keys [:currency, :micros]
@@ -67,22 +68,13 @@ defmodule Clementine.Cost do
   end
 
   @doc """
-  Prices `usage` (a `Clementine.Usage` or a usage map) at the prices the
-  catalog configures for `model` now. `model` is an alias, a
-  `{provider, id}` reference, an alias as a trace entry records it (a
-  string), or a model `ModelRegistry.resolve!/1` resolved. `nil` for a
-  model without prices, or one the catalog does not hold.
+  Prices `usage` (a `Clementine.Usage` or a usage map) at the prices
+  `model` has now: a model id, as a trace entry records it, at the
+  model's default caching, or a call's resolved model (`%{pricing: ...,
+  cache: ...}`). `nil` for a model without prices, or an id no sheet
+  holds.
   """
-  @spec of(
-          Usage.t() | map(),
-          ModelRegistry.model_ref() | ModelRegistry.resolved_model() | String.t() | nil
-        ) :: t() | nil
-  def of(usage, model) when is_binary(model) do
-    of(usage, String.to_existing_atom(model))
-  rescue
-    ArgumentError -> nil
-  end
-
+  @spec of(Usage.t() | map(), String.t() | map() | nil) :: t() | nil
   def of(_usage, nil), do: nil
 
   def of(%Usage{} = usage, model) do
@@ -113,8 +105,8 @@ defmodule Clementine.Cost do
   end
 
   @doc """
-  Nothing spent: zero in the catalog's currency, or `nil` when the catalog
-  prices nothing. What a run that never called a model costs.
+  Nothing spent: zero in the models' currency, or `nil` when no model has
+  prices. What a run that never called a model costs.
   """
   @spec zero() :: t() | nil
   def zero do

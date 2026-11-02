@@ -26,13 +26,11 @@ defmodule Clementine.LLM.AnthropicFakeTest do
   setup do
     previous = Application.get_env(:clementine, :models)
 
-    Application.put_env(:clementine, :models,
-      priced: [
-        provider: :anthropic,
-        id: "claude-sonnet-5",
-        pricing: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
+    Application.put_env(:clementine, :models, %{
+      "claude-sonnet-5" => [
+        prices: [currency: "USD", input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75]
       ]
-    )
+    })
 
     on_exit(fn -> Application.put_env(:clementine, :models, previous) end)
 
@@ -51,7 +49,7 @@ defmodule Clementine.LLM.AnthropicFakeTest do
     on_exit(fn -> :telemetry.detach(id) end)
   end
 
-  defp agent, do: Agent.new(model: :priced, instructions: "Be brief.")
+  defp agent, do: Agent.new(model: "claude-sonnet-5", instructions: "Be brief.")
 
   defp claude_turn(script, fake_opts \\ []) do
     expect(Clementine.LLM.MockClient, :stream, fn model, system, messages, tools, opts ->
@@ -114,7 +112,7 @@ defmodule Clementine.LLM.AnthropicFakeTest do
 
       faked =
         Fake.stream(
-          {:anthropic, "claude-sonnet-5"},
+          "claude-sonnet-5",
           "Be brief.",
           [UserMessage.new("Hi")],
           [],
@@ -147,7 +145,9 @@ defmodule Clementine.LLM.AnthropicFakeTest do
 
     test "refuses a key the API does not report" do
       assert_raise ArgumentError, ~r/usage: takes/, fn ->
-        Fake.stream(:priced, nil, [UserMessage.new("Hi")], [], [], [], usage: [tokens: 1])
+        Fake.stream("claude-sonnet-5", nil, [UserMessage.new("Hi")], [], [], [],
+          usage: [tokens: 1]
+        )
       end
     end
   end
@@ -167,7 +167,7 @@ defmodule Clementine.LLM.AnthropicFakeTest do
 
     test "no step may follow it" do
       assert_raise ArgumentError, ~r/ends the turn/, fn ->
-        Fake.stream(:priced, nil, [UserMessage.new("Hi")], [], [], [
+        Fake.stream("claude-sonnet-5", nil, [UserMessage.new("Hi")], [], [], [
           {:error, "api_error"},
           {:text, "More."}
         ])
@@ -210,7 +210,7 @@ defmodule Clementine.LLM.AnthropicFakeTest do
     test "a backoff sleeps no longer than the call's budget has left, and a spent one is not retried" do
       assert [_binding | _turn] =
                Fake.stream(
-                 :priced,
+                 "claude-sonnet-5",
                  nil,
                  [UserMessage.new("Hi")],
                  [],
@@ -226,7 +226,7 @@ defmodule Clementine.LLM.AnthropicFakeTest do
 
       assert [{:error, {:api_error, 529, _body}}] =
                Fake.stream(
-                 :priced,
+                 "claude-sonnet-5",
                  nil,
                  [UserMessage.new("Hi")],
                  [],
@@ -251,7 +251,13 @@ defmodule Clementine.LLM.AnthropicFakeTest do
 
     test "gives the error as the client does: the status and the body's raw JSON" do
       assert [{:error, {:api_error, 529, body}}] =
-               Fake.stream(:priced, nil, [UserMessage.new("Hi")], [], [], [{:text, "Hi."}],
+               Fake.stream(
+                 "claude-sonnet-5",
+                 nil,
+                 [UserMessage.new("Hi")],
+                 [],
+                 [],
+                 [{:text, "Hi."}],
                  api_errors: [529, 529, 529]
                )
 
@@ -263,37 +269,37 @@ defmodule Clementine.LLM.AnthropicFakeTest do
     test "a text block of only whitespace anywhere the encoder sends one" do
       history = [%UserMessage{content: [Content.text("Hi"), Content.text("\n\n")]}]
 
-      assert {:error, {:api_error, 400, body}} = Fake.check(:priced, nil, history, [])
+      assert {:error, {:api_error, 400, body}} = Fake.check("claude-sonnet-5", nil, history, [])
 
       assert body["error"]["message"] =~
                "messages.0.content.1.text: text content blocks must contain non-whitespace text"
 
       # A stored assistant turn's blank block never goes.
       history = [UserMessage.new("Hi"), AssistantMessage.new([Content.text(" \n")])]
-      assert :ok = Fake.check(:priced, nil, history ++ [UserMessage.new("Again?")], [])
+      assert :ok = Fake.check("claude-sonnet-5", nil, history ++ [UserMessage.new("Again?")], [])
     end
 
     test "an empty text block anywhere the encoder sends one" do
       history = [%UserMessage{content: [Content.text("Hi"), Content.text("")]}]
 
-      assert {:error, {:api_error, 400, body}} = Fake.check(:priced, nil, history, [])
+      assert {:error, {:api_error, 400, body}} = Fake.check("claude-sonnet-5", nil, history, [])
       assert body["error"]["message"] =~ "messages.0.content.1.text"
 
       # A stored assistant turn's empty block never goes.
       history = [UserMessage.new("Hi"), AssistantMessage.new([Content.text("")])]
-      assert :ok = Fake.check(:priced, nil, history ++ [UserMessage.new("Again?")], [])
+      assert :ok = Fake.check("claude-sonnet-5", nil, history ++ [UserMessage.new("Again?")], [])
     end
 
     test "an empty message anywhere but last; the encoder never sends an empty assistant one" do
       history = [UserMessage.new(""), AssistantMessage.new([Content.text("Hm?")])]
 
-      assert {:error, {:api_error, 400, body}} = Fake.check(:priced, nil, history, [])
+      assert {:error, {:api_error, 400, body}} = Fake.check("claude-sonnet-5", nil, history, [])
       assert body["error"]["message"] =~ "messages.0: all messages must have non-empty content"
 
       # A turn stored with no blocks is left out of the request.
       empty = AssistantMessage.new([])
       history = [UserMessage.new("Hi"), empty, UserMessage.new("Hm?")]
-      assert :ok = Fake.check(:priced, nil, history, [])
+      assert :ok = Fake.check("claude-sonnet-5", nil, history, [])
     end
   end
 
@@ -311,14 +317,14 @@ defmodule Clementine.LLM.AnthropicFakeTest do
 
   test "an unfinished call ends the script: no step may follow it" do
     assert_raise ArgumentError, ~r/unfinished_tool_use/, fn ->
-      Fake.stream(:priced, nil, [UserMessage.new("Hi")], [], [], [
+      Fake.stream("claude-sonnet-5", nil, [UserMessage.new("Hi")], [], [], [
         {:unfinished_tool_use, "toolu_1", "echo", "{"},
         {:text, "More."}
       ])
     end
 
     assert [_start | events] =
-             Fake.stream(:priced, nil, [UserMessage.new("Hi")], [], [], [
+             Fake.stream("claude-sonnet-5", nil, [UserMessage.new("Hi")], [], [], [
                {:unfinished_tool_use, "toolu_1", "echo", ~s({"mess)}
              ])
 

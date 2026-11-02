@@ -50,7 +50,7 @@ defmodule Clementine.SkillTest do
   end
 
   defp agent(opts) do
-    Clementine.Agent.new(Keyword.merge([model: :claude_sonnet, instructions: "Help."], opts))
+    Clementine.Agent.new(Keyword.merge([model: "claude-sonnet-5", instructions: "Help."], opts))
   end
 
   describe "the use form" do
@@ -134,7 +134,7 @@ defmodule Clementine.SkillTest do
         @moduledoc false
         use Clementine.Agent,
           key: "support",
-          model: :claude_sonnet,
+          model: "claude-sonnet-5",
           instructions: "Help.",
           tools: [Echo],
           skills: [Clementine.SkillTest.Refunds]

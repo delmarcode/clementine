@@ -18,7 +18,7 @@ defmodule Clementine.Agent do
       defmodule MyApp.Agents.Weather do
         use Clementine.Agent,
           key: "weather",
-          model: :claude_sonnet,
+          model: "claude-sonnet-5-5",
           instructions: "Answer questions about the weather.",
           tools: [MyApp.Agents.Weather.Tools.Forecast],
           defaults: [max_iterations: 10, max_duration: :timer.minutes(5)]
@@ -33,7 +33,7 @@ defmodule Clementine.Agent do
         @impl true
         def agent(run) do
           Clementine.Agent.new(
-            model: :claude_sonnet,
+            model: "claude-sonnet-5-5",
             instructions: MyApp.Triage.instructions(run.subject),
             tools: [MyApp.Agents.Triage.Tools.Assess]
           )
@@ -43,6 +43,66 @@ defmodule Clementine.Agent do
   The fields given to `use` build the agent at compile time, so a typo in
   them fails the build. List the module in the child spec's `agents:`.
 
+  ## The model and its policy
+
+  An agent names its model by the vendor's id and makes its own choices
+  for it, checked against the model's fact sheet (`Clementine.Model`):
+
+      use Clementine.Agent,
+        key: "triage",
+        model: "claude-sonnet-5-5",
+        effort: :high,
+        max_tokens: 16_000,
+        cache: [ttl: :one_hour]
+
+  - `max_tokens:` the output ceiling of one response, thinking included;
+    default `min(16_000, the model's max_output)`.
+  - `effort:` one of the model's effort levels; default the model's own,
+    sent explicitly.
+  - `thinking:` `:adaptive`, `:enabled`, `:between_tools`, or `:off`;
+    default `:adaptive` where the model takes it.
+  - `display:` `:omitted`, `:summarized`, or `:updates`, for the
+    thinking a Claude model returns; default the model's own (`:omitted`
+    from Claude 4.7 on, `:summarized` on 4.5 and 4.6).
+  - `cache:` `true` (default, the model's shortest TTL), `false`, or
+    `[ttl: ...]`.
+  - `provider_options:` what one vendor alone takes (`budget_tokens:` on
+    a Claude model before 4.7, OpenAI's `summary:`).
+
+  `Clementine.LLM.Policy` has each in full. A model the sheets and the
+  app's config do not know, or a choice its sheet refuses, fails
+  `new/1`, boot, and the start of a run, naming what the model takes
+  instead and where the choice came from: `use`, `new/1`, or the model
+  `c:agent/1` picked for the run.
+
+  `use` with `model:` defines `__model__/0`, so a module whose
+  `c:agent/1` builds the agent per run still declares its model where
+  the child spec and tools can read it. `use`'s choices are for its
+  model: the runtime applies them when `c:agent/1` leaves the model to
+  `use` or picks the same one, filling each choice `c:agent/1` leaves
+  unset (and `provider_options:` key by key: `c:agent/1` overrides a key
+  `use` gives but cannot remove one). When `c:agent/1` picks
+  another model for a run, an eval's, say, none of `use`'s choices
+  apply, and the agent runs on that model's defaults and its own
+  choices:
+
+      use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", effort: :xhigh
+
+      @impl true
+      def agent(run) do
+        # "claude-opus-5-5" from an eval runs at its own default effort.
+        Clementine.Agent.new(
+          model: run.metadata["model"] || __model__(),
+          instructions: MyApp.Triage.instructions(run.subject)
+        )
+      end
+
+  `use` builds its agent at compile time, when only compile-time config
+  is read, so a model `config/runtime.exs` declares is left to boot to
+  check. `new/1` checks what it can before the runtime fills the rest
+  (a `thinking: :enabled` whose `budget_tokens` `use` gives passes
+  there); the start of every run checks the whole.
+
   ## Deferred tools
 
   An agent with more tools than a model can choose among well (tens, or
@@ -51,7 +111,7 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent,
         key: "support",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Help customers with their orders.",
         tools: [MyApp.Tools.LookupOrder],
         deferred: [MyApp.Tools.IssueRefund, MyApp.Tools.ChangeAddress]
@@ -75,7 +135,7 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent,
         key: "grader",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Grade the essay against the rubric.",
         tools: [MyApp.Tools.FetchRubric],
         output_schema: %{
@@ -116,7 +176,7 @@ defmodule Clementine.Agent do
         use Clementine.Agent,
           key: "chat",
           turn: true,
-          model: :claude_sonnet,
+          model: "claude-sonnet-5-5",
           instructions: "You are a helpful assistant."
 
         @impl true
@@ -156,7 +216,7 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent,
         key: "support",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Help customers with their orders.",
         tools: [MyApp.Tools.Search],
         skills: [MyApp.Skills.Refunds, MyApp.Skills.Shipping]
@@ -183,7 +243,7 @@ defmodule Clementine.Agent do
 
       use Clementine.Agent,
         key: "planner",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Plan the work. Ask the researcher for facts.",
         delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
 
@@ -194,7 +254,7 @@ defmodule Clementine.Agent do
       use Clementine.Agent,
         key: "researcher",
         description: "Finds and cites facts. Ask it for anything you would look up.",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "..."
 
   `description:` goes to `use` in either form, beside `key:`, with the
@@ -209,9 +269,16 @@ defmodule Clementine.Agent do
   The in-memory agent *process* lives at `Clementine.AgentServer`.
   """
 
-  @enforce_keys [:model]
+  @policy Clementine.LLM.Policy.keys()
+
   defstruct id: nil,
             model: nil,
+            max_tokens: nil,
+            effort: nil,
+            thinking: nil,
+            display: nil,
+            cache: nil,
+            provider_options: nil,
             instructions: nil,
             tools: [],
             deferred: [],
@@ -225,7 +292,13 @@ defmodule Clementine.Agent do
 
   @type t :: %__MODULE__{
           id: term(),
-          model: Clementine.LLM.ModelRegistry.model_ref(),
+          model: String.t() | nil,
+          max_tokens: pos_integer() | nil,
+          effort: Clementine.Model.effort() | nil,
+          thinking: Clementine.Model.thinking_type() | nil,
+          display: :omitted | :summarized | :updates | nil,
+          cache: boolean() | keyword() | nil,
+          provider_options: keyword() | nil,
           instructions: String.t() | nil,
           tools: [module()],
           deferred: [module()],
@@ -350,6 +423,27 @@ defmodule Clementine.Agent do
       @clementine_agent_key key
       @clementine_agent_turn turn
       @clementine_agent_description description
+      @clementine_agent_model Keyword.get(fields, :model)
+      @clementine_agent_policy Keyword.take(fields, Clementine.LLM.Policy.keys())
+      @clementine_agent_output_schema? Keyword.get(fields, :output_schema) != nil
+
+      if @clementine_agent_model == nil and @clementine_agent_policy != [] do
+        raise ArgumentError,
+              "use Clementine.Agent (#{inspect(__MODULE__)}): " <>
+                "#{inspect(Keyword.keys(@clementine_agent_policy))} are choices for a model; " <>
+                "declare it with model: too, or make them in agent/1"
+      end
+
+      @doc "The model id this agent declares on `use`, or `nil`."
+      def __model__, do: @clementine_agent_model
+
+      @doc false
+      # The policy this agent declares on `use`.
+      def __policy__, do: @clementine_agent_policy
+
+      @doc false
+      # Whether this agent's `use` gives an output schema.
+      def __output_schema__?, do: @clementine_agent_output_schema?
 
       @impl Clementine.Agent
       def key, do: @clementine_agent_key
@@ -371,7 +465,7 @@ defmodule Clementine.Agent do
       end
 
       if fields != [] do
-        @clementine_agent Clementine.Agent.new([id: key] ++ fields)
+        @clementine_agent Clementine.Agent.__use__(__MODULE__, [id: key] ++ fields)
 
         @impl Clementine.Agent
         def agent(_run), do: @clementine_agent
@@ -397,7 +491,13 @@ defmodule Clementine.Agent do
 
   ## Options
 
-  - `:model` (required) - model alias atom or `{provider, id}` tuple
+  - `:model` - the model's id (`"claude-sonnet-5-5"`), one Clementine
+    ships a sheet for or `config :clementine, :models` declares. An agent
+    the runtime builds from a module may leave it out and take the
+    module's `__model__/0`
+  - `:max_tokens`, `:effort`, `:thinking`, `:display`, `:cache`,
+    `:provider_options` - the agent's choices for its model (see "The
+    model and its policy" above)
   - `:id` - host-app identifier, kept for audit trails
   - `:instructions` - system prompt
   - `:tools` - tool modules
@@ -422,8 +522,34 @@ defmodule Clementine.Agent do
   """
   @spec new(keyword()) :: t()
   def new(opts) when is_list(opts) do
+    # The runtime may still fill a choice this agent leaves unset from its
+    # module's `use` (`declared!/2`), so what needs one waits for the
+    # check at the run's start, at boot, and on every request.
+    build!(opts, "Clementine.Agent.new/1", partial: true)
+  end
+
+  @doc false
+  # `use Clementine.Agent`'s build, at compile time. Its choices are whole
+  # for its model, so they are checked whole; a model that compile-time
+  # config does not know (one `config/runtime.exs` declares) is left to
+  # boot.
+  @spec __use__(module(), keyword()) :: t()
+  def __use__(module, opts) do
+    model = Keyword.get(opts, :model)
+
+    source = "use Clementine.Agent (#{inspect(module)})"
+
+    if is_nil(model) or Clementine.Models.known?(model) do
+      build!(opts, source, [])
+    else
+      opts |> Keyword.delete(:model) |> build!(source, []) |> Map.put(:model, model)
+    end
+  end
+
+  defp build!(opts, source, checks) do
     agent = struct!(__MODULE__, opts)
     Clementine.Trace.validate_fidelity!(agent.trace)
+    check_model!(agent, source, checks)
 
     case Enum.filter(agent.deferred, &(&1 in agent.tools)) do
       [] ->
@@ -434,6 +560,179 @@ defmodule Clementine.Agent do
               "a tool is in tools: or deferred:, not both; found in both: #{inspect(both)}"
     end
   end
+
+  @doc """
+  The agent's choices for its model, as `Clementine.LLM.Policy` and a
+  client's request opts take them: the ones it sets, and no others.
+  """
+  @spec policy(t()) :: keyword()
+  def policy(%__MODULE__{} = agent) do
+    # `false` is a choice (`cache: false`); only `nil` is unset.
+    for key <- @policy, not is_nil(Map.fetch!(agent, key)), do: {key, Map.fetch!(agent, key)}
+  end
+
+  @doc false
+  # The agent `module.agent/1` built, completed from the module's `use`
+  # and checked whole against the model's sheet. `use`'s choices are for
+  # its model: they fill what agent/1 leaves unset when agent/1 leaves the
+  # model to `use` or names the same one, and none applies when agent/1
+  # picks another model for the run. The runtime calls it at every claim
+  # (an ArgumentError cancels the run as unstartable), and
+  # `Clementine.run/3` given a module.
+  @spec declared!(module(), t()) :: t()
+  def declared!(module, %__MODULE__{} = agent) do
+    {model, declared} = declared(module)
+
+    cond do
+      agent.model == nil and model == nil ->
+        raise ArgumentError,
+              "#{inspect(module)}.agent/1 names no model, and its use Clementine.Agent " <>
+                "declares none: give one (model: \"claude-sonnet-5-5\")"
+
+      model == nil ->
+        check!(agent, &"#{inspect(module)}.agent/1: #{&1}")
+
+      agent.model in [nil, model] ->
+        filled = fill(%{agent | model: model}, declared)
+
+        check!(filled, fn message ->
+          # The default agent/1 returns use's own agent, so only what
+          # differs from use is agent/1's.
+          use_schema? = use_schema?(module)
+          own = policy(agent) -- declared
+          own_schema? = agent.output_schema != nil and not use_schema?
+          alone = Clementine.LLM.Policy.resolve(model, own, output_schema: own_schema?)
+
+          if (own != [] or own_schema?) and match?({:error, _}, alone),
+            do: "#{inspect(module)}.agent/1's Clementine.Agent.new/1 choices: #{message}",
+            else:
+              "#{inspect(module)}'s use Clementine.Agent choices " <>
+                declared_text(declared, use_schema?) <>
+                if(own == [], do: "", else: ", with agent/1's #{inspect(own)}") <>
+                ": #{message}"
+        end)
+
+      true ->
+        check!(agent, fn message ->
+          "#{inspect(module)}.agent/1 picked #{inspect(agent.model)} for this run, not the " <>
+            "#{inspect(model)} its use Clementine.Agent declares, so only agent/1's own " <>
+            "choices apply: #{message}"
+        end)
+    end
+  end
+
+  @doc false
+  # The agent an in-process run executes (`Clementine.run/3`,
+  # `Clementine.stream/3`): an agent struct, checked whole, or a
+  # `use Clementine.Agent` module's, built for `run` and completed from
+  # its `use` as the runtime does.
+  @spec for_run!(t() | module(), term(), String.t()) :: t()
+  def for_run!(%__MODULE__{model: nil}, _run, caller) do
+    raise ArgumentError,
+          "#{caller}: the agent names no model. Give Clementine.Agent.new/1 a model: " <>
+            "(\"claude-sonnet-5-5\"), or pass the agent's module, whose use Clementine.Agent " <>
+            "declares one (#{caller}(MyApp.Agents.Triage, prompt))"
+  end
+
+  def for_run!(%__MODULE__{} = agent, _run, caller),
+    do: check!(agent, &"#{caller}: #{&1}")
+
+  def for_run!(module, run, _caller) when is_atom(module) do
+    unless Clementine.Runs.Config.agent?(module) do
+      raise ArgumentError,
+            "expected a Clementine.Agent struct or a use Clementine.Agent module, got: " <>
+              inspect(module)
+    end
+
+    declared!(module, module.agent(run || default_run(module)))
+  end
+
+  # What an in-process run of a module hands its agent/1 when the caller
+  # gives no run: a row with only the agent's key and kind.
+  defp default_run(module) do
+    fields = [agent_key: module.key(), turn: module.turn(), metadata: %{}]
+
+    if Code.ensure_loaded?(Clementine.Runs.AgentRun),
+      do: struct(Clementine.Runs.AgentRun, fields),
+      else: Map.new(fields)
+  end
+
+  # `use`'s choices under the ones agent/1 made, provider options key by
+  # key.
+  defp fill(agent, declared) do
+    Enum.reduce(declared, agent, fn
+      {:provider_options, options}, agent ->
+        %{agent | provider_options: Keyword.merge(options, agent.provider_options || [])}
+
+      {key, value}, agent ->
+        if is_nil(Map.fetch!(agent, key)), do: Map.put(agent, key, value), else: agent
+    end)
+  end
+
+  defp check!(agent, describe) do
+    case Clementine.LLM.Policy.resolve(agent.model, policy(agent), schema(agent)) do
+      {:ok, _policy} -> agent
+      {:error, message} -> raise ArgumentError, describe.(message)
+    end
+  end
+
+  @doc false
+  # Checks a module's declared model and policy against the sheets and
+  # the app's config, as boot does for every agent in `agents:`.
+  @spec check_declared(module()) :: :ok | {:error, String.t()}
+  def check_declared(module) do
+    with {:ok, _policy} <- resolve_declared(module), do: :ok
+  end
+
+  @doc false
+  # The module's declared model and choices, resolved against the sheet:
+  # `{:ok, nil}` for a module that declares no model.
+  @spec resolve_declared(module()) ::
+          {:ok, Clementine.LLM.Policy.t() | nil} | {:error, String.t()}
+  def resolve_declared(module) do
+    case declared(module) do
+      {nil, _policy} ->
+        {:ok, nil}
+
+      {model, policy} ->
+        schema? = use_schema?(module)
+
+        with {:error, message} <-
+               Clementine.LLM.Policy.resolve(model, policy, output_schema: schema?),
+             do:
+               {:error,
+                "its use Clementine.Agent declares #{declared_text(policy, schema?)}: #{message}"}
+    end
+  end
+
+  defp use_schema?(module),
+    do: function_exported?(module, :__output_schema__?, 0) and module.__output_schema__?()
+
+  defp declared_text([], true), do: "an output_schema:"
+  defp declared_text(policy, true), do: "#{inspect(policy)} and an output_schema:"
+  defp declared_text(policy, false), do: inspect(policy)
+
+  # What a module's `use` declares: its model and its choices. A module
+  # that implements the behaviour by hand declares neither.
+  defp declared(module) do
+    model = if function_exported?(module, :__model__, 0), do: module.__model__()
+    policy = if function_exported?(module, :__policy__, 0), do: module.__policy__(), else: []
+    {model, policy}
+  end
+
+  # An agent without a model is one the runtime completes from its
+  # module (`declared!/2`); one with a model is checked now, so a typo or
+  # a choice its sheet refuses fails the build.
+  defp check_model!(%__MODULE__{model: nil} = agent, _source, _checks), do: agent
+
+  defp check_model!(%__MODULE__{model: model} = agent, source, checks) do
+    case Clementine.LLM.Policy.resolve(model, policy(agent), checks ++ schema(agent)) do
+      {:ok, _policy} -> agent
+      {:error, message} -> raise ArgumentError, "#{source}: #{message}"
+    end
+  end
+
+  defp schema(agent), do: [output_schema: agent.output_schema != nil]
 
   # Delegates are agent modules, kept as given, and checked as far as a
   # build may (Clementine.Delegation.check/2): their keys are read when a

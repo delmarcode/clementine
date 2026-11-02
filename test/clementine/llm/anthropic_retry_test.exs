@@ -54,7 +54,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       end)
 
       events =
-        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+        Anthropic.stream("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
+        |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello from retry!"}, &1))
       assert Enum.any?(events, &match?({:message_stop}, &1))
@@ -83,7 +84,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       end)
 
       events =
-        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+        Anthropic.stream("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
+        |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello after overload!"}, &1))
       assert Agent.get(counter, & &1) == 2
@@ -103,7 +105,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       end)
 
       events =
-        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+        Anthropic.stream("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
+        |> Enum.to_list()
 
       assert {:error, {:api_error, 429, error_body}} in events
 
@@ -157,7 +160,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       budget = 59_000
 
       events =
-        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], [],
+        Anthropic.stream("claude-sonnet-5", "system", [UserMessage.new("Hi")], [],
           receive_timeout: budget
         )
         |> Enum.to_list()
@@ -205,7 +208,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       budget = 1_000
 
       events =
-        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], [],
+        Anthropic.stream("claude-sonnet-5", "system", [UserMessage.new("Hi")], [],
           receive_timeout: budget
         )
         |> Enum.to_list()
@@ -241,7 +244,8 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       end)
 
       events =
-        Anthropic.stream(:claude_sonnet, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+        Anthropic.stream("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
+        |> Enum.to_list()
 
       assert Enum.any?(events, &match?({:text_delta, "Hello after network error!"}, &1))
     end
@@ -263,7 +267,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       end)
 
       assert {:ok, %Response{} = response} =
-               Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+               Anthropic.call("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
 
       assert [%Content.Text{text: "Hello sync after error!"}] = response.content
     end
@@ -290,7 +294,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       end)
 
       assert {:ok, %Response{} = response} =
-               Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+               Anthropic.call("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
 
       assert [%Content.Text{text: "Hello sync!"}] = response.content
       assert Agent.get(counter, & &1) == 2
@@ -312,7 +316,7 @@ defmodule Clementine.LLM.AnthropicRetryTest do
       end)
 
       assert {:error, {:api_error, 429, _}} =
-               Anthropic.call(:claude_sonnet, "system", [UserMessage.new("Hi")], [])
+               Anthropic.call("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
 
       assert Agent.get(counter, & &1) == 3
 

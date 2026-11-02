@@ -301,7 +301,7 @@ defmodule Clementine.Runs.TraceTest do
       assert {:agent_run_trace, :payload} in hits
     end
 
-    test "a model call's provider, model, alias, tokens, cost, duration, and stop reason" do
+    test "a model call's provider, model, tokens, cost, duration, and stop reason; no alias" do
       {:ok, run} = Runs.start(Lookup, "Find the forecast", subject: {"ticket", "t-1"})
       expect_turn(tool_events("tu_1", "lookup", %{"query" => "forecast"}))
       expect_turn(text_events("Sunny."))
@@ -320,7 +320,7 @@ defmodule Clementine.Runs.TraceTest do
                kind: "execution",
                provider: "anthropic",
                model: "claude-sonnet-5",
-               alias: "claude_sonnet",
+               alias: nil,
                agent_fingerprint: <<_::binary-size(64)>>,
                input_tokens: nil,
                tool_name: nil
@@ -333,7 +333,7 @@ defmodule Clementine.Runs.TraceTest do
                  kind: "model_call",
                  provider: "anthropic",
                  model: "claude-sonnet-5",
-                 alias: "claude_sonnet",
+                 alias: nil,
                  input_tokens: 10,
                  output_tokens: 5,
                  cache_read_tokens: 0,

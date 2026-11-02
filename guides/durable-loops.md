@@ -429,7 +429,7 @@ on rather than text it parses:
 defmodule MyApp.Agents.Grader do
   use Clementine.Agent,
     key: "grader",
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "Grade the draft against the rubric.",
     output_schema: %{
       "type" => "object",

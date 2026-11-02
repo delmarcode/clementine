@@ -13,11 +13,11 @@ defmodule Clementine.Trace do
 
   - `:execution`, once per execution: when a run starts, and again when it
     resumes after an approval or a delegation.
-    - `"provider"` — the provider the model resolved to (`"anthropic"`,
-      `"openai"`, ...)
-    - `"model"` — the provider's id for the model
-    - `"alias"` — the catalog alias the agent named; `nil` for a direct
-      `{provider, id}` reference
+    - `"provider"` — the platform the model's request went to
+      (`"anthropic"`, `"openai"`, ...)
+    - `"model"` — the model's id (`Clementine.Model`)
+    - `"alias"` — always `nil` now that models are named by id; the
+      column leaves with trace version 6 (OPS-190)
     - `"agent_fingerprint"` — a sha256 over the model id, the
       instructions, the agent's tool schemas, and, when the agent has
       them, which tools are deferred, the output schema, the skills it
@@ -49,12 +49,10 @@ defmodule Clementine.Trace do
     - `"usage"` — `Clementine.Usage.to_map/1`'s map (`"input_tokens"`,
       `"output_tokens"`, `"cache_read_tokens"`, `"cache_write_tokens"`),
       what the stream reported, so far as it got
-    - `"alias"` — the catalog alias the call ran on, whose prices priced
-      it; `nil` for a direct `{provider, id}` reference. Two aliases may
-      share a provider id at different prices, so the id is not enough.
+    - `"alias"` — always `nil`, as in `:execution`
     - `"cost"` — what the call cost, frozen when it ended at the prices
-      the alias had then: `Clementine.Cost.to_map/1`'s map
-      (`"currency"`, `"micros"`), or `nil` for an alias without prices
+      the model had then: `Clementine.Cost.to_map/1`'s map
+      (`"currency"`, `"micros"`), or `nil` for a model without prices
       (`Clementine.Runs.cost/2` sums them)
     - `"content"` — the assistant's blocks, as
       `Clementine.LLM.Message.Content.to_map/1` maps them
@@ -179,7 +177,6 @@ defmodule Clementine.Trace do
   """
 
   alias Clementine.LLM.Message.Content
-  alias Clementine.LLM.ModelRegistry
   alias Clementine.Trace.Entry
 
   @type fidelity :: :content | :facts
@@ -258,13 +255,15 @@ defmodule Clementine.Trace do
 
   @typedoc """
   The model an execution or a call runs on, resolved once
-  (`resolve_model/1`): the catalog's resolution, or a reference the
-  catalog does not hold, as written.
+  (`resolve_model/2`): the platform it goes to (the `provider` a trace
+  entry records), its id, the agent's caching, and the model's prices,
+  or, for an id no sheet holds, the id alone. `alias` is always `nil`:
+  models are named by id, and the column goes in OPS-190's migration.
   """
   @type model :: %{
-          required(:provider) => ModelRegistry.provider() | nil,
+          required(:provider) => atom() | nil,
           required(:id) => String.t() | nil,
-          required(:alias) => atom() | nil,
+          required(:alias) => nil,
           required(:pricing) => Clementine.LLM.Pricing.t() | nil,
           optional(atom()) => term()
         }
@@ -283,28 +282,33 @@ defmodule Clementine.Trace do
   end
 
   @doc false
-  # The model `ref` names, resolved once for an execution or a call, so
-  # its trace entry, its cost, and its telemetry name the same provider,
-  # id, alias, and prices: the catalog's resolution
-  # (`ModelRegistry.resolve!/1`), or, for a reference the catalog does not
-  # hold (a test's on a mock client, or an alias since removed), the
-  # reference as written, with no provider and no prices, rather than
-  # failing the run over its record. An alias is not a provider's id, so
-  # such an alias leaves the id nil; `alias` names it.
-  @spec resolve_model(ModelRegistry.model_ref()) :: model()
-  def resolve_model(ref) do
-    ModelRegistry.resolve!(ref)
-  rescue
-    ArgumentError ->
-      %{provider: nil, id: written_id(ref), alias: if(is_atom(ref), do: ref), pricing: nil}
-  end
+  # The model `id` names, with the agent's choices `policy` (its
+  # `cache:` decides which write rate applies), resolved once for an
+  # execution, so its trace entries, its costs, and its telemetry name
+  # the same platform, id, and prices. An id no sheet holds, or choices
+  # its sheet refuses (a test's on a mock client, say), resolve to the id
+  # as written, with no provider and no prices, rather than failing the
+  # run over its record: the request itself fails where it must.
+  @spec resolve_model(term(), keyword()) :: model()
+  def resolve_model(id, policy \\ []) do
+    case Clementine.LLM.Policy.resolve(id, policy) do
+      {:ok, resolved} ->
+        %{
+          provider: resolved.platform,
+          id: resolved.model.id,
+          alias: nil,
+          pricing: resolved.model.prices,
+          cache: resolved.cache
+        }
 
-  defp written_id({_provider, id}) when is_binary(id), do: id
-  defp written_id(_ref), do: nil
+      {:error, _message} ->
+        %{provider: nil, id: if(is_binary(id), do: id), alias: nil, pricing: nil, cache: nil}
+    end
+  end
 
   @doc false
   # The `:execution` payload for an execution offering `model` (resolved,
-  # `resolve_model/1`), `instructions`, and `tools`, the agent's own.
+  # `resolve_model/2`), `instructions`, and `tools`, the agent's own.
   # `offer` is what else it offers the model (see `fingerprint/4`), and
   # `offered:`, every tool the execution begins with when that is more
   # than `tools` (the tools of skills restored from a checkpoint, and
@@ -329,7 +333,7 @@ defmodule Clementine.Trace do
 
   @doc false
   # The `:model_call` payload of a call to `model` (resolved for the call,
-  # `resolve_model/1`) that burned `usage` and cost `cost` at the model's
+  # `resolve_model/2`) that burned `usage` and cost `cost` at the model's
   # prices then. `content` is the response's blocks, or nil for a call
   # that produced none.
   @spec model_call(
@@ -558,13 +562,7 @@ defmodule Clementine.Trace do
   schema, changing a skill's description or tools, or changing whom it
   may ask changes it.
   """
-  @spec fingerprint(
-          Clementine.LLM.ModelRegistry.model_ref(),
-          String.t() | nil,
-          [module()],
-          keyword()
-        ) ::
-          String.t()
+  @spec fingerprint(String.t(), String.t() | nil, [module()], keyword()) :: String.t()
   def fingerprint(model, instructions, tools, offer \\ []) do
     model |> resolve_model() |> fingerprint_of(instructions, tools, offer)
   end
@@ -582,13 +580,7 @@ defmodule Clementine.Trace do
     |> Base.encode16(case: :lower)
   end
 
-  # The model enters as the provider's id, or, for an alias the catalog
-  # does not hold, as the alias's name, so such an agent fingerprints as
-  # it always did, and two such aliases apart.
-  defp fingerprint_model(%{id: nil, alias: model_alias})
-       when is_atom(model_alias) and not is_nil(model_alias),
-       do: Atom.to_string(model_alias)
-
+  # The model enters as its id.
   defp fingerprint_model(%{id: id}), do: id
 
   defp offered(offer) do

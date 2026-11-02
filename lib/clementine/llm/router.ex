@@ -1,20 +1,14 @@
 defmodule Clementine.LLM.Router do
   @moduledoc """
-  Routes LLM calls to the provider-specific client configured for a model.
-
-  Models are resolved from `:clementine, :models` and must include a
-  `:provider` key, for example:
-
-      gpt_5: [provider: :openai, id: "gpt-5", defaults: [max_output_tokens: 4096]]
-      claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5", defaults: [max_tokens: 8192]]
-
-  Direct references are also supported:
-
-      {:openai, "gpt-5"}
+  Routes a call to the client for the platform its model is served on
+  (`Clementine.Models.default_platform/1`): `"claude-sonnet-5-5"` to
+  `Clementine.LLM.Anthropic`, `"gpt-6.1-sol"` to `Clementine.LLM.OpenAI`,
+  and a model an app declares on OpenRouter, Bedrock, Vertex, or an
+  OpenAI-compatible server to `Clementine.LLM.ChatCompletions`.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
-  alias Clementine.LLM.ModelRegistry
+  alias Clementine.Models
 
   @default_provider_clients [
     anthropic: Clementine.LLM.Anthropic,
@@ -35,8 +29,32 @@ defmodule Clementine.LLM.Router do
     provider_client(model_ref).stream(model_ref, system, messages, tools, opts)
   end
 
-  defp provider_client(model_ref) do
-    provider = ModelRegistry.resolve!(model_ref).provider
+  @doc false
+  # Whether the platform a resolved request goes to has a credential
+  # configured: present in config, not resolved, so `{:system, "VAR"}`
+  # passes before the variable is set. Boot checks it for every agent.
+  @spec credential(Clementine.LLM.Policy.t()) :: :ok | {:error, String.t()}
+  def credential(%Clementine.LLM.Policy{platform: :openai_compatible}), do: :ok
+
+  def credential(%Clementine.LLM.Policy{platform: platform, model: model}) do
+    key = credential_key(platform)
+    declared = model.platforms |> Keyword.get(platform, %{}) |> Map.get(:api_key)
+
+    if declared || Application.get_env(:clementine, key) do
+      :ok
+    else
+      {:error,
+       "#{inspect(model.id)} goes to #{inspect(platform)}, and config :clementine, " <>
+         "#{key}: is not set"}
+    end
+  end
+
+  defp credential_key(:anthropic), do: :anthropic_api_key
+  defp credential_key(:openai), do: :openai_api_key
+  defp credential_key(platform), do: Clementine.LLM.ChatCompletions.api_key_config(platform)
+
+  defp provider_client(model) do
+    provider = model |> Models.get!() |> Models.default_platform()
 
     clients = Application.get_env(:clementine, :llm_provider_clients, @default_provider_clients)
 

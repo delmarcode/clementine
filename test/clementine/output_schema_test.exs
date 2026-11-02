@@ -30,7 +30,7 @@ defmodule Clementine.OutputSchemaTest do
     @moduledoc false
     use Clementine.Agent,
       key: "output_schema_grader",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Grade.",
       output_schema: %{
         type: :object,
@@ -52,22 +52,23 @@ defmodule Clementine.OutputSchemaTest do
       assert %Clementine.Agent{output_schema: ^expected} = Grader.agent(nil)
 
       assert %Clementine.Agent{output_schema: @verdict} =
-               Clementine.Agent.new(model: :claude_sonnet, output_schema: @verdict)
+               Clementine.Agent.new(model: "claude-sonnet-5", output_schema: @verdict)
 
-      assert %Clementine.Agent{output_schema: nil} = Clementine.Agent.new(model: :claude_sonnet)
+      assert %Clementine.Agent{output_schema: nil} =
+               Clementine.Agent.new(model: "claude-sonnet-5")
     end
 
     test "refuses a schema whose answer is not an object, or that is not a schema" do
       assert_raise ArgumentError, ~r/root needs "type": "object"/, fn ->
-        Clementine.Agent.new(model: :claude_sonnet, output_schema: %{"type" => "string"})
+        Clementine.Agent.new(model: "claude-sonnet-5", output_schema: %{"type" => "string"})
       end
 
       assert_raise ArgumentError, ~r/must be a JSON schema map/, fn ->
-        Clementine.Agent.new(model: :claude_sonnet, output_schema: "verdict")
+        Clementine.Agent.new(model: "claude-sonnet-5", output_schema: "verdict")
       end
 
       assert_raise ArgumentError, ~r/does not encode as JSON/, fn ->
-        Clementine.Agent.new(model: :claude_sonnet, output_schema: %{"type" => {:object}})
+        Clementine.Agent.new(model: "claude-sonnet-5", output_schema: %{"type" => {:object}})
       end
     end
   end
@@ -98,7 +99,7 @@ defmodule Clementine.OutputSchemaTest do
              ~s("/additionalProperties" must be a schema)}
           ] do
         assert_raise ArgumentError, ~r/#{Regex.escape(message)}/, fn ->
-          Clementine.Agent.new(model: :claude_sonnet, output_schema: schema)
+          Clementine.Agent.new(model: "claude-sonnet-5", output_schema: schema)
         end
       end
     end
@@ -235,7 +236,7 @@ defmodule Clementine.OutputSchemaTest do
 
     test "an agent/1 that sets the schema on the struct gets it normalized and checked" do
       agent = %{
-        Clementine.Agent.new(model: :claude_sonnet)
+        Clementine.Agent.new(model: "claude-sonnet-5")
         | output_schema: %{type: :object, required: [:a], additionalProperties: false}
       }
 
@@ -258,7 +259,7 @@ defmodule Clementine.OutputSchemaTest do
 
     test "a schema on the struct that is not one fails the run before the model is called" do
       for schema <- [%{"type" => "string"}, %{"type" => "object", "properties" => []}, "verdict"] do
-        agent = %{Clementine.Agent.new(model: :claude_sonnet) | output_schema: schema}
+        agent = %{Clementine.Agent.new(model: "claude-sonnet-5") | output_schema: schema}
 
         assert {:error, %Clementine.Error{kind: :rollout, code: :invalid_output_schema} = error} =
                  Rollout.execute(Rollout.new(agent: agent, input: "go"))
@@ -296,7 +297,7 @@ defmodule Clementine.OutputSchemaTest do
     test "fails as a Result.Failed through the runner" do
       expect_turn(text_events("I would rather not."))
 
-      agent = Clementine.Agent.new(model: :claude_sonnet, output_schema: @verdict)
+      agent = Clementine.Agent.new(model: "claude-sonnet-5", output_schema: @verdict)
 
       assert {:error, %Result.Failed{error: %Clementine.Error{code: :invalid_output}}} =
                Clementine.run(agent, "Grade it.")
@@ -478,7 +479,7 @@ defmodule Clementine.OutputSchemaTest do
   defp rollout(opts) do
     agent =
       Clementine.Agent.new(
-        model: :claude_sonnet,
+        model: "claude-sonnet-5",
         instructions: "test",
         tools: Keyword.fetch!(opts, :tools),
         output_schema: Keyword.get(opts, :output_schema)

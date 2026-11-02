@@ -1,475 +1,112 @@
 defmodule Clementine.LLM.Reasoning do
   @moduledoc """
-  Normalizes provider-neutral reasoning config into provider request fields.
+  Translates a request's resolved thinking choices (`Clementine.LLM.Policy`)
+  into each wire's fields. The policy has already checked them against
+  the model's sheet, so a translation never refuses.
 
-  Model catalog entries have a provider-neutral top-level `:reasoning` slot.
-  Each provider adapter that supports reasoning owns the final wire
-  translation because providers expose different controls for reasoning
-  effort, token budgets, and returned reasoning content. A translation
-  returns the top-level request-body fields to merge, so one config slot
-  can fan out to however many body fields a provider's wire format needs.
-
-  A bare atom or string is shorthand for the provider's effort control.
-
-  ## Provider mapping
-
-  - `:openai` — `%{"reasoning" => ...}` on the Responses API body. Keys:
-    `:effort` (`none minimal low medium high xhigh`), `:summary` and
-    `:generate_summary` (`auto concise detailed`).
-  - `:anthropic` — `%{"thinking" => ..., "output_config" => ...}` on the
-    Messages API body. Keys: `:effort` (`low medium high xhigh max`) →
-    `output_config.effort`; `:thinking`
-    (`adaptive enabled disabled between_tools`) → `thinking.type`;
-    `:budget_tokens` (positive integer, implies `thinking: :enabled`) →
-    `thinking.budget_tokens`; `:display` (`summarized omitted updates`) →
-    `thinking.display`; `:prefix_mismatch` (`error drop_block`) →
-    `thinking.block_binding.prefix_mismatch_behavior`. `:display` and
-    `:prefix_mismatch` need `thinking: :adaptive` or `:enabled`, and
-    `between_tools` takes neither, as the API requires. `display:
-    :updates` and `:prefix_mismatch` send their beta headers
-    (`Clementine.LLM.Anthropic`). The guide's "Models that bind their
-    thinking" section says when to use each.
-  - `:openrouter` — `%{"reasoning" => ...}`, OpenRouter's unified
-    reasoning object, normalized across the models it fronts (DeepSeek,
-    Qwen, GLM, ...). Keys: `:effort`
-    (`none minimal low medium high xhigh max`), `:max_tokens` (positive
-    integer), `:exclude` and `:enabled` (booleans).
-  - `:bedrock`, `:vertex`, `:openai_compatible` —
-    `%{"reasoning_effort" => ...}`, the Chat Completions dialect's
-    standard effort field (`none minimal low medium high xhigh`). Only
-    `:effort` is accepted; models with bespoke knobs beyond it are the
-    host's affair.
-
-  Key and enum validity are checked here, at config-validation time.
-  Whether a given model accepts a given combination (`budget_tokens` is
-  rejected by models that only take adaptive thinking, `effort` by models
-  that predate it) is left to the provider API — Clementine keeps no
-  per-model capability matrix.
+  - Anthropic's Messages API: `thinking` and `output_config.effort`. A
+    `thinking` field goes only where the agent's choice differs from
+    what the model does without one: `:off` is `{"type": "disabled"}` on
+    a model that thinks by default and nothing on one that does not;
+    `:adaptive` is nothing on a model that thinks adaptively by default,
+    unless a `display` other than the model's default or a
+    `prefix_mismatch` rides on it; `:enabled` carries its
+    `budget_tokens`; `:between_tools` takes no other field. Effort goes
+    whenever the policy has one, so a vendor's recalibrated default
+    never moves an agent.
+  - OpenAI's Responses API: `reasoning.effort` and `reasoning.summary`
+    (the reference deprecates `generate_summary` for it).
+  - Chat Completions: OpenRouter's `reasoning` object (`effort`, and its
+    `max_tokens`, `exclude`, and `enabled`); every other platform's
+    `reasoning_effort`.
   """
 
-  @type config :: nil | atom() | String.t() | keyword() | map()
-  @type provider ::
-          :anthropic | :bedrock | :openai | :openai_compatible | :openrouter | :vertex
+  alias Clementine.LLM.Policy
 
-  @reasoning_providers [:anthropic, :bedrock, :openai, :openai_compatible, :openrouter, :vertex]
-  @reasoning_effort_providers [:bedrock, :vertex, :openai_compatible]
-
-  @openai_reasoning_keys ~w(effort summary generate_summary)
-  @openai_reasoning_efforts ~w(none minimal low medium high xhigh)
-  @openai_reasoning_summaries ~w(auto concise detailed)
-
-  @anthropic_reasoning_keys ~w(effort thinking budget_tokens display prefix_mismatch)
-  @anthropic_reasoning_efforts ~w(low medium high xhigh max)
-  @anthropic_thinking_types ~w(adaptive enabled disabled between_tools)
-  @anthropic_thinking_displays ~w(summarized omitted updates)
-  @anthropic_prefix_mismatches ~w(error drop_block)
-
-  @openrouter_reasoning_keys ~w(effort max_tokens exclude enabled)
-  @openrouter_reasoning_efforts ~w(none minimal low medium high xhigh max)
-
-  @doc false
-  @spec validate_config(config()) :: {:ok, config()} | {:error, String.t()}
-  def validate_config(nil), do: {:ok, nil}
-  def validate_config(value) when is_atom(value), do: {:ok, value}
-  def validate_config(value) when is_binary(value), do: {:ok, value}
-
-  def validate_config(value) when is_list(value) do
-    if Keyword.keyword?(value) do
-      {:ok, value}
-    else
-      {:error, "expected atom, string, keyword list, or map"}
-    end
+  @doc "The Messages API fields for `policy`."
+  @spec anthropic(Policy.t()) :: map()
+  def anthropic(%Policy{} = policy) do
+    %{}
+    |> put("thinking", anthropic_thinking(policy))
+    |> put("output_config", policy.effort && %{"effort" => to_string(policy.effort)})
   end
 
-  def validate_config(value) when is_map(value), do: {:ok, value}
-  def validate_config(_value), do: {:error, "expected atom, string, keyword list, or map"}
+  defp anthropic_thinking(%Policy{thinking: :off, model: %{thinking: %{default: :off}}}), do: nil
+  defp anthropic_thinking(%Policy{thinking: :off}), do: %{"type" => "disabled"}
+  defp anthropic_thinking(%Policy{thinking: :between_tools}), do: %{"type" => "between_tools"}
 
-  @doc false
-  @spec validate_model_config(atom(), config()) :: {:ok, config()} | {:error, String.t()}
-  def validate_model_config(_provider, nil), do: {:ok, nil}
+  defp anthropic_thinking(%Policy{thinking: :adaptive} = policy) do
+    extras = thinking_extras(policy)
 
-  def validate_model_config(provider, config) when provider in @reasoning_providers do
-    with {:ok, _fields} <- to_provider_config(provider, config) do
-      {:ok, config}
-    end
+    if policy.model.thinking.default == :adaptive and extras == %{},
+      do: nil,
+      else: Map.put(extras, "type", "adaptive")
   end
 
-  def validate_model_config(provider, _config) do
-    {:error, "is not supported by Clementine's #{inspect(provider)} adapter yet"}
+  defp anthropic_thinking(%Policy{thinking: :enabled} = policy) do
+    policy
+    |> thinking_extras()
+    |> Map.merge(%{
+      "type" => "enabled",
+      "budget_tokens" => Keyword.fetch!(policy.provider_options, :budget_tokens)
+    })
   end
 
-  @doc false
-  @spec to_provider_config!(provider(), config()) :: map()
-  def to_provider_config!(provider, config) do
-    case to_provider_config(provider, config) do
+  # The display goes only where it is not the model's own default; the
+  # binding controls only where asked for (they need a beta header).
+  defp thinking_extras(%Policy{} = policy) do
+    display =
+      if policy.display not in [nil, policy.model.thinking.display],
+        do: to_string(policy.display)
+
+    mismatch = Keyword.get(policy.provider_options, :prefix_mismatch)
+
+    %{}
+    |> put("display", display)
+    |> put("block_binding", mismatch && %{"prefix_mismatch_behavior" => to_string(mismatch)})
+  end
+
+  @doc "The Responses API fields for `policy`."
+  @spec openai(Policy.t()) :: map()
+  def openai(%Policy{} = policy) do
+    reasoning =
+      %{}
+      |> put("effort", policy.effort && to_string(policy.effort))
+      |> put_option(policy, :summary)
+
+    put(%{}, "reasoning", if(reasoning != %{}, do: reasoning))
+  end
+
+  @doc "The Chat Completions fields for `policy` on its platform."
+  @spec chat_completions(Policy.t()) :: map()
+  def chat_completions(%Policy{platform: :openrouter} = policy) do
+    reasoning =
+      %{}
+      |> put("effort", policy.effort && to_string(policy.effort))
+      |> put_option(policy, :max_tokens)
+      |> put_option(policy, :exclude)
+      |> put_option(policy, :enabled)
+
+    put(%{}, "reasoning", if(reasoning != %{}, do: reasoning))
+  end
+
+  def chat_completions(%Policy{} = policy) do
+    put(%{}, "reasoning_effort", policy.effort && to_string(policy.effort))
+  end
+
+  defp put_option(map, policy, key) do
+    case Keyword.fetch(policy.provider_options, key) do
+      {:ok, value} when is_atom(value) and not is_boolean(value) ->
+        Map.put(map, to_string(key), to_string(value))
+
       {:ok, value} ->
-        value
+        Map.put(map, to_string(key), value)
 
-      {:error, message} ->
-        raise ArgumentError, message
+      :error ->
+        map
     end
   end
 
-  @doc false
-  @spec to_provider_config(provider(), config()) :: {:ok, map()} | {:error, String.t()}
-  def to_provider_config(:openai, config), do: to_openai_config(config)
-  def to_provider_config(:anthropic, config), do: to_anthropic_config(config)
-  def to_provider_config(:openrouter, config), do: to_openrouter_config(config)
-
-  def to_provider_config(provider, config) when provider in @reasoning_effort_providers do
-    to_reasoning_effort_config(provider_label(provider), config)
-  end
-
-  ## OpenAI
-
-  defp to_openai_config(nil), do: {:ok, %{}}
-
-  defp to_openai_config(effort) when is_atom(effort) or is_binary(effort) do
-    with {:ok, effort} <- validate_openai_reasoning_value("effort", effort) do
-      {:ok, %{"reasoning" => %{"effort" => effort}}}
-    end
-  end
-
-  defp to_openai_config(config) when is_list(config) do
-    if Keyword.keyword?(config) do
-      with {:ok, reasoning} <- encode_openai_entries(config) do
-        {:ok, wrap_openai_reasoning(reasoning)}
-      end
-    else
-      {:error, "OpenAI reasoning config must be an atom, string, keyword list, or map"}
-    end
-  end
-
-  defp to_openai_config(config) when is_map(config) do
-    with {:ok, reasoning} <- encode_openai_entries(config) do
-      {:ok, wrap_openai_reasoning(reasoning)}
-    end
-  end
-
-  defp to_openai_config(_config) do
-    {:error, "OpenAI reasoning config must be an atom, string, keyword list, or map"}
-  end
-
-  defp wrap_openai_reasoning(reasoning) when map_size(reasoning) == 0, do: %{}
-  defp wrap_openai_reasoning(reasoning), do: %{"reasoning" => reasoning}
-
-  defp encode_openai_entries(entries) do
-    Enum.reduce_while(entries, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
-      with {:ok, key} <- normalize_key(key, "OpenAI", @openai_reasoning_keys),
-           {:ok, value} <- validate_openai_reasoning_value(key, value) do
-        {:cont, {:ok, Map.put(acc, key, value)}}
-      else
-        {:error, message} -> {:halt, {:error, message}}
-      end
-    end)
-  end
-
-  defp validate_openai_reasoning_value("effort", value) do
-    validate_enum_value("OpenAI reasoning effort", value, @openai_reasoning_efforts)
-  end
-
-  defp validate_openai_reasoning_value(key, value)
-       when key in ["summary", "generate_summary"] do
-    validate_enum_value("OpenAI reasoning #{key}", value, @openai_reasoning_summaries)
-  end
-
-  ## Anthropic
-
-  defp to_anthropic_config(nil), do: {:ok, %{}}
-
-  defp to_anthropic_config(effort) when is_atom(effort) or is_binary(effort) do
-    with {:ok, effort} <-
-           validate_enum_value("Anthropic reasoning effort", effort, @anthropic_reasoning_efforts) do
-      {:ok, %{"output_config" => %{"effort" => effort}}}
-    end
-  end
-
-  defp to_anthropic_config(config) when is_list(config) do
-    if Keyword.keyword?(config) do
-      encode_anthropic_entries(config)
-    else
-      {:error, "Anthropic reasoning config must be an atom, string, keyword list, or map"}
-    end
-  end
-
-  defp to_anthropic_config(config) when is_map(config) do
-    encode_anthropic_entries(config)
-  end
-
-  defp to_anthropic_config(_config) do
-    {:error, "Anthropic reasoning config must be an atom, string, keyword list, or map"}
-  end
-
-  defp encode_anthropic_entries(entries) do
-    normalized_result =
-      Enum.reduce_while(entries, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
-        with {:ok, key} <- normalize_key(key, "Anthropic", @anthropic_reasoning_keys),
-             {:ok, value} <- validate_anthropic_reasoning_value(key, value) do
-          {:cont, {:ok, Map.put(acc, key, value)}}
-        else
-          {:error, message} -> {:halt, {:error, message}}
-        end
-      end)
-
-    with {:ok, normalized} <- normalized_result,
-         {:ok, thinking} <- anthropic_thinking_field(normalized) do
-      fields =
-        case normalized do
-          %{"effort" => effort} -> %{"output_config" => %{"effort" => effort}}
-          _ -> %{}
-        end
-
-      if thinking do
-        {:ok, Map.put(fields, "thinking", thinking)}
-      else
-        {:ok, fields}
-      end
-    end
-  end
-
-  defp validate_anthropic_reasoning_value("effort", value) do
-    validate_enum_value("Anthropic reasoning effort", value, @anthropic_reasoning_efforts)
-  end
-
-  defp validate_anthropic_reasoning_value("thinking", value) do
-    validate_enum_value("Anthropic reasoning thinking", value, @anthropic_thinking_types)
-  end
-
-  defp validate_anthropic_reasoning_value("display", value) do
-    validate_enum_value("Anthropic reasoning display", value, @anthropic_thinking_displays)
-  end
-
-  defp validate_anthropic_reasoning_value("prefix_mismatch", value) do
-    validate_enum_value(
-      "Anthropic reasoning prefix_mismatch",
-      value,
-      @anthropic_prefix_mismatches
-    )
-  end
-
-  defp validate_anthropic_reasoning_value("budget_tokens", value)
-       when is_integer(value) and value > 0 do
-    {:ok, value}
-  end
-
-  defp validate_anthropic_reasoning_value("budget_tokens", value) do
-    {:error,
-     "unsupported Anthropic reasoning budget_tokens #{inspect(value)}; expected a positive integer"}
-  end
-
-  # A missing thinking type with a budget means enabled: budget_tokens only
-  # exists inside the wire's enabled thinking object. `between_tools`
-  # (Claude Sonnet 5.5's lowest setting) takes no other thinking field.
-  defp anthropic_thinking_field(normalized) do
-    thinking = Map.get(normalized, "thinking")
-    budget = Map.get(normalized, "budget_tokens")
-    display = Map.get(normalized, "display")
-    prefix_mismatch = Map.get(normalized, "prefix_mismatch")
-    extras? = display != nil or prefix_mismatch != nil
-
-    case {thinking, budget} do
-      {nil, nil} when extras? ->
-        {:error, anthropic_extras_error()}
-
-      {nil, nil} ->
-        {:ok, nil}
-
-      {"adaptive", nil} ->
-        {:ok, put_thinking_extras(%{"type" => "adaptive"}, display, prefix_mismatch)}
-
-      {"disabled", nil} when extras? ->
-        {:error, anthropic_extras_error()}
-
-      {"disabled", nil} ->
-        {:ok, %{"type" => "disabled"}}
-
-      {"between_tools", nil} when extras? ->
-        {:error,
-         ~s(Anthropic reasoning thinking "between_tools" takes no display or prefix_mismatch)}
-
-      {"between_tools", nil} ->
-        {:ok, %{"type" => "between_tools"}}
-
-      {"enabled", nil} ->
-        {:error, ~s(Anthropic reasoning thinking "enabled" requires budget_tokens)}
-
-      {thinking, budget} when thinking in [nil, "enabled"] ->
-        {:ok,
-         put_thinking_extras(
-           %{"type" => "enabled", "budget_tokens" => budget},
-           display,
-           prefix_mismatch
-         )}
-
-      {_thinking, _budget} ->
-        {:error, ~s(Anthropic reasoning budget_tokens is only supported with thinking "enabled")}
-    end
-  end
-
-  defp anthropic_extras_error do
-    ~s(Anthropic reasoning display and prefix_mismatch require thinking "adaptive" or "enabled")
-  end
-
-  defp put_thinking_extras(thinking, display, prefix_mismatch) do
-    thinking
-    |> put_present("display", display)
-    |> put_present(
-      "block_binding",
-      prefix_mismatch && %{"prefix_mismatch_behavior" => prefix_mismatch}
-    )
-  end
-
-  defp put_present(map, _key, nil), do: map
-  defp put_present(map, key, value), do: Map.put(map, key, value)
-
-  ## OpenRouter
-
-  defp to_openrouter_config(nil), do: {:ok, %{}}
-
-  defp to_openrouter_config(effort) when is_atom(effort) or is_binary(effort) do
-    with {:ok, effort} <-
-           validate_enum_value(
-             "OpenRouter reasoning effort",
-             effort,
-             @openrouter_reasoning_efforts
-           ) do
-      {:ok, %{"reasoning" => %{"effort" => effort}}}
-    end
-  end
-
-  defp to_openrouter_config(config) when is_list(config) do
-    if Keyword.keyword?(config) do
-      with {:ok, reasoning} <- encode_openrouter_entries(config) do
-        {:ok, wrap_openrouter_reasoning(reasoning)}
-      end
-    else
-      {:error, "OpenRouter reasoning config must be an atom, string, keyword list, or map"}
-    end
-  end
-
-  defp to_openrouter_config(config) when is_map(config) do
-    with {:ok, reasoning} <- encode_openrouter_entries(config) do
-      {:ok, wrap_openrouter_reasoning(reasoning)}
-    end
-  end
-
-  defp to_openrouter_config(_config) do
-    {:error, "OpenRouter reasoning config must be an atom, string, keyword list, or map"}
-  end
-
-  defp wrap_openrouter_reasoning(reasoning) when map_size(reasoning) == 0, do: %{}
-  defp wrap_openrouter_reasoning(reasoning), do: %{"reasoning" => reasoning}
-
-  defp encode_openrouter_entries(entries) do
-    Enum.reduce_while(entries, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
-      with {:ok, key} <- normalize_key(key, "OpenRouter", @openrouter_reasoning_keys),
-           {:ok, value} <- validate_openrouter_reasoning_value(key, value) do
-        {:cont, {:ok, Map.put(acc, key, value)}}
-      else
-        {:error, message} -> {:halt, {:error, message}}
-      end
-    end)
-  end
-
-  defp validate_openrouter_reasoning_value("effort", value) do
-    validate_enum_value("OpenRouter reasoning effort", value, @openrouter_reasoning_efforts)
-  end
-
-  defp validate_openrouter_reasoning_value("max_tokens", value)
-       when is_integer(value) and value > 0 do
-    {:ok, value}
-  end
-
-  defp validate_openrouter_reasoning_value("max_tokens", value) do
-    {:error,
-     "unsupported OpenRouter reasoning max_tokens #{inspect(value)}; expected a positive integer"}
-  end
-
-  defp validate_openrouter_reasoning_value(key, value)
-       when key in ["exclude", "enabled"] do
-    if is_boolean(value) do
-      {:ok, value}
-    else
-      {:error, "unsupported OpenRouter reasoning #{key} #{inspect(value)}; expected a boolean"}
-    end
-  end
-
-  ## Chat Completions reasoning_effort (Bedrock, Vertex, OpenAI-compatible)
-
-  defp to_reasoning_effort_config(_label, nil), do: {:ok, %{}}
-
-  defp to_reasoning_effort_config(label, effort) when is_atom(effort) or is_binary(effort) do
-    with {:ok, effort} <-
-           validate_enum_value("#{label} reasoning effort", effort, @openai_reasoning_efforts) do
-      {:ok, %{"reasoning_effort" => effort}}
-    end
-  end
-
-  defp to_reasoning_effort_config(label, config) when is_list(config) do
-    if Keyword.keyword?(config) do
-      encode_reasoning_effort_entries(label, config)
-    else
-      {:error, "#{label} reasoning config must be an atom, string, keyword list, or map"}
-    end
-  end
-
-  defp to_reasoning_effort_config(label, config) when is_map(config) do
-    encode_reasoning_effort_entries(label, config)
-  end
-
-  defp to_reasoning_effort_config(label, _config) do
-    {:error, "#{label} reasoning config must be an atom, string, keyword list, or map"}
-  end
-
-  defp encode_reasoning_effort_entries(label, entries) do
-    Enum.reduce_while(entries, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
-      with {:ok, _key} <- normalize_key(key, label, ~w(effort)),
-           {:ok, value} <-
-             validate_enum_value("#{label} reasoning effort", value, @openai_reasoning_efforts) do
-        {:cont, {:ok, Map.put(acc, "reasoning_effort", value)}}
-      else
-        {:error, message} -> {:halt, {:error, message}}
-      end
-    end)
-  end
-
-  defp provider_label(:bedrock), do: "Bedrock"
-  defp provider_label(:vertex), do: "Vertex"
-  defp provider_label(:openai_compatible), do: "OpenAI-compatible"
-
-  ## Shared validation
-
-  defp normalize_key(key, provider_label, supported) when is_atom(key) do
-    normalize_key(Atom.to_string(key), provider_label, supported)
-  end
-
-  defp normalize_key(key, provider_label, supported) when is_binary(key) do
-    if key in supported do
-      {:ok, key}
-    else
-      {:error,
-       "unsupported #{provider_label} reasoning key #{inspect(key)}; expected one of #{inspect(supported)}"}
-    end
-  end
-
-  defp normalize_key(key, provider_label, _supported) do
-    {:error,
-     "unsupported #{provider_label} reasoning key #{inspect(key)}; expected atom or string"}
-  end
-
-  defp validate_enum_value(label, value, supported) when is_atom(value) do
-    validate_enum_value(label, Atom.to_string(value), supported)
-  end
-
-  defp validate_enum_value(label, value, supported) when is_binary(value) do
-    if value in supported do
-      {:ok, value}
-    else
-      {:error, "unsupported #{label} #{inspect(value)}; expected one of #{inspect(supported)}"}
-    end
-  end
-
-  defp validate_enum_value(label, value, _supported) do
-    {:error, "unsupported #{label} #{inspect(value)}; expected atom or string"}
-  end
+  defp put(map, _key, nil), do: map
+  defp put(map, key, value), do: Map.put(map, key, value)
 end

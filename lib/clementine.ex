@@ -15,7 +15,7 @@ defmodule Clementine do
 
       agent =
         Clementine.Agent.new(
-          model: :claude_sonnet,
+          model: "claude-sonnet-5-5",
           instructions: "You are a helpful assistant.",
           tools: [MyApp.Tools.ReadFile]
         )
@@ -85,35 +85,15 @@ defmodule Clementine do
         anthropic_api_key: {:system, "ANTHROPIC_API_KEY"},
         openai_api_key: {:system, "OPENAI_API_KEY"}
 
-      config :clementine, :models,
-        claude_sonnet: [
-          provider: :anthropic,
-          id: "claude-sonnet-5",
-          defaults: [max_tokens: 8192],
-          reasoning: [thinking: :adaptive, effort: :high]
-        ],
-        gpt_5: [
-          provider: :openai,
-          id: "gpt-5",
-          defaults: [max_output_tokens: 4096],
-          reasoning: [effort: :medium]
-        ],
-        deepseek: [
-          provider: :openrouter,
-          id: "deepseek/deepseek-v3.2",
-          reasoning: [effort: :high]
-        ]
-
-  Open models and fine-tunes served over the OpenAI-compatible Chat
-  Completions dialect (OpenRouter, AWS Bedrock, GCP Vertex, Tinker,
-  self-hosted vLLM) route through `Clementine.LLM.ChatCompletions` —
-  see that module for provider endpoint and credential configuration.
-
-  There are no built-in model aliases: an agent names one the catalog
-  defines, or a `{provider, id}` tuple. `:retry` tunes provider retries.
-  `:default_model` and `:max_iterations` matter only to
-  `Clementine.AgentServer`, for a process that names neither; an agent
-  names its own model and limits.
+  An agent names its model by the vendor's id (`"claude-sonnet-5-5"`).
+  Clementine ships a fact sheet for each current Anthropic and OpenAI
+  model (`Clementine.Models`); an app overrides a fact or declares a
+  model it does not ship under `config :clementine, :models`, a map from
+  id to facts (`docs/MODELS.md`). Open models and fine-tunes served over
+  the OpenAI-compatible Chat Completions dialect (OpenRouter, AWS
+  Bedrock, GCP Vertex, Tinker, self-hosted vLLM) route through
+  `Clementine.LLM.ChatCompletions`; see that module for endpoint and
+  credential configuration. `:retry` tunes provider retries.
   """
 
   alias Clementine.{AgentServer, Events, Result, Rollout, Run, Runner}
@@ -164,6 +144,14 @@ defmodule Clementine do
     back to the agent's defaults
   - `:events` - a `Clementine.Events` sink for execution events (default
     `Clementine.Events.Null`)
+  - `:run` - with an agent module, the run its `c:Clementine.Agent.agent/1`
+    builds for (default: a row with only the agent's key and `turn`)
+
+  `agent` is a `Clementine.Agent` struct, or a `use Clementine.Agent`
+  module, whose `c:Clementine.Agent.agent/1` builds the agent and whose
+  `use` completes it as the durable runtime does. Either is checked
+  against its model's sheet before anything runs, and an agent with no
+  model, or a choice the sheet refuses, raises `ArgumentError`.
 
   ## Returns
 
@@ -179,10 +167,11 @@ defmodule Clementine do
 
       result.output
   """
-  @spec run(Clementine.Agent.t(), String.t(), keyword()) ::
+  @spec run(Clementine.Agent.t() | module(), String.t(), keyword()) ::
           {:ok, Result.Completed.t()}
           | {:error, Result.Failed.t() | Result.Cancelled.t() | Result.Interrupted.t()}
-  def run(%Clementine.Agent{} = agent, prompt, opts \\ []) when is_binary(prompt) do
+  def run(agent, prompt, opts \\ []) when is_binary(prompt) do
+    agent = Clementine.Agent.for_run!(agent, opts[:run], "Clementine.run/3")
     {ref, ctx} = Ephemeral.create()
     run = Run.new(ref: ref, rollout: build_rollout(agent, prompt, opts))
 
@@ -217,8 +206,10 @@ defmodule Clementine do
         _ -> :ok
       end)
   """
-  @spec stream(Clementine.Agent.t(), String.t(), keyword()) :: Enumerable.t()
-  def stream(%Clementine.Agent{} = agent, prompt, opts \\ []) when is_binary(prompt) do
+  @spec stream(Clementine.Agent.t() | module(), String.t(), keyword()) :: Enumerable.t()
+  def stream(agent, prompt, opts \\ []) when is_binary(prompt) do
+    agent = Clementine.Agent.for_run!(agent, opts[:run], "Clementine.stream/3")
+
     Stream.resource(
       fn -> start_stream(agent, prompt, opts) end,
       &next_stream_event/1,

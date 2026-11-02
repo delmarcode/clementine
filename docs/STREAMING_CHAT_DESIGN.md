@@ -796,7 +796,7 @@ defmodule MyApp.Jobs.JobServer do
 
   defp agent_config(job) do
     [
-      model: :claude_sonnet,
+      model: "claude-sonnet-5-5",
       system: job.system_prompt || default_system_prompt(),
       tools: tools_for_job(job),
       max_iterations: 50

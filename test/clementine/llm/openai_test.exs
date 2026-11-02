@@ -7,6 +7,9 @@ defmodule Clementine.LLM.OpenAITest do
   alias Clementine.LLM.OpenAI
   alias Clementine.LLM.Response
 
+  # GPT-6.1 Sol: effort :medium by default, prompt_cache_options TTLs.
+  @model "gpt-6.1-sol"
+
   setup do
     bypass = Bypass.open()
 
@@ -22,10 +25,6 @@ defmodule Clementine.LLM.OpenAITest do
     )
 
     Application.put_env(:clementine, :openai_api_key, "test-openai-key")
-
-    Application.put_env(:clementine, :models,
-      gpt_test: [provider: :openai, id: "gpt-5", defaults: [max_output_tokens: 1024]]
-    )
 
     Application.put_env(:clementine, :retry, max_attempts: 3, base_delay: 0, max_delay: 0)
 
@@ -44,7 +43,7 @@ defmodule Clementine.LLM.OpenAITest do
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       request = Jason.decode!(body)
 
-      assert request["model"] == "gpt-5"
+      assert request["model"] == "gpt-6.1-sol"
       assert request["instructions"] == "system"
 
       response = %{
@@ -66,89 +65,118 @@ defmodule Clementine.LLM.OpenAITest do
     end)
 
     assert {:ok, %Response{} = response} =
-             OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [])
+             OpenAI.call(@model, "system", [UserMessage.new("Hi")], [])
 
     assert [%Content.Text{text: "Hello from OpenAI"}] = response.content
     assert response.stop_reason == "end_turn"
     assert response.usage["output_tokens"] == 4
   end
 
-  test "call/5 supports direct tuple model references", %{bypass: bypass} do
+  test "call/5 sends the model's max_output_tokens and default effort", %{bypass: bypass} do
+    test = self()
+
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
-      request = Jason.decode!(body)
-
-      assert request["model"] == "gpt-5"
-
-      response = %{
-        "id" => "resp_direct",
-        "output" => [
-          %{
-            "type" => "message",
-            "id" => "msg_1",
-            "role" => "assistant",
-            "content" => [%{"type" => "output_text", "text" => "Direct model ref"}]
-          }
-        ],
-        "usage" => %{"input_tokens" => 12, "output_tokens" => 4}
-      }
+      send(test, {:request, Jason.decode!(body)})
 
       conn
       |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.resp(200, Jason.encode!(response))
+      |> Plug.Conn.resp(200, text_response("Defaults"))
     end)
 
-    assert {:ok, %Response{content: [%Content.Text{text: "Direct model ref"}]}} =
-             OpenAI.call({:openai, "gpt-5"}, "system", [UserMessage.new("Hi")], [])
+    assert {:ok, %Response{content: [%Content.Text{text: "Defaults"}]}} =
+             OpenAI.call(@model, "system", [UserMessage.new("Hi")], [])
+
+    assert_received {:request, request}
+    assert request["max_output_tokens"] == 16_000
+    assert request["reasoning"] == %{"effort" => "medium"}
+
+    # GPT-4.1 does not reason, so no reasoning field goes.
+    assert {:ok, %Response{}} = OpenAI.call("gpt-4.1", "system", [UserMessage.new("Hi")], [])
+
+    assert_received {:request, request}
+    assert request["model"] == "gpt-4.1"
+    assert request["max_output_tokens"] == 16_000
+    refute Map.has_key?(request, "reasoning")
   end
 
-  test "call/5 includes configured reasoning", %{bypass: bypass} do
-    Application.put_env(:clementine, :models,
-      gpt_reasoning: [
-        provider: :openai,
-        id: "gpt-5",
-        reasoning: [effort: :high, summary: :auto]
-      ]
-    )
-
+  test "call/5 sends the agent's max_tokens, effort, and summary", %{bypass: bypass} do
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       request = Jason.decode!(body)
 
+      assert request["max_output_tokens"] == 1024
       assert request["reasoning"] == %{"effort" => "high", "summary" => "auto"}
 
       conn
       |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.resp(200, text_response("Configured reasoning"))
+      |> Plug.Conn.resp(200, text_response("Chosen"))
     end)
 
-    assert {:ok, %Response{content: [%Content.Text{text: "Configured reasoning"}]}} =
-             OpenAI.call(:gpt_reasoning, "system", [UserMessage.new("Hi")], [])
+    assert {:ok, %Response{content: [%Content.Text{text: "Chosen"}]}} =
+             OpenAI.call(@model, "system", [UserMessage.new("Hi")], [],
+               max_tokens: 1024,
+               effort: :high,
+               provider_options: [summary: :auto]
+             )
   end
 
-  test "call/5 lets request opts override configured reasoning", %{bypass: bypass} do
-    Application.put_env(:clementine, :models,
-      gpt_reasoning: [provider: :openai, id: "gpt-5", reasoning: [effort: :high]]
-    )
+  test "max_output_tokens defaults to a declared model's ceiling where it is under 16,000", %{
+    bypass: bypass
+  } do
+    Application.put_env(:clementine, :models, %{
+      "gpt-6.1-sol" => [max_output: 8_000],
+      "ft:gpt-6.1-sol:acme:triage:abc123" => [
+        vendor: :openai,
+        context: 1_050_000,
+        max_output: 4_096,
+        platforms: [openai: []]
+      ]
+    })
+
+    test = self()
 
     Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
-      request = Jason.decode!(body)
-
-      assert request["reasoning"] == %{"effort" => "low"}
+      send(test, {:request, Jason.decode!(body)})
 
       conn
       |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.resp(200, text_response("Overridden reasoning"))
+      |> Plug.Conn.resp(200, text_response("ok"))
     end)
 
-    assert {:ok, %Response{content: [%Content.Text{text: "Overridden reasoning"}]}} =
-             OpenAI.call(:gpt_reasoning, "system", [UserMessage.new("Hi")], [], reasoning: :low)
+    assert {:ok, %Response{}} = OpenAI.call(@model, "system", [UserMessage.new("Hi")], [])
+    assert_received {:request, %{"max_output_tokens" => 8_000}}
+
+    fine_tuned = "ft:gpt-6.1-sol:acme:triage:abc123"
+    assert {:ok, %Response{}} = OpenAI.call(fine_tuned, "system", [UserMessage.new("Hi")], [])
+    assert_received {:request, request}
+    assert request["model"] == fine_tuned
+    assert request["max_output_tokens"] == 4_096
+    refute Map.has_key?(request, "reasoning")
   end
 
-  test "call/5 rejects invalid OpenAI reasoning opts" do
-    assert_raise ArgumentError, ~r/unsupported OpenAI reasoning effort/, fn ->
-      OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [], reasoning: :max)
+  test "call/5 refuses, before sending, what the model's sheet refuses" do
+    call = fn model, opts -> OpenAI.call(model, "system", [UserMessage.new("Hi")], [], opts) end
+
+    assert_raise ArgumentError, ~r/takes effort \[:low, :medium, :high, :xhigh, :max\]/, fn ->
+      call.("gpt-6.1-sol", effort: :none)
+    end
+
+    assert_raise ArgumentError, ~r/takes no effort setting/, fn ->
+      call.("gpt-4.1", effort: :low)
+    end
+
+    assert_raise ArgumentError, ~r/provider_options: /, fn ->
+      call.(@model, provider_options: [budget_tokens: 2048])
+    end
+
+    assert_raise ArgumentError, ~r/unknown model "gpt-7"/, fn ->
+      call.("gpt-7", [])
+    end
+
+    assert_raise ArgumentError, ~r/goes to :anthropic, not :openai/, fn ->
+      call.("claude-sonnet-5-5", [])
     end
   end
 
@@ -214,7 +242,7 @@ defmodule Clementine.LLM.OpenAITest do
     tools = [Clementine.Test.Tools.Echo, Clementine.Test.Tools.Add]
 
     assert {:ok, %Response{}} =
-             OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], tools,
+             OpenAI.call(@model, "system", [UserMessage.new("Hi")], tools,
                deferred: [Clementine.Test.Tools.Add]
              )
   end
@@ -263,7 +291,7 @@ defmodule Clementine.LLM.OpenAITest do
 
     assert {:ok, %Response{content: [%Content.Text{text: ~s({"verdict":"pass"})}]}} =
              OpenAI.call(
-               :gpt_test,
+               @model,
                "system",
                [UserMessage.new("Hi")],
                [Clementine.Test.Tools.Echo],
@@ -289,7 +317,7 @@ defmodule Clementine.LLM.OpenAITest do
       |> Plug.Conn.resp(200, Jason.encode!(response))
     end)
 
-    assert {:ok, %Response{}} = OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [])
+    assert {:ok, %Response{}} = OpenAI.call(@model, "system", [UserMessage.new("Hi")], [])
   end
 
   test "call/5 reads a refusal and a cut-off response by their stop reasons", %{bypass: bypass} do
@@ -341,13 +369,13 @@ defmodule Clementine.LLM.OpenAITest do
     end)
 
     assert {:ok, %Response{} = refused} =
-             OpenAI.call(:gpt_test, "system", [UserMessage.new("Refuse")], [])
+             OpenAI.call(@model, "system", [UserMessage.new("Refuse")], [])
 
     assert [%Content.Text{text: "I can't help with that."}, %Content.ToolUse{}] = refused.content
     assert refused.stop_reason == "refusal"
 
     assert {:ok, %Response{stop_reason: "max_tokens", content: [%Content.Text{text: "{"}]}} =
-             OpenAI.call(:gpt_test, "system", [UserMessage.new("Cut off")], [])
+             OpenAI.call(@model, "system", [UserMessage.new("Cut off")], [])
   end
 
   test "call/5 parses tool calls", %{bypass: bypass} do
@@ -372,7 +400,7 @@ defmodule Clementine.LLM.OpenAITest do
     end)
 
     assert {:ok, %Response{} = response} =
-             OpenAI.call(:gpt_test, "system", [UserMessage.new("Find docs")], [])
+             OpenAI.call(@model, "system", [UserMessage.new("Find docs")], [])
 
     assert [
              %Content.ToolUse{
@@ -393,12 +421,12 @@ defmodule Clementine.LLM.OpenAITest do
       |> Plug.Conn.resp(200, text_stream_sse("Hello stream"))
     end)
 
-    events = OpenAI.stream(:gpt_test, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+    events = OpenAI.stream(@model, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
     assert Enum.any?(events, &match?({:text_delta, "Hello stream"}, &1))
     assert Enum.any?(events, &match?({:message_stop}, &1))
 
     assert {:ok, %Response{} = response} =
-             OpenAI.stream(:gpt_test, "system", [UserMessage.new("Hi")], [])
+             OpenAI.stream(@model, "system", [UserMessage.new("Hi")], [])
              |> LLM.collect_stream()
 
     assert [%Content.Text{text: "Hello stream"}] = response.content
@@ -414,7 +442,7 @@ defmodule Clementine.LLM.OpenAITest do
       |> Plug.Conn.resp(404, error_body)
     end)
 
-    events = OpenAI.stream(:gpt_test, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+    events = OpenAI.stream(@model, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
     assert [{:error, {:api_error, 404, ^error_body}}] = events
   end
@@ -428,7 +456,7 @@ defmodule Clementine.LLM.OpenAITest do
       Plug.Conn.resp(conn, 500, error_body)
     end)
 
-    events = OpenAI.stream(:gpt_test, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+    events = OpenAI.stream(@model, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
     assert {:error, {:api_error, 500, error_body}} in events
 
@@ -446,7 +474,7 @@ defmodule Clementine.LLM.OpenAITest do
     end)
 
     assert {:ok, %Response{} = response} =
-             OpenAI.stream(:gpt_test, "system", [UserMessage.new("search for phoenix")], [])
+             OpenAI.stream(@model, "system", [UserMessage.new("search for phoenix")], [])
              |> LLM.collect_stream()
 
     assert [
@@ -476,7 +504,7 @@ defmodule Clementine.LLM.OpenAITest do
     end)
 
     assert {:ok, %Response{} = response} =
-             OpenAI.stream(:gpt_test, "system", [UserMessage.new("search elixir docs")], [])
+             OpenAI.stream(@model, "system", [UserMessage.new("search elixir docs")], [])
              |> LLM.collect_stream()
 
     assert [
@@ -496,7 +524,7 @@ defmodule Clementine.LLM.OpenAITest do
     end)
 
     assert {:ok, %Response{} = response} =
-             OpenAI.stream(:gpt_test, "system", [UserMessage.new("parallel tools")], [])
+             OpenAI.stream(@model, "system", [UserMessage.new("parallel tools")], [])
              |> LLM.collect_stream()
 
     assert [
@@ -547,7 +575,7 @@ defmodule Clementine.LLM.OpenAITest do
     end)
 
     assert {:ok, %Response{content: [%Content.Text{text: "Recovered"}]}} =
-             OpenAI.call(:gpt_test, "system", [UserMessage.new("Hi")], [])
+             OpenAI.call(@model, "system", [UserMessage.new("Hi")], [])
 
     assert Agent.get(counter, & &1) == 2
     Agent.stop(counter)

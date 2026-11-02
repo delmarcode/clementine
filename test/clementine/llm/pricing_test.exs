@@ -1,13 +1,25 @@
 defmodule Clementine.LLM.PricingTest do
   @moduledoc """
-  The catalog's `pricing:` key: what a priced alias must say, checked at
-  boot, and the cache write rate picked by the TTL the alias writes with.
-  The rates are illustrative, not anyone's current prices.
+  A model's `prices:` fact: what a priced model must say, checked at boot,
+  and the cache write rate picked by the TTL the agent writes with. The
+  rates are illustrative, not anyone's current prices.
   """
 
   use ExUnit.Case, async: false
 
-  alias Clementine.LLM.{ModelRegistry, Pricing}
+  alias Clementine.{Agent, Models, Trace}
+  alias Clementine.LLM.{Policy, Pricing}
+
+  defmodule HourAgent do
+    @moduledoc false
+    # Writes its cache for an hour: built at compile time, when no model
+    # has prices, and checked again at boot against the app's.
+    use Clementine.Agent,
+      key: "test_pricing_hour",
+      model: "claude-sonnet-5",
+      instructions: "Answer.",
+      cache: [ttl: :one_hour]
+  end
 
   @card [
     currency: "USD",
@@ -29,7 +41,7 @@ defmodule Clementine.LLM.PricingTest do
 
   defp boot_error(models) do
     put_models(models)
-    assert_raise ArgumentError, &ModelRegistry.validate_config!/0
+    assert_raise ArgumentError, &Models.validate_config!/0
   end
 
   describe "validate/1" do
@@ -109,14 +121,14 @@ defmodule Clementine.LLM.PricingTest do
   end
 
   describe "of/1" do
-    test "picks the cache write rate for the TTL the resolved alias writes with" do
+    test "picks the cache write rate for the TTL the resolved model writes with" do
       {:ok, pricing} = Pricing.validate(@card)
 
       assert %Pricing{cache_write: 3_750_000} =
-               Pricing.of(%{provider: :anthropic, pricing: pricing, cache: %{ttl: :five_minutes}})
+               Pricing.of(%{pricing: pricing, cache: %{ttl: :five_minutes}})
 
       assert %Pricing{cache_write: 6_000_000} =
-               Pricing.of(%{provider: :anthropic, pricing: pricing, cache: %{ttl: :one_hour}})
+               Pricing.of(%{pricing: pricing, cache: %{ttl: :one_hour}})
     end
 
     test "a single cache write rate holds whatever the TTL, or with none" do
@@ -124,76 +136,101 @@ defmodule Clementine.LLM.PricingTest do
 
       for ttl <- [:five_minutes, :one_hour, nil] do
         assert %Pricing{cache_write: 3_750_000} =
-                 Pricing.of(%{provider: :anthropic, pricing: pricing, cache: %{ttl: ttl}})
+                 Pricing.of(%{pricing: pricing, cache: %{ttl: ttl}})
       end
     end
 
-    test "nil for an alias without prices and a direct reference" do
-      put_models(claude: [provider: :anthropic, id: "claude-sonnet-5"])
+    test "an id is priced at the model's default caching; an agent's TTL picks its own rate" do
+      put_models(%{"claude-sonnet-5" => [prices: @card]})
 
-      assert Pricing.of(:claude) == nil
-      assert Pricing.of({:anthropic, "claude-sonnet-5"}) == nil
-      assert Pricing.of(:missing) == nil
+      # Claude's shortest TTL, five minutes, is the default.
+      assert %Pricing{cache_write: 3_750_000} = Pricing.of("claude-sonnet-5")
+
+      agent = Agent.new(model: "claude-sonnet-5", cache: [ttl: :one_hour])
+
+      assert %Pricing{cache_write: 6_000_000} =
+               Pricing.of(Trace.resolve_model(agent.model, Agent.policy(agent)))
+    end
+
+    test "nil for a model without prices and an id no sheet holds" do
+      put_models(%{"claude-sonnet-5" => [prices: @one_rate]})
+
+      assert Pricing.of("claude-sonnet-5-5") == nil
+      assert Pricing.of("gpt-6.1-sol") == nil
+      assert Pricing.of("not-a-model") == nil
+      assert Pricing.of(:claude_sonnet) == nil
     end
   end
 
   describe "at boot" do
-    test "a priced catalog validates, and resolve!/1 carries the prices" do
-      put_models(
-        claude: [provider: :anthropic, id: "claude-sonnet-5", pricing: @one_rate],
-        plain: [provider: :openai, id: "gpt-5"]
-      )
+    test "a priced override validates, and the model carries the prices" do
+      put_models(%{"claude-sonnet-5" => [prices: @one_rate]})
 
-      assert :ok = ModelRegistry.validate_config!()
-      assert %{pricing: %Pricing{currency: "USD"}} = ModelRegistry.resolve!(:claude)
-      assert %{pricing: nil} = ModelRegistry.resolve!(:plain)
-      assert %{pricing: nil} = ModelRegistry.resolve!({:openai, "gpt-5"})
+      assert :ok = Models.validate_config!()
+
+      assert %{prices: %Pricing{currency: "USD", cache_write: 3_750_000}} =
+               Models.get!("claude-sonnet-5")
+
+      assert %{pricing: %Pricing{currency: "USD"}} = Trace.resolve_model("claude-sonnet-5")
+      assert %{prices: nil} = Models.get!("claude-sonnet-5-5")
+      assert %{pricing: nil} = Trace.resolve_model("gpt-6.1-sol")
     end
 
-    test "a sub-micro rate fails, naming the alias and the key" do
-      error =
-        boot_error(
-          claude: [
-            provider: :anthropic,
-            id: "claude-sonnet-5",
-            pricing: Keyword.put(@one_rate, :output, 0.0000003)
-          ]
-        )
+    test "a declared model takes prices like a shipped one" do
+      put_models(%{
+        "deepseek/deepseek-v3.2" => [
+          vendor: :deepseek,
+          context: 163_840,
+          max_output: 16_000,
+          platforms: [openrouter: []],
+          prices: Keyword.put(@one_rate, :source, "https://openrouter.ai/deepseek")
+        ]
+      })
 
-      assert error.message =~ "Invalid model config for :claude"
+      assert :ok = Models.validate_config!()
+
+      assert %Pricing{cache_write: 3_750_000, source: "https://openrouter.ai/deepseek"} =
+               Pricing.of("deepseek/deepseek-v3.2")
+    end
+
+    test "a sub-micro rate fails, naming the model and the key" do
+      error =
+        boot_error(%{"claude-sonnet-5" => [prices: Keyword.put(@one_rate, :output, 0.0000003)]})
+
+      assert error.message =~ ~s(Invalid :clementine, :models entry "claude-sonnet-5")
       assert error.message =~ "output 3.0e-7 is finer than six decimal places"
     end
 
-    test "a partial price list fails, naming the alias" do
-      error =
-        boot_error(
-          claude: [
-            provider: :anthropic,
-            id: "claude-sonnet-5",
-            pricing: Keyword.delete(@card, :output)
-          ]
-        )
+    test "a partial price list fails, naming the model" do
+      error = boot_error(%{"claude-sonnet-5" => [prices: Keyword.delete(@card, :output)]})
 
-      assert error.message =~ "Invalid model config for :claude"
+      assert error.message =~ ~s(Invalid :clementine, :models entry "claude-sonnet-5")
       assert error.message =~ "missing [:output]"
     end
 
-    test "a per-TTL cache_write without the rate for the alias's TTL fails" do
-      error =
-        boot_error(
-          claude: [
-            provider: :anthropic,
-            id: "claude-sonnet-5",
-            cache: [ttl: :one_hour],
-            pricing: Keyword.put(@card, :cache_write, five_minutes: 3.75)
-          ]
-        )
+    test "a per-TTL cache_write without the rate for the agent's TTL fails the agent" do
+      put_models(%{
+        "claude-sonnet-5" => [prices: Keyword.put(@card, :cache_write, five_minutes: 3.75)]
+      })
 
-      assert error.message =~ "Invalid model config for :claude"
-      assert error.message =~ "names no rate for :one_hour"
+      # The model is priced at its default TTL; an agent that writes for
+      # an hour is not.
+      assert :ok = Models.validate_config!()
+      assert %Pricing{cache_write: 3_750_000} = Pricing.of("claude-sonnet-5")
+
+      assert {:error, message} = Policy.resolve("claude-sonnet-5", cache: [ttl: :one_hour])
+      assert message =~ ~s("claude-sonnet-5": prices: cache_write names no rate for :one_hour)
+
+      assert_raise ArgumentError, ~r/names no rate for :one_hour/, fn ->
+        Agent.new(model: "claude-sonnet-5", cache: [ttl: :one_hour])
+      end
+
+      # Boot checks every agent's declared choices the same way.
+      assert {:error, message} = Agent.check_declared(HourAgent)
+      assert message =~ "names no rate for :one_hour"
     end
 
-    test "GPT-5.6 through OpenRouter or Bedrock writes for thirty minutes; caching off, none" do
+    test "GPT-5.6 and later write for thirty minutes, wherever served; caching off, none" do
       card = [
         currency: "USD",
         input: 2.0,
@@ -202,67 +239,129 @@ defmodule Clementine.LLM.PricingTest do
         cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0]
       ]
 
-      put_models(
-        routed: [provider: :openrouter, id: "openai/gpt-5.6", pricing: card],
-        hosted: [provider: :bedrock, id: "openai.gpt-5.6", pricing: card]
-      )
+      put_models(%{
+        "gpt-5.6-sol" => [prices: card],
+        "openai.gpt-5.6" => [
+          vendor: :openai,
+          context: 1_050_000,
+          max_output: 128_000,
+          cache: [ttls: [:thirty_minutes, :twelve_hours]],
+          platforms: [bedrock: []],
+          prices: card
+        ]
+      })
 
-      assert :ok = ModelRegistry.validate_config!()
-      assert %Pricing{cache_write: 2_500_000} = Pricing.of(:routed)
-      assert %Pricing{cache_write: 2_500_000} = Pricing.of(:hosted)
+      assert :ok = Models.validate_config!()
+      assert %Pricing{cache_write: 2_500_000} = Pricing.of("gpt-5.6-sol")
+      assert %Pricing{cache_write: 2_500_000} = Pricing.of("openai.gpt-5.6")
 
-      error =
-        boot_error(
-          hosted: [provider: :bedrock, id: "openai.gpt-5.6", cache: false, pricing: card]
-        )
+      # The first-party client sends the longer TTL, so it is billed at it;
+      # the Chat Completions client sends none, so Bedrock refuses it.
+      assert %Pricing{cache_write: 5_000_000} =
+               Pricing.of(Trace.resolve_model("gpt-5.6-sol", cache: [ttl: :twelve_hours]))
 
-      assert error.message =~ "give one cache_write rate"
+      assert {:error, message} = Policy.resolve("openai.gpt-5.6", cache: [ttl: :twelve_hours])
+      assert message =~ "is not sent on :bedrock"
+
+      # Prices are the model's and caching the agent's: an agent with
+      # caching off runs, and writes its provider still reports are
+      # priced at the shortest TTL.
+      for id <- ["gpt-5.6-sol", "openai.gpt-5.6"] do
+        assert {:ok, %Policy{cache: %{enabled: false, ttl: nil}}} =
+                 Policy.resolve(id, cache: false)
+
+        assert %Pricing{cache_write: 2_500_000} =
+                 Pricing.of(Trace.resolve_model(id, cache: false))
+      end
     end
 
-    test "a per-TTL cache_write on an alias whose writes carry no TTL fails" do
-      error =
-        boot_error(
-          qwen: [
-            provider: :bedrock,
-            id: "qwen.qwen3-235b-a22b-2507-v1:0",
-            pricing: [
-              currency: "USD",
-              input: 1,
-              output: 1,
-              cache_read: 0.1,
-              cache_write: [five_minutes: 1]
-            ]
+    test "an agent with caching off runs on a model with per-TTL prices" do
+      put_models(%{
+        "claude-opus-5-5" => [
+          prices: [
+            currency: "USD",
+            input: 3.60,
+            output: 18.00,
+            cache_read: 0.18,
+            cache_write: [one_hour: 7.20, five_minutes: 4.50]
           ]
-        )
+        ]
+      })
 
-      assert error.message =~ "Invalid model config for :qwen"
-      assert error.message =~ "give one cache_write rate"
+      agent = Agent.new(model: "claude-opus-5-5", cache: false)
+      assert Agent.policy(agent) == [cache: false]
+
+      assert %Pricing{cache_write: 4_500_000} =
+               Pricing.of(Trace.resolve_model(agent.model, Agent.policy(agent)))
+
+      # A write the provider reports anyway costs the five-minute rate.
+      usage = %Clementine.Usage{input_tokens: 1_000_000, cache_write_tokens: 1_000_000}
+      pricing = Pricing.of(Trace.resolve_model(agent.model, cache: false))
+      assert %Clementine.Cost{micros: 4_500_000} = Clementine.Cost.price(usage, pricing)
     end
 
-    test "priced aliases in two currencies fail: their costs would not add up" do
-      error =
-        boot_error(
-          claude: [provider: :anthropic, id: "claude-sonnet-5", pricing: @one_rate],
-          gpt: [
-            provider: :openai,
-            id: "gpt-5",
-            pricing: [currency: "EUR", input: 1, output: 8, cache_read: 0.1, cache_write: 1]
+    test "a per-TTL cache_write on a model whose writes carry no TTL fails the agent" do
+      put_models(%{
+        "qwen.qwen3-235b-a22b-2507-v1:0" => [
+          vendor: :qwen,
+          context: 262_144,
+          max_output: 16_384,
+          platforms: [bedrock: []],
+          prices: [
+            currency: "USD",
+            input: 1,
+            output: 1,
+            cache_read: 0.1,
+            cache_write: [five_minutes: 1]
           ]
-        )
+        ]
+      })
 
-      assert error.message =~ "every priced alias names one currency"
-      assert error.message =~ ~s(["USD", "EUR"])
+      assert {:error, message} = Policy.resolve("qwen.qwen3-235b-a22b-2507-v1:0")
+      assert message =~ ~s("qwen.qwen3-235b-a22b-2507-v1:0": prices:)
+      assert message =~ "give one cache_write rate"
+
+      # An agent that sets its caching is refused at build; boot refuses
+      # the price list itself, which no agent's TTL could use.
+      assert_raise ArgumentError, ~r/give one cache_write rate/, fn ->
+        Agent.new(model: "qwen.qwen3-235b-a22b-2507-v1:0", cache: true)
+      end
+
+      assert_raise ArgumentError, ~r/the model does not offer/, fn ->
+        Clementine.Models.validate_config!()
+      end
     end
 
-    test "the catalog's currency is the one its priced aliases name, or nil" do
-      put_models(
-        plain: [provider: :openai, id: "gpt-5"],
-        claude: [provider: :anthropic, id: "claude-sonnet-5", pricing: @one_rate]
-      )
+    test "priced models in two currencies fail: their costs would not add up" do
+      error =
+        boot_error(%{
+          "claude-sonnet-5" => [prices: @one_rate],
+          "gpt-6.1-sol" => [
+            prices: [currency: "EUR", input: 1, output: 8, cache_read: 0.1, cache_write: 1]
+          ]
+        })
 
+      assert error.message =~ "every priced model names one currency"
+      assert error.message =~ ~s("USD")
+      assert error.message =~ ~s("EUR")
+    end
+
+    test "the models' currency is the one the priced ones name, or nil" do
+      plain = [
+        vendor: :qwen,
+        context: 32_768,
+        max_output: 8_192,
+        platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+      ]
+
+      put_models(%{"my-qwen" => plain, "claude-sonnet-5" => [prices: @one_rate]})
       assert Pricing.currency() == "USD"
 
-      put_models(plain: [provider: :openai, id: "gpt-5"])
+      put_models(%{"my-qwen" => plain})
+      assert Pricing.currency() == nil
+
+      # No models config at all, as an app that sets none has.
+      put_models(nil)
       assert Pricing.currency() == nil
     end
   end

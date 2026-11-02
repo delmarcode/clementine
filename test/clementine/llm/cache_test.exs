@@ -3,7 +3,8 @@ defmodule Clementine.LLM.CacheTest do
 
   import Mox
 
-  alias Clementine.LLM.{Cache, ModelRegistry, ProviderUsage}
+  alias Clementine.{Model, Models}
+  alias Clementine.LLM.{Cache, Policy, ProviderUsage}
 
   setup :verify_on_exit!
 
@@ -19,115 +20,205 @@ defmodule Clementine.LLM.CacheTest do
     :ok
   end
 
-  describe "the catalog's cache: key" do
-    test "defaults per provider when an alias sets none" do
-      put_models(
-        claude: [provider: :anthropic, id: "claude-sonnet-5"],
-        gpt_5: [provider: :openai, id: "gpt-5"],
-        gpt_5_6: [provider: :openai, id: "gpt-5.6-sol"],
-        or_claude: [provider: :openrouter, id: "anthropic/claude-sonnet-5"],
-        or_claude_latest: [provider: :openrouter, id: "~anthropic/claude-sonnet-latest"],
-        or_deepseek: [provider: :openrouter, id: "deepseek/deepseek-v3.2"],
-        or_gpt_5_6: [provider: :openrouter, id: "openai/gpt-5.6-sol"],
-        bedrock: [provider: :bedrock, id: "openai.gpt-oss-120b-1:0"],
-        bedrock_gpt_5_6: [provider: :bedrock, id: "global.openai.gpt-5.6-sol"],
-        vertex: [provider: :vertex, id: "deepseek-ai/deepseek-v3.2-maas"],
-        vllm: [provider: :openai_compatible, base_url: "http://localhost:8000/v1", id: "qwen3"]
-      )
+  @markers [ttls: [:five_minutes, :one_hour]]
 
-      assert :ok = ModelRegistry.validate_config!()
+  # Models Clementine ships no sheet for, as an app declares them.
+  @declared %{
+    # Claude on OpenRouter, its TTLs on the model.
+    "anthropic/claude-sonnet-5" => [
+      vendor: :anthropic,
+      context: 1_000_000,
+      max_output: 128_000,
+      cache: @markers,
+      platforms: [openrouter: []]
+    ],
+    # The same TTLs as a fact of the platform entry.
+    "~anthropic/claude-sonnet-latest" => [
+      vendor: :anthropic,
+      context: 1_000_000,
+      max_output: 128_000,
+      platforms: [openrouter: [cache: @markers]]
+    ],
+    # An id that names Anthropic no longer implies markers: the facts do.
+    "anthropic/claude-haiku-5-5" => [
+      vendor: :anthropic,
+      context: 200_000,
+      max_output: 64_000,
+      platforms: [openrouter: []]
+    ],
+    "deepseek/deepseek-v3.2" => [
+      vendor: :deepseek,
+      context: 163_840,
+      max_output: 65_536,
+      platforms: [openrouter: []]
+    ],
+    # GPT-5.6 on OpenRouter and Bedrock: their writes are billed for 30
+    # minutes, and Clementine sends them no TTL.
+    "openai/gpt-5.6-sol" => [
+      vendor: :openai,
+      context: 1_050_000,
+      max_output: 128_000,
+      cache: [ttls: [:thirty_minutes]],
+      platforms: [openrouter: []]
+    ],
+    "global.openai.gpt-5.6-sol" => [
+      vendor: :openai,
+      context: 1_050_000,
+      max_output: 128_000,
+      cache: [ttls: [:thirty_minutes]],
+      platforms: [bedrock: []]
+    ],
+    "openai.gpt-oss-120b-1:0" => [
+      vendor: :openai,
+      context: 128_000,
+      max_output: 32_768,
+      platforms: [bedrock: []]
+    ],
+    "deepseek-ai/deepseek-v3.2-maas" => [
+      vendor: :deepseek,
+      context: 163_840,
+      max_output: 32_768,
+      platforms: [vertex: []]
+    ],
+    "zai/glm-4.7-maas" => [
+      vendor: :zai,
+      context: 200_000,
+      max_output: 128_000,
+      platforms: [vertex: []]
+    ],
+    "google/gemini-3-pro" => [
+      vendor: :google,
+      context: 1_048_576,
+      max_output: 65_536,
+      cache: [ttls: [:five_minutes]],
+      platforms: [openrouter: []]
+    ],
+    "qwen3" => [
+      vendor: :qwen,
+      context: 32_768,
+      max_output: 8_192,
+      platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+    ],
+    # Claude behind a proxy, under the id the proxy takes.
+    "proxy/claude-sonnet-5" => [
+      vendor: :anthropic,
+      context: 1_000_000,
+      max_output: 128_000,
+      cache: @markers,
+      platforms: [openai_compatible: [id: "claude-sonnet-5", base_url: "http://proxy/v1"]]
+    ]
+  }
 
-      assert cache(:claude) == %{enabled: true, ttl: :five_minutes, markers: true}
-      assert cache(:gpt_5) == %{enabled: true, ttl: nil, markers: false}
-      assert cache(:gpt_5_6) == %{enabled: true, ttl: :thirty_minutes, markers: false}
-      assert cache(:or_claude) == %{enabled: true, ttl: :five_minutes, markers: true}
-      assert cache(:or_claude_latest) == %{enabled: true, ttl: :five_minutes, markers: true}
-      assert cache(:or_deepseek) == %{enabled: true, ttl: nil, markers: false}
-      # GPT-5.6 and later cache on their own wherever they run, and bill
-      # each write for 30 minutes.
-      assert cache(:or_gpt_5_6) == %{enabled: true, ttl: :thirty_minutes, markers: false}
-      assert cache(:bedrock) == %{enabled: true, ttl: nil, markers: false}
-      assert cache(:bedrock_gpt_5_6) == %{enabled: true, ttl: :thirty_minutes, markers: false}
-      assert cache(:vertex) == %{enabled: true, ttl: nil, markers: false}
-      assert cache(:vllm) == %{enabled: true, ttl: nil, markers: false}
+  @five_minutes %{enabled: true, ttl: :five_minutes, markers: true}
+  @thirty_minutes %{enabled: true, ttl: :thirty_minutes, markers: false}
+  @on_its_own %{enabled: true, ttl: nil, markers: false}
+
+  describe "a model's cache facts" do
+    test "decide the default: cache_control markers, a billed TTL, or caching on its own" do
+      put_models(@declared)
+      assert :ok = Models.validate_config!()
+
+      # Shipped sheets.
+      assert cache("claude-sonnet-5") == @five_minutes
+      assert cache("claude-haiku-4-5") == @five_minutes
+      assert cache("gpt-5") == @on_its_own
+      assert cache("gpt-5.5") == @on_its_own
+      assert cache("gpt-5.6-sol") == @thirty_minutes
+      assert cache("gpt-6.1-sol") == @thirty_minutes
+
+      # Declarations.
+      assert cache("anthropic/claude-sonnet-5") == @five_minutes
+      assert cache("~anthropic/claude-sonnet-latest") == @five_minutes
+      assert cache("anthropic/claude-haiku-5-5") == @on_its_own
+      assert cache("deepseek/deepseek-v3.2") == @on_its_own
+      assert cache("openai/gpt-5.6-sol") == @thirty_minutes
+      assert cache("global.openai.gpt-5.6-sol") == @thirty_minutes
+      assert cache("openai.gpt-oss-120b-1:0") == @on_its_own
+      assert cache("deepseek-ai/deepseek-v3.2-maas") == @on_its_own
+      assert cache("qwen3") == @on_its_own
+      assert cache("proxy/claude-sonnet-5") == @five_minutes
     end
 
-    test "a direct tuple reference takes its provider's default" do
-      assert ModelRegistry.resolve!({:anthropic, "claude-sonnet-5"}).cache ==
-               %{enabled: true, ttl: :five_minutes, markers: true}
+    test "false turns caching off, and each model takes the TTLs it offers" do
+      put_models(@declared)
+
+      off = %{enabled: false, ttl: nil, markers: false}
+      assert cache("claude-sonnet-5", false) == off
+      assert cache("gpt-6.1-sol", false) == off
+      assert cache("deepseek/deepseek-v3.2", false) == off
+
+      assert cache("claude-sonnet-5", true) == @five_minutes
+      assert cache("claude-sonnet-5", ttl: :one_hour) == %{@five_minutes | ttl: :one_hour}
+      assert cache("gpt-6.1-sol", ttl: :twelve_hours) == %{@thirty_minutes | ttl: :twelve_hours}
+      assert cache("google/gemini-3-pro", []) == @five_minutes
+      assert cache("proxy/claude-sonnet-5", ttl: :one_hour) == %{@five_minutes | ttl: :one_hour}
     end
 
-    test "false turns caching off, and each provider takes its own TTLs" do
-      put_models(
-        off: [provider: :anthropic, id: "claude-sonnet-5", cache: false],
-        claude_hour: [provider: :anthropic, id: "claude-sonnet-5", cache: [ttl: :one_hour]],
-        gpt_long: [provider: :openai, id: "gpt-6.1-sol", cache: [ttl: :twelve_hours]],
-        or_gemini: [provider: :openrouter, id: "google/gemini-3-pro", cache: [markers: true]],
-        proxy: [
-          provider: :openai_compatible,
-          base_url: "http://proxy/v1",
-          id: "claude-sonnet-5",
-          cache: [markers: true, ttl: :one_hour]
-        ]
-      )
+    test "the shipped OpenAI sheets offer prompt_cache_options from GPT-5.6 on" do
+      for id <- ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"] do
+        assert Models.get!(id).cache.ttls == [:thirty_minutes, :twelve_hours], id
+        assert Model.cache_mechanism(Models.get!(id).cache.ttls) == :options, id
+      end
 
-      assert :ok = ModelRegistry.validate_config!()
-      assert cache(:off) == %{enabled: false, ttl: nil, markers: false}
-      assert cache(:claude_hour) == %{enabled: true, ttl: :one_hour, markers: true}
-      assert cache(:gpt_long) == %{enabled: true, ttl: :twelve_hours, markers: false}
-      assert cache(:or_gemini) == %{enabled: true, ttl: :five_minutes, markers: true}
-      assert cache(:proxy) == %{enabled: true, ttl: :one_hour, markers: true}
+      for id <- ["gpt-5", "gpt-5.5", "gpt-5.5-pro", "gpt-5.4-mini", "gpt-4.1"] do
+        assert Model.cache_mechanism(Models.get!(id).cache.ttls) == :none, id
+      end
+
+      for %Model{lifecycle: %{status: status}} = model <- Models.list(vendor: :anthropic),
+          status != :retired do
+        assert Model.cache_mechanism(model.cache.ttls) == :markers, model.id
+      end
     end
 
-    test "boot refuses what a provider cannot honour" do
-      for {config, message} <- [
-            {[provider: :anthropic, id: "claude-sonnet-5", cache: [ttl: :twelve_hours]],
-             "expected :ttl with cache_control markers"},
-            {[provider: :openai, id: "gpt-5.6-sol", cache: [ttl: :one_hour]],
-             "expected :ttl on :openai"},
-            {[provider: :openai, id: "gpt-5.5", cache: [ttl: :thirty_minutes]],
-             ":ttl needs GPT-5.6 or later"},
-            {[provider: :anthropic, id: "claude-sonnet-5", cache: [markers: false]],
-             ":markers is only for :openrouter and :openai_compatible"},
-            {[provider: :bedrock, id: "openai.gpt-oss-120b-1:0", cache: [markers: true]],
-             ":markers is only for"},
-            {[provider: :vertex, id: "zai/glm-4.7-maas", cache: [ttl: :five_minutes]],
-             ":ttl needs cache_control markers"},
-            {[provider: :openrouter, id: "deepseek/deepseek-v3.2", cache: [ttl: :one_hour]],
-             ":ttl needs cache_control markers"},
-            {[provider: :bedrock, id: "openai.gpt-5.6-terra", cache: [ttl: :twelve_hours]],
-             ":ttl is not sent to OpenAI models on :bedrock"},
-            {[provider: :anthropic, id: "claude-sonnet-5", cache: [ttl: "1h"]],
-             "expected :ttl to be one of"},
-            {[provider: :anthropic, id: "claude-sonnet-5", cache: [retention: :long]],
-             "unknown key :retention"},
-            {[provider: :anthropic, id: "claude-sonnet-5", cache: :on],
-             "expected true, false, or a keyword list"}
+    test "a TTL the model does not offer on its platform is refused" do
+      put_models(Map.put(@declared, "claude-haiku-4-5", cache: [ttls: [:five_minutes]]))
+
+      for {id, setting, message} <- [
+            {"claude-sonnet-5", [ttl: :twelve_hours],
+             "cache: [ttl: :twelve_hours] is not offered; on :anthropic it offers " <>
+               "[:five_minutes, :one_hour]"},
+            {"gpt-6.1-sol", [ttl: :one_hour],
+             "on :openai it offers [:thirty_minutes, :twelve_hours]"},
+            # Before GPT-5.6, OpenAI keeps its own retention.
+            {"gpt-5.5", [ttl: :thirty_minutes],
+             "on :openai it caches on its own, if at all, and takes no TTL"},
+            # An override narrows a shipped sheet.
+            {"claude-haiku-4-5", [ttl: :one_hour], "on :anthropic it offers [:five_minutes]"},
+            {"zai/glm-4.7-maas", [ttl: :five_minutes], "on :vertex it caches on its own"},
+            {"deepseek/deepseek-v3.2", [ttl: :one_hour], "on :openrouter it caches on its own"},
+            {"anthropic/claude-haiku-5-5", [ttl: :five_minutes],
+             "on :openrouter it caches on its own"},
+            # OpenRouter and Bedrock bill GPT-5.6's writes for 30 minutes.
+            {"global.openai.gpt-5.6-sol", [ttl: :twelve_hours],
+             "on :bedrock it offers [:thirty_minutes]"},
+            {"claude-sonnet-5", [ttl: "1h"], ~s(cache: [ttl: "1h"] is not offered)},
+            {"claude-sonnet-5", [retention: :long],
+             "cache: takes true, false, or [ttl: ...], got: [retention: :long]"},
+            {"claude-sonnet-5", :on, "cache: takes true, false, or [ttl: ...], got: :on"}
           ] do
-        put_models(bad: config)
+        assert {:error, error} = Policy.resolve(id, cache: setting)
+        assert error =~ inspect(id), error
+        assert error =~ message, error
+      end
+    end
 
-        error = assert_raise ArgumentError, fn -> ModelRegistry.validate_config!() end
-        assert error.message =~ "Invalid model config for :bad"
+    test "boot refuses a malformed cache fact, naming the model" do
+      base = @declared["deepseek/deepseek-v3.2"]
+
+      for {facts, message} <- [
+            {Keyword.put(base, :cache, ttls: [:five_minutes, :thirty_minutes]),
+             "mixes cache_control TTLs"},
+            {Keyword.put(base, :cache, ttls: [:one_day]), ":one_day"},
+            {Keyword.put(base, :cache, retention: :long), "retention"},
+            {Keyword.put(base, :platforms, openrouter: [cache: [ttls: :one_hour]]), "ttls"}
+          ] do
+        put_models(%{"deepseek/deepseek-v3.2" => facts})
+
+        error = assert_raise ArgumentError, fn -> Models.validate_config!() end
+        assert error.message =~ ~s(Invalid :clementine, :models entry "deepseek/deepseek-v3.2")
         assert error.message =~ message
       end
     end
-  end
-
-  test "prompt_cache_options is documented for GPT-5.6 and later, wherever it runs" do
-    for id <- ["gpt-5.6-sol", "gpt-5.6", "gpt-5.10-mini", "gpt-6-astra", "gpt-6.1-terra"],
-        do: assert(Cache.prompt_cache_options?(:openai, id), id)
-
-    for id <- ["gpt-5", "gpt-5.5-pro", "gpt-4.1", "o3", "o4-mini", "chatgpt-4o-latest"],
-        do: refute(Cache.prompt_cache_options?(:openai, id), id)
-
-    assert Cache.prompt_cache_options?(:openrouter, "openai/gpt-5.6-sol")
-    refute Cache.prompt_cache_options?(:openrouter, "openai/gpt-5.5")
-    refute Cache.prompt_cache_options?(:openrouter, "gpt-5.6-sol")
-    assert Cache.prompt_cache_options?(:bedrock, "openai.gpt-5.6-luna")
-    assert Cache.prompt_cache_options?(:bedrock, "us.openai.gpt-6-astra")
-    refute Cache.prompt_cache_options?(:bedrock, "openai.gpt-oss-120b-1:0")
-    refute Cache.prompt_cache_options?(:vertex, "gpt-5.6-sol")
-    refute Cache.prompt_cache_options?(:openai_compatible, "gpt-5.6-sol")
   end
 
   describe "key/1" do
@@ -185,7 +276,7 @@ defmodule Clementine.LLM.CacheTest do
       ]
     end)
 
-    agent = Clementine.Agent.new(model: :claude_sonnet, instructions: "Be brief.")
+    agent = Clementine.Agent.new(model: "claude-sonnet-5", instructions: "Be brief.")
 
     assert {:ok, %Clementine.Result.Completed{}} =
              Clementine.run(agent, "Hi",
@@ -296,5 +387,7 @@ defmodule Clementine.LLM.CacheTest do
   end
 
   defp put_models(models), do: Application.put_env(:clementine, :models, models)
-  defp cache(alias_name), do: ModelRegistry.resolve!(alias_name).cache
+
+  defp cache(id), do: Policy.resolve!(id).cache
+  defp cache(id, setting), do: Policy.resolve!(id, cache: setting).cache
 end

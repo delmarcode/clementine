@@ -7,7 +7,7 @@ defmodule Clementine.Delegation do
 
       use Clementine.Agent,
         key: "planner",
-        model: :claude_sonnet,
+        model: "claude-sonnet-5-5",
         instructions: "Plan the work; ask the researcher for facts.",
         delegates: [MyApp.Agents.Researcher, MyApp.Agents.Writer]
 

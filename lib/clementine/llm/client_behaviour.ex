@@ -5,7 +5,8 @@ defmodule Clementine.LLM.ClientBehaviour do
   This behaviour allows for mocking the LLM client in tests.
   """
 
-  @type model :: Clementine.LLM.ModelRegistry.model_ref()
+  @typedoc "A model id: one Clementine ships a sheet for, or one the app declares."
+  @type model :: String.t()
   @type messages :: [Clementine.LLM.Message.message()]
   @type tools :: [module()]
   # `:deferred` names tools in `tools` the model may load on demand; a

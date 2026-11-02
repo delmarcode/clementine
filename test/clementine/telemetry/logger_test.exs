@@ -46,12 +46,12 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :rollout, :start],
             %{system_time: System.system_time()},
-            %{model: :claude_sonnet, tool_count: 3, max_iterations: 30}
+            %{model: "claude-sonnet-5", tool_count: 3, max_iterations: 30}
           )
         end)
 
       assert log =~ "[Clementine] Rollout started"
-      assert log =~ "model=claude_sonnet"
+      assert log =~ "model=claude-sonnet-5"
       assert log =~ "tools=3"
       assert log =~ "max_iterations=30"
     end
@@ -89,7 +89,7 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :rollout, :stop],
             %{duration: System.convert_time_unit(1234, :millisecond, :native), iterations: 2},
-            %{model: :claude_sonnet, status: :success}
+            %{model: "claude-sonnet-5", status: :success}
           )
         end)
 
@@ -107,7 +107,7 @@ defmodule Clementine.Telemetry.LoggerTest do
             [:clementine, :rollout, :exception],
             %{duration: System.convert_time_unit(10, :millisecond, :native)},
             %{
-              model: :claude_sonnet,
+              model: "claude-sonnet-5",
               kind: :error,
               reason: %RuntimeError{message: "boom"},
               stacktrace: []
@@ -169,7 +169,7 @@ defmodule Clementine.Telemetry.LoggerTest do
               input_tokens: 850,
               output_tokens: 120
             },
-            %{model: :claude_sonnet, iteration: 1, stop_reason: "tool_use", streaming: true}
+            %{model: "claude-sonnet-5", iteration: 1, stop_reason: "tool_use", streaming: true}
           )
         end)
 
@@ -189,7 +189,7 @@ defmodule Clementine.Telemetry.LoggerTest do
             [:clementine, :llm, :stop],
             %{duration: 0, input_tokens: 850, output_tokens: 120, cost_micros: 4_350},
             %{
-              model: :claude_sonnet,
+              model: "claude-sonnet-5",
               iteration: 1,
               stop_reason: "end_turn",
               currency: "USD",
@@ -537,7 +537,7 @@ defmodule Clementine.Telemetry.LoggerTest do
           :telemetry.execute(
             [:clementine, :rollout, :start],
             %{system_time: System.system_time()},
-            %{model: :claude_sonnet, tool_count: 0, max_iterations: 10}
+            %{model: "claude-sonnet-5", tool_count: 0, max_iterations: 10}
           )
         end)
 

@@ -14,7 +14,7 @@ defmodule Clementine.OutputSchemaDurableTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_output_grader",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Grade the essay.",
       tools: [Clementine.RunsCase.Context],
       output_schema: %{

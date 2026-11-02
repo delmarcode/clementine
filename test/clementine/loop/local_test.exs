@@ -301,7 +301,7 @@ defmodule Clementine.Loop.LocalTest do
       build = fn {:job, 1}, _args ->
         agent =
           Clementine.Agent.new(
-            model: :claude_sonnet,
+            model: "claude-sonnet-5",
             instructions: "answer",
             tools: [Clementine.Test.Tools.Echo]
           )
@@ -463,7 +463,7 @@ defmodule Clementine.Loop.LocalTest do
   end
 
   defp build_rollout(input) do
-    agent = Clementine.Agent.new(model: :claude_sonnet, instructions: "answer briefly")
+    agent = Clementine.Agent.new(model: "claude-sonnet-5", instructions: "answer briefly")
     Rollout.new(agent: agent, input: input)
   end
 

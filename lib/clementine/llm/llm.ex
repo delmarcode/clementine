@@ -8,10 +8,10 @@ defmodule Clementine.LLM do
   ## Usage
 
       # Synchronous call
-      {:ok, response} = Clementine.LLM.call(:claude_sonnet, system, messages, tools)
+      {:ok, response} = Clementine.LLM.call("claude-sonnet-5-5", system, messages, tools)
 
       # Streaming call
-      stream = Clementine.LLM.stream(:claude_sonnet, system, messages, tools)
+      stream = Clementine.LLM.stream("claude-sonnet-5-5", system, messages, tools)
       Enum.each(stream, fn event -> IO.inspect(event) end)
 
   """
@@ -24,13 +24,17 @@ defmodule Clementine.LLM do
 
   ## Parameters
 
-  - `model` - Model reference: alias atom (e.g., `:claude_sonnet`) or `{provider, id}` tuple
+  - `model` - The model's id (`"claude-sonnet-5-5"`), shipped or declared (`Clementine.Models`)
   - `system` - The system prompt (can be nil or empty string)
   - `messages` - List of conversation messages
   - `tools` - List of tool modules (can be empty)
   - `opts` - Additional options:
-    - `:max_tokens` - Override max tokens for this request
-    - `:reasoning` - Override configured provider reasoning for this request
+    - `:max_tokens`, `:effort`, `:thinking`, `:display`, `:cache`,
+      `:provider_options` - the choices an agent makes for its model,
+      checked against the model's sheet (`Clementine.LLM.Policy`); each
+      defaults as it does on an agent
+    - `:cache_key` - the `prompt_cache_key` for the request
+      (`Clementine.LLM.Cache.key/1`)
     - `:deferred` - The tool modules in `tools` the model need not see up
       front. A provider with tool search (Anthropic) sends them with
       `defer_loading: true`, beside its search tool, and the model loads
@@ -82,7 +86,7 @@ defmodule Clementine.LLM do
 
   ## Example
 
-      Clementine.LLM.stream(:claude_sonnet, system, messages, tools)
+      Clementine.LLM.stream("claude-sonnet-5-5", system, messages, tools)
       |> Enum.each(fn
         {:text_delta, text} -> IO.write(text)
         {:tool_use_start, _id, name} -> IO.puts("\\n[Calling \#{name}...]")
@@ -113,7 +117,7 @@ defmodule Clementine.LLM do
 
   ## Example
 
-      stream = Clementine.LLM.stream(:claude_sonnet, system, messages, tools)
+      stream = Clementine.LLM.stream("claude-sonnet-5-5", system, messages, tools)
       {:ok, response} = Clementine.LLM.collect_stream(stream)
 
   """

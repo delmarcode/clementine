@@ -165,12 +165,6 @@ if Code.ensure_loaded?(Igniter) do
         [:anthropic_api_key],
         {:code, Sourceror.parse_string!(~s|{:system, "ANTHROPIC_API_KEY"}|)}
       )
-      |> Igniter.Project.Config.configure_new(
-        "config.exs",
-        :clementine,
-        [:models, :claude_sonnet],
-        {:code, Sourceror.parse_string!(~s|[provider: :anthropic, id: "claude-sonnet-5"]|)}
-      )
       # Clementine's worker tags its logs with the run, and the formatter
       # prints only the metadata keys it lists.
       |> Igniter.Project.Config.configure(

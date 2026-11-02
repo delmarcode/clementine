@@ -103,7 +103,7 @@ defmodule Clementine.RolloutExecuteTest do
   defp rollout(opts \\ []) do
     agent =
       Clementine.Agent.new(
-        model: :claude_sonnet,
+        model: "claude-sonnet-5",
         instructions: "test",
         tools: Keyword.get(opts, :tools, [])
       )

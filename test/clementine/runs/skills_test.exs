@@ -49,7 +49,7 @@ defmodule Clementine.Runs.SkillsTest do
     def agent(run) do
       agent =
         Clementine.Agent.new(
-          model: :claude_sonnet,
+          model: "claude-sonnet-5",
           instructions: "Release things.",
           tools: [Clementine.RunsCase.Context],
           skills: if(run.metadata["dropped"], do: [], else: [Releases])

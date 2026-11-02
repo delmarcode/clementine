@@ -63,7 +63,7 @@ defmodule Clementine.LoopCase.Task do
   # A task agent for the battery's children: one model turn answers.
   use Clementine.Agent,
     key: "conformance_task",
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "Do the task."
 end
 
@@ -76,7 +76,7 @@ defmodule Clementine.LoopCase.Turn do
   use Clementine.Agent,
     key: "conformance_turn",
     turn: true,
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "Answer the thread.",
     tools: [Clementine.LoopCase.ContextTool]
 

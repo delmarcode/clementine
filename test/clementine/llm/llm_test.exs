@@ -24,12 +24,28 @@ defmodule Clementine.LLMTest do
   describe "call/5" do
     test "normalizes model resolution exceptions" do
       Application.delete_env(:clementine, :llm_client)
-      Application.put_env(:clementine, :models, [])
+      Application.put_env(:clementine, :models, %{})
 
       assert {:error, {:llm_exception, %{kind: :error, message: message}}} =
-               LLM.call(:missing_alias, "", [], [])
+               LLM.call("claude-sonnet-9", "", [], [])
 
-      assert message =~ "Unknown model alias"
+      assert message =~ ~s(unknown model "claude-sonnet-9")
+
+      # An alias atom from before fact sheets names no model.
+      assert {:error, {:llm_exception, %{kind: :error, message: message}}} =
+               LLM.call(:claude_sonnet, "", [], [])
+
+      assert message =~ "a model is named by its id"
+    end
+
+    test "normalizes malformed models config" do
+      Application.delete_env(:clementine, :llm_client)
+      Application.put_env(:clementine, :models, claude_sonnet: [provider: :anthropic])
+
+      assert {:error, {:llm_exception, %{kind: :error, message: message}}} =
+               LLM.call("claude-sonnet-5", "", [], [])
+
+      assert message =~ "expected a map from model id to facts"
     end
   end
 
@@ -43,7 +59,7 @@ defmodule Clementine.LLMTest do
       end)
 
       assert [{:error, {:llm_exception, %{kind: :error, message: "stream setup failed"}}}] =
-               LLM.stream(:claude_sonnet, "", [], []) |> Enum.to_list()
+               LLM.stream("claude-sonnet-5", "", [], []) |> Enum.to_list()
     end
 
     test "normalizes lazy stream exceptions during enumeration" do
@@ -60,7 +76,7 @@ defmodule Clementine.LLMTest do
       assert [
                {:text_delta, "partial"},
                {:error, {:llm_exception, %{kind: :error, message: "stream blew up"}}}
-             ] = LLM.stream(:claude_sonnet, "", [], []) |> Enum.to_list()
+             ] = LLM.stream("claude-sonnet-5", "", [], []) |> Enum.to_list()
     end
 
     test "returns an error event for invalid stream client results" do
@@ -72,7 +88,7 @@ defmodule Clementine.LLMTest do
       end)
 
       assert [{:error, {:invalid_llm_client_stream, :not_an_enumerable}}] =
-               LLM.stream(:claude_sonnet, "", [], []) |> Enum.to_list()
+               LLM.stream("claude-sonnet-5", "", [], []) |> Enum.to_list()
     end
   end
 

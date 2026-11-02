@@ -3,7 +3,9 @@ defmodule Clementine.LLM.ChatCompletions do
   OpenAI Chat Completions dialect client for OpenAI-compatible providers.
 
   One wire dialect covers every lane the open-model ecosystem serves
-  fine-tunes through; the provider atom picks the endpoint and credentials:
+  fine-tunes through. A model the app declares under
+  `config :clementine, :models` names its platform, and the platform
+  picks the endpoint and credentials:
 
   - `:openrouter` — `https://openrouter.ai/api/v1` with
     `config :clementine, openrouter_api_key: ...`. Model ids are
@@ -27,10 +29,12 @@ defmodule Clementine.LLM.ChatCompletions do
     `config :clementine, openai_compatible_base_url: ...` app-wide.
     `api_key` is optional — keyless local servers send no auth header.
 
-  Per-model `base_url:`/`api_key:` catalog entries override the provider
-  app config. API keys accept a literal string, `{:system, "ENV_VAR"}`, or
-  `{module, function, args}` resolved per request — the MFA form suits
-  short-lived credentials like Vertex OAuth tokens:
+  A declared model's platform entry may carry `base_url:` and `api_key:`
+  (`platforms: [openai_compatible: [base_url: ..., api_key: ...]]`),
+  which override the platform's app config. API keys accept a literal
+  string, `{:system, "ENV_VAR"}`, or `{module, function, args}` resolved
+  per request — the MFA form suits short-lived credentials like Vertex
+  OAuth tokens:
 
       config :clementine,
         vertex_access_token: {MyApp.GcpAuth, :access_token, []}
@@ -46,22 +50,22 @@ defmodule Clementine.LLM.ChatCompletions do
   fails the run (`Clementine.OutputSchema`). A server that enforces the
   format over the whole completion with a grammar (vLLM, SGLang, Ollama,
   and llama.cpp may) leaves the model no way to call a tool, so the
-  agent answers at once without its tools and nothing fails. For such a
-  model, set `structured_output: :instructions` on its catalog entry:
-  no `response_format` is sent, the agent's instructions describe the
-  answer, and the engine still checks it.
+  agent answers at once without its tools and nothing fails. So
+  `response_format` goes only to a model whose sheet says
+  `features: [structured_outputs: true]`; for any other, the agent's
+  instructions describe the answer, and the engine still checks it.
 
   A refusal (`delta.refusal`, or `message.refusal` on `call/5`) arrives
   as the turn's text with stop reason `"refusal"`.
 
-  Prompt caching: an alias with markers (OpenRouter's `anthropic/`
-  models by default, any `:openrouter` or `:openai_compatible` alias with
-  `cache: [markers: true]`) sends a `cache_control` content part on the
-  system prompt and the top-level `cache_control` for the conversation's
-  tail. OpenRouter also gets the run's `prompt_cache_key`, which it uses
-  for sticky routing. Other servers cache prefixes on their own; with
-  `cache: false`, OpenAI's GPT-5.6 and later on OpenRouter or Bedrock get
-  `prompt_cache_options.mode: "explicit"`, which turns that off. A stream
+  Prompt caching: a model whose sheet offers `cache_control` TTLs
+  (`cache: [ttls: [:five_minutes, :one_hour]]`, a Claude model on
+  OpenRouter or behind a proxy) gets a `cache_control` content part on
+  the system prompt and the top-level `cache_control` for the
+  conversation's tail. OpenRouter also gets the run's `prompt_cache_key`,
+  which it uses for sticky routing. Other servers cache prefixes on their
+  own; with `cache: false`, a model offering `prompt_cache_options` TTLs
+  gets `mode: "explicit"`, which turns that off. A stream
   asks for usage with `stream_options.include_usage`, and usage reads
   `prompt_tokens_details.cached_tokens` and `cache_write_tokens` wherever
   the server reports them.
@@ -69,15 +73,15 @@ defmodule Clementine.LLM.ChatCompletions do
 
   @behaviour Clementine.LLM.ClientBehaviour
 
-  alias Clementine.LLM.{Cache, ModelRegistry, ProviderUsage}
+  alias Clementine.Model
+  alias Clementine.LLM.{Cache, Policy, ProviderUsage}
   alias Clementine.LLM.ChatCompletions.{Messages, Tools}
   alias Clementine.LLM.ChatCompletionsStreamParser
   alias Clementine.LLM.ProviderStream
   alias Clementine.LLM.Reasoning
   alias Clementine.LLM.Response
 
-  @providers [:openrouter, :bedrock, :vertex, :openai_compatible]
-  @default_max_tokens 8192
+  @platforms [:openrouter, :bedrock, :vertex, :openai_compatible]
   @retriable_statuses [429, 500, 502, 503, 504]
 
   @doc """
@@ -85,7 +89,7 @@ defmodule Clementine.LLM.ChatCompletions do
   """
   @impl true
   def call(model, system, messages, tools, opts \\ []) do
-    resolved = resolve_model(model)
+    resolved = policy!(model, opts, stream: false)
     body = build_body(resolved, system, messages, tools, opts)
     headers = build_headers(resolved)
     url = request_url(resolved)
@@ -125,7 +129,7 @@ defmodule Clementine.LLM.ChatCompletions do
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
-    resolved = resolve_model(model)
+    resolved = policy!(model, opts, stream: true)
 
     # Usage arrives in the stream's last chunk only when asked for.
     body =
@@ -257,33 +261,16 @@ defmodule Clementine.LLM.ChatCompletions do
     min(delay, max_delay)
   end
 
-  defp build_body(resolved, system, messages, tools, opts) do
-    max_tokens =
-      Keyword.get(
-        opts,
-        :max_tokens,
-        Keyword.get(
-          opts,
-          :max_output_tokens,
-          Keyword.get(
-            resolved.defaults,
-            :max_tokens,
-            Keyword.get(resolved.defaults, :max_output_tokens, @default_max_tokens)
-          )
-        )
-      )
-
-    body = %{
-      "model" => resolved.id,
-      "messages" => encode_messages(system, messages, resolved.cache),
-      "max_tokens" => max_tokens
-    }
-
+  defp build_body(%Policy{} = policy, system, messages, tools, opts) do
     body =
-      body
-      |> maybe_put_reasoning(resolved.provider, Keyword.get(opts, :reasoning, resolved.reasoning))
-      |> maybe_put_output_schema(resolved.structured_output, Keyword.get(opts, :output_schema))
-      |> put_cache(resolved, Keyword.get(opts, :cache_key))
+      %{
+        "model" => Model.platform_id(policy.model),
+        "messages" => encode_messages(system, messages, policy.cache),
+        "max_tokens" => policy.max_tokens
+      }
+      |> Map.merge(Reasoning.chat_completions(policy))
+      |> maybe_put_output_schema(policy.model, Keyword.get(opts, :output_schema))
+      |> put_cache(policy, Keyword.get(opts, :cache_key))
 
     if is_list(tools) and tools != [] do
       body
@@ -318,39 +305,37 @@ defmodule Clementine.LLM.ChatCompletions do
   # provider that serves it). OpenRouter routes a user's requests to one
   # provider by prompt_cache_key; no other Chat Completions provider is
   # sent one, since a strict server may refuse a field it does not know.
-  # With caching off, OpenAI's GPT-5.6 and later on OpenRouter or Bedrock
-  # get explicit mode and no breakpoints, which turns their implicit
-  # caching and its write charge off; nothing else can be turned off.
-  defp put_cache(body, %{cache: %{enabled: false}, provider: provider, id: id}, _key) do
-    if Cache.prompt_cache_options?(provider, id),
+  # With caching off, a model offering prompt_cache_options TTLs gets
+  # explicit mode and no breakpoints, which turns its implicit caching and
+  # its write charge off; nothing else can be turned off.
+  defp put_cache(body, %Policy{cache: %{enabled: false}, model: model}, _key) do
+    if Model.cache_mechanism(model.cache.ttls) == :options,
       do: Map.put(body, "prompt_cache_options", %{"mode" => "explicit"}),
       else: body
   end
 
-  defp put_cache(body, %{cache: cache, provider: provider}, key) do
+  defp put_cache(body, %Policy{cache: cache, platform: platform}, key) do
     body =
       if cache.markers,
         do: Map.put(body, "cache_control", Cache.cache_control(cache)),
         else: body
 
-    if provider == :openrouter and key, do: Map.put(body, "prompt_cache_key", key), else: body
+    if platform == :openrouter and key, do: Map.put(body, "prompt_cache_key", key), else: body
   end
 
-  defp maybe_put_reasoning(body, _provider, nil), do: body
+  # A grammar-enforcing server would take the model's tools away, so the
+  # format goes only where the sheet says the model has structured
+  # outputs; elsewhere the instructions describe the answer.
+  defp maybe_put_output_schema(body, _model, nil), do: body
 
-  defp maybe_put_reasoning(body, provider, reasoning) do
-    Map.merge(body, Reasoning.to_provider_config!(provider, reasoning))
-  end
-
-  defp maybe_put_output_schema(body, _structured_output, nil), do: body
-  defp maybe_put_output_schema(body, :instructions, _schema), do: body
-
-  defp maybe_put_output_schema(body, :native, schema) do
+  defp maybe_put_output_schema(body, %Model{features: %{structured_outputs: true}}, schema) do
     Map.put(body, "response_format", %{
       "type" => "json_schema",
       "json_schema" => %{"name" => "output", "schema" => schema, "strict" => true}
     })
   end
+
+  defp maybe_put_output_schema(body, _model, _schema), do: body
 
   defp build_headers(resolved) do
     case api_key(resolved) do
@@ -359,8 +344,8 @@ defmodule Clementine.LLM.ChatCompletions do
     end
   end
 
-  defp request_url(resolved) do
-    base_url = resolved.base_url || provider_base_url(resolved.provider)
+  defp request_url(%Policy{} = policy) do
+    base_url = endpoint(policy, :base_url) || provider_base_url(policy.platform)
     String.trim_trailing(base_url, "/") <> "/chat/completions"
   end
 
@@ -413,25 +398,33 @@ defmodule Clementine.LLM.ChatCompletions do
     end
   end
 
-  defp api_key(resolved) do
-    configured = resolved.api_key || Application.get_env(:clementine, api_key_config(resolved))
+  defp api_key(%Policy{platform: platform} = policy) do
+    configured =
+      endpoint(policy, :api_key) || Application.get_env(:clementine, api_key_config(platform))
 
     case resolve_credential(configured) do
       key when is_binary(key) and key != "" ->
         key
 
-      nil when resolved.provider == :openai_compatible ->
+      nil when platform == :openai_compatible ->
         nil
 
       _ ->
-        raise "Missing #{inspect(api_key_config(resolved))} configuration for :clementine"
+        raise "Missing #{inspect(api_key_config(platform))} configuration for :clementine"
     end
   end
 
-  defp api_key_config(%{provider: :openrouter}), do: :openrouter_api_key
-  defp api_key_config(%{provider: :bedrock}), do: :bedrock_api_key
-  defp api_key_config(%{provider: :vertex}), do: :vertex_access_token
-  defp api_key_config(%{provider: :openai_compatible}), do: :openai_compatible_api_key
+  # A declared model's platform entry may name its own endpoint.
+  defp endpoint(%Policy{model: model, platform: platform}, key) do
+    model.platforms |> Keyword.get(platform, %{}) |> Map.get(key)
+  end
+
+  @doc false
+  # The app config key that holds a platform's credential.
+  def api_key_config(:openrouter), do: :openrouter_api_key
+  def api_key_config(:bedrock), do: :bedrock_api_key
+  def api_key_config(:vertex), do: :vertex_access_token
+  def api_key_config(:openai_compatible), do: :openai_compatible_api_key
 
   defp resolve_credential({:system, env_var}) when is_binary(env_var) do
     System.get_env(env_var)
@@ -445,18 +438,19 @@ defmodule Clementine.LLM.ChatCompletions do
   defp resolve_credential(key) when is_binary(key), do: key
   defp resolve_credential(_), do: nil
 
-  defp resolve_model(model_ref) do
-    resolved = ModelRegistry.resolve!(model_ref)
+  defp policy!(model, opts, checks) do
+    policy = Policy.resolve!(model, opts, checks)
 
-    unless resolved.provider in @providers do
-      raise "Model #{inspect(model_ref)} is configured for provider " <>
-              "#{inspect(resolved.provider)}, not an OpenAI-compatible chat completions provider"
+    unless policy.platform in @platforms do
+      raise ArgumentError,
+            "#{inspect(model)} goes to #{inspect(policy.platform)}, not a Chat Completions " <>
+              "platform (#{inspect(@platforms)})"
     end
 
-    resolved
+    policy
   end
 
-  defp usage_meta(resolved), do: %{provider: resolved.provider, model: resolved.id}
+  defp usage_meta(%Policy{} = policy), do: %{provider: policy.platform, model: policy.model.id}
 
   defp parse_response(%{"choices" => [choice | _]} = body, usage_meta) do
     message = Map.get(choice, "message", %{})

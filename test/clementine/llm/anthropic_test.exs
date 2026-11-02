@@ -5,6 +5,10 @@ defmodule Clementine.LLM.AnthropicTest do
   alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
   alias Clementine.LLM.Response
 
+  # Claude Sonnet 5: adaptive thinking by default, effort :high, tool
+  # search, no binding, and no mid-conversation system messages.
+  @model "claude-sonnet-5"
+
   setup do
     bypass = Bypass.open()
 
@@ -19,15 +23,6 @@ defmodule Clementine.LLM.AnthropicTest do
     )
 
     Application.put_env(:clementine, :anthropic_api_key, "test-anthropic-key")
-
-    Application.put_env(:clementine, :models,
-      claude_test: [provider: :anthropic, id: "claude-sonnet-5", defaults: [max_tokens: 1024]],
-      claude_reasoning: [
-        provider: :anthropic,
-        id: "claude-sonnet-5",
-        reasoning: [thinking: :adaptive, effort: :high]
-      ]
-    )
 
     on_exit(fn ->
       restore_env(:anthropic_base_url, prev_url)
@@ -54,64 +49,131 @@ defmodule Clementine.LLM.AnthropicTest do
     end
   end
 
-  describe "reasoning request fields" do
-    test "call/5 omits reasoning fields when unconfigured", %{bypass: bypass} do
+  describe "the model's sheet and the agent's choices" do
+    test "call/5 sends the model's id, max_tokens, and effort, and no thinking it does by default",
+         %{bypass: bypass} do
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         request = Jason.decode!(body)
 
         assert request["model"] == "claude-sonnet-5"
+        assert request["max_tokens"] == 16_000
         refute Map.has_key?(request, "thinking")
-        refute Map.has_key?(request, "output_config")
-
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(200, text_response("No reasoning"))
-      end)
-
-      assert {:ok, %Response{content: [%Content.Text{text: "No reasoning"}]}} =
-               Anthropic.call(:claude_test, "system", [UserMessage.new("Hi")], [])
-    end
-
-    test "call/5 includes configured reasoning", %{bypass: bypass} do
-      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
-        {:ok, body, conn} = Plug.Conn.read_body(conn)
-        request = Jason.decode!(body)
-
-        assert request["thinking"] == %{"type" => "adaptive"}
         assert request["output_config"] == %{"effort" => "high"}
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(200, text_response("Configured reasoning"))
+        |> Plug.Conn.resp(200, text_response("Defaults"))
       end)
 
-      assert {:ok, %Response{content: [%Content.Text{text: "Configured reasoning"}]}} =
-               Anthropic.call(:claude_reasoning, "system", [UserMessage.new("Hi")], [])
+      assert {:ok, %Response{content: [%Content.Text{text: "Defaults"}]}} =
+               Anthropic.call(@model, "system", [UserMessage.new("Hi")], [])
     end
 
-    test "call/5 lets request opts override configured reasoning", %{bypass: bypass} do
+    test "call/5 sends the agent's max_tokens, thinking, effort, and display", %{bypass: bypass} do
+      test = self()
+
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test, {:request, Jason.decode!(body)})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("Chosen"))
+      end)
+
+      assert {:ok, %Response{content: [%Content.Text{text: "Chosen"}]}} =
+               Anthropic.call(@model, "system", [UserMessage.new("Hi")], [],
+                 max_tokens: 1024,
+                 effort: :low,
+                 display: :summarized
+               )
+
+      assert_received {:request, request}
+      assert request["max_tokens"] == 1024
+      assert request["thinking"] == %{"type" => "adaptive", "display" => "summarized"}
+      assert request["output_config"] == %{"effort" => "low"}
+
+      assert {:ok, %Response{}} =
+               Anthropic.call(@model, "system", [UserMessage.new("Hi")], [], thinking: :off)
+
+      assert_received {:request, request}
+      assert request["thinking"] == %{"type" => "disabled"}
+      assert request["output_config"] == %{"effort" => "high"}
+    end
+
+    test "call/5 sends a budget with enabled thinking where the model takes one", %{
+      bypass: bypass
+    } do
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         request = Jason.decode!(body)
 
+        assert request["model"] == "claude-opus-4-6"
+
         assert request["thinking"] == %{"type" => "enabled", "budget_tokens" => 2048}
-        refute Map.has_key?(request, "output_config")
+
+        assert request["output_config"] == %{"effort" => "high"}
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(200, text_response("Overridden reasoning"))
+        |> Plug.Conn.resp(200, text_response("Budgeted"))
       end)
 
-      assert {:ok, %Response{content: [%Content.Text{text: "Overridden reasoning"}]}} =
-               Anthropic.call(:claude_reasoning, "system", [UserMessage.new("Hi")], [],
-                 reasoning: [budget_tokens: 2048]
+      assert {:ok, %Response{content: [%Content.Text{text: "Budgeted"}]}} =
+               Anthropic.call("claude-opus-4-6", "system", [UserMessage.new("Hi")], [],
+                 provider_options: [budget_tokens: 2048]
                )
     end
 
-    test "call/5 rejects invalid Anthropic reasoning opts" do
-      assert_raise ArgumentError, ~r/unsupported Anthropic reasoning effort/, fn ->
-        Anthropic.call(:claude_test, "system", [UserMessage.new("Hi")], [], reasoning: :ultra)
+    test "max_tokens defaults to the model's output ceiling where it is under 16,000", %{
+      bypass: bypass
+    } do
+      Application.put_env(:clementine, :models, %{"claude-sonnet-5" => [max_output: 8_000]})
+
+      Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert Jason.decode!(body)["max_tokens"] == 8_000
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, text_response("ok"))
+      end)
+
+      assert {:ok, %Response{}} = Anthropic.call(@model, "system", [UserMessage.new("Hi")], [])
+    end
+
+    test "call/5 refuses, before sending, what the model's sheet refuses" do
+      call = fn model, opts ->
+        Anthropic.call(model, "system", [UserMessage.new("Hi")], [], opts)
+      end
+
+      assert_raise ArgumentError, ~r/takes effort \[:low, .*\], got: :ultra/, fn ->
+        call.(@model, effort: :ultra)
+      end
+
+      assert_raise ArgumentError, ~r/refuses thinking: :between_tools/, fn ->
+        call.(@model, thinking: :between_tools)
+      end
+
+      assert_raise ArgumentError, ~r/refuses provider_options: \[budget_tokens: \.\.\.\]/, fn ->
+        call.(@model, provider_options: [budget_tokens: 2048])
+      end
+
+      assert_raise ArgumentError, ~r/max_tokens: 200000 is over/, fn ->
+        call.(@model, max_tokens: 200_000)
+      end
+
+      assert_raise ArgumentError, ~r/"claude-sonnet-4-20250514": is retired/, fn ->
+        call.("claude-sonnet-4-20250514", [])
+      end
+
+      assert_raise ArgumentError, ~r/unknown model "claude-sonnet-9"/, fn ->
+        call.("claude-sonnet-9", [])
+      end
+
+      assert_raise ArgumentError, ~r/goes to :openai, not :anthropic/, fn ->
+        call.("gpt-6.1-sol", [])
       end
     end
   end
@@ -124,6 +186,8 @@ defmodule Clementine.LLM.AnthropicTest do
       "additionalProperties" => false
     }
 
+    # Claude Haiku 4.5 has no effort levels, so output_config is the
+    # format alone.
     test "call/5 sends the schema as output_config.format", %{bypass: bypass} do
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -139,12 +203,12 @@ defmodule Clementine.LLM.AnthropicTest do
       end)
 
       assert {:ok, %Response{content: [%Content.Text{text: ~s({"verdict": "pass"})}]}} =
-               Anthropic.call(:claude_test, "system", [UserMessage.new("Hi")], [],
+               Anthropic.call("claude-haiku-4-5", "system", [UserMessage.new("Hi")], [],
                  output_schema: @output_schema
                )
     end
 
-    test "call/5 puts the format beside a configured reasoning effort", %{bypass: bypass} do
+    test "call/5 puts the format beside the agent's effort", %{bypass: bypass} do
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         request = Jason.decode!(body)
@@ -152,7 +216,7 @@ defmodule Clementine.LLM.AnthropicTest do
         assert request["thinking"] == %{"type" => "adaptive"}
 
         assert request["output_config"] == %{
-                 "effort" => "high",
+                 "effort" => "xhigh",
                  "format" => %{"type" => "json_schema", "schema" => @output_schema}
                }
 
@@ -161,8 +225,10 @@ defmodule Clementine.LLM.AnthropicTest do
         |> Plug.Conn.resp(200, text_response(~s({"verdict": "pass"})))
       end)
 
+      # Claude Opus 4.8 does not think by default, so adaptive goes.
       assert {:ok, %Response{}} =
-               Anthropic.call(:claude_reasoning, "system", [UserMessage.new("Hi")], [],
+               Anthropic.call("claude-opus-4-8", "system", [UserMessage.new("Hi")], [],
+                 effort: :xhigh,
                  output_schema: @output_schema
                )
     end
@@ -189,7 +255,7 @@ defmodule Clementine.LLM.AnthropicTest do
       end)
 
       assert {:ok, %Response{} = response} =
-               Anthropic.call(:claude_reasoning, "system", [UserMessage.new("Hi")], [])
+               Anthropic.call(@model, "system", [UserMessage.new("Hi")], [])
 
       assert [
                %Content.Thinking{thinking: "Let me reason.", signature: "sig123"},
@@ -237,7 +303,7 @@ defmodule Clementine.LLM.AnthropicTest do
         %ToolResultMessage{content: [Content.tool_result("toolu_1", "hi")]}
       ]
 
-      assert {:ok, %Response{}} = Anthropic.call(:claude_test, "system", messages, [])
+      assert {:ok, %Response{}} = Anthropic.call(@model, "system", messages, [])
     end
   end
 
@@ -269,7 +335,7 @@ defmodule Clementine.LLM.AnthropicTest do
         |> Plug.Conn.resp(200, Clementine.Test.Fixtures.sse_text_stream("ok"))
       end)
 
-      :claude_test
+      @model
       |> Anthropic.stream("system", [UserMessage.new("Hi")], [Echo, Add, GatedDeploy],
         deferred: [Add, GatedDeploy]
       )
@@ -308,19 +374,23 @@ defmodule Clementine.LLM.AnthropicTest do
       end)
 
       assert {:ok, %Response{}} =
-               Anthropic.call(:claude_test, "system", [UserMessage.new("Hi")], [Echo, Add],
+               Anthropic.call(@model, "system", [UserMessage.new("Hi")], [Echo, Add],
                  deferred: []
                )
     end
 
-    test "a model released before tool search gets its deferred tools as ordinary tools", %{
+    test "a model without tool search gets its deferred tools as ordinary tools", %{
       bypass: bypass
     } do
+      Application.put_env(:clementine, :models, %{
+        "claude-sonnet-5" => [features: [tool_search: false]]
+      })
+
       Bypass.expect(bypass, "POST", "/v1/messages", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         request = Jason.decode!(body)
 
-        assert request["model"] == "claude-opus-4-1"
+        assert request["model"] == "claude-sonnet-5"
         assert [%{"name" => "echo"} = echo, %{"name" => "add"} = add] = request["tools"]
         refute Map.has_key?(echo, "defer_loading")
         refute Map.has_key?(add, "defer_loading")
@@ -330,28 +400,56 @@ defmodule Clementine.LLM.AnthropicTest do
         |> Plug.Conn.resp(200, text_response("ok"))
       end)
 
-      model = {:anthropic, "claude-opus-4-1"}
       messages = [UserMessage.new("Hi")]
 
       assert {:ok, %Response{}} =
-               Anthropic.call(model, "system", messages, [Echo, Add], deferred: [Add])
+               Anthropic.call(@model, "system", messages, [Echo, Add], deferred: [Add])
     end
 
-    test "tool search is for every model but those released before it" do
-      for id <-
-            ~w(claude-opus-4-0 claude-opus-4-1 claude-opus-4-20250514 claude-opus-4-1-20250805
-               claude-sonnet-4-0 claude-sonnet-4-20250514 claude-3-7-sonnet-20250219
-               claude-3-5-haiku-20241022 claude-3-opus-20240229 claude-2.1 claude-instant-1.2) do
-        refute Anthropic.Tools.searchable?(id), id
+    test "every Claude model Clementine serves has tool search, by its sheet" do
+      models =
+        for model <- Clementine.Models.list(vendor: :anthropic),
+            model.lifecycle.status != :retired,
+            do: model.id
+
+      assert "claude-haiku-4-5-20251001" in models and "claude-mythos-5-1" in models
+
+      for id <- models do
+        {body, _binding, _dropped} =
+          Anthropic.request(id, "system", [UserMessage.new("Hi")], [Echo, Add], deferred: [Add])
+
+        assert [
+                 %{"type" => "tool_search_tool_regex_20251119"},
+                 %{"name" => "echo"},
+                 %{"name" => "add", "defer_loading" => true}
+               ] = body["tools"],
+               id
+      end
+    end
+
+    test "a declared Claude model has tool search only where its sheet says so" do
+      declared = [vendor: :anthropic, context: 200_000, max_output: 64_000]
+
+      Application.put_env(:clementine, :models, %{
+        "my-claude-deployment" => declared ++ [platforms: [anthropic: []]],
+        "my-searching-deployment" =>
+          declared ++ [features: [tool_search: true], platforms: [anthropic: []]]
+      })
+
+      request = fn id ->
+        {body, _binding, _dropped} =
+          Anthropic.request(id, "system", [UserMessage.new("Hi")], [Echo, Add], deferred: [Add])
+
+        body["tools"]
       end
 
-      for id <-
-            ~w(claude-opus-4-5-20251101 claude-sonnet-4-5-20250929 claude-haiku-4-5
-               claude-haiku-4-5-20251001 claude-opus-4-6 claude-sonnet-4-6 claude-opus-4-7
-               claude-opus-4-8 claude-sonnet-5 claude-sonnet-5-5 claude-opus-5 claude-opus-5-5
-               claude-haiku-5-5 claude-fable-5 claude-fable-5-1 claude-mythos-5-1) do
-        assert Anthropic.Tools.searchable?(id), id
-      end
+      assert [%{"name" => "echo"} = echo, %{"name" => "add"} = add] =
+               request.("my-claude-deployment")
+
+      refute Map.has_key?(echo, "defer_loading") or Map.has_key?(add, "defer_loading")
+
+      assert [%{"type" => "tool_search_tool_regex_20251119"}, _echo, %{"defer_loading" => true}] =
+               request.("my-searching-deployment")
     end
 
     test "a request without the search tool leaves past searches out of history", %{
@@ -371,11 +469,13 @@ defmodule Clementine.LLM.AnthropicTest do
       # No deferred tool left on a model with tool search, then deferred
       # tools on a model without it: neither request carries the search
       # tool, so neither may replay a search.
-      Anthropic.call(:claude_test, "system", searched_history(), [Echo])
+      Anthropic.call(@model, "system", searched_history(), [Echo])
 
-      Anthropic.call({:anthropic, "claude-opus-4-1"}, "system", searched_history(), [Echo, Add],
-        deferred: [Add]
-      )
+      Application.put_env(:clementine, :models, %{
+        "claude-sonnet-5" => [features: [tool_search: false]]
+      })
+
+      Anthropic.call(@model, "system", searched_history(), [Echo, Add], deferred: [Add])
 
       for _request <- 1..2 do
         assert_received {:request, request}
@@ -430,9 +530,7 @@ defmodule Clementine.LLM.AnthropicTest do
 
       # "issue_refund" left the agent since the search found it.
       assert {:ok, %Response{}} =
-               Anthropic.call(:claude_test, "system", searched_history(), [Add, Echo],
-                 deferred: [Echo]
-               )
+               Anthropic.call(@model, "system", searched_history(), [Add, Echo], deferred: [Echo])
     end
 
     test "stream/5 collects a tool search turn in the order the API sent it", %{bypass: bypass} do
@@ -443,7 +541,7 @@ defmodule Clementine.LLM.AnthropicTest do
       end)
 
       assert {:ok, %Response{stop_reason: "tool_use", content: content}} =
-               :claude_test
+               @model
                |> Anthropic.stream("system", [UserMessage.new("Weather in SF?")], [Echo, Add],
                  deferred: [Add]
                )
@@ -469,7 +567,7 @@ defmodule Clementine.LLM.AnthropicTest do
       end)
 
       assert {:ok, %Response{} = response} =
-               Anthropic.call(:claude_test, "system", [UserMessage.new("Weather?")], [Echo])
+               Anthropic.call(@model, "system", [UserMessage.new("Weather?")], [Echo])
 
       assert [
                %Content.Text{text: "I'll search for tools to help with the weather information."},
@@ -525,7 +623,7 @@ defmodule Clementine.LLM.AnthropicTest do
       ]
 
       assert {:ok, %Response{}} =
-               Anthropic.call(:claude_test, "system", messages, [Echo, GetWeather],
+               Anthropic.call(@model, "system", messages, [Echo, GetWeather],
                  deferred: [GetWeather]
                )
     end
@@ -543,7 +641,7 @@ defmodule Clementine.LLM.AnthropicTest do
       end)
 
       events =
-        Anthropic.stream(:claude_test, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+        Anthropic.stream(@model, "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
 
       assert [{:error, {:api_error, 404, ^error_body}}] = events
     end

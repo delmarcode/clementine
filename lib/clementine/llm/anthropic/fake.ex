@@ -4,8 +4,9 @@ defmodule Clementine.LLM.Anthropic.Fake do
   lost an earlier turn's thinking, and checks a replayed history the way
   the Messages API does on models that bind their thinking.
 
-  Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and
-  later models accept a thinking block only after the exact system
+  A model whose sheet binds its thinking (`thinking.binding: :prefix`:
+  Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5)
+  accepts a thinking block only after the exact system
   prompt, tools, and messages it was produced after. Clementine checks
   that before it sends (`Clementine.LLM.Message.AssistantMessage`'s
   `binding`) and sends a turn without its thinking once the history
@@ -167,8 +168,8 @@ defmodule Clementine.LLM.Anthropic.Fake do
     # The client reports what it dropped before the API answers, so the
     # engine's telemetry sees a drop the strict check then refuses.
     with :ok <- answered(fake_opts[:api_errors], Keyword.get(opts, :receive_timeout, 300_000)),
-         {:ok, body} <- checked(body, dropped, fake_opts[:strict]) do
-      Binding.events(binding, dropped) ++ turn(body, script, fake_opts)
+         {:ok, body} <- checked(model, body, dropped, fake_opts[:strict]) do
+      Binding.events(binding, dropped) ++ turn(model, body, script, fake_opts)
     else
       {:error, {:api_error, _status, _body} = error} ->
         Binding.events(nil, dropped) ++ [{:error, error}]
@@ -185,7 +186,7 @@ defmodule Clementine.LLM.Anthropic.Fake do
     fake_opts = Keyword.validate!(fake_opts, strict: true)
     {body, _binding, dropped} = Anthropic.request(model, system, messages, tools || [], opts)
 
-    with {:ok, _body} <- checked(body, dropped, fake_opts[:strict]), do: :ok
+    with {:ok, _body} <- checked(model, body, dropped, fake_opts[:strict]), do: :ok
   end
 
   ## HTTP errors before the answer
@@ -225,11 +226,11 @@ defmodule Clementine.LLM.Anthropic.Fake do
 
   ## The check
 
-  defp checked(body, dropped, strict?) do
+  defp checked(model, body, dropped, strict?) do
     with :ok <- check_dropped(dropped, strict?),
          :ok <- check_system_messages(body["messages"]),
          :ok <- check_content(body["messages"]) do
-      if Binding.binds?(body["model"]), do: check_thinking(body), else: {:ok, body}
+      if facts(model).binding == :prefix, do: check_thinking(body), else: {:ok, body}
     end
   end
 
@@ -418,8 +419,8 @@ defmodule Clementine.LLM.Anthropic.Fake do
   # input the request burned, the steps' blocks, then the stop and the
   # whole usage, or a mid-stream error in its place. Usage leaves
   # normalized, as the client's parser leaves it.
-  defp turn(body, script, fake_opts) do
-    display = display(body)
+  defp turn(model, body, script, fake_opts) do
+    display = display(model, body)
     request = without_continuation(body["messages"])
     digest = Enum.reduce(request, start(body), &chain(&2, &1))
     previous = last_signature(body["messages"])
@@ -579,11 +580,20 @@ defmodule Clementine.LLM.Anthropic.Fake do
      ], previous}
   end
 
-  defp display(%{"thinking" => %{"type" => "between_tools"}}), do: "between_tools"
-  defp display(%{"thinking" => %{"display" => display}}), do: display
+  defp display(_model, %{"thinking" => %{"type" => "between_tools"}}), do: "between_tools"
+  defp display(_model, %{"thinking" => %{"display" => display}}), do: display
 
-  defp display(%{"model" => model}),
-    do: if(Binding.binds?(model), do: "omitted", else: "summarized")
+  defp display(model, _body), do: to_string(facts(model).display || :summarized)
+
+  # The thinking facts of the model the request is for, by its id: the
+  # body names the id it goes by on its platform, which an override may
+  # change.
+  defp facts(id) do
+    case Clementine.Models.get(id) do
+      %Clementine.Model{thinking: thinking} -> thinking
+      nil -> %{binding: :none, display: nil}
+    end
+  end
 
   # A request that ends with an assistant turn continues that turn (a
   # paused one): what the response adds follows the conversation before

@@ -40,7 +40,7 @@ defmodule Clementine.Runs.ToolPolicyTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_cashier",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Refund orders.",
       tools: [Refund]
   end
@@ -49,7 +49,7 @@ defmodule Clementine.Runs.ToolPolicyTest do
     @moduledoc false
     use Clementine.Agent,
       key: "test_manager",
-      model: :claude_sonnet,
+      model: "claude-sonnet-5",
       instructions: "Get refunds done.",
       tools: [Refund],
       delegates: [Cashier]

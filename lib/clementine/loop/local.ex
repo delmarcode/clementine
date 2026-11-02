@@ -527,8 +527,10 @@ defmodule Clementine.Loop.Local do
 
       fun when is_function(fun, 2) ->
         case fun.(tag, child_args) do
+          # The child's agent is checked whole, as a run's start checks it.
           {:ok, %Rollout{} = rollout} ->
-            {:ok, rollout}
+            caller = "Clementine.Loop.run_local/3's build_child for #{inspect(tag)}"
+            {:ok, %{rollout | agent: Clementine.Agent.for_run!(rollout.agent, nil, caller)}}
 
           {:error, reason} ->
             raise ArgumentError,

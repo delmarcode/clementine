@@ -28,7 +28,8 @@ defmodule Mix.Tasks.Clementine.InstallTest do
       config = content(igniter, "config/config.exs")
       assert config =~ "queues: [default: 10, agents: 10]"
       assert config =~ ~s|anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}|
-      assert config =~ ~s|claude_sonnet: [provider: :anthropic, id: "claude-sonnet-5"]|
+      # Agents name their models by id; there is no catalog to configure.
+      refute config =~ ":models"
       assert config =~ "metadata: [:request_id, :run_id]"
       refute config =~ "Catalog"
 

@@ -1,13 +1,14 @@
 defmodule Clementine.LLM.Anthropic.Binding do
   @moduledoc false
 
-  # Claude Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, and
-  # every later model bind each thinking block to the conversation it
-  # was produced in: the system prompt, the set of tools, and every
-  # message before it (Anthropic's preserved-thinking doc, read
-  # 2026-11-01). Replaying a block after any of those changed is a 400
-  # on accounts created on or after 2026-08-31 (on every account for
-  # Mythos 5.1), and billed stale reasoning on older ones.
+  # A model whose sheet says `thinking.binding: :prefix` (Claude Fable
+  # 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) binds each thinking
+  # block to the conversation it was produced in: the system prompt, the
+  # set of tools, and every message before it (Anthropic's
+  # preserved-thinking doc, read 2026-11-01). Replaying a block after any
+  # of those changed is a 400 on accounts created on or after 2026-08-31
+  # (on every account for Mythos 5.1), and billed stale reasoning on
+  # older ones.
   #
   # Clementine checks the same thing on its side before it sends. Each
   # assistant turn from a binding model carries `binding`: a digest of
@@ -29,49 +30,6 @@ defmodule Clementine.LLM.Anthropic.Binding do
   alias Clementine.LLM.Message.{AssistantMessage, Content}
 
   require Logger
-
-  @doc """
-  What Clementine knows of `model_id`: `:binds` for a Claude model from
-  version 5.1 on, in any family; `:older` for one before it (a closed
-  set); `:unknown` for an id it cannot read, such as a deployment name
-  behind `:anthropic_base_url`.
-  """
-  def model(model_id) when is_binary(model_id) do
-    case Regex.run(~r/^claude-[a-z]+-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/, model_id) do
-      [_, major] ->
-        if to_int(major) > 5, do: :binds, else: :older
-
-      [_, major, minor] ->
-        if {to_int(major), to_int(minor)} >= {5, 1}, do: :binds, else: :older
-
-      nil ->
-        if Regex.match?(~r/^claude-(instant|\d|mythos-preview)/, model_id),
-          do: :older,
-          else: :unknown
-    end
-  end
-
-  defp to_int(digits), do: String.to_integer(digits)
-
-  @doc """
-  Whether Clementine checks a request to `model_id` before sending it:
-  every model but the older ones. An unknown id is checked, since the
-  check only drops thinking whose conversation changed, which a model
-  that binds would refuse and one that does not would never read.
-  """
-  def binds?(model_id), do: model(model_id) != :older
-
-  @doc """
-  Whether a `Clementine.LLM.Message.SystemMessage` goes to `model_id`
-  where it stands, as a mid-conversation system message with inline
-  tool definitions: only on a model known to bind. Mid-conversation
-  system messages exist on some models and platforms only (not Claude
-  Sonnet 5, not Microsoft Foundry), so an unknown id gets the message
-  folded into `system` and `tools`, which every model takes; the check
-  then costs the earlier turns' thinking once, where a misplaced system
-  message would fail every request.
-  """
-  def inline_system?(model_id), do: model(model_id) == :binds
 
   @doc """
   The digest a request starts from: its system prompt and its tools as a

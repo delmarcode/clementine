@@ -45,16 +45,6 @@ defmodule Clementine.RolloutStopsTest do
   setup :verify_on_exit!
 
   setup do
-    previous = Application.get_env(:clementine, :models)
-
-    Application.put_env(
-      :clementine,
-      :models,
-      Keyword.put(previous, :sonnet_55, provider: :anthropic, id: "claude-sonnet-5-5")
-    )
-
-    on_exit(fn -> Application.put_env(:clementine, :models, previous) end)
-
     test = self()
     id = {__MODULE__, make_ref()}
 
@@ -69,7 +59,9 @@ defmodule Clementine.RolloutStopsTest do
   end
 
   defp agent(opts \\ []) do
-    Agent.new(Keyword.merge([model: :sonnet_55, instructions: "Be brief.", tools: [Echo]], opts))
+    Agent.new(
+      Keyword.merge([model: "claude-sonnet-5-5", instructions: "Be brief.", tools: [Echo]], opts)
+    )
   end
 
   # Each script answers one model call, through the fake.
@@ -340,7 +332,9 @@ defmodule Clementine.RolloutStopsTest do
       next = UserMessage.new("Take a note.")
 
       assert {:error, {:api_error, 400, body}} =
-               Fake.check(:sonnet_55, nil, Enum.drop(thread, -1) ++ [next], [], [], strict: false)
+               Fake.check("claude-sonnet-5-5", nil, Enum.drop(thread, -1) ++ [next], [], [],
+                 strict: false
+               )
 
       assert body["error"]["message"] =~ "a system message must follow a user message"
 

@@ -9,17 +9,23 @@ defmodule Clementine.CoreSpecsTest do
       agent =
         Agent.new(
           id: "agent_1",
-          model: :claude_sonnet,
+          model: "claude-sonnet-5",
           instructions: "Be helpful.",
           tools: [SomeTool],
           defaults: [max_iterations: 5]
         )
 
-      assert %Agent{model: :claude_sonnet, tools: [SomeTool]} = agent
+      assert %Agent{model: "claude-sonnet-5", tools: [SomeTool]} = agent
     end
 
-    test "model is required" do
-      assert_raise ArgumentError, fn -> Agent.new(id: "no_model") end
+    test "a model the sheets and config do not know fails the build, naming the nearest" do
+      error = assert_raise ArgumentError, fn -> Agent.new(model: "claude-sonnet-5-6") end
+      assert error.message =~ ~s(unknown model "claude-sonnet-5-6")
+      assert error.message =~ ~s("claude-sonnet-5-5")
+    end
+
+    test "a model may be left for the module's use to give at the claim" do
+      assert %Agent{model: nil} = Agent.new(id: "no_model")
     end
   end
 
@@ -27,7 +33,7 @@ defmodule Clementine.CoreSpecsTest do
     test "builds an inert spec" do
       agent =
         Agent.new(
-          model: :claude_sonnet,
+          model: "claude-sonnet-5",
           instructions: "sys",
           tools: [ToolA],
           defaults: [max_iterations: 5]
@@ -47,7 +53,7 @@ defmodule Clementine.CoreSpecsTest do
 
     test "rollout limits win over agent defaults, unset keys fall through" do
       agent =
-        Agent.new(model: :claude_sonnet, defaults: [max_iterations: 5, max_duration: 60_000])
+        Agent.new(model: "claude-sonnet-5", defaults: [max_iterations: 5, max_duration: 60_000])
 
       rollout = Rollout.new(agent: agent, input: "x", limits: [max_iterations: 2])
       limits = Rollout.limits(rollout)
@@ -57,7 +63,7 @@ defmodule Clementine.CoreSpecsTest do
     end
 
     test "limits are empty when neither agent nor rollout set any" do
-      agent = Agent.new(model: :claude_sonnet)
+      agent = Agent.new(model: "claude-sonnet-5")
       rollout = Rollout.new(agent: agent, input: "x")
 
       assert Rollout.limits(rollout) == []
@@ -69,7 +75,7 @@ defmodule Clementine.CoreSpecsTest do
   end
 
   test "Run.new/1 requires ref and rollout" do
-    agent = Agent.new(model: :claude_sonnet)
+    agent = Agent.new(model: "claude-sonnet-5")
     rollout = Rollout.new(agent: agent, input: "x")
 
     assert %Run{ref: "run_9", metadata: %{}} = Run.new(ref: "run_9", rollout: rollout)

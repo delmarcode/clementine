@@ -7,8 +7,10 @@ defmodule Clementine.Application do
 
   @impl true
   def start(_type, _args) do
-    # Fail fast on invalid model configuration.
-    Clementine.LLM.ModelRegistry.validate_config!()
+    # Fail fast on an invalid override or declaration under
+    # config :clementine, :models. Each agent's own model and choices are
+    # checked when it is built, and again at the child spec's start.
+    Clementine.Models.validate_config!()
 
     children = [
       # Task supervisor for tool execution

@@ -16,17 +16,25 @@ defmodule Clementine.LLM.OpenAI do
   `required` (an optional one is typed `["string", "null"]`), and the
   API refuses a schema outside it.
 
+  A request names a model by its id (`"gpt-6.1-sol"`), and the client
+  reads its sheet (`Clementine.Model`): `max_output_tokens`, the
+  reasoning effort and summary (`Clementine.LLM.Reasoning`), and the
+  cache TTLs, all checked against the agent's choices first
+  (`Clementine.LLM.Policy`).
+
   Prompt caching is automatic. A request carries the run's
-  `prompt_cache_key` (`Clementine.LLM.Cache.key/1`), and on GPT-5.6 and
-  later `prompt_cache_options` with the alias's TTL, or, with `cache:
-  false`, explicit mode with no breakpoints, which turns caching off.
+  `prompt_cache_key` (`Clementine.LLM.Cache.key/1`), and on a model whose
+  sheet offers `:thirty_minutes` (GPT-5.6 and later)
+  `prompt_cache_options` with the agent's TTL, or, with `cache: false`,
+  explicit mode with no breakpoints, which turns caching off.
   Usage reads `input_tokens_details.cached_tokens` and
   `cache_write_tokens`.
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
 
-  alias Clementine.LLM.{Cache, ModelRegistry, ProviderUsage}
+  alias Clementine.Model
+  alias Clementine.LLM.{Cache, Policy, ProviderUsage}
   alias Clementine.LLM.Message.Content
   alias Clementine.LLM.Reasoning
   alias Clementine.LLM.ProviderStream
@@ -34,7 +42,6 @@ defmodule Clementine.LLM.OpenAI do
   alias Clementine.LLM.OpenAIStreamParser
   alias Clementine.LLM.Response
 
-  @default_max_output_tokens 8192
   @retriable_statuses [429, 500, 502, 503, 504]
 
   @doc """
@@ -42,7 +49,7 @@ defmodule Clementine.LLM.OpenAI do
   """
   @impl true
   def call(model, system, messages, tools, opts \\ []) do
-    body = build_body(model, system, messages, tools, opts)
+    body = build_body(model, system, messages, tools, opts, stream: false)
     headers = build_headers()
 
     retry_opts = Application.get_env(:clementine, :retry, [])
@@ -77,7 +84,9 @@ defmodule Clementine.LLM.OpenAI do
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
-    body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
+    body =
+      build_body(model, system, messages, tools, opts, stream: true) |> Map.put("stream", true)
+
     headers = build_headers()
     # A runner caps this to the execution deadline's remaining budget. It
     # bounds the whole streaming call, not one attempt: per-attempt receive
@@ -200,36 +209,23 @@ defmodule Clementine.LLM.OpenAI do
     min(delay, max_delay)
   end
 
-  defp build_body(model, system, messages, tools, opts) do
-    resolved = resolve_model(model)
-    model_id = resolved.id
+  defp build_body(model, system, messages, tools, opts, checks) do
+    schema? = Keyword.get(opts, :output_schema) != nil
+    policy = Policy.resolve!(model, opts, [output_schema: schema?] ++ checks)
 
-    max_output_tokens =
-      Keyword.get(
-        opts,
-        :max_output_tokens,
-        Keyword.get(
-          opts,
-          :max_tokens,
-          Keyword.get(
-            resolved.defaults,
-            :max_output_tokens,
-            Keyword.get(resolved.defaults, :max_tokens, @default_max_output_tokens)
-          )
-        )
-      )
-
-    body = %{
-      "model" => model_id,
-      "input" => format_messages(messages),
-      "max_output_tokens" => max_output_tokens
-    }
+    if policy.platform != :openai do
+      raise ArgumentError, "#{inspect(model)} goes to #{inspect(policy.platform)}, not :openai"
+    end
 
     body =
-      body
-      |> maybe_put_reasoning(Keyword.get(opts, :reasoning, resolved.reasoning))
+      %{
+        "model" => Model.platform_id(policy.model),
+        "input" => format_messages(messages),
+        "max_output_tokens" => policy.max_tokens
+      }
+      |> Map.merge(Reasoning.openai(policy))
       |> maybe_put_output_schema(Keyword.get(opts, :output_schema))
-      |> put_cache(resolved, Keyword.get(opts, :cache_key))
+      |> put_cache(policy, Keyword.get(opts, :cache_key))
 
     body =
       if is_binary(system) and system != "" do
@@ -247,24 +243,19 @@ defmodule Clementine.LLM.OpenAI do
     end
   end
 
-  defp maybe_put_reasoning(body, nil), do: body
-
-  defp maybe_put_reasoning(body, reasoning) do
-    Map.merge(body, Reasoning.to_provider_config!(:openai, reasoning))
-  end
-
   # Caching is automatic. The key keeps a user's requests on one cache
   # (routing on models before GPT-5.6, cache accounting after), and
-  # GPT-5.6 and later take the write's lifetime in prompt_cache_options;
-  # with caching off there, explicit mode and no breakpoints turn it off.
-  defp put_cache(body, %{cache: %{enabled: true} = cache}, key) do
+  # GPT-5.6 and later (a sheet offering :thirty_minutes) take the write's
+  # lifetime in prompt_cache_options; with caching off there, explicit
+  # mode and no breakpoints turn it off.
+  defp put_cache(body, %Policy{cache: %{enabled: true} = cache}, key) do
     body
     |> put_if("prompt_cache_key", key)
     |> put_if("prompt_cache_options", cache.ttl && %{"ttl" => Cache.wire_ttl(cache.ttl)})
   end
 
-  defp put_cache(body, %{cache: %{enabled: false}, id: id}, _key) do
-    if Cache.prompt_cache_options?(:openai, id),
+  defp put_cache(body, %Policy{cache: %{enabled: false}, model: model}, _key) do
+    if Model.cache_mechanism(model.cache.ttls) == :options,
       do: Map.put(body, "prompt_cache_options", %{"mode" => "explicit"}),
       else: body
   end
@@ -307,16 +298,6 @@ defmodule Clementine.LLM.OpenAI do
   defp resolve_api_key({:system, env_var}) when is_binary(env_var), do: System.get_env(env_var)
   defp resolve_api_key(key) when is_binary(key), do: key
   defp resolve_api_key(_), do: nil
-
-  defp resolve_model(model_ref) do
-    resolved = ModelRegistry.resolve!(model_ref)
-
-    if resolved.provider != :openai do
-      raise "Model #{inspect(model_ref)} is configured for provider #{inspect(resolved.provider)}, not :openai"
-    end
-
-    resolved
-  end
 
   defp format_messages(messages) do
     Messages.encode_all(messages)

@@ -11,7 +11,7 @@ defmodule ClementineSmoke.Agents.Chat do
   use Clementine.Agent,
     key: "chat",
     turn: true,
-    model: :claude_sonnet,
+    model: "claude-sonnet-5",
     instructions: "You are a friendly assistant. Answer in a sentence."
 
   alias ClementineSmoke.Conversations
