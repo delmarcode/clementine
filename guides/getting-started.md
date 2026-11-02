@@ -216,9 +216,10 @@ accept: an object at the root, `"additionalProperties": false` on every
 object, and, for OpenAI, every property listed in `required` (type an
 optional one `["string", "null"]`). The engine decodes the answer and
 checks it against the schema too. An answer that does not decode or
-match, as when the model refuses or runs out of tokens, fails the run
-with a `Clementine.Error` of code `:invalid_output`; whether to try
-again is outer control (below).
+match fails the run with a `Clementine.Error` of code `:invalid_output`,
+and one the model refused or ran out of tokens on fails it first, with
+`:refused` or `:truncated`; whether to try again is outer control
+(below).
 
 ## Streaming
 

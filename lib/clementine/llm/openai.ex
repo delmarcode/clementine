@@ -307,12 +307,19 @@ defmodule Clementine.LLM.OpenAI do
   end
 
   defp parse_response(%{"output" => output} = body) when is_list(output) do
-    content = Messages.decode_output_items(output)
+    content =
+      output
+      |> Enum.reject(
+        &(match?(%{"type" => "function_call"}, &1) and not OpenAIStreamParser.whole_call?(&1))
+      )
+      |> Messages.decode_output_items()
 
+    # A refusal or a content filter beats the calls, as in a stream.
     stop_reason =
       cond do
-        Enum.any?(content, &match?(%Content.ToolUse{}, &1)) -> "tool_use"
         refused?(output) -> "refusal"
+        OpenAIStreamParser.incomplete_reason(body) == "content_filter" -> "content_filter"
+        Enum.any?(content, &match?(%Content.ToolUse{}, &1)) -> "tool_use"
         true -> OpenAIStreamParser.incomplete_reason(body)
       end
 

@@ -8,7 +8,9 @@ if Code.ensure_loaded?(Ecto.Schema) do
     `subject_id` (what the run is about), `actor_type` and `actor_id`
     (whose authority it acts with), `turn` (whether it is a turn on a
     thread, copied from the agent at start), `input`
-    (`%{"prompt" => ...}`), `result` (`%{"output" => ...}` once completed),
+    (`%{"prompt" => ...}`), `result` (`%{"output" => ..., "stop_reason" => ...}`
+    once completed: the answer, and the final turn's stop reason,
+    `Clementine.Result.Completed`'s),
     `oban_job_id`, and `metadata`. `status` is one of `queued`, `running`,
     `waiting`, `completed`, `failed`, `cancelled`, and `interrupted`;
     `active?/1` and `terminal?/1` read it. The other lifecycle fields are

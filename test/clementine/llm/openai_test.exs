@@ -327,12 +327,20 @@ defmodule Clementine.LLM.OpenAITest do
       response =
         case Jason.decode!(body)["input"] do
           [%{"content" => "Refuse"}] ->
+            # A refusal beats the call beside it.
             %{
               "status" => "completed",
               "output" => [
                 %{
                   "type" => "message",
                   "content" => [%{"type" => "refusal", "refusal" => "I can't help with that."}]
+                },
+                %{
+                  "type" => "function_call",
+                  "call_id" => "call_1",
+                  "name" => "echo",
+                  "arguments" => "{}",
+                  "status" => "completed"
                 }
               ]
             }
@@ -342,7 +350,15 @@ defmodule Clementine.LLM.OpenAITest do
               "status" => "incomplete",
               "incomplete_details" => %{"reason" => "max_output_tokens"},
               "output" => [
-                %{"type" => "message", "content" => [%{"type" => "output_text", "text" => "{"}]}
+                %{"type" => "message", "content" => [%{"type" => "output_text", "text" => "{"}]},
+                # A call the cut fell inside is no call.
+                %{
+                  "type" => "function_call",
+                  "call_id" => "call_2",
+                  "name" => "echo",
+                  "arguments" => ~s({"mess),
+                  "status" => "incomplete"
+                }
               ]
             }
         end
@@ -355,10 +371,10 @@ defmodule Clementine.LLM.OpenAITest do
     assert {:ok, %Response{} = refused} =
              OpenAI.call(@model, "system", [UserMessage.new("Refuse")], [])
 
-    assert [%Content.Text{text: "I can't help with that."}] = refused.content
+    assert [%Content.Text{text: "I can't help with that."}, %Content.ToolUse{}] = refused.content
     assert refused.stop_reason == "refusal"
 
-    assert {:ok, %Response{stop_reason: "max_tokens"}} =
+    assert {:ok, %Response{stop_reason: "max_tokens", content: [%Content.Text{text: "{"}]}} =
              OpenAI.call(@model, "system", [UserMessage.new("Cut off")], [])
   end
 

@@ -637,6 +637,38 @@ use Clementine.Agent, key: "grader", model: "claude-sonnet-5-5", instructions: "
   whose `raw["output"]` is the text the model wrote. There is no retry
   inside the run; retry from a loop or your own code.
 
+## Refusals, cut-off answers, and empty ones
+
+- A run whose final turn the provider refused fails with
+  `Clementine.Error` code `:refused`; one whose final answer was cut off
+  (`max_tokens`, the context window) fails `:truncated`, and so does a
+  cut inside a tool call's input, whose turn runs none of its calls. A
+  run that wrote no text and called no tools fails `:empty`. None is
+  retryable. A completed run's `stop_reason` is `"end_turn"`,
+  `"stop_sequence"`, or `"empty"` (`run.result["stop_reason"]`).
+- Never read a failed run as "nothing found" or "nothing to do". An
+  extractor or a screener records the work as incomplete, with the
+  code. Have an extractor say in words or a tool when there is nothing
+  to record: an empty run is `:empty`, not "none".
+- On `:refused`, retry on another model first: that usually answers
+  it (Anthropic's advice). `error.raw["stop_details"]["category"]`
+  names the policy area; `"reasoning_extraction"` needs a prompt change
+  (stop asking for the model's reasoning in its answer), not a retry.
+  Then a person.
+- In a chat, show `:refused` as the assistant declining, not a crash,
+  and take down the text it streamed before it. Keep the user's message
+  in the thread: two user messages in a row are valid.
+- On `:truncated`, raise the model's `max_tokens` or ask for less.
+  Nothing completes a cut-off answer.
+- A final turn that wrote no text after tool calls completes with
+  `stop_reason: "empty"` and `output: ""`, its turn an assistant message
+  of no content at the end of `messages`. Store it like any turn: it
+  closes the exchange, so the next turn does not repeat its calls. A
+  chat shows that the assistant did not reply, never silence.
+- A thread's `"on_failure": "retry"` repeats a refused turn and its
+  tools' effects. Keep `"surface"` for turns whose tools are not safe
+  to repeat.
+
 ## Prompt caching
 
 - Caching is on, with no code: every client sends what its provider
@@ -667,9 +699,9 @@ use Clementine.Agent, key: "grader", model: "claude-sonnet-5-5", instructions: "
   blocks of stored turns.
 - Test threads turn by turn with `Clementine.LLM.Anthropic.Fake` (the
   installer's `expect_claude_turn/2`). It fails a turn whose request
-  lost an earlier turn's thinking; pass `strict: false` only for a turn
-  that changes the thread on purpose. Never set
-  `prefix_mismatch: :drop_block` by default.
+  lost an earlier turn's thinking, or holds a blank text block; pass
+  `strict: false` only for a turn that changes the thread on purpose.
+  Never set `prefix_mismatch: :drop_block` by default.
 
 ## Never
 
@@ -723,7 +755,13 @@ loop's step with `perform_job(Clementine.Runs.StepWorker, %{"run_id" =>
 loop.id})` (a thread's first step runs `init/1`; the next starts the
 turn a `send/3` asked for, which `Runs.child/2` then finds). Script the
 model with `MyApp.AgentsCase`'s `expect_turn/1`, `text_events/1`, and
-`tool_events/3`. Every host callback, `run_event/2`
+`tool_events/3`, or `expect_claude_turn/2`, whose options script what a
+real response carries: `stop_reason: "refusal"` (or `"max_tokens"`,
+`"pause_turn"`) and `stop_details:`, `usage:` with cache tokens, and
+`api_errors: [529]`; a `{:error, "overloaded_error"}` step ends the
+turn mid-stream, and `{:unfinished_tool_use, id, name, json}` cuts it
+inside a call. Test each agent's refusal, cut-off answer, and empty
+answer this way. Every host callback, `run_event/2`
 included, has returned by the time `perform_job/2` does, so a test that
 subscribed first finds the broadcasts in its mailbox.
 

@@ -3,10 +3,12 @@ defmodule Clementine.LLM.OpenAIStreamParser do
 
   # Parses Responses API SSE streams into Clementine's provider event
   # tuples. A refusal streams as `response.refusal.delta`: it becomes the
-  # turn's text, and the stop reason "refusal". A response that ends
-  # `response.incomplete` stops with "max_tokens" when it ran out of
-  # output tokens (its other reasons pass through as they are), and one
-  # that ends `response.failed` is an error, not an empty answer. Usage
+  # turn's text, and the stop reason "refusal", which beats the turn's
+  # calls: a refused turn runs none. A response that ends
+  # `response.incomplete` stops on its cut (`incomplete_reason/1`), and
+  # one that ends `response.failed` is an error, not an empty answer. A
+  # call whose item ends `status: "incomplete"` never closes, so a turn
+  # cut inside it fails on its cut instead of running it. Usage
   # leaves in the keys `Clementine.Usage` reads
   # (`Clementine.LLM.ProviderUsage.openai/1`).
 
@@ -206,13 +208,15 @@ defmodule Clementine.LLM.OpenAIStreamParser do
     {events, state}
   end
 
-  # Cut off: what streamed is the turn, and nothing more arrives. A call
-  # still open has no complete arguments, so none is replayed.
+  # Cut off: what streamed is the turn, and nothing more arrives. It
+  # stops on its cut, a refusal first. The engine runs the calls that
+  # closed before a cut, as any turn's, unless the cut fell inside one
+  # still open: then the turn fails on its cut, and none runs.
   defp convert_event("response.incomplete", %{"response" => response}, state) do
     usage = ProviderUsage.openai(Map.get(response, "usage"), usage_meta(response))
+    stop_reason = if state.refused, do: "refusal", else: incomplete_reason(response)
 
-    {[{:message_delta, %{"stop_reason" => stop_reason(response, state)}, usage}, {:message_stop}],
-     state}
+    {[{:message_delta, %{"stop_reason" => stop_reason}, usage}, {:message_stop}], state}
   end
 
   defp convert_event("response.failed", %{"response" => response}, state) do
@@ -237,24 +241,37 @@ defmodule Clementine.LLM.OpenAIStreamParser do
     {[], state}
   end
 
+  # A refusal or a content filter beats the calls: the provider stopped
+  # the turn, and none of its calls runs.
   defp stop_reason(response, state) do
     output = Map.get(response, "output") || []
 
     cond do
-      Enum.any?(output, &match?(%{"type" => "function_call"}, &1)) -> "tool_use"
       state.refused -> "refusal"
+      incomplete_reason(response) == "content_filter" -> "content_filter"
+      Enum.any?(output, &whole_call?/1) -> "tool_use"
       true -> incomplete_reason(response)
     end
   end
 
   @doc false
+  # A function call the response finished: an item cut off mid-call ends
+  # `status: "incomplete"` (`call/5` reads it too).
+  def whole_call?(%{"type" => "function_call"} = item), do: item["status"] != "incomplete"
+  def whole_call?(_item), do: false
+
+  @doc false
   # The stop reason a finished response's status gives (`call/5` reads it
-  # too): "max_tokens" for one cut off at max_output_tokens.
+  # too): "max_tokens" for one cut off at max_output_tokens,
+  # "content_filter" for one a content filter stopped, and "incomplete"
+  # for any other incomplete response (max_messages, steered, one
+  # OpenAI adds later). Each fails a final turn (Clementine.Error.stopped/2):
+  # an incomplete response is never a whole answer.
   def incomplete_reason(%{"status" => "incomplete"} = response) do
     case get_in(response, ["incomplete_details", "reason"]) do
       "max_output_tokens" -> "max_tokens"
-      reason when is_binary(reason) -> reason
-      _ -> "incomplete"
+      "content_filter" -> "content_filter"
+      _other -> "incomplete"
     end
   end
 
@@ -295,7 +312,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
       end
 
     {stop_events, state} =
-      if stage == :done and not MapSet.member?(state.closed_calls, call_id) do
+      if stage == :done and whole_call?(item) and not MapSet.member?(state.closed_calls, call_id) do
         {[{:content_block_stop, output_index}],
          %{state | closed_calls: MapSet.put(state.closed_calls, call_id)}}
       else
@@ -315,7 +332,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
       {%{"type" => "function_call"} = item, index}, {events, state} ->
         call_id = Map.get(item, "call_id") || Map.get(item, "id") || "tool_call_#{index}"
 
-        if MapSet.member?(state.closed_calls, call_id) do
+        if MapSet.member?(state.closed_calls, call_id) or not whole_call?(item) do
           {events, state}
         else
           {new_events, state} = replay_unfinished_tool_call(item, index, state)

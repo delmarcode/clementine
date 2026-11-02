@@ -18,7 +18,9 @@ defmodule Clementine.OutputSchema do
   constrain at all (nor is it asked to, for a declared model whose sheet
   leaves `features.structured_outputs` off; see
   `Clementine.LLM.ChatCompletions`). An answer that is not JSON, or does not match, fails
-  the run with a `Clementine.Error` of code `:invalid_output`.
+  the run with a `Clementine.Error` of code `:invalid_output`. A final
+  turn the provider refused or cut off fails the run before it is
+  decoded, `:refused` or `:truncated` (`Clementine.Error.stopped/2`).
 
   The check covers the schema's structure: `type`, `properties`,
   `required`, `additionalProperties`, `items`, `enum`, `const`, `anyOf`,
