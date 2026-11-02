@@ -460,6 +460,45 @@ defmodule Clementine.LLM.PricingTest do
                Pricing.of("deepseek/deepseek-v3.2")
     end
 
+    test "a based_on declaration inherits no prices, and carries its own when it gives them" do
+      put_models(%{
+        "claude-haiku-6" => [based_on: "claude-haiku-5-5", display_name: "Claude Haiku 6"],
+        "claude-sonnet-6" => [
+          based_on: "claude-sonnet-5-5",
+          prices: [
+            currency: "USD",
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.1,
+            cache_write: [five_minutes: 2.5, one_hour: 4.0],
+            over: [
+              prompt_tokens: 200_000,
+              input: 4.0,
+              output: 15.0,
+              cache_read: 0.2,
+              cache_write: [five_minutes: 5.0, one_hour: 8.0]
+            ],
+            source: "https://example.com/pricing",
+            read: ~D[2027-01-12]
+          ]
+        ]
+      })
+
+      assert :ok = Models.validate_config!()
+
+      # Haiku 5.5's list prices and tier are its own, not the new model's.
+      assert Models.get!("claude-haiku-6").prices == nil
+      assert Pricing.of("claude-haiku-6") == nil
+      assert Clementine.Cost.of(%Clementine.Usage{input_tokens: 10}, "claude-haiku-6") == nil
+
+      assert %Pricing{over: %{prompt_tokens: 200_000}, source: "https://example.com/pricing"} =
+               Models.get!("claude-sonnet-6").prices
+
+      # Over its own line: 200,001 × 4.00 per million.
+      assert %Clementine.Cost{micros: 800_004} =
+               Clementine.Cost.of(%Clementine.Usage{input_tokens: 200_001}, "claude-sonnet-6")
+    end
+
     test "a sub-micro rate fails, naming the model and the key" do
       error =
         boot_error(%{"claude-sonnet-5" => [prices: Keyword.put(@one_rate, :output, 0.0000003)]})
