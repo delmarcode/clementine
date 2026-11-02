@@ -25,7 +25,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     @key {__MODULE__, :config}
 
-    defstruct [:repo, :oban, :queue, :agents, :host, :lifecycle, inline_steps: false]
+    defstruct [:repo, :oban, :queue, :agents, :host, :lifecycle, offered: [], inline_steps: false]
 
     @type t :: %__MODULE__{
             repo: module(),
@@ -34,6 +34,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             agents: %{String.t() => module()},
             host: module() | nil,
             lifecycle: map(),
+            offered: [String.t()],
             inline_steps: boolean()
           }
 
@@ -51,7 +52,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         queue: opts[:queue],
         agents: agents!(opts[:agents]),
         host: host!(opts[:host]),
-        lifecycle: EctoLifecycle.config(repo, AgentRun, [])
+        lifecycle: EctoLifecycle.config(repo, AgentRun, []),
+        offered: offered!()
       }
     end
 
@@ -121,6 +123,24 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             raise ArgumentError, "agent #{inspect(key)} (#{inspect(module)}): #{message}"
         end
       end
+    end
+
+    # The app may build an agent on any model it offers, so each is
+    # checked as an agent's model is, with the model's own defaults.
+    defp offered! do
+      ids = Clementine.Models.offered()
+
+      Enum.each(ids, fn id ->
+        with {:ok, policy} <- Clementine.LLM.Policy.resolve(id, []),
+             :ok <- credentials(policy) do
+          :ok
+        else
+          {:error, message} ->
+            raise ArgumentError, "offered model (config :clementine, :offer): #{message}"
+        end
+      end)
+
+      ids
     end
 
     # The platform the agent's model goes to, with the agent's own

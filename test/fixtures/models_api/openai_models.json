@@ -1,0 +1,54 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-6.2-sol",
+      "object": "model",
+      "created": 1794960000,
+      "owned_by": "openai",
+      "shutdown_date": null
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "object": "model",
+      "created": 1792972800,
+      "owned_by": "openai",
+      "shutdown_date": "2027-10-26"
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "object": "model",
+      "created": 1790640000,
+      "owned_by": "openai",
+      "shutdown_date": null
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "object": "model",
+      "created": 1772668800,
+      "owned_by": "openai",
+      "shutdown_date": "2027-05-01"
+    },
+    {
+      "id": "gpt-5",
+      "object": "model",
+      "created": 1754524800,
+      "owned_by": "openai",
+      "shutdown_date": "2026-12-11"
+    },
+    {
+      "id": "text-embedding-3-large",
+      "object": "model",
+      "created": 1705881600,
+      "owned_by": "system",
+      "shutdown_date": null
+    },
+    {
+      "id": "ft:gpt-6.1-terra:acme::B1x2y3z4",
+      "object": "model",
+      "created": 1795132800,
+      "owned_by": "org-acme",
+      "shutdown_date": null
+    }
+  ]
+}

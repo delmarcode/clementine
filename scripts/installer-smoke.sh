@@ -12,7 +12,8 @@
 # agent whose history/1 reads it, and a host module that stores each turn
 # in run_finished/2 and streams runs through run_event/2,
 # run_transition/2, and run_committed/2. Its test holds a two-turn
-# conversation through the runtime.
+# conversation through the runtime. `mix clementine.models` must report
+# both agents, the chat agent's model one behind the newest Sonnet.
 #
 # Needs the phx_new archive (`mix archive.install hex phx_new`; set
 # MIX_ARCHIVES to use one outside ~/.mix) and a Postgres the generated
@@ -86,6 +87,16 @@ if [ -n "$issues" ]; then
   echo "FAIL: credo --strict flags generated code" >&2
   exit 1
 fi
+# The adoption report reads both agents from the compiled code, with no
+# database: Weather on the newest Sonnet, Chat one behind it.
+report="$(mix clementine.models)"
+echo "$report"
+echo "$report" | grep -Eq '^chat +claude-sonnet-5 +anthropic +active, .+ +claude-sonnet-5-5 +binding none->prefix; thinking \+between_tools -off; cache read 0\.1x->0\.05x; min prefix 1024->512$' ||
+  { echo "FAIL: mix clementine.models did not report the chat agent" >&2; exit 1; }
+echo "$report" | grep -Eq '^weather +claude-sonnet-5-5 +anthropic +active, .+ +- +-$' ||
+  { echo "FAIL: mix clementine.models did not report the weather agent" >&2; exit 1; }
+mix clementine.models --json | grep -q '"newest": "claude-sonnet-5-5"' ||
+  { echo "FAIL: mix clementine.models --json did not report the chat agent's newest" >&2; exit 1; }
 # A test database left by an earlier run would hold tables from migrations
 # with other timestamps.
 MIX_ENV=test mix ecto.drop --quiet

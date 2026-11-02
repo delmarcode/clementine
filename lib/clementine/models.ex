@@ -80,6 +80,7 @@ defmodule Clementine.Models do
   # Built at compile time, so a malformed shipped sheet fails the build.
   @shipped Map.new(@shipped_sheets, &{Keyword.fetch!(&1, :id), Model.new!(&1)})
   @order Enum.map(@shipped_sheets, &Keyword.fetch!(&1, :id))
+  @shipped_read @shipped_sheets |> Enum.map(&Keyword.fetch!(&1, :read)) |> Enum.max(Date)
 
   # Facts an override merges into key by key; every other fact it
   # replaces.
@@ -292,6 +293,51 @@ defmodule Clementine.Models do
         :ok
     end
   end
+
+  @doc """
+  The model ids the app offers: the ones a tenant or an eval may pick
+  where the app builds agents from data (stored rows) rather than
+  declaring each one's model on `use Clementine.Agent`. The offer is the
+  app's; `config :clementine, :offer` points Clementine at it, as a list
+  of ids or a `{module, function, args}` that returns one:
+
+      config :clementine, :offer, {MyApp.Models, :offered, []}
+
+  `{Clementine, ...}` checks each offered id when it starts, as it checks
+  an agent's model with the model's defaults (an unknown or retired id
+  fails boot), and warns for each as for an agent's
+  (`Clementine.Models.Warnings`); `mix clementine.models` reports each
+  beside the agents. Without the config the offer is empty.
+  """
+  @spec offered() :: [String.t()]
+  def offered do
+    case Application.get_env(:clementine, :offer) do
+      nil ->
+        []
+
+      {module, function, args} = mfa
+      when is_atom(module) and is_atom(function) and is_list(args) ->
+        module |> apply(function, args) |> offered!("#{inspect(mfa)} returned")
+
+      ids ->
+        offered!(ids, "config :clementine, :offer is")
+    end
+  end
+
+  defp offered!(ids, what) do
+    if is_list(ids) and Enum.all?(ids, &is_binary/1) do
+      Enum.uniq(ids)
+    else
+      raise ArgumentError,
+            "#{what} #{inspect(ids)}; the offer is a list of model ids " <>
+              ~s|(["claude-sonnet-5-5", ...]), or a {module, function, args} that returns one|
+    end
+  end
+
+  @doc false
+  # The newest `read` date among the sheets this release ships.
+  @spec shipped_read() :: Date.t()
+  def shipped_read, do: @shipped_read
 
   @doc false
   # Whether `id` names a shipped sheet or a model the app's config (as

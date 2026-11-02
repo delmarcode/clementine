@@ -85,7 +85,8 @@ lib/
 │   └── application.ex             # Starts Clementine.TaskSupervisor
 └── mix/
     ├── clementine.ex              # Shared generator machinery (guarded child placement)
-    └── tasks/                     # clementine.install, clementine.gen.agent (Igniter)
+    └── tasks/                     # clementine.install, clementine.gen.agent (Igniter);
+                                   #   clementine.models (the adoption report)
 priv/templates/                    # What the generators write into a host app
 ```
 
@@ -214,9 +215,14 @@ configures `:clementine` itself. The library reads `:models` (a map
 from model id to facts: overrides of the sheets Clementine ships in
 `lib/clementine/models/`, and declarations of models it does not;
 `docs/MODELS.md` has every key), provider credentials and endpoints
-(`anthropic_api_key: {:system, "..."}`, ...), `:retry` for provider
-calls, and `:llm_client` (the mock, in tests). An agent names its own
-model by id, with its own choices for it (`Clementine.LLM.Policy`).
+(`anthropic_api_key: {:system, "..."}`, ...), `:offer` (the model ids an
+app that builds agents from data may pick, which boot checks), `:retry`
+for provider calls, and `:llm_client` (the mock, in tests). An agent
+names its own model by id, with its own choices for it
+(`Clementine.LLM.Policy`). Boot errors come only from the sheets and
+config; a model's dates only warn (`Clementine.Models.Warnings`), and
+`mix clementine.models` reports each agent's model against the newest
+in its line.
 
 ## Common tasks
 
