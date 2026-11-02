@@ -156,11 +156,13 @@ defmodule Clementine.Models.Check do
     |> differing(model.id)
   end
 
-  # Only the types the API states a support for are compared.
+  # Only the types the API states a support for, true or false, are
+  # compared. (A generator, not a match filter: a filter would drop a
+  # stated false, and miss a type the API no longer takes.)
   defp thinking(model, capabilities) do
     stated =
       for {name, type} <- @thinking,
-          supported = supported(capabilities, ["thinking", "types", name]),
+          supported <- [supported(capabilities, ["thinking", "types", name])],
           is_boolean(supported),
           do: {type, supported}
 
@@ -172,7 +174,7 @@ defmodule Clementine.Models.Check do
   defp efforts(model, capabilities) do
     stated =
       for {name, level} <- @efforts,
-          supported = supported(capabilities, ["effort", name]),
+          supported <- [supported(capabilities, ["effort", name])],
           is_boolean(supported),
           do: {level, supported}
 

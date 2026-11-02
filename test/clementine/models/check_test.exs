@@ -158,6 +158,23 @@ defmodule Clementine.Models.CheckTest do
     end
   end
 
+  test "a capability the API no longer states as supported is a difference" do
+    entry =
+      "anthropic_page_1.json"
+      |> fixture_entry("claude-opus-5-5")
+      |> put_in(["capabilities", "thinking", "types", "adaptive", "supported"], false)
+      |> put_in(["capabilities", "effort", "max", "supported"], false)
+      |> put_in(["capabilities", "structured_outputs", "supported"], false)
+
+    assert %{findings: findings} = Check.compare(:anthropic, [entry])
+
+    assert by_model(findings, "claude-opus-5-5") == [
+             {:thinking, [:adaptive], []},
+             {:effort, [:low, :medium, :high, :xhigh, :max], [:low, :medium, :high, :xhigh]},
+             {:structured_outputs, true, false}
+           ]
+  end
+
   test "an app's own read date never moves OpenAI's cutoff for new ids" do
     models = Application.get_env(:clementine, :models)
     on_exit(fn -> Application.put_env(:clementine, :models, models) end)
@@ -194,13 +211,7 @@ defmodule Clementine.Models.CheckTest do
       "claude-sonnet-6" => [based_on: "claude-sonnet-5-5", line: :sonnet, context: 2_000_000]
     })
 
-    entry =
-      @fixtures
-      |> Path.join("anthropic_page_1.json")
-      |> File.read!()
-      |> Jason.decode!()
-      |> Map.fetch!("data")
-      |> Enum.find(&(&1["id"] == "claude-sonnet-6"))
+    entry = fixture_entry("anthropic_page_1.json", "claude-sonnet-6")
 
     assert %{
              findings: [
@@ -222,6 +233,15 @@ defmodule Clementine.Models.CheckTest do
     conn
     |> Plug.Conn.put_resp_content_type("application/json")
     |> Plug.Conn.resp(200, File.read!(Path.join(@fixtures, fixture)))
+  end
+
+  defp fixture_entry(fixture, id) do
+    @fixtures
+    |> Path.join(fixture)
+    |> File.read!()
+    |> Jason.decode!()
+    |> Map.fetch!("data")
+    |> Enum.find(&(&1["id"] == id))
   end
 
   defp by_model(findings, id) do
