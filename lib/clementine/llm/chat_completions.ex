@@ -483,10 +483,8 @@ defmodule Clementine.LLM.ChatCompletions do
     }
   end
 
-  defp stop_reason("stop", _content), do: "end_turn"
-  defp stop_reason("tool_calls", _content), do: "tool_use"
-  defp stop_reason("length", _content), do: "max_tokens"
-  defp stop_reason(reason, _content) when is_binary(reason), do: reason
+  defp stop_reason(reason, _content) when is_binary(reason),
+    do: Clementine.LLM.ChatCompletionsStreamParser.stop_reason(reason)
 
   defp stop_reason(_reason, content) do
     if Enum.any?(content, &match?(%Clementine.LLM.Message.Content.ToolUse{}, &1)) do

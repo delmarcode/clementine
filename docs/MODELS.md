@@ -309,10 +309,16 @@ OpenAI refusal content part or `response.refusal.delta`, a Chat
 Completions `refusal`), a content filter's stop is `"content_filter"`,
 and an answer that ran out of output tokens stops with `"max_tokens"`
 (OpenAI's `response.incomplete` with `max_output_tokens`, Chat
-Completions' `length`); any other incomplete OpenAI response stops with
-`"incomplete"`. A final turn that stops on any of them fails the run,
-`:refused` or `:truncated` (`Clementine.Error.stopped/1`), before a
-schema agent's answer is decoded.
+Completions' `length`); any other incomplete OpenAI response, and a
+Chat Completions finish reason Clementine does not know (OpenRouter's
+`"error"`, a server's own), stops with `"incomplete"`, the server's
+reason kept in the stop details. A refusal or a content filter beats
+the turn's calls on every provider: none runs. A final turn that stops
+on any of them fails the run, `:refused` or `:truncated`
+(`Clementine.Error.stopped/2`), before a schema agent's answer is
+decoded, and so does a turn cut inside a call (an OpenAI call item
+that ends `"incomplete"`, the call a Chat Completions `length` stop
+fell in), whose calls none runs.
 
 ## Prompt caching
 
