@@ -71,6 +71,29 @@ defmodule <%= @app_module %>.AgentsCase do
   through it, storing each as the app does, and a replay that would
   cost the model its reasoning fails the test. Pass `strict: false`
   for the turn of a test that changes the thread on purpose.
+
+  `opts` script the rest of the response:
+
+  - `stop_reason:` any the API sends. `"refusal"` fails the run
+    `:refused`, and `"max_tokens"` on a final answer fails it
+    `:truncated`. `stop_details:` adds a refusal's
+    `%{"category" => ..., "explanation" => ...}`.
+  - `usage:` in the API's keys (`input_tokens`, `output_tokens`,
+    `cache_read_input_tokens`, `cache_creation_input_tokens`,
+    `cache_creation`), over the default of 10 input and 5 output
+    tokens. It reaches the token, cache, and cost metrics as a real
+    response's would.
+  - `api_errors:` HTTP statuses before the answer: `[529]` is retried
+    and answered; `[529, 529, 529]` fails the run `:overloaded`.
+
+  A `{:error, "overloaded_error"}` step in `script` ends the turn
+  mid-stream, and `{:unfinished_tool_use, id, name, "{\"note\": \"Pa"}`
+  ends it cut off inside a call's input (`:truncated`; none of the
+  turn's calls runs). A final turn that writes nothing completes with
+  `stop_reason: "empty"` after tool calls, and fails the run `:empty`
+  without them: script both for a chat agent.
+
+      expect_claude_turn([{:text, "I can't help with"}], stop_reason: "refusal")
   """
   def expect_claude_turn(script, opts \\ []) when is_list(script) do
     Mox.expect(<%= @agents %>.LLMMock, :stream, fn model, system, messages, tools, request ->

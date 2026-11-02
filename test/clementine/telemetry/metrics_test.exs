@@ -160,6 +160,25 @@ defmodule Clementine.Telemetry.MetricsTest do
 
     assert :ok = perform_job(Worker, %{"run_id" => failed.id})
 
+    # A final turn the provider refused, scripted through the Anthropic
+    # fake with the usage it reports, cache tokens included: an error,
+    # never a success, and its tokens and cost count as a real stream's.
+    {:ok, refused} = Runs.start(Echo, "Something it will not do")
+
+    expect(Clementine.LLM.MockClient, :stream, fn model, system, messages, tools, opts ->
+      Clementine.LLM.Anthropic.Fake.stream(model, system, messages, tools, opts, [],
+        stop_reason: "refusal",
+        usage: [
+          input_tokens: 40,
+          output_tokens: 7,
+          cache_read_input_tokens: 900,
+          cache_creation_input_tokens: 300
+        ]
+      )
+    end)
+
+    assert :ok = perform_job(Worker, %{"run_id" => refused.id})
+
     # A queued run cancelled directly: its end names the row's key.
     {:ok, cancelled} = Runs.start(Echo, "Never mind")
     assert {:ok, :finished} = Runs.cancel(cancelled.id)
@@ -356,8 +375,43 @@ defmodule Clementine.Telemetry.MetricsTest do
              series(exports, "clementine_tool_input_repaired_total")
            )
 
-    assert {Map.merge(in_process, %{kind: :error, error_kind: :rollout}), 1} in sum_by(
+    assert {Map.merge(in_process, %{
+              kind: :error,
+              error_kind: :rollout,
+              error_code: :max_iterations
+            }), 1} in sum_by(series(exports, "clementine_rollout_exceptions_total"))
+
+    # The refused run: an error by its code, with the fake's cache tokens
+    # and their cost in the call series.
+    echo = %{lookup | agent_key: "test_echo"}
+    echo_stopped = Map.put(echo, :outcome, :stop)
+
+    assert {Map.merge(echo, %{kind: :error, error_kind: :rollout, error_code: :refused}), 1} in sum_by(
              series(exports, "clementine_rollout_exceptions_total")
+           )
+
+    refute Enum.any?(
+             series(exports, "clementine_rollout_stops_total"),
+             fn {labels, _value} -> labels.agent_key == "test_echo" end
+           )
+
+    assert {Map.put(echo_stopped, :stop_reason, "refusal"), 1} in sum_by(
+             series(exports, "clementine_llm_calls_total")
+           )
+
+    assert {echo_stopped, 1240} in sum_by(series(exports, "clementine_llm_input_tokens_total"))
+
+    assert {echo_stopped, 900} in sum_by(
+             series(exports, "clementine_llm_cache_read_tokens_total")
+           )
+
+    assert {echo_stopped, 300} in sum_by(
+             series(exports, "clementine_llm_cache_write_tokens_total")
+           )
+
+    # 40 × 3.0 + 900 × 0.3 + 300 × 3.75 + 7 × 15.0, per million tokens.
+    assert {Map.put(echo_stopped, :currency, "USD"), 1620} in sum_by(
+             series(exports, "clementine_llm_cost_micros_total")
            )
 
     assert {%{in_process | model: "claude-sonnet-5-5", alias: ""}, 1} in sum_by(
@@ -569,6 +623,30 @@ defmodule Clementine.Telemetry.MetricsTest do
     end
 
     assert code.(:exception) == :exception
+
+    # The engine's own rollout errors, a final turn refused or cut off
+    # among them, label the rollout series by code.
+    rollout_code =
+      &by_name["clementine_rollout_exceptions_total"].tag_values.(%{error_code: &1}).error_code
+
+    for reason <- [
+          "refusal",
+          "content_filter",
+          "max_tokens",
+          "model_context_window_exceeded",
+          "incomplete"
+        ] do
+      %Clementine.Error{code: error_code} = Clementine.Error.stopped(reason)
+      assert rollout_code.(error_code) == error_code
+    end
+
+    assert rollout_code.(Clementine.Error.empty("end_turn").code) == :empty
+
+    for engine_code <- [:max_iterations, :deadline_exceeded, :invalid_output] do
+      assert rollout_code.(engine_code) == engine_code
+    end
+
+    assert rollout_code.(:an_apps_own_code) == :other
     assert code.(:an_apps_own_code) == :other
     assert kind.(:an_apps_own_kind) == :other
     assert code.(nil) == ""

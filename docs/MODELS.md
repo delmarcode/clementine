@@ -303,13 +303,22 @@ the answer, and the engine checks it as always (one markdown fence
 around the JSON is tolerated). Try an agent with tools and an
 `output_schema:` against a new server before relying on `:native`.
 
-A refusal and a cut-off answer explain themselves on every provider:
-the refusal text is the turn's text with stop reason `"refusal"` (an
+A refusal and a cut-off answer read the same on every provider: the
+refusal text is the turn's text with stop reason `"refusal"` (an
 OpenAI refusal content part or `response.refusal.delta`, a Chat
-Completions `refusal`), and an answer that ran out of output tokens
-stops with `"max_tokens"` (OpenAI's `response.incomplete` with
-`max_output_tokens`, Chat Completions' `length`). A schema agent's
-`:invalid_output` error says which.
+Completions `refusal`), a content filter's stop is `"content_filter"`,
+and an answer that ran out of output tokens stops with `"max_tokens"`
+(OpenAI's `response.incomplete` with `max_output_tokens`, Chat
+Completions' `length`); any other incomplete OpenAI response, and a
+Chat Completions finish reason Clementine does not know (OpenRouter's
+`"error"`, a server's own), stops with `"incomplete"`, the server's
+reason kept in the stop details. A refusal or a content filter beats
+the turn's calls on every provider: none runs. A final turn that stops
+on any of them fails the run, `:refused` or `:truncated`
+(`Clementine.Error.stopped/2`), before a schema agent's answer is
+decoded, and so does a turn cut inside a call (an OpenAI call item
+that ends `"incomplete"`, the call a Chat Completions `length` stop
+fell in), whose calls none runs.
 
 ## Prompt caching
 

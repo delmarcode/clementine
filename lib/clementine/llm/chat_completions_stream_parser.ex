@@ -209,18 +209,27 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
 
   # The [DONE] sentinel closes the message: open tool calls get their
   # content_block_stop, then stop_reason and usage flush in message_delta.
-  # A retried stream resets parser state, so `done` only guards duplicate
-  # sentinels within one attempt.
+  # A cut answer's last call is the one the cut fell in (a call's
+  # arguments end only where the next call or the turn does), so it never
+  # closes, and the engine fails the turn on its cut instead of running
+  # half a call. A retried stream resets parser state, so `done` only
+  # guards duplicate sentinels within one attempt.
   defp finish(%State{done: true} = state), do: {[], state}
 
   defp finish(state) do
-    stop_events =
-      Enum.map(state.started_calls, fn {index, _call_id} -> {:content_block_stop, index} end)
+    stop_reason = turn_stop(state)
+
+    closing =
+      if stop_reason in ["max_tokens", "incomplete"],
+        do: Enum.drop(state.started_calls, -1),
+        else: state.started_calls
+
+    stop_events = Enum.map(closing, fn {index, _call_id} -> {:content_block_stop, index} end)
 
     events =
       stop_events ++
         [
-          {:message_delta, %{"stop_reason" => stop_reason(state)},
+          {:message_delta, delta(stop_reason, state),
            ProviderUsage.chat_completions(state.usage, state.usage_meta)},
           {:message_stop}
         ]
@@ -228,12 +237,25 @@ defmodule Clementine.LLM.ChatCompletionsStreamParser do
     {events, %{state | done: true}}
   end
 
-  defp stop_reason(%State{refused: true}), do: "refusal"
-  defp stop_reason(%State{finish_reason: "stop"}), do: "end_turn"
-  defp stop_reason(%State{finish_reason: "tool_calls"}), do: "tool_use"
-  defp stop_reason(%State{finish_reason: "length"}), do: "max_tokens"
-  defp stop_reason(%State{finish_reason: reason}) when is_binary(reason), do: reason
+  # A reason Clementine does not know keeps its name in the stop details.
+  defp delta("incomplete", %State{finish_reason: reason}) when is_binary(reason),
+    do: %{"stop_reason" => "incomplete", "stop_details" => %{"finish_reason" => reason}}
 
-  defp stop_reason(%State{started_calls: started}) when started != [], do: "tool_use"
-  defp stop_reason(_state), do: "end_turn"
+  defp delta(stop_reason, _state), do: %{"stop_reason" => stop_reason}
+
+  defp turn_stop(%State{refused: true}), do: "refusal"
+  defp turn_stop(%State{finish_reason: reason}) when is_binary(reason), do: stop_reason(reason)
+  defp turn_stop(%State{started_calls: started}) when started != [], do: "tool_use"
+  defp turn_stop(_state), do: "end_turn"
+
+  @doc false
+  # The stop reason a finish reason names (`call/5` reads it too). One
+  # Clementine does not know (OpenRouter's "error", a server's own) is
+  # "incomplete": never a whole answer, so a final turn that ends on it
+  # fails :truncated (Clementine.Error.stopped/2).
+  def stop_reason("stop"), do: "end_turn"
+  def stop_reason(reason) when reason in ["tool_calls", "function_call"], do: "tool_use"
+  def stop_reason("length"), do: "max_tokens"
+  def stop_reason("content_filter"), do: "content_filter"
+  def stop_reason(reason) when is_binary(reason), do: "incomplete"
 end

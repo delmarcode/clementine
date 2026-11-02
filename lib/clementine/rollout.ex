@@ -934,6 +934,11 @@ defmodule Clementine.Rollout do
         record_model_call(exec, call, nil, partial.content)
         conclude(exec, unwind(signal))
 
+      {:stopped, error, response, call} ->
+        exec = record_usage(exec, response)
+        record_model_call(exec, call, response.stop_reason, response.content)
+        fail(exec, error)
+
       {:error, reason, usage, call} ->
         exec = record_usage(exec, %{usage: usage})
         record_model_call(exec, call, nil, nil)
@@ -1011,6 +1016,7 @@ defmodule Clementine.Rollout do
       end
 
     duration = System.monotonic_time() - started
+    stopped = stopped_inside_call(acc)
 
     cond do
       signal != nil ->
@@ -1021,6 +1027,15 @@ defmodule Clementine.Rollout do
         emit_llm_stop(metadata, call, nil)
         emit_llm_usage(metadata, call, :aborted, nil)
         {:signal, signal, Accumulator.to_response(acc), call}
+
+      stopped != nil ->
+        # The provider ended the call as it does any other; the turn fails
+        # on its stop, not on the half call the stop fell inside.
+        response = Accumulator.to_response(acc)
+        call = metered(model, duration, response.usage)
+        emit_llm_stop(metadata, call, response.stop_reason)
+        emit_llm_usage(metadata, call, :stop, response.stop_reason)
+        {:stopped, stopped, response, call}
 
       Accumulator.error?(acc) ->
         # What the stream reported before the error burned too, and the
@@ -1048,6 +1063,27 @@ defmodule Clementine.Rollout do
         emit_llm_stop(metadata, call, response.stop_reason)
         emit_llm_usage(metadata, call, :stop, response.stop_reason)
         {:ok, response, call}
+    end
+  end
+
+  # A refusal or a cut that fell inside a tool call (revy's extractor and
+  # yakky's screener answer in tool input, so it is the likeliest cut)
+  # fails the turn on its stop reason, with the unfinished call in `raw`:
+  # its input is half-written at best, and the turn's other calls were
+  # part of the same unfinished answer, so none of them runs.
+  defp stopped_inside_call(acc) do
+    alias Clementine.LLM.StreamParser.Accumulator
+
+    with %Clementine.Error{} = error <-
+           Clementine.Error.stopped(acc.stop_reason, acc.stop_details),
+         %{} = call <- Accumulator.unfinished_call(acc) do
+      %{
+        error
+        | message: "#{error.message} It stopped inside a call to #{call["tool_name"]}.",
+          raw: Map.put(error.raw, "unfinished_call", call)
+      }
+    else
+      _whole -> nil
     end
   end
 
@@ -1161,29 +1197,49 @@ defmodule Clementine.Rollout do
   # gather, bounded by the iteration cap like any other. The continuation
   # joins the paused turn's message, so history holds the turn as one
   # assistant message and the output is the whole turn's text.
+  #
+  # A final turn the provider refused or cut off fails the run
+  # (Clementine.Error.stopped/2), so no refused or partial answer reads
+  # as a completed one, and a host that stores a thread's turns from
+  # Completed never replays it. A refused turn runs none of its tools:
+  # the provider stopped the turn, a tool call it began included.
   defp act(%Execution{} = exec, response) do
-    exec = %{exec | messages: append_turn(exec, response), paused?: false}
+    turn = turn(exec, response)
+    exec = %{exec | messages: put_turn(exec, turn), paused?: false}
+    stopped = Clementine.Error.stopped(response.stop_reason, response.stop_details)
 
     cond do
+      match?(%Clementine.Error{code: :refused}, stopped) ->
+        fail(exec, stopped)
+
       LLM.tool_use?(response) ->
         act_on_tools(exec, LLM.get_tool_uses(response))
 
       LLM.paused?(response) ->
         boundary(%{exec | paused?: true})
 
+      stopped != nil ->
+        fail(exec, stopped)
+
       true ->
-        case final_output(exec, List.last(exec.messages), response) do
+        messages = Enum.drop(exec.messages, exec.prefix_len)
+
+        # A final turn that wrote no text completes "empty" when the run
+        # called tools (an agent whose answer is its tool calls is done;
+        # a chat shows that the assistant did not reply), and fails
+        # :empty when it did nothing at all.
+        case final_output(exec, turn, response) do
           {:ok, output} ->
-            conclude(
-              exec,
-              {:ok,
-               Clementine.Result.completed(
-                 input_message: exec.input_message,
-                 messages: Enum.drop(exec.messages, exec.prefix_len),
-                 output: output,
-                 usage: exec.usage
-               )}
-            )
+            cond do
+              not (is_binary(output) and String.trim(output) == "") ->
+                complete(exec, messages, output, response.stop_reason)
+
+              Enum.any?(messages, &called_tools?/1) ->
+                complete(exec, messages, "", "empty")
+
+              true ->
+                fail(exec, Clementine.Error.empty(response.stop_reason))
+            end
 
           {:error, %Clementine.Error{} = error} ->
             fail(exec, error)
@@ -1191,17 +1247,47 @@ defmodule Clementine.Rollout do
     end
   end
 
+  defp complete(exec, messages, output, stop_reason) do
+    conclude(
+      exec,
+      {:ok,
+       Clementine.Result.completed(
+         input_message: exec.input_message,
+         messages: messages,
+         output: output,
+         stop_reason: stop_reason,
+         usage: exec.usage
+       )}
+    )
+  end
+
+  defp called_tools?(%AssistantMessage{} = message), do: AssistantMessage.has_tool_use?(message)
+  defp called_tools?(_message), do: false
+
   # The paused turn keeps its binding: the continuation answered a request
   # that ended with the turn itself, and the joined turn replays after
   # what the paused one did.
-  defp append_turn(%Execution{paused?: true, messages: messages}, response) do
+  defp turn(%Execution{paused?: true, messages: messages}, response) do
     %AssistantMessage{} = paused = List.last(messages)
-    List.replace_at(messages, -1, %{paused | content: paused.content ++ response.content})
+    %{paused | content: paused.content ++ response.content}
   end
 
-  defp append_turn(%Execution{messages: messages}, response) do
-    messages ++ [%{AssistantMessage.new(response.content) | binding: response.binding}]
-  end
+  defp turn(%Execution{}, response),
+    do: %{AssistantMessage.new(response.content) | binding: response.binding}
+
+  # Every turn is a message, a final turn of no blocks too (Claude's
+  # empty end_turn, which it sends most after tool results): it closes
+  # the exchange before it, so a window or an app's trim that drops an
+  # open exchange at a thread's end (Clementine.History) keeps the calls
+  # it made, and a skill's system message is followed by an assistant
+  # turn. No provider is sent an empty message: Anthropic's encoder drops
+  # it, or, after a system message, sends its stand-in
+  # (Clementine.LLM.Anthropic.Binding), and the others encode it to
+  # nothing.
+  defp put_turn(%Execution{paused?: true, messages: messages}, turn),
+    do: List.replace_at(messages, -1, turn)
+
+  defp put_turn(%Execution{messages: messages}, turn), do: messages ++ [turn]
 
   # The output is the final turn's text, the paused turn's included. An
   # agent with an output_schema answers in JSON: the output is the decoded
@@ -1957,7 +2043,12 @@ defmodule Clementine.Rollout do
         :telemetry.execute(
           [:clementine, :rollout, :exception],
           measurements,
-          Map.merge(identity(exec), %{kind: :error, reason: error, error_kind: error.kind})
+          Map.merge(identity(exec), %{
+            kind: :error,
+            reason: error,
+            error_kind: error.kind,
+            error_code: error.code
+          })
         )
 
       _stopped ->
@@ -1980,8 +2071,8 @@ defmodule Clementine.Rollout do
   # A genuine raise concludes no exit value, so `conclude/2` never sees it:
   # the span still terminates — `:exception` with the raise's kind and
   # stacktrace, no iteration count — and the raise continues to the
-  # runner's rescue tier. Its error kind is the one the runner's rescue
-  # gives it (`Clementine.Error.from_exception/3`).
+  # runner's rescue tier. Its error kind and code are the ones the
+  # runner's rescue gives it (`Clementine.Error.from_exception/3`).
   defp emit_rollout_raise(%Execution{} = exec, kind, reason, stacktrace) do
     :telemetry.execute(
       [:clementine, :rollout, :exception],
@@ -1990,7 +2081,8 @@ defmodule Clementine.Rollout do
         kind: kind,
         reason: reason,
         stacktrace: stacktrace,
-        error_kind: :runtime
+        error_kind: :runtime,
+        error_code: :exception
       })
     )
   end
