@@ -250,10 +250,21 @@ says so; a run that did nothing at all fails:
   requires. No provider is sent it as an empty message, and no history
   sends a text block that is empty or only whitespace, which the API
   refuses on every later turn.
-- A failed turn returns no messages, so a host that stores a thread's
-  turns from `Result.Completed` stores nothing of it. Keep the user's
-  message that drew a refusal in the thread: it is what the user said,
-  and two user messages in a row are valid on every provider.
+- A failed run keeps the steps it completed. `Result.Failed`'s
+  `messages` are each model turn whose tool calls all settled, their
+  results, and the system messages a skill load added, closed by an
+  assistant message of no content; the step that failed is not in them
+  (the refused or cut-off turn, an answer that did not decode, calls
+  that did not run). They are `[]` when no step completed. Store them
+  in `run_finished/2` as you store a completed turn's: they are the
+  record of what the run's tools did (a sent email, a flagged
+  emergency), so the next turn does not do it again. The closing turn
+  ends the exchange, as an empty final turn does: `History.window/2`
+  and an app's trim keep it, the next prompt replays valid on every
+  provider, and no provider is sent it as an empty message.
+- Keep the user's message that drew a refusal in the thread too: it is
+  what the user said, and two user messages in a row are valid on
+  every provider.
 - A refusal is usually not the last word. Anthropic's advice is to send
   the same request to another Claude model, which usually answers it.
   Its server-side fallback (`fallbacks: "default"`, a beta) does that
@@ -299,9 +310,11 @@ What each kind of agent does with it:
   a way to ask again), never silence, and store the turn's messages as
   usual: the empty turn is what closes its tool calls (a sent email, a
   flagged emergency). `:empty` (a turn that did nothing) shows the same.
-  `"on_failure": "retry"` runs a refused or cut-off turn again, which
-  is likely refused or cut off again, and repeats what its tools did (a
-  sent email): keep it for turns whose tools are safe to repeat.
+  A thread never retries a refused, cut-off, or empty turn, or one
+  whose tools had effects: `"on_failure": "retry"` runs a failed turn
+  again only when its error is retryable (an overloaded provider, an
+  outage) and its run had no effects (`Result.Failed`'s `effects?`), so
+  a retry never sends an email twice.
 
 In tests, script the stop through the Anthropic fake
 (`expect_claude_turn/2`):
@@ -705,9 +718,11 @@ defmodule MyApp.Agents.Host do
 
   # What must happen when a run ends. Inside the transaction that ends
   # it: these writes, and the mail job, commit with the run's end or not
-  # at all. A chat turn stores its messages here.
+  # at all. A chat turn stores its messages here, and a failed one the
+  # steps it completed (its tool calls and their results).
   @impl true
-  def run_finished(%{agent_key: "chat"} = run, %Result.Completed{} = result) do
+  def run_finished(%{agent_key: "chat"} = run, %ended{} = result)
+      when ended in [Result.Completed, Result.Failed] do
     MyApp.Chat.append!(run.subject_id, [result.input_message | result.messages])
   end
 

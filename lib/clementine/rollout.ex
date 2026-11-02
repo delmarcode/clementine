@@ -227,14 +227,15 @@ defmodule Clementine.Rollout do
   @typedoc """
   The closed return set of `execute/2`. Every value a rollout can produce is
   named here; anything else is a contract violation the runner converts to
-  `finish(failed)` — never a crash.
+  `finish(failed)` — never a crash. A failure carries its error and the
+  steps the run completed before it (`Clementine.Result.Failed`).
   """
   @type execute_result ::
           {:ok, Clementine.Result.Completed.t()}
           | {:suspend, Clementine.Suspension.Request.t()}
           | {:cancelled, reason :: term()}
           | :drained
-          | {:error, Clementine.Error.t()}
+          | {:error, Clementine.Result.Failed.t()}
           | :lost_lease
 
   @doc """
@@ -256,9 +257,9 @@ defmodule Clementine.Rollout do
     no pending operation (an `{:until, t}` wait resumed with `:elapsed`,
     or host-built prior messages) simply continues the loop. An
     unreadable or incompatible checkpoint — unknown version, undecodable
-    envelope, or a pending call this rollout cannot support — returns
-    `{:error, %Error{code: :incompatible_checkpoint}}`; never a crash and
-    never a bare atom.
+    envelope, or a pending call this rollout cannot support — fails with
+    `%Error{code: :incompatible_checkpoint}`; never a crash and never a
+    bare atom.
   - `:emit` - a `Clementine.Events.Stamper` for execution events; omitted
     means no events.
   - `:trace` - the runner's trace buffer: the rollout records an entry
@@ -2030,7 +2031,35 @@ defmodule Clementine.Rollout do
 
   defp fail(%Execution{} = exec, %Clementine.Error{} = error) do
     emit_event(exec, :error, %{error: error})
-    conclude(exec, {:error, error})
+
+    conclude(
+      exec,
+      {:error,
+       %Clementine.Result.Failed{
+         error: error,
+         input_message: exec.input_message,
+         messages: kept_steps(Enum.drop(exec.messages, exec.prefix_len)),
+         usage: exec.usage
+       }}
+    )
+  end
+
+  # A failed run keeps every step whose tool calls all settled, so the
+  # record says which tools ran, and drops the step that failed: the
+  # last assistant turn, when nothing answered it (a refused or cut-off
+  # turn, an answer that did not decode, a batch a failure stopped
+  # before it settled). Each step ends with its results and the system
+  # messages its skill loads added, so whatever follows the last one is
+  # that turn. An empty assistant turn closes what is kept, as a run's
+  # own empty final turn does: `Clementine.History.window/2` and an
+  # app's trim keep a closed exchange, and after a skill's system
+  # message the next prompt needs an assistant turn between them. No
+  # provider is sent it empty (Clementine.LLM.Anthropic.Binding).
+  defp kept_steps(generated) do
+    case generated |> Enum.reverse() |> Enum.drop_while(&match?(%AssistantMessage{}, &1)) do
+      [] -> []
+      kept -> Enum.reverse([AssistantMessage.new([]) | kept])
+    end
   end
 
   # Every exit from the loop flows through here exactly once — at the site
@@ -2045,7 +2074,7 @@ defmodule Clementine.Rollout do
     }
 
     case result do
-      {:error, %Clementine.Error{} = error} ->
+      {:error, %Clementine.Result.Failed{error: error}} ->
         :telemetry.execute(
           [:clementine, :rollout, :exception],
           measurements,

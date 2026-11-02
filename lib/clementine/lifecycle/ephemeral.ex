@@ -13,7 +13,8 @@ defmodule Clementine.Lifecycle.Ephemeral do
 
   The host projection collapses to remembering the terminal result:
   every transition into a terminal status carries its `Result`, and
-  `result/1` hands it back to the facade.
+  `result/1` hands it back to the facade, a failed or interrupted one
+  with the run's effect fence (`effects?`).
 
   `ctx` is the value returned by `create/1`; it is single-process by
   construction and never escapes the facade.
@@ -22,6 +23,7 @@ defmodule Clementine.Lifecycle.Ephemeral do
   @behaviour Clementine.Lifecycle
 
   alias Clementine.Lifecycle.{Facts, Transition}
+  alias Clementine.Result
 
   @type ctx :: %{key: {module(), reference()}, forward_to: {pid(), reference()} | nil}
 
@@ -80,7 +82,12 @@ defmodule Clementine.Lifecycle.Ephemeral do
              facts.epoch == transition.expect.epoch do
           new_facts = apply_set(facts, transition.set, now)
           state = %{state | facts: new_facts}
-          state = if transition.result, do: %{state | result: transition.result}, else: state
+
+          state =
+            if transition.result,
+              do: %{state | result: Result.with_effects(transition.result, new_facts.effects?)},
+              else: state
+
           Process.put(key, state)
           {:ok, new_facts}
         else

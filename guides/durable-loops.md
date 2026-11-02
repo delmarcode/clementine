@@ -77,7 +77,9 @@ policies as creation args: `"busy"` (`"queue"`, the default, or
 place once the cancel completes), `"on_failure"` (`"surface"`, the
 default, or `"retry"` after `"retry_after_ms"`), and
 `"retry_interrupted"` (one immediate retry of a turn whose node died).
-Start it, feed it, and read its turns back:
+A retry runs only a turn whose run had no effects, and a failed one
+only on an error a retry gets past, so it never repeats a sent email
+or a refusal. Start it, feed it, and read its turns back:
 
 <!-- guide-sample: parse-only -->
 ```elixir

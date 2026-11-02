@@ -58,11 +58,42 @@ defmodule Clementine.Result do
     and one it cut off with `code: :truncated` (`Clementine.Error.stopped/2`).
     A run that wrote nothing and called no tools fails with `code: :empty`
     (`Clementine.Error.empty/1`).
+
+    `messages` are the steps the run completed before it failed: each
+    model turn whose tool calls all settled, their results, and the
+    system messages a skill load added after them, closed by an
+    assistant message of no content. The failing step is not in them: a
+    refused or cut-off turn, an answer that did not decode, a turn whose
+    calls did not all settle. So history records which tools ran (a
+    sent email, a flagged emergency), and the next turn replays valid:
+    the closing turn ends the exchange, as `Clementine.Result.Completed`'s
+    empty final turn does, and no provider is sent it as an empty
+    message. `messages` is `[]` when no step completed, and when the run
+    raised. `input_message` is the run's prompt, as on a completed run,
+    so a failed one folds the same way (`history ++ [input_message] ++
+    messages`); a host that stored the user's message when it arrived
+    stores `messages` alone.
+
+    `effects?` is the run's effect fence as its lifecycle stored it
+    (`agent_runs.effects` on the runtime): `true` once a tool not
+    declared `retry: :safe` ran, or may have, so running the work again
+    could repeat it; `nil` when the lifecycle that ended the run did
+    not say. `Clementine.Thread` retries a failed turn only on `false`.
     """
     @enforce_keys [:error]
-    defstruct error: nil, usage: %Clementine.Usage{}
+    defstruct error: nil,
+              input_message: nil,
+              messages: [],
+              effects?: nil,
+              usage: %Clementine.Usage{}
 
-    @type t :: %__MODULE__{error: Clementine.Error.t(), usage: Clementine.Usage.t()}
+    @type t :: %__MODULE__{
+            error: Clementine.Error.t(),
+            input_message: Clementine.LLM.Message.message() | nil,
+            messages: [Clementine.LLM.Message.message()],
+            effects?: boolean() | nil,
+            usage: Clementine.Usage.t()
+          }
   end
 
   defmodule Cancelled do
@@ -88,12 +119,19 @@ defmodule Clementine.Result do
   end
 
   defmodule Interrupted do
-    @moduledoc "Execution infrastructure stopped before a terminal result."
+    @moduledoc """
+    Execution infrastructure stopped before a terminal result.
+
+    `effects?` is the run's effect fence, as on `Clementine.Result.Failed`:
+    a drain interrupts a run only when it had effects (it requeues one
+    without), and the reaper interrupts a dead node's run either way.
+    """
     @enforce_keys [:reason]
-    defstruct reason: nil, usage: %Clementine.Usage{}
+    defstruct reason: nil, effects?: nil, usage: %Clementine.Usage{}
 
     @type t :: %__MODULE__{
             reason: Clementine.InterruptReason.t(),
+            effects?: boolean() | nil,
             usage: Clementine.Usage.t()
           }
   end
@@ -126,6 +164,14 @@ defmodule Clementine.Result do
   def status(%Failed{}), do: :failed
   def status(%Cancelled{}), do: :cancelled
   def status(%Interrupted{}), do: :interrupted
+
+  @doc false
+  # A lifecycle that ends a run stamps its stored effect fence on the
+  # ends a retry decides on, before the host or a loop hears of them.
+  @spec with_effects(t(), boolean()) :: t()
+  def with_effects(%Failed{} = result, effects?), do: %{result | effects?: effects?}
+  def with_effects(%Interrupted{} = result, effects?), do: %{result | effects?: effects?}
+  def with_effects(result, _effects?), do: result
 
   @doc "Usage is present on every variant, by design."
   @spec usage(t()) :: Usage.t()

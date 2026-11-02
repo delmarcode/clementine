@@ -1,8 +1,9 @@
 defmodule ClementineSmoke.Agents.Host do
   @moduledoc """
-  The agents' host. A chat turn's messages commit with its end, and a
-  conversation's runs stream on its PubSub topic: text as it arrives,
-  each change of status, and the end.
+  The agents' host. A chat turn's messages commit with its end (a
+  failed turn's: the steps it completed), and a conversation's runs
+  stream on its PubSub topic: text as it arrives, each change of status,
+  and the end.
   """
 
   @behaviour Clementine.Host
@@ -26,7 +27,8 @@ defmodule ClementineSmoke.Agents.Host do
   def run_transition(_run, _transition), do: :ok
 
   @impl true
-  def run_finished(%{agent_key: "chat"} = run, %Result.Completed{} = result) do
+  def run_finished(%{agent_key: "chat"} = run, %ended{} = result)
+      when ended in [Result.Completed, Result.Failed] do
     Conversations.append!(run.subject_id, [result.input_message | result.messages])
   end
 

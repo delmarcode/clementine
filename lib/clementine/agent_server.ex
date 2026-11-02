@@ -7,7 +7,8 @@ defmodule Clementine.AgentServer do
   the house: convenience for interactive local use, never the ontology.
 
   Each turn builds a rollout with `messages: history`; a `Completed` result
-  folds back as `history ++ [input_message] ++ messages`. Results follow
+  folds back as `history ++ [input_message] ++ messages`, and so does a
+  `Failed` one that completed steps before it failed. Results follow
   `Clementine.run/3`'s contract — `{:ok, %Clementine.Result.Completed{}}`
   or `{:error, result}` with the other terminal `Clementine.Result`
   variants, every one carrying usage.
@@ -457,10 +458,18 @@ defmodule Clementine.AgentServer do
       end
 
       # The history fold: history ++ [input_message] ++ generated messages —
-      # stated this way so the fold cannot silently drop user input.
+      # stated this way so the fold cannot silently drop user input. A
+      # failed turn folds the steps it completed, so the next turn knows
+      # what its tools did; one that completed none folds nothing.
       defp apply_history(state, %Clementine.Result.Completed{} = result) do
         %{state | history: state.history ++ [result.input_message | result.messages]}
       end
+
+      defp apply_history(state, %Clementine.Result.Failed{messages: [_ | _]} = result) do
+        %{state | history: state.history ++ [result.input_message | result.messages]}
+      end
+
+      defp apply_history(state, _result), do: state
 
       defp validate_history!(history) when is_list(history) do
         Enum.each(history, fn
@@ -536,21 +545,12 @@ defmodule Clementine.AgentServer do
         notify_stream_consumer(task_info, result)
       end
 
-      defp maybe_apply_task_history(
-             state,
-             %{stream_consumer: consumer},
-             {:ok, %Clementine.Result.Completed{} = result}
-           ) do
+      defp maybe_apply_task_history(state, %{stream_consumer: consumer}, {_status, result}) do
         if Process.alive?(consumer), do: apply_history(state, result), else: state
       end
 
-      defp maybe_apply_task_history(
-             state,
-             _task_info,
-             {:ok, %Clementine.Result.Completed{} = result}
-           ) do
-        apply_history(state, result)
-      end
+      defp maybe_apply_task_history(state, _task_info, {_status, result}),
+        do: apply_history(state, result)
 
       defp maybe_apply_task_history(state, _task_info, _result), do: state
 

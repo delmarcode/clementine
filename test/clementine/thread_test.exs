@@ -4,7 +4,9 @@ defmodule Clementine.ThreadTest do
   queue, interrupt, surface, retry, retry-interrupted, and poison, each
   observed through the children the thread asked for and the model calls
   they made; then the decision table on its own, where the script path
-  cannot reach (a turn interrupted twice, a stale fire, bad args).
+  cannot reach (a turn interrupted twice, a stale fire, bad args). A
+  retry never repeats an effectful tool, nor a failure the same request
+  would meet again.
   """
 
   use ExUnit.Case, async: true
@@ -33,6 +35,22 @@ defmodule Clementine.ThreadTest do
     def run(_args, _context) do
       send(Process.whereis(:clementine_thread_test), {:clementine, :drain})
       {:ok, "draining"}
+    end
+  end
+
+  defmodule SendReply do
+    @moduledoc false
+    # An effectful tool with no idempotency key, as Meli's email reply
+    # is: each call tells the test, so a repeat shows.
+    use Clementine.Tool,
+      name: "send_reply",
+      description: "Sends the reply.",
+      parameters: []
+
+    @impl true
+    def run(_args, _context) do
+      send(Process.whereis(:clementine_thread_test), :reply_sent)
+      {:ok, "sent"}
     end
   end
 
@@ -112,8 +130,8 @@ defmodule Clementine.ThreadTest do
       assert spawns() == [{{:turn, "m1"}, "one"}, {{:turn, "m2"}, "two"}]
     end
 
-    test "retry: a failed turn runs again under the same tag after the delay, then the queue moves" do
-      expect_failure()
+    test "retry: a retryable failure with no effects runs again under the same tag after the delay, then the queue moves" do
+      expect_overloaded()
       expect_answer("one, retried")
       expect_answer("two")
 
@@ -126,8 +144,8 @@ defmodule Clementine.ThreadTest do
     end
 
     test "retry: the retry fails too; the turn is over" do
-      expect_failure()
-      expect_failure()
+      expect_overloaded()
+      expect_overloaded()
       expect_answer("two")
 
       run_thread(%{"agent" => "chat", "on_failure" => "retry", "retry_after_ms" => 1_000}, [
@@ -137,6 +155,47 @@ defmodule Clementine.ThreadTest do
 
       assert spawns() == [{{:turn, "m1"}, "one"}, {{:turn, "m1"}, "one"}, {{:turn, "m2"}, "two"}]
     end
+
+    test "retry: a turn that sent its reply and was then cut off is over, and the reply went once" do
+      Process.register(self(), :clementine_thread_test)
+      expect_tool_call("send_reply")
+      expect_stop("max_tokens")
+      expect_answer("two")
+
+      run_thread(
+        %{"agent" => "chat", "on_failure" => "retry"},
+        [message("m1", "one"), message("m2", "two")],
+        tools: [SendReply]
+      )
+
+      assert spawns() == [{{:turn, "m1"}, "one"}, {{:turn, "m2"}, "two"}]
+      assert_received :reply_sent
+      refute_received :reply_sent
+    end
+
+    test "retry: a refused turn with no effects is over: the same request is refused again" do
+      expect_stop("refusal")
+      expect_answer("two")
+
+      run_thread(%{"agent" => "chat", "on_failure" => "retry"}, [
+        message("m1", "one"),
+        message("m2", "two")
+      ])
+
+      assert spawns() == [{{:turn, "m1"}, "one"}, {{:turn, "m2"}, "two"}]
+    end
+
+    test "retry: an error that is not retryable is over, whatever it is (a client bug here)" do
+      expect_failure()
+      expect_answer("two")
+
+      run_thread(%{"agent" => "chat", "on_failure" => "retry"}, [
+        message("m1", "one"),
+        message("m2", "two")
+      ])
+
+      assert spawns() == [{{:turn, "m1"}, "one"}, {{:turn, "m2"}, "two"}]
+    end
   end
 
   describe "run_local: retry_interrupted" do
@@ -145,21 +204,14 @@ defmodule Clementine.ThreadTest do
       :ok
     end
 
-    test "an interrupted turn runs again at once, under the same tag" do
-      expect_drain()
-      expect_answer("one, after the restart")
-
-      run_thread(%{"agent" => "chat"}, [message("m1", "one")], tools: [DrainTool])
-
-      assert spawns() == [{{:turn, "m1"}, "one"}, {{:turn, "m1"}, "one"}]
-    end
-
-    test "retry_interrupted false: the interrupted turn is over" do
+    # The script path's one interrupted end is a drain with effects; a
+    # turn with none is retried (handle/2 below).
+    test "an interrupted turn whose run had effects is over: running it again would repeat them" do
       expect_drain()
       expect_answer("two")
 
       run_thread(
-        %{"agent" => "chat", "retry_interrupted" => false},
+        %{"agent" => "chat"},
         [message("m1", "one"), message("m2", "two")],
         tools: [DrainTool]
       )
@@ -224,18 +276,12 @@ defmodule Clementine.ThreadTest do
         Thread.handle({:message, message("m1", "one")}, idle())
 
       assert {:ok, state, [{:run, {:turn, "m1"}, %{"prompt" => "one"}}]} =
-               Thread.handle(
-                 {:completed, {:turn, "m1"}, Result.interrupted(:lease_expired)},
-                 state
-               )
+               Thread.handle({:completed, {:turn, "m1"}, died(effects?: false)}, state)
 
       assert state["turn"]["retried"] == true
 
       assert {:ok, %{"turn" => nil}, []} =
-               Thread.handle(
-                 {:completed, {:turn, "m1"}, Result.interrupted(:lease_expired)},
-                 state
-               )
+               Thread.handle({:completed, {:turn, "m1"}, died(effects?: false)}, state)
     end
 
     test "a retried turn that fails is not retried again, whatever the policy" do
@@ -243,10 +289,53 @@ defmodule Clementine.ThreadTest do
       {:ok, state, _} = Thread.handle({:message, message("m1", "one")}, state)
 
       {:ok, state, _} =
-        Thread.handle({:completed, {:turn, "m1"}, Result.interrupted(:lease_expired)}, state)
+        Thread.handle({:completed, {:turn, "m1"}, died(effects?: false)}, state)
 
       assert {:ok, %{"turn" => nil}, []} =
-               Thread.handle({:completed, {:turn, "m1"}, Result.failed(:boom)}, state)
+               Thread.handle({:completed, {:turn, "m1"}, overloaded(effects?: false)}, state)
+    end
+
+    test "a retry runs only a turn that repeats nothing: no effects, and an error a retry gets past" do
+      state = idle(%{"on_failure" => "retry"})
+
+      cases = [
+        {overloaded(effects?: false), [{:timer, {:retry, "m1"}, 300_000}]},
+        {died(effects?: false),
+         [{:run, {:turn, "m1"}, %{"agent" => "chat", "metadata" => %{}, "prompt" => "one"}}]},
+        # It sent an email, then failed: running it again sends another.
+        {overloaded(effects?: true), []},
+        {died(effects?: true), []},
+        # A lifecycle that did not say whether the run had effects.
+        {overloaded(effects?: nil), []},
+        {died(effects?: nil), []},
+        # The same request meets the same answer.
+        {failed(:refused, effects?: false), []},
+        {failed(:truncated, effects?: false), []},
+        {failed(:empty, effects?: false), []},
+        {failed(:invalid_output, effects?: false), []},
+        {%{Result.failed(:max_iterations_reached) | effects?: false}, []},
+        {Result.cancelled(%{"code" => "cancelled"}), []}
+      ]
+
+      for {result, actions} <- cases do
+        {:ok, state, _} = Thread.handle({:message, message("m1", "one")}, state)
+
+        assert {:ok, _state, ^actions} =
+                 Thread.handle({:completed, {:turn, "m1"}, result}, state),
+               "#{inspect(result)} should give #{inspect(actions)}"
+      end
+    end
+
+    test "each policy switches its own retry off" do
+      for {args, result} <- [
+            {%{}, overloaded(effects?: false)},
+            {%{"on_failure" => "retry", "retry_interrupted" => false}, died(effects?: false)}
+          ] do
+        {:ok, state, _} = Thread.handle({:message, message("m1", "one")}, idle(args))
+
+        assert {:ok, %{"turn" => nil}, []} =
+                 Thread.handle({:completed, {:turn, "m1"}, result}, state)
+      end
     end
 
     test "interrupt during a retry wait drops the retry and runs the new message now" do
@@ -254,7 +343,7 @@ defmodule Clementine.ThreadTest do
       {:ok, state, _} = Thread.handle({:message, message("m1", "one")}, state)
 
       {:ok, state, [{:timer, {:retry, "m1"}, 300_000}]} =
-        Thread.handle({:completed, {:turn, "m1"}, Result.failed(:boom)}, state)
+        Thread.handle({:completed, {:turn, "m1"}, overloaded(effects?: false)}, state)
 
       assert {:ok, state,
               [{:cancel_timer, {:retry, "m1"}}, {:run, {:turn, "m2"}, %{"prompt" => "two"}}]} =
@@ -365,6 +454,16 @@ defmodule Clementine.ThreadTest do
 
   defp message(id, prompt), do: %{"id" => id, "prompt" => prompt}
 
+  # Ends as a lifecycle reports them: the effect fence stamped on.
+  defp overloaded(effects?: effects?),
+    do: %{Result.failed({:api_error, 529, ""}) | effects?: effects?}
+
+  defp died(effects?: effects?), do: %{Result.interrupted(:lease_expired) | effects?: effects?}
+
+  defp failed(code, effects?: effects?) do
+    %Result.Failed{error: %Error{kind: :rollout, code: code}, effects?: effects?}
+  end
+
   defp idle(overrides \\ %{}) do
     {:ok, state, []} = Thread.init(Map.merge(%{"agent" => "chat"}, overrides))
     state
@@ -397,6 +496,36 @@ defmodule Clementine.ThreadTest do
       [
         {:text_delta, text},
         {:message_delta, %{"stop_reason" => "end_turn"},
+         %{"input_tokens" => 7, "output_tokens" => 3}}
+      ]
+    end)
+  end
+
+  # The provider overloaded mid-stream: a failure a retry gets past.
+  defp expect_overloaded do
+    expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+      [{:error, %{"type" => "overloaded_error", "message" => "Overloaded"}}]
+    end)
+  end
+
+  defp expect_tool_call(name) do
+    expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+      [
+        {:tool_use_start, "tu_1", name},
+        {:input_json_delta, "tu_1", "{}"},
+        {:content_block_stop, 0},
+        {:message_delta, %{"stop_reason" => "tool_use"},
+         %{"input_tokens" => 5, "output_tokens" => 2}}
+      ]
+    end)
+  end
+
+  # A final turn that ends on `stop_reason`: "refusal" or "max_tokens".
+  defp expect_stop(stop_reason) do
+    expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+      [
+        {:text_delta, "The answer is"},
+        {:message_delta, %{"stop_reason" => stop_reason},
          %{"input_tokens" => 7, "output_tokens" => 3}}
       ]
     end)

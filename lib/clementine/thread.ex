@@ -42,15 +42,24 @@ defmodule Clementine.Thread do
   - `"on_failure"`: `"surface"` (the default) moves on from a turn that
     failed; the host saw its `Clementine.Result.Failed`. `"retry"` runs
     the turn again after `"retry_after_ms"` (default `300000`, five
-    minutes), under the same tag.
+    minutes), under the same tag, when a retry can repeat nothing (below).
   - `"retry_interrupted"`: `true` (the default) runs a turn whose node
     died again at once, when the reaper's `Clementine.Result.Interrupted`
-    arrives.
+    arrives, when a retry can repeat nothing.
 
-  A turn is retried at most once, whichever policy asked, and the retry
-  runs under the same tag, so `Clementine.Runs.child/2` finds it where it
-  found the first attempt. Args outside this contract end the loop
-  `failed` in its first step, with the reason in the run's error.
+  A turn is retried only when its run had no effects (`effects?: false`
+  on the result: no tool that is not `retry: :safe` ran, the fence a
+  drain's requeue reads), so a retry never sends an email twice; and a
+  failed turn only when its error is retryable (`Clementine.Error`'s
+  `retryable?`: an overloaded or rate-limited provider, an outage, the
+  network). A refused, cut-off, or empty turn, an answer that did not
+  decode, and a turn out of iterations or time would get the same answer
+  again, so the thread moves on from it, as from any turn it does not
+  retry. A turn is retried at most once, whichever policy asked, and
+  the retry runs under the same tag, so `Clementine.Runs.child/2` finds
+  it where it found the first attempt. Args outside this contract end
+  the loop `failed` in its first step, with the reason in the run's
+  error.
 
   ## Messages
 
@@ -130,22 +139,20 @@ defmodule Clementine.Thread do
   end
 
   def handle({:completed, {:turn, id}, result}, %{"turn" => %{"id" => id} = turn} = state) do
-    cond do
-      # The turn was cancelled for the message at the head of the queue.
-      turn["phase"] == "interrupting" ->
-        advance(state)
+    # A turn cancelled for the message at the head of the queue is over,
+    # and so is one retried once already.
+    retry = if turn["phase"] != "interrupting" and not turn["retried"], do: retry(result, state)
 
-      match?(%Result.Failed{}, result) and state["on_failure"] == "retry" and
-          not turn["retried"] ->
+    case retry do
+      :later ->
         turn = %{turn | "phase" => "retry_wait", "retried" => true}
         {:ok, put_turn(state, turn), [{:timer, {:retry, id}, state["retry_after_ms"]}]}
 
-      match?(%Result.Interrupted{}, result) and state["retry_interrupted"] and
-          not turn["retried"] ->
+      :now ->
         turn = %{turn | "phase" => "running", "retried" => true}
         {:ok, put_turn(state, turn), [run(state, turn)]}
 
-      true ->
+      nil ->
         advance(state)
     end
   end
@@ -167,6 +174,20 @@ defmodule Clementine.Thread do
   # Poison evidence: a message without a prompt burned its attempts and
   # was dead-lettered. The mailbox never jams; nothing to decide.
   def handle({:input_failed, _ref, _error}, state), do: {:ok, state, []}
+
+  # A turn runs again only when that repeats nothing. Its run had no
+  # effects: `false`, the fence a drain's requeue reads, and never nil,
+  # which is a lifecycle that did not say. A failure's error is one the
+  # same request can get past (`retryable?`); a refused, cut-off, or
+  # empty turn, an answer that did not decode, and a turn out of
+  # iterations or time get the same answer again.
+  defp retry(%Result.Failed{effects?: false, error: %Error{retryable?: true}}, state),
+    do: if(state["on_failure"] == "retry", do: :later)
+
+  defp retry(%Result.Interrupted{effects?: false}, state),
+    do: if(state["retry_interrupted"], do: :now)
+
+  defp retry(_result, _state), do: nil
 
   ## The policy
 
