@@ -55,6 +55,11 @@ defmodule Clementine.Agent do
         max_tokens: 16_000,
         cache: [ttl: :one_hour]
 
+  - `platform:` where its requests go (`Clementine.Platform`): one the
+    model's sheet lists, such as `:bedrock` or `:foundry` for Claude;
+    default the vendor's own (`:anthropic`, `:openai`). Moving an agent
+    is this one line, and the platform's credentials under
+    `config :clementine, :platforms`.
   - `max_tokens:` the output ceiling of one response, thinking included;
     default `min(16_000, the model's max_output)`.
   - `effort:` one of the model's effort levels; default the model's own,
@@ -84,7 +89,11 @@ defmodule Clementine.Agent do
   `use` gives but cannot remove one). When `c:agent/1` picks
   another model for a run, an eval's, say, none of `use`'s choices
   apply, and the agent runs on that model's defaults and its own
-  choices:
+  choices. The one exception is `platform:`, which says where the app
+  sends that vendor's models rather than what the model takes: it
+  carries to another model of the same vendor, and a model of another
+  vendor goes to its vendor's default platform unless `c:agent/1` names
+  one:
 
       use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", effort: :xhigh
 
@@ -273,6 +282,7 @@ defmodule Clementine.Agent do
 
   defstruct id: nil,
             model: nil,
+            platform: nil,
             max_tokens: nil,
             effort: nil,
             thinking: nil,
@@ -293,6 +303,7 @@ defmodule Clementine.Agent do
   @type t :: %__MODULE__{
           id: term(),
           model: String.t() | nil,
+          platform: atom() | nil,
           max_tokens: pos_integer() | nil,
           effort: Clementine.Model.effort() | nil,
           thinking: Clementine.Model.thinking_type() | nil,
@@ -495,9 +506,9 @@ defmodule Clementine.Agent do
     ships a sheet for or `config :clementine, :models` declares. An agent
     the runtime builds from a module may leave it out and take the
     module's `__model__/0`
-  - `:max_tokens`, `:effort`, `:thinking`, `:display`, `:cache`,
-    `:provider_options` - the agent's choices for its model (see "The
-    model and its policy" above)
+  - `:platform`, `:max_tokens`, `:effort`, `:thinking`, `:display`,
+    `:cache`, `:provider_options` - the agent's choices for its model
+    (see "The model and its policy" above)
   - `:id` - host-app identifier, kept for audit trails
   - `:instructions` - system prompt
   - `:tools` - tool modules
@@ -576,7 +587,8 @@ defmodule Clementine.Agent do
   # and checked whole against the model's sheet. `use`'s choices are for
   # its model: they fill what agent/1 leaves unset when agent/1 leaves the
   # model to `use` or names the same one, and none applies when agent/1
-  # picks another model for the run. The runtime calls it at every claim
+  # picks another model for the run, but `platform:` when that model has
+  # `use`'s model's vendor. The runtime calls it at every claim
   # (an ArgumentError cancels the run as unstartable), and
   # `Clementine.run/3` given a module.
   @spec declared!(module(), t()) :: t()
@@ -613,11 +625,40 @@ defmodule Clementine.Agent do
         end)
 
       true ->
-        check!(agent, fn message ->
+        carried = carried(agent.model, model, declared)
+
+        agent
+        |> fill(carried)
+        |> check!(fn message ->
           "#{inspect(module)}.agent/1 picked #{inspect(agent.model)} for this run, not the " <>
             "#{inspect(model)} its use Clementine.Agent declares, so only agent/1's own " <>
-            "choices apply: #{message}"
+            "choices apply#{if carried != [], do: ", and use's platform"}: #{message}"
         end)
+    end
+  end
+
+  @doc false
+  # The `use` choices (`declared`, for `use_model`) that apply to a run on
+  # `model`: all of them on `use`'s own model; on another model of the
+  # same vendor only `platform:`, which says where the app sends that
+  # vendor's models (an eval's `--model`); on another vendor's, none, so
+  # it goes to its own vendor's default platform unless the run names
+  # one. `Clementine.AgentServer` applies the same rule.
+  @spec carried(String.t() | nil, String.t() | nil, keyword()) :: keyword()
+  def carried(model, use_model, declared) do
+    cond do
+      model in [nil, use_model] -> declared
+      same_vendor?(model, use_model) -> Keyword.take(declared, [:platform])
+      true -> []
+    end
+  end
+
+  defp same_vendor?(one, other) do
+    with {:ok, one} <- Clementine.Models.fetch(one),
+         {:ok, other} <- Clementine.Models.fetch(other) do
+      one.vendor == other.vendor
+    else
+      {:error, _message} -> false
     end
   end
 

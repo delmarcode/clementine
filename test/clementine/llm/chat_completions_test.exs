@@ -9,21 +9,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
     def fetch, do: "vertex-token-123"
   end
 
-  @env_keys [
-    :models,
-    :retry,
-    :openrouter_base_url,
-    :openrouter_api_key,
-    :bedrock_base_url,
-    :bedrock_api_key,
-    :bedrock_region,
-    :vertex_base_url,
-    :vertex_access_token,
-    :vertex_project,
-    :vertex_region,
-    :openai_compatible_base_url,
-    :openai_compatible_api_key
-  ]
+  @env_keys [:models, :retry, :platforms]
 
   setup do
     bypass = Bypass.open()
@@ -88,8 +74,9 @@ defmodule Clementine.LLM.ChatCompletionsTest do
 
   describe ":openrouter" do
     setup %{base_url: base_url} do
-      Application.put_env(:clementine, :openrouter_base_url, base_url <> "/api/v1")
-      Application.put_env(:clementine, :openrouter_api_key, "test-openrouter-key")
+      Clementine.TestPlatforms.put(
+        openrouter: [api_key: "test-openrouter-key", base_url: base_url <> "/api/v1"]
+      )
 
       put_models(%{@deepseek => deepseek(), @qwen => qwen()})
 
@@ -486,8 +473,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       bypass: bypass,
       base_url: base_url
     } do
-      Application.put_env(:clementine, :bedrock_base_url, base_url <> "/v1")
-      Application.put_env(:clementine, :bedrock_api_key, "test-bedrock-key")
+      Clementine.TestPlatforms.put(bedrock: [api_key: "test-bedrock-key", base_url: base_url])
 
       Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -514,7 +500,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
     end
 
     test "call/5 refuses OpenRouter's reasoning options on Bedrock" do
-      Application.put_env(:clementine, :bedrock_api_key, "test-bedrock-key")
+      Clementine.TestPlatforms.put(bedrock: [api_key: "test-bedrock-key", region: "us-east-1"])
 
       assert_raise ArgumentError, ~r/provider_options: :bedrock takes none/, fn ->
         ChatCompletions.call(
@@ -528,9 +514,9 @@ defmodule Clementine.LLM.ChatCompletionsTest do
     end
 
     test "call/5 raises without a Bedrock endpoint configuration" do
-      Application.put_env(:clementine, :bedrock_api_key, "test-bedrock-key")
+      Clementine.TestPlatforms.put(bedrock: [api_key: "test-bedrock-key"])
 
-      assert_raise RuntimeError, ~r/:bedrock_base_url or :bedrock_region/, fn ->
+      assert_raise ArgumentError, ~r/bedrock: needs region:/, fn ->
         ChatCompletions.call(
           "qwen.qwen3-235b-a22b-2507-v1:0",
           "system",
@@ -559,8 +545,12 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       bypass: bypass,
       base_url: base_url
     } do
-      Application.put_env(:clementine, :vertex_base_url, base_url <> "/v1/endpoints/openapi")
-      Application.put_env(:clementine, :vertex_access_token, {TokenSource, :fetch, []})
+      Clementine.TestPlatforms.put(
+        vertex: [
+          access_token: {TokenSource, :fetch, []},
+          base_url: base_url <> "/v1/endpoints/openapi"
+        ]
+      )
 
       Bypass.expect(bypass, "POST", "/v1/endpoints/openapi/chat/completions", fn conn ->
         assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer vertex-token-123"]
@@ -575,37 +565,37 @@ defmodule Clementine.LLM.ChatCompletionsTest do
     end
 
     test "call/5 raises without a Vertex endpoint configuration" do
-      Application.put_env(:clementine, :vertex_access_token, "test-vertex-token")
+      Clementine.TestPlatforms.put(vertex: [access_token: "test-vertex-token"])
 
-      assert_raise RuntimeError, ~r/:vertex_base_url or :vertex_project/, fn ->
+      assert_raise ArgumentError, ~r/vertex: needs project: and region:, or base_url:/, fn ->
         ChatCompletions.call("zai/glm-4.7-maas", "system", [UserMessage.new("Hi")], [])
       end
     end
   end
 
   describe ":openai_compatible" do
-    test "call/5 uses the platform entry's base_url and env-resolved api key", %{
+    test "call/5 sends to a platform the app names, with its env-resolved api key", %{
       bypass: bypass,
       base_url: base_url
     } do
       System.put_env("CLEMENTINE_CC_TEST_KEY", "sk-finetune")
       on_exit(fn -> System.delete_env("CLEMENTINE_CC_TEST_KEY") end)
 
-      # App config the platform entry overrides.
-      Application.put_env(:clementine, :openai_compatible_base_url, "http://unused.invalid/v1")
-      Application.put_env(:clementine, :openai_compatible_api_key, "sk-unused")
+      Clementine.TestPlatforms.put(
+        openai_compatible: [base_url: "http://unused.invalid/v1", api_key: "sk-unused"],
+        tinker: [
+          protocol: :chat_completions,
+          base_url: base_url <> "/oai/api/v1",
+          api_key: {:system, "CLEMENTINE_CC_TEST_KEY"}
+        ]
+      )
 
       put_models(%{
         "tinker://run:train:0/sampler_weights/000080" => [
           vendor: :qwen,
           context: 32_768,
           max_output: 8_192,
-          platforms: [
-            openai_compatible: [
-              base_url: base_url <> "/oai/api/v1",
-              api_key: {:system, "CLEMENTINE_CC_TEST_KEY"}
-            ]
-          ]
+          platforms: [tinker: []]
         ]
       })
 
@@ -636,7 +626,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
       bypass: bypass,
       base_url: base_url
     } do
-      Application.put_env(:clementine, :openai_compatible_base_url, base_url <> "/v1")
+      Clementine.TestPlatforms.put(openai_compatible: [base_url: base_url <> "/v1"])
 
       put_models(%{
         "qwen3-8b-local" => [
@@ -672,7 +662,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
         ]
       })
 
-      assert_raise RuntimeError, ~r/:base_url in model config/, fn ->
+      assert_raise ArgumentError, ~r/openai_compatible: needs base_url:/, fn ->
         ChatCompletions.call("qwen3-8b-local", "system", [UserMessage.new("Hi")], [])
       end
     end
@@ -717,12 +707,12 @@ defmodule Clementine.LLM.ChatCompletionsTest do
 
   test "call/5 refuses a model that goes to a platform outside the Chat Completions dialect" do
     assert_raise ArgumentError,
-                 ~r/"claude-sonnet-5" goes to :anthropic, not a Chat Completions/,
+                 ~r/"claude-sonnet-5" goes to :anthropic over :messages, not Chat Completions/,
                  fn ->
                    ChatCompletions.call("claude-sonnet-5", "system", [UserMessage.new("Hi")], [])
                  end
 
-    assert_raise ArgumentError, ~r/"gpt-6.1-sol" goes to :openai, not a Chat Completions/, fn ->
+    assert_raise ArgumentError, ~r/"gpt-6.1-sol" goes to :openai over :responses, not Chat/, fn ->
       ChatCompletions.call("gpt-6.1-sol", "system", [UserMessage.new("Hi")], [])
     end
   end

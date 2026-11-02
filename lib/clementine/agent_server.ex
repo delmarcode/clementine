@@ -45,6 +45,12 @@ defmodule Clementine.AgentServer do
   - `:name` - Required. The agent's name for identification.
   - `:model` - The model's id (`"claude-sonnet-5-5"`); here or in
     `start_link/1`
+  - `:platform`, `:max_tokens`, `:effort`, `:thinking`, `:display`,
+    `:cache`, `:provider_options` - the agent's choices for its model, as
+    `use Clementine.Agent` takes them; `platform: :bedrock` runs it on
+    Bedrock (`Clementine.Platform`). They are for `use`'s model: a
+    `start_link/1` that names another model takes none of them but
+    `platform:`, and that only for a model of the same vendor
   - `:tools` - List of tool modules (default: [])
   - `:system` - System prompt (default: "")
   - `:max_iterations` - Maximum loop iterations (default: 10)
@@ -64,6 +70,7 @@ defmodule Clementine.AgentServer do
       :tools,
       :max_iterations,
       :context,
+      policy: [],
       history: [],
       tasks: %{}
     ]
@@ -76,6 +83,8 @@ defmodule Clementine.AgentServer do
 
   - `:name` - Required. The agent's name.
   - `:model` - The model's id; required here or in `start_link/1`
+  - `:platform`, `:max_tokens`, `:effort`, `:thinking`, `:display`,
+    `:cache`, `:provider_options` - the agent's choices for its model
   - `:tools` - List of tool modules
   - `:system` - System prompt
   - `:max_iterations` - Maximum loop iterations
@@ -86,6 +95,7 @@ defmodule Clementine.AgentServer do
 
       @agent_name Keyword.fetch!(opts, :name)
       @agent_model Keyword.get(opts, :model)
+      @agent_policy Keyword.take(opts, Clementine.LLM.Policy.keys())
       @agent_tools Keyword.get(opts, :tools, [])
       @agent_system Keyword.get(opts, :system, "")
       @agent_max_iterations Keyword.get(opts, :max_iterations)
@@ -100,6 +110,9 @@ defmodule Clementine.AgentServer do
 
       - `:name` - Process name for registration
       - `:model` - The model's id, over the one `use` names
+      - `:platform`, `:max_tokens`, `:effort`, `:thinking`, `:display`,
+        `:cache`, `:provider_options` - the agent's choices for its
+        model, each over the one `use` names
       - `:system` - Override the system prompt
       - `:max_iterations` - Override max iterations
       - `:context` - Initial context map
@@ -119,6 +132,7 @@ defmodule Clementine.AgentServer do
         %{
           name: @agent_name,
           model: @agent_model,
+          policy: @agent_policy,
           tools: @agent_tools,
           system: @agent_system,
           max_iterations: @agent_max_iterations
@@ -137,9 +151,29 @@ defmodule Clementine.AgentServer do
                   "Clementine.AgentServer or to start_link/1 (model: \"claude-sonnet-5-5\")"
         end
 
-        # The model is the agent's one choice here: checked whole once, as
-        # a run's start checks it.
-        Clementine.Agent.for_run!(%Clementine.Agent{model: model}, nil, inspect(__MODULE__))
+        # use's choices are for use's model, as Clementine.Agent's are:
+        # start_link/1's model of another vendor takes none of them, and
+        # one of the same vendor only its platform:. A use that names no
+        # model gives its choices for whichever start_link/1 names.
+        declared =
+          if @agent_model,
+            do: Clementine.Agent.carried(model, @agent_model, @agent_policy),
+            else: @agent_policy
+
+        policy =
+          declared
+          |> Keyword.merge(Keyword.take(opts, Clementine.LLM.Policy.keys()), fn
+            :provider_options, declared, own -> Keyword.merge(declared, own)
+            _key, _declared, own -> own
+          end)
+
+        # The model and its choices, checked whole once, as a run's start
+        # checks them.
+        Clementine.Agent.for_run!(
+          struct!(Clementine.Agent, [model: model] ++ policy),
+          nil,
+          inspect(__MODULE__)
+        )
 
         context =
           Keyword.get(opts, :context, %{})
@@ -151,6 +185,7 @@ defmodule Clementine.AgentServer do
         state = %Clementine.AgentServer.State{
           name: @agent_name,
           model: model,
+          policy: policy,
           system: Keyword.get(opts, :system, @agent_system),
           tools: @agent_tools,
           max_iterations: Keyword.get(opts, :max_iterations, @agent_max_iterations || 10),
@@ -442,10 +477,12 @@ defmodule Clementine.AgentServer do
       defp turn_rollout(state, prompt) do
         agent =
           Clementine.Agent.new(
-            model: state.model,
-            instructions: state.system,
-            tools: state.tools,
-            defaults: [max_iterations: state.max_iterations]
+            [
+              model: state.model,
+              instructions: state.system,
+              tools: state.tools,
+              defaults: [max_iterations: state.max_iterations]
+            ] ++ state.policy
           )
 
         Clementine.Rollout.new(
@@ -828,7 +865,7 @@ defmodule Clementine.AgentServer do
           model: state.model,
           system: state.system,
           history: history
-        ],
+        ] ++ state.policy,
         opts
       )
 

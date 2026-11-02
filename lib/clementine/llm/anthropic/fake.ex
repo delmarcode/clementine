@@ -281,6 +281,10 @@ defmodule Clementine.LLM.Anthropic.Fake do
     end)
   end
 
+  # A drop the model's platform made (a skill's load folded into the
+  # prefix on Bedrock or Foundry) is no edit of the app's.
+  defp check_dropped(%{cause: :fold}, _strict), do: :ok
+
   defp check_dropped(%{turns: turns, blocks: blocks, first_index: index}, true) do
     refuse(
       "messages.#{index}: Clementine sent this turn without its thinking, and " <>

@@ -246,7 +246,7 @@ defmodule Clementine.CostTest do
         "zai/glm-4.7-maas" => declared.({:vertex, []}, cheap),
         "my-qwen" =>
           declared.(
-            {:openai_compatible, [base_url: "http://localhost:8000/v1"]},
+            {:openai_compatible, []},
             currency: "USD",
             input: 0,
             output: 0,
@@ -484,7 +484,7 @@ defmodule Clementine.CostTest do
           vendor: :qwen,
           context: 32_768,
           max_output: 8_192,
-          platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+          platforms: [openai_compatible: []]
         ],
         "claude-sonnet-5" => [prices: nil]
       })

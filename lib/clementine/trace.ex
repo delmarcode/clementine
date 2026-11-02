@@ -16,8 +16,8 @@ defmodule Clementine.Trace do
     - `"provider"` — the model's vendor (`"anthropic"`, `"openai"`,
       `"deepseek"`, ...), `Clementine.Model`'s `vendor`
     - `"platform"` — where the model's requests went (`"anthropic"`,
-      `"openrouter"`, `"bedrock"`, ...): the model's default platform
-      until an agent can name one (`Clementine.Models.default_platform/1`)
+      `"bedrock"`, `"foundry"`, ...): the agent's `platform:`, else the
+      model's default (`Clementine.Models.default_platform/1`)
     - `"model"` — the model's id (`Clementine.Model`)
     - `"agent_fingerprint"` — a sha256 over the model id, the
       instructions, the agent's tool schemas, and, when the agent has

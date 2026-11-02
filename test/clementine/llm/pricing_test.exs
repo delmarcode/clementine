@@ -311,7 +311,7 @@ defmodule Clementine.LLM.PricingTest do
           vendor: :qwen,
           context: 32_768,
           max_output: 8_192,
-          platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+          platforms: [openai_compatible: []]
         ],
         "claude-sonnet-5" => [prices: nil]
       })
@@ -400,7 +400,7 @@ defmodule Clementine.LLM.PricingTest do
           max_output: 8_192,
           cache: [ttls: [:five_minutes]],
           prices: [currency: "USD", input: 1, output: 2, cache_read: 0.1, cache_write: 1.25],
-          platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+          platforms: [openai_compatible: []]
         ]
       })
 

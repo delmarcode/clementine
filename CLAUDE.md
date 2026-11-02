@@ -213,10 +213,11 @@ changes once runs exist.
 configures `:clementine` itself. The library reads `:models` (a map
 from model id to facts: overrides of the sheets Clementine ships in
 `lib/clementine/models/`, and declarations of models it does not;
-`docs/MODELS.md` has every key), provider credentials and endpoints
-(`anthropic_api_key: {:system, "..."}`, ...), `:retry` for provider
-calls, and `:llm_client` (the mock, in tests). An agent names its own
-model by id, with its own choices for it (`Clementine.LLM.Policy`).
+`docs/MODELS.md` has every key), `:platforms` (each platform's endpoint
+and credential, `anthropic: [api_key: {:system, "..."}]`, ...;
+`Clementine.Platform`), `:retry` for provider calls, and `:llm_client`
+(the mock, in tests). An agent names its own model by id, with its own
+choices for it, its platform among them (`Clementine.LLM.Policy`).
 
 ## Common tasks
 
