@@ -49,30 +49,30 @@ defmodule Clementine.LLM.OpenAI do
   """
   @impl true
   def call(model, system, messages, tools, opts \\ []) do
-    body = build_body(model, system, messages, tools, opts, stream: false)
+    {body, policy} = build_body(model, system, messages, tools, opts, stream: false)
     headers = build_headers()
 
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
 
-    do_call_with_retry(body, headers, max_attempts, 1)
+    do_call_with_retry(body, headers, usage_meta(policy), max_attempts, 1)
   end
 
-  defp do_call_with_retry(body, headers, max_attempts, attempt) do
+  defp do_call_with_retry(body, headers, usage_meta, max_attempts, attempt) do
     case Req.post(base_url(), json: body, headers: headers, receive_timeout: 120_000) do
       {:ok, %{status: 200, body: resp_body}} ->
-        {:ok, parse_response(resp_body)}
+        {:ok, parse_response(resp_body, usage_meta)}
 
       {:ok, %{status: status}} when status in @retriable_statuses and attempt < max_attempts ->
         Process.sleep(calculate_backoff(attempt))
-        do_call_with_retry(body, headers, max_attempts, attempt + 1)
+        do_call_with_retry(body, headers, usage_meta, max_attempts, attempt + 1)
 
       {:ok, %{status: status, body: resp_body}} ->
         {:error, {:api_error, status, resp_body}}
 
       {:error, _reason} when attempt < max_attempts ->
         Process.sleep(calculate_backoff(attempt))
-        do_call_with_retry(body, headers, max_attempts, attempt + 1)
+        do_call_with_retry(body, headers, usage_meta, max_attempts, attempt + 1)
 
       {:error, reason} ->
         {:error, {:request_failed, reason}}
@@ -84,8 +84,8 @@ defmodule Clementine.LLM.OpenAI do
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
-    body =
-      build_body(model, system, messages, tools, opts, stream: true) |> Map.put("stream", true)
+    {body, policy} = build_body(model, system, messages, tools, opts, stream: true)
+    body = Map.put(body, "stream", true)
 
     headers = build_headers()
     # A runner caps this to the execution deadline's remaining budget. It
@@ -95,7 +95,9 @@ defmodule Clementine.LLM.OpenAI do
     receive_timeout = Keyword.get(opts, :receive_timeout, 300_000)
     budget_ends = System.monotonic_time(:millisecond) + receive_timeout
 
-    ProviderStream.new(OpenAIStreamParser, fn parent, ref ->
+    parser = OpenAIStreamParser.new(usage_meta(policy))
+
+    ProviderStream.new({OpenAIStreamParser, parser}, fn parent, ref ->
       do_stream_request(body, headers, parent, ref, budget_ends)
     end)
   end
@@ -234,13 +236,16 @@ defmodule Clementine.LLM.OpenAI do
         body
       end
 
-    if is_list(tools) and tools != [] do
-      body
-      |> Map.put("tools", format_tools(tools))
-      |> Map.put("tool_choice", "auto")
-    else
-      body
-    end
+    body =
+      if is_list(tools) and tools != [] do
+        body
+        |> Map.put("tools", format_tools(tools))
+        |> Map.put("tool_choice", "auto")
+      else
+        body
+      end
+
+    {body, policy}
   end
 
   # Caching is automatic. The key keeps a user's requests on one cache
@@ -307,7 +312,7 @@ defmodule Clementine.LLM.OpenAI do
     Tools.encode_all(tools)
   end
 
-  defp parse_response(%{"output" => output} = body) when is_list(output) do
+  defp parse_response(%{"output" => output} = body, usage_meta) when is_list(output) do
     content =
       output
       |> Enum.reject(
@@ -327,20 +332,22 @@ defmodule Clementine.LLM.OpenAI do
     %Response{
       content: content,
       stop_reason: stop_reason,
-      usage: ProviderUsage.openai(Map.get(body, "usage"), usage_meta(body))
+      usage: ProviderUsage.openai(Map.get(body, "usage"), usage_meta)
     }
   end
 
-  defp parse_response(body) when is_map(body) do
+  defp parse_response(body, usage_meta) when is_map(body) do
     %Response{
       content: [],
       stop_reason: nil,
-      usage: ProviderUsage.openai(Map.get(body, "usage"), usage_meta(body))
+      usage: ProviderUsage.openai(Map.get(body, "usage"), usage_meta)
     }
   end
 
-  defp usage_meta(body),
-    do: %{provider: :openai, platform: :openai, model: Map.get(body, "model")}
+  # The vendor is the model's, as `Clementine.LLM.ChatCompletions` says
+  # it: a model an app declares on :openai need not be OpenAI's.
+  defp usage_meta(%Policy{} = policy),
+    do: %{provider: policy.model.vendor, platform: policy.platform, model: policy.model.id}
 
   defp refused?(output) do
     Enum.any?(output, fn

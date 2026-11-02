@@ -21,15 +21,15 @@ defmodule Clementine.LLM.OpenAIStreamParser do
               started_calls: MapSet.new(),
               calls_with_arg_deltas: MapSet.new(),
               closed_calls: MapSet.new(),
-              refused: false
+              refused: false,
+              usage_meta: %{}
   end
 
-  def new do
-    %State{}
+  # `usage_meta` names the vendor, platform, and model for the usage
+  # normalizer's `usage_clamped` event (`Clementine.LLM.ProviderUsage`).
+  def new(usage_meta \\ %{}) do
+    %State{usage_meta: usage_meta}
   end
-
-  defp usage_meta(response),
-    do: %{provider: :openai, platform: :openai, model: Map.get(response, "model")}
 
   def parse(%State{buffer: buffer} = state, data) when is_binary(data) do
     full_data = buffer <> data
@@ -197,7 +197,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
 
   defp convert_event("response.completed", %{"response" => response}, state) do
     {fallback_tool_events, state} = ensure_completed_tool_events(response, state)
-    usage = ProviderUsage.openai(Map.get(response, "usage"), usage_meta(response))
+    usage = ProviderUsage.openai(Map.get(response, "usage"), state.usage_meta)
 
     events =
       fallback_tool_events ++
@@ -214,7 +214,7 @@ defmodule Clementine.LLM.OpenAIStreamParser do
   # closed before a cut, as any turn's, unless the cut fell inside one
   # still open: then the turn fails on its cut, and none runs.
   defp convert_event("response.incomplete", %{"response" => response}, state) do
-    usage = ProviderUsage.openai(Map.get(response, "usage"), usage_meta(response))
+    usage = ProviderUsage.openai(Map.get(response, "usage"), state.usage_meta)
     stop_reason = if state.refused, do: "refusal", else: incomplete_reason(response)
 
     {[{:message_delta, %{"stop_reason" => stop_reason}, usage}, {:message_stop}], state}
