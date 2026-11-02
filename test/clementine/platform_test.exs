@@ -106,14 +106,42 @@ defmodule Clementine.PlatformTest do
     test "a credential that resolves to nothing raises, naming the key and never a value" do
       put(anthropic: [api_key: {:system, "CLEMENTINE_PLATFORM_TEST_UNSET"}])
 
-      assert_raise ArgumentError, ~r/anthropic: \[api_key: ...\] resolved to no value/, fn ->
-        Platform.auth_headers(Platform.fetch!(:anthropic), :messages)
-      end
+      assert_raise ArgumentError,
+                   ~r/anthropic: \[api_key: ...\] resolved to no value: the environment variable CLEMENTINE_PLATFORM_TEST_UNSET/,
+                   fn -> Platform.auth_headers(Platform.fetch!(:anthropic), :messages) end
 
       put([])
 
       assert_raise ArgumentError, ~r/anthropic: \[api_key: ...\] is not set/, fn ->
         Platform.auth_headers(Platform.fetch!(:anthropic), :messages)
+      end
+    end
+
+    test "an {m, f, a} that returns no string says what it returned, never the value" do
+      for {function, pattern} <- [
+            {:ok_tuple, ~r/ok_tuple\/0 returned an \{:ok, value\} tuple, not a string/},
+            {:number, ~r/number\/0 returned an integer, not a string/},
+            {:nothing, ~r/resolved to no value: Clementine.PlatformTest.nothing\/0 returned nil/}
+          ] do
+        put(bedrock: [region: "us-east-1", api_key: {__MODULE__, function, []}])
+
+        error =
+          assert_raise ArgumentError, fn ->
+            Platform.auth_headers(Platform.fetch!(:bedrock), :messages)
+          end
+
+        assert error.message =~ pattern
+        refute error.message =~ "sk-not-a-real-key"
+      end
+
+      # An optional credential in the wrong shape raises too, rather than
+      # going without.
+      put(
+        proxy: [protocol: :messages, base_url: "https://p", api_key: {__MODULE__, :ok_tuple, []}]
+      )
+
+      assert_raise ArgumentError, ~r/returned an \{:ok, value\} tuple/, fn ->
+        Platform.auth_headers(Platform.fetch!(:proxy), :messages)
       end
     end
   end
@@ -154,6 +182,97 @@ defmodule Clementine.PlatformTest do
       assert {:error, message} = Platform.fetch(:anthropic)
       refute message =~ "sk-not-a-real-key"
     end
+
+    test "never prints a credential in the wrong shape, in fetch/1 or at boot" do
+      key = "sk-not-a-real-key"
+
+      for {platforms, name, shape} <- [
+            # System.fetch_env/1, or a vault helper's {:ok, secret}.
+            {[anthropic: [api_key: {:ok, key}]], :anthropic, "an {:ok, value} tuple"},
+            {[anthropic: [api_key: {:error, key}]], :anthropic, "an {:error, reason} tuple"},
+            {[anthropic: [api_key: [key]]], :anthropic, "a list"},
+            {[anthropic: [api_key: %{key: key}]], :anthropic, "a map"},
+            {[anthropic: [api_key: {"a", "b", key}]], :anthropic, "a 3-element tuple"},
+            {[anthropic: [api_key: {:system, :not_a_string, key}]], :anthropic, "a 3-element"},
+            {[foundry: [resource: "r", access_token: {:ok, key}]], :foundry, "an {:ok, value}"},
+            {[vertex: [project: "p", region: "r", access_token: [{:token, key}]]], :vertex,
+             "a list"},
+            # The entry itself in the wrong shape.
+            {[anthropic: {:ok, key}], :anthropic, "an {:ok, value} tuple"},
+            {[anthropic: key], :anthropic, "a string"}
+          ] do
+        put(platforms)
+
+        assert {:error, message} = Platform.fetch(name)
+        assert message =~ shape, message
+        refute message =~ key
+
+        error = assert_raise ArgumentError, &Platform.validate_config!/0
+        assert error.message =~ shape
+        refute error.message =~ key
+      end
+
+      # The whole key in the wrong shape.
+      put(%{anthropic: key})
+      error = assert_raise ArgumentError, &Platform.validate_config!/0
+      assert error.message =~ "got a map"
+      refute error.message =~ key
+
+      put(anthropic: [api_key: {:ok, key}])
+      error = assert_raise ArgumentError, &Platform.validate_config!/0
+      assert error.message =~ "unwrap it"
+    end
+
+    test "inspect shows an {m, f, a}'s module and function, never its arguments" do
+      put(bedrock: [region: "us-east-1", api_key: {__MODULE__, :token, ["sk-not-a-real-key"]}])
+
+      inspected = inspect(Platform.fetch!(:bedrock))
+      refute inspected =~ "sk-not-a-real-key"
+      assert inspected =~ "{Clementine.PlatformTest, :token, [\"**redacted**\"]}"
+
+      put(anthropic: [api_key: {:system, "ANTHROPIC_API_KEY"}])
+      assert inspect(Platform.fetch!(:anthropic)) =~ ~s({:system, "ANTHROPIC_API_KEY"})
+    end
+
+    test "a base_url that ends in the path Clementine appends is refused, naming the convention" do
+      for {platforms, name, pattern} <- [
+            {[anthropic: [api_key: "k", base_url: "https://api.anthropic.com/v1/messages"]],
+             :anthropic, ~r"ends in /v1/messages.*https://api.anthropic.com\)"},
+            {[anthropic: [api_key: "k", base_url: "https://api.anthropic.com/v1/"]], :anthropic,
+             ~r"ends in /v1,"},
+            {[openai: [api_key: "k", base_url: "https://api.openai.com/v1/responses"]], :openai,
+             ~r"ends in /responses.*before /responses"},
+            {[foundry: [api_key: "k", base_url: "https://r.services.ai.azure.com/anthropic/v1"]],
+             :foundry, ~r"ends in /v1,.*/anthropic\)"},
+            # Anthropic's Bedrock page gives SDKs .../anthropic.
+            {[
+               bedrock: [
+                 api_key: "k",
+                 base_url: "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+               ]
+             ], :bedrock, ~r"ends in /anthropic,.*Mantle host"},
+            {[
+               bedrock: [
+                 api_key: "k",
+                 base_url: "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+               ]
+             ], :bedrock, ~r"ends in /openai/v1,.*app-named platform"},
+            {[bedrock: [api_key: "k", base_url: "https://bedrock-mantle.us-east-1.api.aws/v1"]],
+             :bedrock, ~r"ends in /v1,"},
+            {[tinker: [protocol: :chat_completions, base_url: "https://t/v1/chat/completions"]],
+             :tinker, ~r"ends in /chat/completions"},
+            {[proxy: [protocol: :messages, base_url: "https://proxy.example/v1"]], :proxy,
+             ~r"ends in /v1,"}
+          ] do
+        put(platforms)
+        assert {:error, message} = Platform.fetch(name)
+        assert message =~ pattern, message
+
+        assert_raise ArgumentError, ~r/Invalid :clementine, :platforms: #{name}: base_url:/, fn ->
+          Platform.validate_config!()
+        end
+      end
+    end
   end
 
   describe "protocol/2" do
@@ -192,6 +311,45 @@ defmodule Clementine.PlatformTest do
   end
 
   describe "validate_config!/0" do
+    test "an {m, f, a} credential names a function that exists" do
+      put(bedrock: [region: "us-east-1", api_key: {__MODULE__, :no_such_token, []}])
+
+      assert_raise ArgumentError,
+                   ~r/bedrock: \[api_key: \{Clementine.PlatformTest, :no_such_token, ...\}\] names Clementine.PlatformTest.no_such_token\/0, which does not exist/,
+                   &Platform.validate_config!/0
+
+      put(foundry: [resource: "r", access_token: {NoSuch.Module, :token, ["sk-not-a-real-key"]}])
+      error = assert_raise ArgumentError, &Platform.validate_config!/0
+      assert error.message =~ "NoSuch.Module.token/1, which does not exist"
+      refute error.message =~ "sk-not-a-real-key"
+
+      put(bedrock: [region: "us-east-1", api_key: {__MODULE__, :token, ["bedrock"]}])
+      assert :ok = Platform.validate_config!()
+    end
+
+    test "an app config key the platforms replaced fails every request too" do
+      put(anthropic: [api_key: "k", base_url: "http://localhost:1"])
+      Application.put_env(:clementine, :anthropic_base_url, "http://localhost:2")
+
+      try do
+        assert {:error, message} = Platform.fetch(:anthropic)
+        assert message =~ "anthropic_base_url: is replaced by config :clementine, :platforms"
+        assert message =~ "anthropic: [base_url: ...]"
+        assert message =~ "on every request"
+
+        assert_raise ArgumentError, ~r/anthropic_base_url: is replaced/, fn ->
+          Clementine.LLM.Anthropic.call(
+            "claude-sonnet-5-5",
+            "Be brief.",
+            [Clementine.LLM.Message.UserMessage.new("Hi")],
+            []
+          )
+        end
+      after
+        Application.delete_env(:clementine, :anthropic_base_url)
+      end
+    end
+
     test "an app config key the platforms replaced fails boot, naming its new place" do
       for {old, pattern} <- [
             {:anthropic_api_key, ~r/:platforms, anthropic: \[api_key: ...\]/},
@@ -235,4 +393,7 @@ defmodule Clementine.PlatformTest do
   end
 
   def token(kind), do: "#{kind}-token"
+  def ok_tuple, do: {:ok, "sk-not-a-real-key"}
+  def number, do: 42
+  def nothing, do: nil
 end

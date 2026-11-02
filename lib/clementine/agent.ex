@@ -88,9 +88,12 @@ defmodule Clementine.Agent do
   unset (and `provider_options:` key by key: `c:agent/1` overrides a key
   `use` gives but cannot remove one). When `c:agent/1` picks
   another model for a run, an eval's, say, none of `use`'s choices
-  apply but `platform:`, which says where the app's credentials are
-  rather than what the model takes, and the agent runs on that model's
-  defaults and its own choices:
+  apply, and the agent runs on that model's defaults and its own
+  choices. The one exception is `platform:`, which says where the app
+  sends that vendor's models rather than what the model takes: it
+  carries to another model of the same vendor, and a model of another
+  vendor goes to its vendor's default platform unless `c:agent/1` names
+  one:
 
       use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", effort: :xhigh
 
@@ -584,7 +587,8 @@ defmodule Clementine.Agent do
   # and checked whole against the model's sheet. `use`'s choices are for
   # its model: they fill what agent/1 leaves unset when agent/1 leaves the
   # model to `use` or names the same one, and none applies when agent/1
-  # picks another model for the run. The runtime calls it at every claim
+  # picks another model for the run, but `platform:` when that model has
+  # `use`'s model's vendor. The runtime calls it at every claim
   # (an ArgumentError cancels the run as unstartable), and
   # `Clementine.run/3` given a module.
   @spec declared!(module(), t()) :: t()
@@ -621,13 +625,28 @@ defmodule Clementine.Agent do
         end)
 
       true ->
+        # use's platform: says where the app sends that vendor's models,
+        # so it carries to another model of the same vendor; a model of
+        # another vendor (an eval's cross-vendor --model) takes its own
+        # vendor's default platform unless agent/1 names one.
+        carried = if same_vendor?(agent.model, model), do: Keyword.take(declared, [:platform])
+
         agent
-        |> fill(Keyword.take(declared, [:platform]))
+        |> fill(carried || [])
         |> check!(fn message ->
           "#{inspect(module)}.agent/1 picked #{inspect(agent.model)} for this run, not the " <>
             "#{inspect(model)} its use Clementine.Agent declares, so only agent/1's own " <>
-            "choices apply, and use's platform: #{message}"
+            "choices apply#{if carried not in [nil, []], do: ", and use's platform"}: #{message}"
         end)
+    end
+  end
+
+  defp same_vendor?(one, other) do
+    with {:ok, one} <- Clementine.Models.fetch(one),
+         {:ok, other} <- Clementine.Models.fetch(other) do
+      one.vendor == other.vendor
+    else
+      {:error, _message} -> false
     end
   end
 

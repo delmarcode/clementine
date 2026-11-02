@@ -607,8 +607,10 @@ defmodule Clementine.LLM.Message do
     and appends a change here instead: editing either would void every
     earlier turn's reasoning. On those models a system message goes as a
     `role: "system"` message, with each `Content.ToolAddition` as an
-    inline tool definition. Elsewhere its text joins the system prompt
-    and its tools are offered as ordinary tools.
+    inline tool definition where the platform takes one (the Claude
+    API), and as an ordinary tool where it does not (Bedrock).
+    Elsewhere its text joins the system prompt and its tools are offered
+    as ordinary tools.
 
     The engine records one after a skill load's result, naming the skill
     in `skill` (`Clementine.Skill`), with tool definitions and no text.

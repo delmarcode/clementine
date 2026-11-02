@@ -220,7 +220,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
           context: 200_000,
           max_output: 64_000,
           thinking: [binding: :prefix],
-          features: [mid_conversation_system: true],
+          features: [mid_conversation_system: true, inline_tools: true],
           platforms: [anthropic: []]
         ]
       })
@@ -272,6 +272,43 @@ defmodule Clementine.LLM.AnthropicBindingTest do
       assert Enum.map(body["tools"], & &1["name"]) == ["echo"]
       assert [_user, %{"role" => "system"}] = body["messages"]
       assert "inline-tools-2026-09-15" in Anthropic.betas(body)
+    end
+
+    test "on Bedrock, its text in place and its tools in tools, with no inline beta" do
+      messages = [
+        UserMessage.new("Hi"),
+        SystemMessage.new(
+          [
+            Content.text("Use safe_echo."),
+            %Content.ToolAddition{definition: %{"name" => "safe_echo"}}
+          ],
+          skill: "notes"
+        )
+      ]
+
+      {body, stamp, nil} =
+        Anthropic.request("claude-sonnet-5-5", "Be brief.", messages, [Echo, SafeEcho],
+          platform: :bedrock
+        )
+
+      assert is_binary(stamp)
+      assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
+
+      assert [_user, %{"role" => "system", "content" => [%{"type" => "text", "text" => text}]}] =
+               body["messages"]
+
+      assert text == "Use safe_echo."
+      assert Anthropic.betas(body) == []
+
+      # A skill's load is tools and no text: nothing goes in its place.
+      {body, _stamp, nil} =
+        Anthropic.request("claude-sonnet-5-5", "Be brief.", skill_load(), [Echo, SafeEcho],
+          platform: :bedrock
+        )
+
+      assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
+      assert [%{"role" => "user"}] = body["messages"]
+      assert Anthropic.betas(body) == []
     end
   end
 

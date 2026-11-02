@@ -53,21 +53,39 @@ defmodule Clementine.Platform do
   (`https://api.anthropic.com`), on Responses and Chat Completions the
   part before `/responses` or `/chat/completions`, and on Bedrock the
   Mantle host both wires share (`https://bedrock-mantle.us-east-1.api.aws`).
-  Foundry takes `resource:` or `base_url:`
+  This is the convention Anthropic's SDKs follow, with one exception:
+  Anthropic's Bedrock page sets an SDK's base URL to `.../anthropic`,
+  which Clementine appends itself. A `base_url:` that ends in the path
+  Clementine appends (`/v1/messages`, `/v1`, `/responses`,
+  `/chat/completions`, and on Bedrock `/anthropic`) is refused, rather
+  than sent to a doubled path. Foundry takes `resource:` or `base_url:`
   (`https://myapp-prod.services.ai.azure.com/anthropic`), and Bedrock
   `region:` or `base_url:`. Vertex takes `project:` and `region:`, or
   `base_url:`.
 
+  Bedrock's Chat Completions wire is `/v1/chat/completions` on the
+  Mantle host. An open model Bedrock serves under `/openai/v1` instead
+  takes an app-named platform:
+
+      bedrock_openai: [
+        protocol: :chat_completions,
+        base_url: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+        api_key: {MyApp.Bedrock, :token, []}
+      ]
+
   ## Credentials
 
   A credential is a literal string, `{:system, "ENV_VAR"}`, or
-  `{module, function, args}`, called on every request. Short-lived
-  credentials take the last form, with a function that caches the token
-  and mints a new one before it expires: an Amazon Bedrock short-term API
-  key lasts 12 hours at most (AWS's `aws-bedrock-token-generator`), a
-  Microsoft Entra ID token about an hour, a Google OAuth token an hour.
-  `inspect/2` on a platform redacts a literal credential, and no error
-  prints one.
+  `{module, function, args}`, called on every request and returning the
+  string itself. Short-lived credentials take the last form, with a
+  function that caches the token and mints a new one before it expires:
+  an Amazon Bedrock short-term API key lasts 12 hours at most (AWS's
+  `aws-bedrock-token-generator`), a Microsoft Entra ID token about an
+  hour, a Google OAuth token an hour. Boot checks that the function
+  exists. No error prints a credential, whatever its shape (one in the
+  wrong shape, such as `System.fetch_env/1`'s `{:ok, key}`, is named by
+  its shape), and `inspect/2` on a platform shows only an environment
+  variable's name and an `{m, f, a}`'s module and function.
 
   Bedrock and Foundry are reached with bearer credentials only. AWS SigV4
   signing and Bedrock's InvokeModel API (with its ARN-versioned ids) are
@@ -83,7 +101,9 @@ defmodule Clementine.Platform do
   A model's facts on a platform are its sheet with that platform's
   entry merged in (`Clementine.Models.for_platform/2`), and the clients
   read only those: Foundry takes no mid-conversation system messages, so
-  a skill's load folds into the system prompt there.
+  a skill's load folds into the system prompt and `tools` there, and
+  Bedrock takes no tool defined inside one (`inline_tools: false`), so a
+  skill's tools join `tools` there.
 
   ## Prices
 
@@ -123,8 +143,9 @@ defmodule Clementine.Platform do
     deployments: %{}
   ]
 
-  @credential {:custom, Model, :validate_credential, []}
+  @credential {:custom, __MODULE__, :validate_credential, []}
   @string {:custom, __MODULE__, :validate_string, []}
+  @credential_keys [:api_key, :access_token]
 
   @schemas %{
     anthropic: [api_key: [type: @credential], base_url: [type: @string]],
@@ -239,14 +260,19 @@ defmodule Clementine.Platform do
   that entry. A shipped platform with no entry builds with its defaults
   and no credential.
   """
+  # It runs on every request, so an app config key `:platforms` replaced
+  # fails there too: a test's `Application.put_env(:clementine,
+  # :anthropic_base_url, ...)` after boot is refused, not ignored on the
+  # way to the real endpoint.
   @spec fetch(name()) :: {:ok, t()} | {:error, String.t()}
   def fetch(name) when is_atom(name) do
-    entry = Keyword.get(config!(), name, [])
-
-    with {:ok, schema} <- schema(name),
+    with :ok <- replaced(),
+         entry = Keyword.get(config!(), name, []),
+         {:ok, schema} <- schema(name),
          {:ok, opts} <- validate(name, entry, schema),
          platform = struct(__MODULE__, [name: name] ++ opts),
          :ok <- endpoint(platform),
+         :ok <- base_url_path(platform),
          :ok <- one_credential(platform) do
       {:ok, platform}
     end
@@ -325,12 +351,16 @@ defmodule Clementine.Platform do
     case credential_key(platform, protocol) do
       {:optional, key} ->
         case resolve(Map.fetch!(platform, key)) do
-          nil -> []
-          value -> [header(platform, protocol, key, value)]
+          {:ok, value} -> [header(platform, protocol, key, value)]
+          {:none, _why} -> []
+          {:error, why} -> raise ArgumentError, unresolved(platform, key, why)
         end
 
       {:required, key} ->
-        [header(platform, protocol, key, resolve!(platform, key))]
+        case resolve(Map.fetch!(platform, key)) do
+          {:ok, value} -> [header(platform, protocol, key, value)]
+          {_none_or_error, why} -> raise ArgumentError, unresolved(platform, key, why)
+        end
 
       {:either, keys} ->
         raise ArgumentError,
@@ -362,26 +392,44 @@ defmodule Clementine.Platform do
 
   @doc """
   Checks `config :clementine, :platforms`: every entry builds, every app
-  name speaks a wire Clementine has, and none of the app config keys it
-  replaced is still set. Raises `ArgumentError`. `Clementine.Application`
-  calls it at boot.
+  name speaks a wire Clementine has, every `{m, f, a}` credential names a
+  function that exists, and none of the app config keys it replaced is
+  still set. Raises `ArgumentError`. `Clementine.Application` calls it at
+  boot.
   """
   @spec validate_config!() :: :ok
   def validate_config! do
-    for {old, {name, key}} <- @replaced, Application.get_env(:clementine, old) != nil do
-      raise ArgumentError,
-            "config :clementine, #{old}: is replaced by config :clementine, :platforms, " <>
-              "#{name}: [#{key}: ...]" <> replaced_hint(key)
-    end
+    with {:error, message} <- replaced(), do: raise(ArgumentError, message)
 
     for {name, _entry} <- config!() do
-      case fetch(name) do
-        {:ok, _platform} -> :ok
+      with {:ok, platform} <- fetch(name),
+           :ok <- callable(platform) do
+        :ok
+      else
         {:error, message} -> raise ArgumentError, "Invalid :clementine, :platforms: #{message}"
       end
     end
 
     :ok
+  end
+
+  # The first app config key `:platforms` replaced that is still set,
+  # named with its new place. Boot checks it, and so does every request
+  # (`fetch/1`), so one set after boot is refused rather than ignored.
+  defp replaced do
+    case Enum.find(@replaced, fn {old, _new} -> Application.get_env(:clementine, old) != nil end) do
+      nil ->
+        :ok
+
+      {old, {name, key}} ->
+        {:error,
+         "config :clementine, #{old}: is replaced by config :clementine, :platforms, " <>
+           "#{name}: [#{key}: ...]" <>
+           replaced_hint(key) <>
+           ". Clementine refuses it at boot and on every request, so one put after boot " <>
+           "(Application.put_env(:clementine, #{inspect(old)}, ...) in a test) fails here " <>
+           "rather than being ignored"}
+    end
   end
 
   defp replaced_hint(:base_url),
@@ -391,10 +439,72 @@ defmodule Clementine.Platform do
 
   defp replaced_hint(_key), do: ""
 
+  # An {m, f, a} credential names a function that exists. Only boot
+  # checks it; a request would raise calling it.
+  defp callable(%__MODULE__{} = platform) do
+    Enum.find_value(@credential_keys, :ok, fn key ->
+      case Map.fetch!(platform, key) do
+        {module, function, args} ->
+          unless Code.ensure_loaded?(module) and
+                   function_exported?(module, function, length(args)) do
+            {:error,
+             "#{platform.name}: [#{key}: {#{inspect(module)}, #{inspect(function)}, ...}] names " <>
+               "#{inspect(module)}.#{function}/#{length(args)}, which does not exist"}
+          end
+
+        _other ->
+          nil
+      end
+    end)
+  end
+
   @doc false
   @spec validate_string(term()) :: {:ok, String.t()} | {:error, String.t()}
   def validate_string(value) when is_binary(value) and value != "", do: {:ok, value}
   def validate_string(other), do: {:error, "expected a non-empty string, got: #{inspect(other)}"}
+
+  @doc false
+  # A credential's shape, never its value: a message that quoted one in
+  # the wrong shape ({:ok, key} from System.fetch_env/1, a vault helper's
+  # tuple, a list) would print the key into a boot crash log.
+  @spec validate_credential(term()) :: {:ok, credential()} | {:error, String.t()}
+  def validate_credential(key) when is_binary(key), do: {:ok, key}
+  def validate_credential({:system, env} = key) when is_binary(env), do: {:ok, key}
+
+  def validate_credential({module, function, args} = key)
+      when is_atom(module) and is_atom(function) and is_list(args),
+      do: {:ok, key}
+
+  def validate_credential(other) do
+    {:error,
+     ~s(expected a string, {:system, "ENV_VAR"}, or {module, function, args}, got ) <>
+       shape(other) <> unwrap_hint(other)}
+  end
+
+  defp unwrap_hint({:ok, _value}),
+    do:
+      ~s( \(unwrap it, or give {:system, "ENV_VAR"} or {module, function, args}, read on ) <>
+        "every request)"
+
+  defp unwrap_hint(_other), do: ""
+
+  @doc false
+  # What kind of term `value` is, in words, without any of its contents.
+  @spec shape(term()) :: String.t()
+  def shape(nil), do: "nil"
+  def shape(value) when is_binary(value), do: "a string"
+  def shape(value) when is_boolean(value), do: "a boolean"
+  def shape(value) when is_atom(value), do: "an atom"
+  def shape(value) when is_integer(value), do: "an integer"
+  def shape(value) when is_float(value), do: "a float"
+  def shape({:ok, _value}), do: "an {:ok, value} tuple"
+  def shape({:error, _reason}), do: "an {:error, reason} tuple"
+  def shape(value) when is_tuple(value), do: "a #{tuple_size(value)}-element tuple"
+  def shape(value) when is_list(value), do: "a list"
+  def shape(%{__struct__: module}) when is_atom(module), do: "a #{inspect(module)} struct"
+  def shape(value) when is_map(value), do: "a map"
+  def shape(value) when is_function(value), do: "a function"
+  def shape(_value), do: "a term of another kind"
 
   defp config! do
     case Application.get_env(:clementine, :platforms, []) do
@@ -410,7 +520,7 @@ defmodule Clementine.Platform do
 
   defp malformed(config) do
     "Invalid :clementine, :platforms: expected a keyword list from platform to its config " <>
-      "(anthropic: [api_key: ...]), got: #{inspect(redact(config))}"
+      "(anthropic: [api_key: ...]), got #{shape(config)}"
   end
 
   defp app_entry(name) do
@@ -449,8 +559,11 @@ defmodule Clementine.Platform do
     end
   end
 
+  # An entry in the wrong shape may be the credential itself
+  # (`anthropic: System.fetch_env("ANTHROPIC_API_KEY")`), so only its
+  # shape is named.
   defp validate(name, other, _schema) do
-    {:error, "#{name}: expected a keyword list, got: #{inspect(redact(other))}"}
+    {:error, "#{name}: expected a keyword list (api_key: ...), got #{shape(other)}"}
   end
 
   # The keys a platform needs to know where to send.
@@ -469,6 +582,56 @@ defmodule Clementine.Platform do
     do: {:error, "openai_compatible: needs base_url: (the server's, before /chat/completions)"}
 
   defp endpoint(%__MODULE__{}), do: :ok
+
+  # A base_url stops before the path Clementine appends, as Anthropic's
+  # and OpenAI's SDKs take it; one that carries it would send to a
+  # doubled path (`/anthropic/anthropic/v1/messages`).
+  defp base_url_path(%__MODULE__{base_url: nil}), do: :ok
+
+  defp base_url_path(%__MODULE__{base_url: base_url} = platform) do
+    {tails, convention} = base_url_convention(platform)
+    trimmed = String.trim_trailing(base_url, "/")
+
+    case tails
+         |> Enum.filter(&String.ends_with?(trimmed, &1))
+         |> Enum.sort_by(&(-byte_size(&1))) do
+      [] ->
+        :ok
+
+      [tail | _shorter] ->
+        {:error,
+         "#{platform.name}: base_url: ends in #{tail}, which Clementine appends itself: " <>
+           convention}
+    end
+  end
+
+  @messages_tails ["/v1/messages", "/messages", "/v1"]
+  @chat_tails ["/chat/completions"]
+  @bedrock_tails ["/anthropic", "/anthropic/v1", "/anthropic/v1/messages", "/openai/v1"] ++
+                   @messages_tails ++ ["/v1/chat/completions" | @chat_tails]
+
+  defp base_url_convention(%__MODULE__{name: :bedrock}) do
+    {@bedrock_tails,
+     "give the Mantle host both of Bedrock's wires share " <>
+       "(https://bedrock-mantle.us-east-1.api.aws), not the SDKs' .../anthropic. An open " <>
+       "model Bedrock serves under /openai/v1 takes an app-named platform " <>
+       "(protocol: :chat_completions, base_url: \"https://bedrock-mantle.<region>.api.aws/openai/v1\")"}
+  end
+
+  defp base_url_convention(%__MODULE__{name: :foundry}),
+    do:
+      {@messages_tails,
+       "give the part before /v1/messages (https://myapp-prod.services.ai.azure.com/anthropic)"}
+
+  defp base_url_convention(%__MODULE__{name: :openai}),
+    do: {["/responses"], "give the part before /responses (https://api.openai.com/v1)"}
+
+  defp base_url_convention(%__MODULE__{name: name, protocol: protocol})
+       when name == :anthropic or protocol == :messages,
+       do: {@messages_tails, "give the part before /v1/messages (https://api.anthropic.com)"}
+
+  defp base_url_convention(%__MODULE__{}),
+    do: {@chat_tails, "give the part before /chat/completions (https://openrouter.ai/api/v1)"}
 
   defp one_credential(%__MODULE__{name: :foundry, api_key: key, access_token: token})
        when not is_nil(key) and not is_nil(token),
@@ -501,24 +664,41 @@ defmodule Clementine.Platform do
   defp header(%__MODULE__{}, :messages, :api_key, value), do: {"x-api-key", value}
   defp header(%__MODULE__{}, _protocol, _key, value), do: {"authorization", "Bearer " <> value}
 
-  defp resolve!(platform, key) do
-    case platform |> Map.fetch!(key) |> resolve() do
-      nil ->
-        raise ArgumentError,
-              "config :clementine, :platforms, #{platform.name}: [#{key}: ...] " <>
-                "#{if Map.fetch!(platform, key), do: "resolved to no value", else: "is not set"}"
+  defp unresolved(platform, key, why),
+    do: "config :clementine, :platforms, #{platform.name}: [#{key}: ...] #{why}"
 
-      value ->
-        value
+  # A credential's value now, `{:none, why}` when it has none, or
+  # `{:error, why}` when an {m, f, a} returned something other than a
+  # string. Never a value in `why`.
+  defp resolve(nil), do: {:none, "is not set"}
+
+  defp resolve({:system, var}) do
+    case System.get_env(var) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _unset -> {:none, "resolved to no value: the environment variable #{var} is unset or empty"}
     end
   end
 
-  defp resolve({:system, var}), do: present(System.get_env(var))
-  defp resolve({module, function, args}), do: present(apply(module, function, args))
-  defp resolve(value), do: present(value)
+  defp resolve({module, function, args}) do
+    call = "#{inspect(module)}.#{function}/#{length(args)}"
 
-  defp present(value) when is_binary(value) and value != "", do: value
-  defp present(_value), do: nil
+    case apply(module, function, args) do
+      value when is_binary(value) and value != "" ->
+        {:ok, value}
+
+      value when value in [nil, ""] ->
+        {:none, "resolved to no value: #{call} returned #{inspect(value)}"}
+
+      {:ok, _value} ->
+        {:error, "#{call} returned an {:ok, value} tuple, not a string: return the token itself"}
+
+      other ->
+        {:error, "#{call} returned #{shape(other)}, not a string"}
+    end
+  end
+
+  defp resolve(value) when is_binary(value) and value != "", do: {:ok, value}
+  defp resolve(_empty), do: {:none, "resolved to no value"}
 
   defp base(%__MODULE__{base_url: nil, name: name}), do: Map.fetch!(@defaults, name)
   defp base(%__MODULE__{base_url: base_url}), do: String.trim_trailing(base_url, "/")
@@ -529,40 +709,79 @@ defmodule Clementine.Platform do
   defp bedrock_host(%__MODULE__{base_url: base_url}), do: String.trim_trailing(base_url, "/")
 
   @doc false
-  # `term` with every literal credential replaced, for an error message.
+  # `term` with every value under `api_key:` or `access_token:` redacted,
+  # whatever its shape, for an error message.
   @spec redact(term()) :: term()
-  def redact({key, value}) when key in [:api_key, :access_token] and is_binary(value),
-    do: {key, "**redacted**"}
-
+  def redact({key, value}) when key in @credential_keys, do: {key, redact_credential(value)}
   def redact(list) when is_list(list), do: Enum.map(list, &redact/1)
   def redact(%{__struct__: _} = struct), do: struct
   def redact(map) when is_map(map), do: Map.new(map, &redact/1)
   def redact({key, value}), do: {key, redact(value)}
   def redact(other), do: other
 
-  # A NimbleOptions message may quote the value it refused.
-  defp scrub(message, entry) do
-    entry
-    |> Enum.flat_map(fn
-      {key, value} when key in [:api_key, :access_token] and is_binary(value) and value != "" ->
-        [value]
+  @doc false
+  # A credential as it may be shown: an environment variable's name, an
+  # {m, f, a}'s module and function with its arguments redacted, and
+  # nothing of any other shape.
+  @spec redact_credential(term()) :: term()
+  def redact_credential(nil), do: nil
+  def redact_credential({:system, var} = credential) when is_binary(var), do: credential
 
-      _other ->
-        []
-    end)
+  def redact_credential({module, function, args})
+      when is_atom(module) and is_atom(function) and is_list(args),
+      do: {module, function, Enum.map(args, fn _arg -> "**redacted**" end)}
+
+  def redact_credential(_value), do: "**redacted**"
+
+  @doc false
+  # `message` with every string held under `api_key:` or `access_token:`
+  # anywhere in `term` replaced, for a message a library composed (a
+  # NimbleOptions error may quote the value it refused).
+  @spec scrub(String.t(), term()) :: String.t()
+  def scrub(message, term) do
+    term
+    |> secrets()
+    |> Enum.uniq()
+    |> Enum.sort_by(&(-String.length(&1)))
     |> Enum.reduce(message, &String.replace(&2, &1, "**redacted**"))
   end
+
+  defp secrets({key, value}) when key in @credential_keys, do: secret_strings(value)
+  defp secrets(list) when is_list(list), do: Enum.flat_map(list, &secrets/1)
+  defp secrets(%{__struct__: _}), do: []
+  defp secrets(map) when is_map(map), do: Enum.flat_map(map, &secrets/1)
+  defp secrets(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> secrets()
+  defp secrets(_other), do: []
+
+  defp secret_strings({:system, var}) when is_binary(var), do: []
+
+  defp secret_strings({module, function, args})
+       when is_atom(module) and is_atom(function) and is_list(args),
+       do: secret_strings(args)
+
+  # A string too short to be a key or token (a tag beside one in a
+  # tuple) is left alone: replacing it would mangle the message.
+  defp secret_strings(value) when is_binary(value) and byte_size(value) < 8, do: []
+  defp secret_strings(value) when is_binary(value), do: [value]
+  defp secret_strings(list) when is_list(list), do: Enum.flat_map(list, &secret_strings/1)
+
+  defp secret_strings(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> secret_strings()
+
+  defp secret_strings(%{__struct__: _} = struct),
+    do: struct |> Map.from_struct() |> secret_strings()
+
+  defp secret_strings(map) when is_map(map),
+    do: Enum.flat_map(map, fn {key, value} -> secret_strings(key) ++ secret_strings(value) end)
+
+  defp secret_strings(_other), do: []
 end
 
 defimpl Inspect, for: Clementine.Platform do
   def inspect(%Clementine.Platform{} = platform, opts) do
     redacted =
       for key <- [:api_key, :access_token], reduce: platform do
-        acc ->
-          case Map.fetch!(acc, key) do
-            value when is_binary(value) -> Map.put(acc, key, "**redacted**")
-            _other -> acc
-          end
+        acc -> Map.update!(acc, key, &Clementine.Platform.redact_credential/1)
       end
 
     Inspect.Any.inspect(redacted, opts)

@@ -88,9 +88,10 @@ one that always thinks (Opus 5.5, Fable 5.1), naming a lower effort or
 `:between_tools`; send `prompt_cache_options` only where the sheet's
 TTLs are OpenAI's; send `defer_loading` only where
 `features.tool_search`; check thinking bindings only where
-`thinking.binding == :prefix`; send a skill's tools in a
+`thinking.binding == :prefix`; send a skill's load as a
 mid-conversation system message only where
-`features.mid_conversation_system`; send `response_format` on Chat
+`features.mid_conversation_system`, and its tools defined inside it only
+where `features.inline_tools` too; send `response_format` on Chat
 Completions only where `features.structured_outputs`.
 
 ## The sheets
@@ -107,7 +108,7 @@ Clementine.Models.get!("claude-sonnet-5-5")
 #=>               max_effort: %{between_tools: :high}, binding: :prefix, display: :omitted},
 #=>   rejects: [:temperature, :top_p, :top_k, :prefill, :forced_tool_choice, :budget_tokens],
 #=>   features: %{tool_search: true, structured_outputs: true, mid_conversation_system: true,
-#=>               streaming: true},
+#=>               inline_tools: true, streaming: true},
 #=>   cache: %{min_prefix: 512, ttls: [:five_minutes, :one_hour]},
 #=>   prices: %Clementine.LLM.Pricing{currency: "USD", input: 2_000_000, output: 10_000_000,
 #=>             cache_read: 100_000, cache_write: %{five_minutes: 2_500_000, one_hour: 4_000_000},
@@ -233,8 +234,9 @@ whose clients send the schema as given, an agent with an
   [:adaptive], efforts: [...]]`, and `default_effort:` if it has one.
 - A Claude model Clementine lacks (5.1 or later):
   `thinking: [binding: :prefix]`, and
-  `features: [mid_conversation_system: true]` where its platform takes
-  them, and `features: [structured_outputs: true]`, or an agent with an
+  `features: [mid_conversation_system: true, inline_tools: true]` where
+  its platform takes them (`inline_tools` only on the Claude API), and
+  `features: [structured_outputs: true]`, or an agent with an
   `output_schema:` is refused on `:anthropic`. Better, declare it
   `based_on:` the sheet it succeeds (below), which carries all of these.
 - An OpenAI model Clementine lacks, on `:openai`: its efforts and
@@ -368,13 +370,24 @@ later, and Haiku 4.5). Claude on Vertex and Claude Platform on AWS
 arrive with OPS-199.
 
 **What a platform withholds** is in the model's facts on it
-(`Clementine.Models.for_platform/2`), which the clients read: Foundry
-has no mid-conversation system messages (Anthropic's platform table, read
-2026-11-01), so a skill's load folds into the system prompt there.
-Neither Bedrock nor Foundry has server-side `fallbacks`, the Models
-API, or Message Batches, none of which Clementine sends; Foundry's
-deployments hosted on Azure also refuse code execution, Agent Skills,
-and the Files API, which Clementine does not send either.
+(`Clementine.Models.for_platform/2`), which the clients read:
+
+- Foundry has no mid-conversation system messages (Anthropic's platform
+  table, read 2026-11-01), so a skill's load folds into the system
+  prompt and `tools` there.
+- Bedrock takes mid-conversation system messages, but Anthropic's
+  mid-conversation system messages page documents a tool defined inside
+  one (the `inline-tools-2026-09-15` beta) on the Claude API only. A
+  skill's tools therefore join `tools` on Bedrock
+  (`features: [inline_tools: false]`), which costs the cache and, on a
+  model that binds its thinking, the earlier turns' thinking at the
+  load, as on Foundry. Bedrock documents tool changes by reference
+  (`mid-conversation-tool-changes-2026-07-01`), which Clementine does
+  not send.
+- Neither Bedrock nor Foundry has server-side `fallbacks`, the Models
+  API, or Message Batches, none of which Clementine sends. Foundry's
+  deployments hosted on Azure also refuse code execution, Agent Skills,
+  and the Files API, which Clementine does not send either.
 
 **Prices.** A call costs its model's prices wherever it runs. Foundry
 bills at the Claude API's rates. Bedrock prices Claude itself, and

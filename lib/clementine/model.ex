@@ -49,8 +49,12 @@ defmodule Clementine.Model do
   - `features`: `tool_search` (deferred tools go with `defer_loading`),
     `structured_outputs`, `mid_conversation_system` (a skill's load
     goes inline as a system message rather than folding into `system`
-    and `tools`), and `streaming` (default `true`; an agent's runs
-    always stream, so one on a model that does not is refused).
+    and `tools`), `inline_tools` (with `mid_conversation_system`, the
+    tools a skill's load adds go inline in that message, as
+    `tool_addition` definitions under the `inline-tools-2026-09-15`
+    beta, rather than joining `tools`), and `streaming` (default
+    `true`; an agent's runs always stream, so one on a model that does
+    not is refused).
   - `cache`: `min_prefix`, the fewest tokens a cached prefix holds
     (`nil` where the vendor states none), and
     `ttls`, the cache lifetimes it offers, shortest first. Which TTLs
@@ -160,6 +164,7 @@ defmodule Clementine.Model do
             tool_search: boolean(),
             structured_outputs: boolean(),
             mid_conversation_system: boolean(),
+            inline_tools: boolean(),
             streaming: boolean()
           },
           cache: %{min_prefix: non_neg_integer() | nil, ttls: [ttl()]},
@@ -212,6 +217,7 @@ defmodule Clementine.Model do
         tool_search: [type: :boolean],
         structured_outputs: [type: :boolean],
         mid_conversation_system: [type: :boolean],
+        inline_tools: [type: :boolean],
         streaming: [type: :boolean]
       ]
     ],
@@ -229,6 +235,19 @@ defmodule Clementine.Model do
     read: [type: @date, default: nil]
   ]
 
+  # The keys of a platform's own config (`Clementine.Platform`), which a
+  # model's platform entry does not take.
+  @platform_config_keys [
+    :base_url,
+    :api_key,
+    :access_token,
+    :region,
+    :resource,
+    :project,
+    :deployments,
+    :protocol
+  ]
+
   @platform_schema [
     id: [type: :string],
     lifecycle: [type: {:in, [:partner, nil]}, default: nil],
@@ -239,6 +258,7 @@ defmodule Clementine.Model do
         tool_search: [type: :boolean],
         structured_outputs: [type: :boolean],
         mid_conversation_system: [type: :boolean],
+        inline_tools: [type: :boolean],
         streaming: [type: :boolean]
       ]
     ],
@@ -274,6 +294,7 @@ defmodule Clementine.Model do
     tool_search: false,
     structured_outputs: false,
     mid_conversation_system: false,
+    inline_tools: false,
     streaming: true
   }
   @cache_defaults %{min_prefix: nil, ttls: []}
@@ -366,46 +387,14 @@ defmodule Clementine.Model do
   def cache_mechanism([ttl | _rest]) when ttl in @option_ttls, do: :options
 
   @doc false
-  # `term` with every literal `api_key:` replaced, for an error message.
+  # `term` with every credential (`api_key:`, `access_token:`) redacted,
+  # whatever its shape, for an error message. A sheet holds none; one
+  # put there by mistake is still never printed.
   @spec redact(term()) :: term()
-  def redact({:api_key, key}) when is_binary(key), do: {:api_key, "**redacted**"}
-  def redact(list) when is_list(list), do: Enum.map(list, &redact/1)
-  def redact(%{__struct__: _} = struct), do: struct
+  defdelegate redact(term), to: Clementine.Platform
 
-  def redact(map) when is_map(map),
-    do: Map.new(map, fn {key, value} -> redact({key, value}) end)
-
-  def redact({key, value}), do: {key, redact(value)}
-  def redact(other), do: other
-
-  # `message` with every literal `api_key:` in `term` replaced.
-  defp scrub(message, term) do
-    term
-    |> literal_keys()
-    |> Enum.reduce(message, &String.replace(&2, &1, "**redacted**"))
-  end
-
-  defp literal_keys({:api_key, key}) when is_binary(key) and key != "", do: [key]
-  defp literal_keys(list) when is_list(list), do: Enum.flat_map(list, &literal_keys/1)
-  defp literal_keys(%{__struct__: _}), do: []
-  defp literal_keys(map) when is_map(map), do: Enum.flat_map(map, &literal_keys/1)
-  defp literal_keys({_key, value}), do: literal_keys(value)
-  defp literal_keys(_other), do: []
-
-  @doc false
-  @spec validate_credential(term()) :: {:ok, term()} | {:error, String.t()}
-  def validate_credential(key) when is_binary(key), do: {:ok, key}
-  def validate_credential({:system, env} = key) when is_binary(env), do: {:ok, key}
-
-  def validate_credential({module, function, args} = key)
-      when is_atom(module) and is_atom(function) and is_list(args),
-      do: {:ok, key}
-
-  def validate_credential(other) do
-    {:error,
-     ~s(expected a string, {:system, "ENV_VAR"}, or {module, function, args}, got: ) <>
-       inspect(other)}
-  end
+  # `message` with every credential string in `term` replaced.
+  defp scrub(message, term), do: Clementine.Platform.scrub(message, term)
 
   defp validate(opts, schema) do
     case NimbleOptions.validate(opts, schema) do
@@ -446,8 +435,9 @@ defmodule Clementine.Model do
   # compile time never reads the app's config.
   defp known_platform?(name), do: name in @platforms or Clementine.Platform.app_named?(name)
 
-  defp platform_entry(_name, entry) when is_list(entry) do
-    with {:ok, validated} <- validate(entry, @platform_schema) do
+  defp platform_entry(name, entry) when is_list(entry) do
+    with :ok <- no_platform_config(name, entry),
+         {:ok, validated} <- validate(entry, @platform_schema) do
       {:ok,
        validated
        |> Map.new()
@@ -459,8 +449,30 @@ defmodule Clementine.Model do
   defp platform_entry(_name, other),
     do:
       {:error,
-       "expected a keyword list (id:, lifecycle:, features:, cache:), got: " <>
-         inspect(redact(other))}
+       "expected a keyword list (id:, lifecycle:, features:, cache:), got " <>
+         Clementine.Platform.shape(other)}
+
+  # Where a model's platform entry once took an endpoint or a credential
+  # (`base_url:`, `api_key:`), the platform's own config now holds it.
+  defp no_platform_config(name, entry) do
+    case Enum.filter(Keyword.keys(entry), &(&1 in @platform_config_keys)) do
+      [] ->
+        :ok
+
+      keys ->
+        place =
+          if name in @platforms,
+            do: "config :clementine, :platforms, #{name}: [...]",
+            else:
+              "config :clementine, :platforms, #{name}: [protocol: :chat_completions or " <>
+                ":messages, base_url: ..., api_key: ...], an app-named platform"
+
+        {:error,
+         "#{Enum.map_join(keys, ", ", &"#{&1}:")} no longer go on a model's platform entry, " <>
+           "which takes only id:, lifecycle:, features:, and cache:; the endpoint and " <>
+           "credential go under #{place} (Clementine.Platform)"}
+    end
+  end
 
   defp build(opts, platforms) do
     %__MODULE__{

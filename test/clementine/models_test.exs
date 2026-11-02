@@ -160,7 +160,15 @@ defmodule Clementine.ModelsTest do
              ~r/none of which Clementine can send a :me model to/},
             {%{"claude-sonnet-5" => [id: "other"]}, ~r/no other id/},
             {%{"claude-sonnet-5" => [platforms: [anthropic: [base_url: "http://x"]]]},
-             ~r/unknown options \[:base_url\]/},
+             ~r/base_url: no longer go on a model's platform entry.*config :clementine, :platforms, anthropic: \[...\]/},
+            {%{
+               "mine" => [
+                 vendor: :me,
+                 context: 1,
+                 max_output: 1,
+                 platforms: [openrouter: [base_url: "http://x", api_key: "k"]]
+               ]
+             }, ~r/base_url:, api_key: no longer go on a model's platform entry/},
             {%{
                "claude-sonnet-5" => [
                  prices: [
@@ -348,7 +356,10 @@ defmodule Clementine.ModelsTest do
             base ++ [platforms: [openai_compatible: key]],
             %{platforms: [openai_compatible: key]},
             base ++ [platforms: [openai_compatible: Map.new(key)]],
-            base ++ [platforms: %{openai_compatible: key}]
+            base ++ [platforms: %{openai_compatible: key}],
+            base ++ [platforms: [openai_compatible: [api_key: {:ok, "sk-not-a-real-key"}]]],
+            %{platforms: [openai_compatible: [api_key: {:ok, "sk-not-a-real-key"}]]},
+            base ++ [platforms: [openai_compatible: {:ok, "sk-not-a-real-key"}]]
           ] do
         put_models(%{"qwen3" => facts})
         error = assert_raise ArgumentError, fn -> Models.validate_config!() end

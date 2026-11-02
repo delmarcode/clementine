@@ -8,7 +8,7 @@ defmodule Clementine.LLM.PlatformsTest do
   use ExUnit.Case, async: false
 
   alias Clementine.LLM.{Anthropic, ChatCompletions}
-  alias Clementine.LLM.Message.{SystemMessage, UserMessage}
+  alias Clementine.LLM.Message.{Content, SystemMessage, UserMessage}
   alias Clementine.Test.Fixtures
 
   defmodule OnAnthropic do
@@ -60,6 +60,9 @@ defmodule Clementine.LLM.PlatformsTest do
   # A short-term Amazon Bedrock API key lasts 12 hours at most, so an app
   # gives an {m, f, a} that mints a fresh one; it is called per request.
   def bedrock_token, do: "bedrock-short-term-token"
+
+  # A token helper that returns its cache's tuple rather than the token.
+  def minted_tuple, do: {:ok, "minted-secret"}
 
   defp capture(bypass, path) do
     test = self()
@@ -183,6 +186,36 @@ defmodule Clementine.LLM.PlatformsTest do
       assert foundry["messages"] == [%{"role" => "user", "content" => "Hi"}]
       assert [%{"text" => "Be brief.\n\nAnswer in French."}] = foundry["system"]
     end
+
+    test "Bedrock withholds the inline tool beta: a skill's tools join tools", %{bypass: bypass} do
+      definition = %{
+        "name" => "lookup_note",
+        "description" => "Look up a note.",
+        "input_schema" => %{"type" => "object", "properties" => %{}}
+      }
+
+      # What the engine records after a skill load: tools and no text.
+      messages = [
+        UserMessage.new("Hi"),
+        SystemMessage.new([%Content.ToolAddition{definition: definition}], skill: "notes")
+      ]
+
+      capture(bypass, "/v1/messages")
+      {headers, anthropic} = stream_claude([], messages)
+
+      assert [_user, %{"role" => "system", "content" => [addition]}] = anthropic["messages"]
+      assert addition["tool"] == %{"type" => "tool_definition", "definition" => definition}
+      assert header(headers, "anthropic-beta") == ["inline-tools-2026-09-15"]
+      refute Map.has_key?(anthropic, "tools")
+
+      capture(bypass, "/anthropic/v1/messages")
+      {headers, bedrock} = stream_claude([platform: :bedrock], messages)
+
+      assert bedrock["messages"] == [%{"role" => "user", "content" => "Hi"}]
+      assert [tool] = bedrock["tools"]
+      assert Map.take(tool, ["name", "description", "input_schema"]) == definition
+      assert header(headers, "anthropic-beta") == []
+    end
   end
 
   describe "an open model on Bedrock" do
@@ -260,6 +293,38 @@ defmodule Clementine.LLM.PlatformsTest do
                Clementine.Cost.of(usage, "claude-sonnet-5-5", platform: :bedrock)
     end
 
+    test "a credential that fails to resolve is a failed call, counted after its start" do
+      handler = "platforms-credential-#{System.unique_integer([:positive])}"
+      test = self()
+
+      :telemetry.attach_many(
+        handler,
+        [[:clementine, :llm, :start], [:clementine, :llm, :exception]],
+        &__MODULE__.forward_llm/4,
+        test
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      Clementine.TestPlatforms.put(
+        bedrock: [api_key: {__MODULE__, :minted_tuple, []}, base_url: "http://localhost:1"]
+      )
+
+      outcome =
+        try do
+          Clementine.run(OnBedrock, "Hi")
+        rescue
+          error -> {:raised, error}
+        end
+
+      refute match?({:ok, _result}, outcome)
+      assert_received {:llm, [:clementine, :llm, :start], %{platform: :bedrock}}
+      assert_received {:llm, [:clementine, :llm, :exception], %{kind: :error, reason: reason}}
+      assert {:llm_exception, %{message: message}} = reason
+      assert message =~ "minted_tuple/0 returned an {:ok, value} tuple, not a string"
+      refute inspect(reason) =~ "minted-secret"
+    end
+
     test "boot checks the platform it names, and an eval's model keeps it" do
       config = Clementine.Runs.Config.new!(repo: Clementine.TestRepo, agents: [OnBedrock])
       assert %{agents: %{"platforms_screener" => OnBedrock}} = config
@@ -274,14 +339,29 @@ defmodule Clementine.LLM.PlatformsTest do
       assert error.message =~ "goes to :bedrock"
       assert error.message =~ "bedrock: [api_key: ...] is not set"
 
-      # An agent/1 that picks another model for a run keeps use's
-      # platform: where the app's credentials are.
+      # An agent/1 that picks another model of the same vendor for a run
+      # keeps use's platform: where the app sends Claude.
       agent =
         Clementine.Agent.declared!(OnBedrock, Clementine.Agent.new(model: "claude-opus-5-5"))
 
       assert agent.platform == :bedrock
+
+      # A model of another vendor (an eval's cross-vendor --model) goes
+      # to its own vendor's default, unless agent/1 names a platform.
+      agent = Clementine.Agent.declared!(OnBedrock, Clementine.Agent.new(model: "gpt-6.1-sol"))
+      assert agent.platform == nil
+      assert {:ok, %{platform: :openai}} = Clementine.LLM.Policy.resolve(agent.model, [])
+
+      agent =
+        Clementine.Agent.declared!(
+          OnBedrock,
+          Clementine.Agent.new(model: "gpt-6.1-sol", platform: :openai)
+        )
+
+      assert agent.platform == :openai
     end
   end
 
   def forward(_event, _measurements, metadata, test), do: send(test, {:llm_stop, metadata})
+  def forward_llm(event, _measurements, metadata, test), do: send(test, {:llm, event, metadata})
 end

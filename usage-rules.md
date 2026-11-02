@@ -52,7 +52,9 @@ the drain at shutdown.
   `model: run.metadata["model"] || __model__()`. `use`'s choices are for
   `use`'s model: the runtime fills them in when `agent/1` leaves the
   model to `use` or names the same one, and a different model runs on
-  its own defaults and whatever `agent/1` sets, on `use`'s `platform:`.
+  its own defaults and whatever `agent/1` sets. `use`'s `platform:`
+  carries to a model of the same vendor; a model of another vendor goes
+  to its vendor's default platform unless `agent/1` names one.
 - A model the vendor shipped today goes under `config :clementine,
   :models` with `based_on:` a shipped sheet (`docs/MODELS.md`), rather
   than as a bare declaration that knows none of the base's facts.

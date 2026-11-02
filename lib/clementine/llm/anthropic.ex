@@ -21,7 +21,8 @@ defmodule Clementine.LLM.Anthropic do
   model cannot do there is in its facts on that platform
   (`Clementine.Models.for_platform/2`), which the request reads: Foundry
   takes no mid-conversation system messages, so a skill's load folds
-  into the system prompt.
+  into the system prompt and `tools`, and Bedrock takes no tool defined
+  inside one, so a skill's tools join `tools` there.
 
       config :clementine, :platforms, anthropic: [api_key: {:system, "ANTHROPIC_API_KEY"}]
 
@@ -75,18 +76,20 @@ defmodule Clementine.LLM.Anthropic do
   turn's thinking only while its binding still holds (a turn without
   one goes without its thinking), so an edited history costs that
   reasoning and is never refused; the engine reports it as
-  `[:clementine, :llm, :thinking_dropped]`. Where the sheet has
-  `features.mid_conversation_system`, a
+  `[:clementine, :llm, :thinking_dropped]`. Where the model's facts on
+  its platform have `features.mid_conversation_system`, a
   `Clementine.LLM.Message.SystemMessage` goes as a mid-conversation
-  `role: "system"` message, its tools as inline definitions, and the
-  tools it adds stay out of `tools`; elsewhere its text joins the
-  system prompt and its tools join `tools`. The runtime guide's "Models
-  that bind their thinking" has the whole policy.
+  `role: "system"` message. With `features.inline_tools` too, its tools
+  go in it as inline definitions and stay out of `tools`; without
+  (Bedrock), only its text goes there, and its tools join `tools`.
+  Elsewhere its text joins the system prompt and its tools join
+  `tools`. The runtime guide's "Models that bind their thinking" has
+  the whole policy.
 
   Beta headers follow the body: `thinking-display-updates-2026-08-18`
   for `display: :updates`, `thinking-binding-controls-2026-08-01` for
   `prefix_mismatch:`, and `inline-tools-2026-09-15` when a system message
-  adds a tool.
+  defines a tool inline.
 
   ## Prompt caching
 
@@ -349,9 +352,9 @@ defmodule Clementine.LLM.Anthropic do
     policy = policy!(model, opts, [output_schema: schema?] ++ checks)
     facts = policy.model
     binds? = facts.thinking.binding == :prefix
-    inline? = facts.features.mid_conversation_system
+    placement = placement(facts.features)
 
-    {system, tools, added} = arrange(inline?, system, messages, tools || [])
+    {system, tools, added} = arrange(placement, system, messages, tools || [])
 
     # A model without tool search gets its deferred tools as ordinary
     # tools, as every other provider does, rather than a request the API
@@ -365,9 +368,10 @@ defmodule Clementine.LLM.Anthropic do
       end
 
     # A system message folded into `system` and `tools` sends nothing
-    # where it stands.
+    # where it stands; one whose tools joined `tools` sends its text.
     replay = fn
-      %SystemMessage{} when not inline? -> []
+      %SystemMessage{} when placement == :fold -> []
+      %SystemMessage{} = message when placement == :text -> text_only(message)
       message -> Messages.encode_replay(message, tool_search: loadable(encoded_tools))
     end
 
@@ -391,28 +395,36 @@ defmodule Clementine.LLM.Anthropic do
     {policy, body, binding, dropped}
   end
 
-  # A model that takes mid-conversation system messages keeps them in
-  # place, and a tool one of them adds goes inline there, not in `tools`:
-  # the request's tools stay as the first turn sent them. Elsewhere a
-  # system message's text joins the system prompt, and the tools it adds
-  # join the request's (the engine already offers a loaded skill's).
-  defp arrange(true, system, messages, tools) do
+  # Where a system message goes on the model's platform: in place with
+  # the tools it adds defined inline (`:inline`), in place with its text
+  # only and its tools in `tools` (`:text`: Bedrock, which documents
+  # mid-conversation system messages but the inline tool definition on
+  # the Claude API only), or folded into `system` and `tools` (`:fold`:
+  # Foundry, and a model that takes none in place).
+  defp placement(%{mid_conversation_system: false}), do: :fold
+  defp placement(%{inline_tools: true}), do: :inline
+  defp placement(_features), do: :text
+
+  # Inline, a tool a system message adds goes in that message, not in
+  # `tools`: the request's tools stay as the first turn sent them.
+  # Otherwise the tools it adds join the request's (the engine already
+  # offers a loaded skill's), and folded, its text joins the system
+  # prompt too.
+  defp arrange(:inline, system, messages, tools) do
     added = MapSet.new(added_definitions(messages), & &1["name"])
     {system, Enum.reject(tools, &(tool_name(&1) in added)), []}
   end
 
-  defp arrange(false, system, messages, tools) do
-    system_messages = Enum.filter(messages, &match?(%SystemMessage{}, &1))
-    names = MapSet.new(tools, &tool_name/1)
+  defp arrange(:text, system, messages, tools) do
+    {system, tools, added_tools(messages, tools)}
+  end
 
-    added =
-      system_messages
-      |> added_definitions()
-      |> Enum.reject(&(&1["name"] in names))
-      |> Enum.uniq_by(& &1["name"])
-
+  defp arrange(:fold, system, messages, tools) do
     texts =
-      for message <- system_messages, text = SystemMessage.get_text(message), text != "", do: text
+      for %SystemMessage{} = message <- messages,
+          text = SystemMessage.get_text(message),
+          text != "",
+          do: text
 
     system =
       case Enum.reject([system | texts], &(&1 in [nil, ""])) do
@@ -420,7 +432,26 @@ defmodule Clementine.LLM.Anthropic do
         parts -> Enum.join(parts, "\n\n")
       end
 
-    {system, tools, added}
+    {system, tools, added_tools(messages, tools)}
+  end
+
+  # The definitions system messages add that the request's tools lack.
+  defp added_tools(messages, tools) do
+    names = MapSet.new(tools, &tool_name/1)
+
+    messages
+    |> added_definitions()
+    |> Enum.reject(&(&1["name"] in names))
+    |> Enum.uniq_by(& &1["name"])
+  end
+
+  # A system message without the tools it adds, or nothing when it
+  # added tools and said nothing.
+  defp text_only(%SystemMessage{content: content} = message) do
+    case Enum.reject(content, &match?(%Clementine.LLM.Message.Content.ToolAddition{}, &1)) do
+      [] -> []
+      text -> [Messages.encode(%{message | content: text})]
+    end
   end
 
   defp added_definitions(messages) do
@@ -542,7 +573,7 @@ defmodule Clementine.LLM.Anthropic do
   defp inline_tools?(messages) do
     Enum.any?(messages || [], fn
       %{"role" => "system", "content" => content} when is_list(content) ->
-        Enum.any?(content, &(&1["type"] == "tool_addition"))
+        Enum.any?(content, &match?(%{"tool" => %{"type" => "tool_definition"}}, &1))
 
       _message ->
         false
