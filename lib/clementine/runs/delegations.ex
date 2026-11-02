@@ -299,8 +299,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # running the parent's work again (a thread's retry of its turn, a
     # requeue) would ask again, and the child would act again. The
     # parent's terminal write carries the fence to whoever decides
-    # (Clementine.Thread reads effects? on the end), so it rises before
-    # the parent can resume, with the write that made it true.
+    # (Clementine.Thread reads effects? on the end), so it rises in the
+    # transaction that ends the child, before the parent can resume.
     defp raise_fence(run_id) do
       %Config{repo: repo} = Config.fetch!()
 
