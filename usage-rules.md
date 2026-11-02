@@ -203,12 +203,17 @@ end
   reasoning, and emits `[:clementine, :llm, :thinking_dropped]` (guide:
   "Models that bind their thinking").
 - The conversation is the app's data, in its own table. Store each
-  finished turn in `run_finished/2`: `result.input_message` (unless the
-  app stored the user's message when it arrived) and `result.messages`,
-  as `jsonb` through `Clementine.LLM.Message.to_map/1`, for a
-  `Result.Failed` as for a `Result.Completed`: a failed turn's
-  `messages` are the steps it completed (its tool calls, a sent email),
-  and the next turn must see them. Read them back with `from_map/1`.
+  finished turn in `run_finished/2`, for a `Result.Failed` as for a
+  `Result.Completed`: `result.messages` (a failed turn's are the steps
+  it completed, its tool calls and a sent email, and the next turn must
+  see them) and the turn's prompt, `result.input_message`, once per
+  turn. A thread's `"retry"` runs a failed turn again with the same
+  prompt, so store the user's message when it arrives, or insert the
+  prompt keyed on the turn (`run.tag_id`, the same for the retry) and
+  skip one already stored. Never append `[input_message | messages]` at
+  every end: a retried turn's prompt is stored twice. Store them as
+  `jsonb` through `Clementine.LLM.Message.to_map/1`, and read them back
+  with `from_map/1`.
 - One turn is one run with subject `{"conversation", id}`, so a second
   turn while one is in flight, of this agent or another, returns
   `{:error, :active_run_exists}`.
@@ -351,8 +356,9 @@ the message.
   (`true`), one immediate retry of a turn whose node died. A turn is
   retried at most once, under the same tag, and only when its run had no
   effects (`effects?: false` on the result: it called no tool that is
-  not `retry: :safe`); a failed one only on a retryable error (an
-  overloaded provider, an outage), never a refusal, a cut, or `:empty`.
+  not `retry: :safe`, and no delegate it asked did); a failed one only
+  on a retryable error (an overloaded provider, an outage, a stalled
+  stream), never a refusal, a cut, or `:empty`.
   Bad args end the loop `failed` in its first step.
 - `send/3` appends the message, wakes the loop, and enqueues its step in
   one transaction. Inside the caller's transaction they commit with it
@@ -685,7 +691,8 @@ use Clementine.Agent, key: "grader", model: "claude-sonnet-5-5", instructions: "
   `messages` are its finished tool calls and their results, closed by
   an assistant message of no content, without the turn that failed
   (`[]` when no step finished). Store them like a completed turn's, or
-  the next turn repeats what the tools did.
+  the next turn repeats what the tools did, and the turn's prompt once
+  per turn, not per run: a retry runs the turn with the same prompt.
 - A thread retries neither a refused, cut-off, or empty turn nor one
   whose tools had effects, whatever `"on_failure"` says.
 

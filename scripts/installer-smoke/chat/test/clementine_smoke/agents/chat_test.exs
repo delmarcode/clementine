@@ -2,7 +2,9 @@ defmodule ClementineSmoke.Agents.ChatTest do
   use ClementineSmoke.AgentsCase
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
-  alias ClementineSmoke.Agents.Chat
+  alias Clementine.Result
+  alias Clementine.Runs.AgentRun
+  alias ClementineSmoke.Agents.{Chat, Host}
   alias ClementineSmoke.Agents.LLMMock
   alias ClementineSmoke.Conversations
 
@@ -52,6 +54,32 @@ defmodule ClementineSmoke.Agents.ChatTest do
     id = second.id
     assert {:chat_text, id, "Your name is Ada."} in broadcasts()
     assert length(Conversations.messages(conversation)) == 4
+  end
+
+  test "a turn's prompt is stored once, when a retry of the turn ends too", %{
+    conversation: conversation
+  } do
+    # A thread's turn that failed with nothing done, and its retry.
+    run = %AgentRun{agent_key: "chat", subject_id: conversation, tag_kind: "turn", tag_id: "m1"}
+    prompt = UserMessage.new("Hello?")
+    overloaded = %Clementine.Error{code: :overloaded, retryable?: true}
+
+    :ok =
+      Host.run_finished(
+        %{run | id: Ecto.UUID.generate()},
+        %Result.Failed{error: overloaded, input_message: prompt, effects?: false}
+      )
+
+    :ok =
+      Host.run_finished(
+        %{run | id: Ecto.UUID.generate()},
+        Result.completed(input_message: prompt, messages: [AssistantMessage.new("Hi.")])
+      )
+
+    assert [%UserMessage{content: "Hello?"}, %AssistantMessage{} = reply] =
+             Conversations.messages(conversation)
+
+    assert AssistantMessage.get_text(reply) == "Hi."
   end
 
   test "a second turn waits for the first to finish", %{conversation: conversation} do

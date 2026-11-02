@@ -150,8 +150,9 @@ defmodule MyApp.ThreadLoop do
   end
 
   # Pod death mid-turn: the reaper interrupted the child and its end
-  # reached here like any other completion. Retry it once, after a pause.
-  def handle({:completed, {:turn, id}, %Result.Interrupted{}}, state) do
+  # reached here like any other completion. Retry it once, after a pause,
+  # unless its tools had effects: running it again would repeat them.
+  def handle({:completed, {:turn, id}, %Result.Interrupted{effects?: false}}, state) do
     {:ok, state, [{:timer, {:retry, id}, :timer.seconds(30)}]}
   end
 
@@ -159,7 +160,8 @@ defmodule MyApp.ThreadLoop do
     {:ok, state, [turn(state, message)]}
   end
 
-  # A failed or cancelled turn: the host saw the result; move on.
+  # A failed or cancelled turn, or an interrupted one that had effects:
+  # the host saw the result; move on.
   def handle({:completed, {:turn, _id}, _failed_or_cancelled}, state) do
     next(state)
   end

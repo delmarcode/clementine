@@ -265,6 +265,13 @@ says so; a run that did nothing at all fails:
 - Keep the user's message that drew a refusal in the thread too: it is
   what the user said, and two user messages in a row are valid on
   every provider.
+- Store a turn's prompt once per turn, not once per run. A thread's
+  `"retry"` runs a failed turn again under the same tag, with the same
+  prompt, so appending `[input_message | messages]` at every end stores
+  the prompt twice. Store the user's message when it arrives (and leave
+  it out of that turn's `history/1`), or insert `input_message` keyed on
+  the turn, `run.tag_id` (the message's id, the same for the retry),
+  skipping one already stored; then append only `messages`.
 - A refusal is usually not the last word. Anthropic's advice is to send
   the same request to another Claude model, which usually answers it.
   Its server-side fallback (`fallbacks: "default"`, a beta) does that
@@ -314,7 +321,8 @@ What each kind of agent does with it:
   whose tools had effects: `"on_failure": "retry"` runs a failed turn
   again only when its error is retryable (an overloaded provider, an
   outage) and its run had no effects (`Result.Failed`'s `effects?`), so
-  a retry never sends an email twice.
+  a retry never sends an email twice. The effects of a delegate the turn
+  asked count as the turn's.
 
 In tests, script the stop through the Anthropic fake
 (`expect_claude_turn/2`):
@@ -719,11 +727,15 @@ defmodule MyApp.Agents.Host do
   # What must happen when a run ends. Inside the transaction that ends
   # it: these writes, and the mail job, commit with the run's end or not
   # at all. A chat turn stores its messages here, and a failed one the
-  # steps it completed (its tool calls and their results).
+  # steps it completed (its tool calls and their results). The prompt is
+  # stored once per turn, keyed on its tag: a thread's retry runs the
+  # turn again under the same tag, with the same prompt. A run with no
+  # tag (Runs.start/3) is never retried, so its own id keys it.
   @impl true
   def run_finished(%{agent_key: "chat"} = run, %ended{} = result)
       when ended in [Result.Completed, Result.Failed] do
-    MyApp.Chat.append!(run.subject_id, [result.input_message | result.messages])
+    MyApp.Chat.put_prompt!(run.subject_id, run.tag_id || run.id, result.input_message)
+    MyApp.Chat.append!(run.subject_id, result.messages)
   end
 
   def run_finished(run, %Result.Completed{output: output}) do

@@ -21,6 +21,25 @@ defmodule ClementineSmoke.Conversations do
     |> Enum.map(&Message.from_map/1)
   end
 
+  @doc """
+  Stores a turn's prompt, unless the turn's is stored already: `turn`
+  keys it, and a retry of the turn has the same key and the same prompt.
+  """
+  def put_prompt!(conversation_id, turn, message) do
+    entry = %{
+      conversation_id: conversation_id,
+      turn: turn,
+      message: Message.to_map(message),
+      inserted_at: DateTime.utc_now()
+    }
+
+    Repo.insert_all(Entry, [entry],
+      on_conflict: :nothing,
+      conflict_target: [:conversation_id, :turn]
+    )
+    :ok
+  end
+
   @doc "Appends `messages` to the conversation, in order."
   def append!(conversation_id, messages) do
     now = DateTime.utc_now()
