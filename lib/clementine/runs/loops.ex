@@ -764,7 +764,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
            ctx
          ) do
       row = repo.get!(AgentRun, commit.loop_ref)
-      Lifecycle.project(result, row, ctx)
+      Lifecycle.project(Result.with_effects(result, row.effects), row, ctx)
       :ok
     end
 

@@ -170,9 +170,10 @@ if Code.ensure_loaded?(Ecto.Query) do
     The host's product projection: invoked with the transition's
     `Clementine.Result` and the freshly updated row, inside the same
     transaction as the state write, for every transition into a terminal
-    status — finish, reaper interrupt, and direct cancel alike. Raise to
-    abort: the transition will not commit. The default implementation is a
-    no-op.
+    status — finish, reaper interrupt, and direct cancel alike. A
+    `Clementine.Result.Failed` or `Clementine.Result.Interrupted` carries
+    the row's effect fence as `effects?`. Raise to abort: the transition
+    will not commit. The default implementation is a no-op.
     """
     @callback project(Clementine.Result.t(), row :: Ecto.Schema.t(), ctx :: term()) :: any()
 
@@ -355,16 +356,17 @@ if Code.ensure_loaded?(Ecto.Query) do
 
             case cas_update(config, transition, now) do
               {:ok, row} ->
+                facts = Codec.to_facts(row, fields)
                 record_trace(module, transition, row, ctx)
-                if transition.result, do: module.project(transition.result, row, ctx)
-                row
+                if transition.result, do: project(module, transition.result, row, facts, ctx)
+                facts
 
               {:error, :stale} ->
                 repo.rollback(:stale)
             end
           end)
           |> tap(fn
-            {:ok, _row} -> Clementine.Emissions.flush(token)
+            {:ok, _facts} -> Clementine.Emissions.flush(token)
             {:error, _reason} -> :ok
           end)
         after
@@ -372,9 +374,7 @@ if Code.ensure_loaded?(Ecto.Query) do
         end
 
       case result do
-        {:ok, row} ->
-          facts = Codec.to_facts(row, fields)
-
+        {:ok, %Facts{} = facts} ->
           emit(fn ->
             push_cancel(config, transition)
             notify(module, facts, transition, ctx)
@@ -386,6 +386,12 @@ if Code.ensure_loaded?(Ecto.Query) do
           {:error, reason}
       end
     end
+
+    # A failed or interrupted end carries the run's effect fence as this
+    # write committed it, for whoever decides on a retry (a thread, the
+    # host): running the work again repeats what a fenced run did.
+    defp project(module, result, row, %Facts{effects?: effects?}, ctx),
+      do: module.project(Clementine.Result.with_effects(result, effects?), row, ctx)
 
     defp record_trace(_module, %Transition{trace: []}, _row, _ctx), do: :ok
 

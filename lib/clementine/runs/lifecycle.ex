@@ -114,13 +114,12 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       :ok
     end
 
-    # A failed or interrupted end carries the run's effect fence as this
-    # write committed it, for whoever decides on a retry (a thread, the
-    # host): running the work again repeats what a fenced run did.
+    # A failed or interrupted end arrives with the run's effect fence
+    # (`effects?`), stamped by the adapter from the row this write
+    # committed, and the loop's own end by its step.
     @impl Clementine.Lifecycle.Ecto
     def project(result, %AgentRun{} = run, _ctx) do
       %Config{repo: repo, host: host} = Config.fetch!()
-      result = Result.with_effects(result, run.effects)
       run = store_output(repo, result, run)
 
       # A child tells its parent inside this same transaction: a loop

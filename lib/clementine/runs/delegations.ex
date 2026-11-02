@@ -13,7 +13,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     #     checkpoint. A parent flagged for cancel starts none;
     #   * a child's end: inside the child's terminal transaction
     #     (Loops.append_completion/2 dispatches here on the parent's
-    #     kind), under the parent's row lock, the last child to end
+    #     kind), under the parent's row lock, a child that had effects
+    #     raises the parent's effect fence, and the last child to end
     #     resumes the parent with every child's outcome and its new job;
     #   * the parent's cancel while it waits: a flag, like a running
     #     run's, and its live children cancelled in the same transaction.
@@ -21,7 +22,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     #     the flag, so it ends after them and a cascade finishes bottom up;
     #   * the parent's end while it waits (the reaper's wait ceiling, a
     #     cancel of a park that started no child): its live children are
-    #     cancelled in the same transaction.
+    #     cancelled in the same transaction, and the end carries their
+    #     effects in its fence.
     #
     # reconcile/1 resumes a parent whose children have all ended and that
     # still waits: after a park that started none (the worker calls it
@@ -271,12 +273,15 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     @doc false
     # Inside `child`'s terminal transaction, with `parent` (a rollout)
-    # locked: when the parent waits on it and every child it waits on has
-    # ended, the parent resumes with their outcomes, and its job commits
-    # with the child's end. A parent that no longer waits on the child
-    # (ended, or resumed by an earlier end) hears nothing.
+    # locked: a child that had effects raises the parent's fence, and
+    # when the parent waits on it and every child it waits on has ended,
+    # the parent resumes with their outcomes, and its job commits with
+    # the child's end. A parent that no longer waits on the child (ended,
+    # or resumed by an earlier end) hears nothing.
     @spec child_ended(AgentRun.t(), AgentRun.t()) :: :ok
     def child_ended(%AgentRun{} = parent, %AgentRun{} = child) do
+      if child.effects and not AgentRun.terminal?(parent), do: raise_fence(parent.id)
+
       case Codec.to_facts(parent, @fields) do
         %Facts{
           status: :waiting,
@@ -288,6 +293,22 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         %Facts{} ->
           :ok
       end
+    end
+
+    # A child's effects are its parent's: the parent asked for them, so
+    # running the parent's work again (a thread's retry of its turn, a
+    # requeue) would ask again, and the child would act again. The
+    # parent's terminal write carries the fence to whoever decides
+    # (Clementine.Thread reads effects? on the end), so it rises before
+    # the parent can resume, with the write that made it true.
+    defp raise_fence(run_id) do
+      %Config{repo: repo} = Config.fetch!()
+
+      repo.update_all(from(r in AgentRun, where: r.id == ^run_id and not r.effects),
+        set: [effects: true]
+      )
+
+      :ok
     end
 
     @doc false
@@ -391,10 +412,13 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # The flag, or the end, and the cascade, one transaction: the live
     # descendants locked deepest first, then the run's own row, compared
     # with what the write expects, then the write, then each live child
-    # cancelled (a waiting one cascades the same way). A run that moved
-    # meanwhile (its last child's end resumed it) is `{:error, :stale}`,
-    # returned as a value with nothing written, so a cancel inside an
-    # enclosing unit (a loop's step) fetches again and goes on.
+    # cancelled (a waiting one cascades the same way). An end raises the
+    # run's fence first when a child or a live descendant had effects: a
+    # live one acted, or may have, before the cancel reaches it. A run
+    # that moved meanwhile (its last child's end resumed it) is
+    # `{:error, :stale}`, returned as a value with nothing written, so a
+    # cancel inside an enclosing unit (a loop's step) fetches again and
+    # goes on.
     @spec write_wait(Transition.t(), term()) :: {:ok, Facts.t()} | {:error, term()}
     def write_wait(%Transition{run_ref: run_id} = transition, ctx) do
       %Config{repo: repo} = Config.fetch!()
@@ -403,9 +427,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       Emissions.after_commit(fn ->
         repo.transaction(fn ->
           rollout? = rollout?(repo, run_id)
-          if rollout?, do: lock_live_descendants(repo, run_id)
+          live = if rollout?, do: lock_live_descendants(repo, run_id), else: []
 
           if expected?(repo, transition) do
+            if rollout? and transition.result, do: inherit_effects(repo, run_id, live)
+
             case EctoLifecycle.apply_transition(Lifecycle, transition, ctx) do
               {:ok, %Facts{} = facts} ->
                 if rollout?, do: cancel_live_children(repo, run_id, code)
@@ -431,6 +457,15 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       repo.one(from(r in AgentRun, where: r.id == ^run_id, select: r.kind)) == "rollout"
     end
 
+    defp inherit_effects(repo, run_id, live) do
+      if repo.exists?(
+           from(r in AgentRun,
+             where: (r.parent_id == ^run_id or r.id in ^live) and r.effects
+           )
+         ),
+         do: raise_fence(run_id)
+    end
+
     defp expected?(repo, %Transition{run_ref: run_id, expect: expect}) do
       case repo.one(from(r in AgentRun, where: r.id == ^run_id, lock: "FOR UPDATE")) do
         nil ->
@@ -447,6 +482,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # child's park committed in between) would be taken after its parent,
     # the other way round: the locks go back to a savepoint, and the walk
     # starts again with it. A locked run cannot park, so the walk settles.
+    # The ids it holds.
     defp lock_live_descendants(repo, run_id, attempts \\ @lock_attempts) do
       repo.query!("SAVEPOINT clementine_descendants")
       levels = live_levels(repo, [run_id], [])
@@ -457,6 +493,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       cond do
         MapSet.subset?(found, locked) ->
           repo.query!("RELEASE SAVEPOINT clementine_descendants")
+          MapSet.to_list(locked)
 
         attempts == 1 ->
           Logger.warning(
@@ -466,6 +503,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
           )
 
           repo.query!("RELEASE SAVEPOINT clementine_descendants")
+          MapSet.to_list(locked)
 
         true ->
           repo.query!("ROLLBACK TO SAVEPOINT clementine_descendants")
