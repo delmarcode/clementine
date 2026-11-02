@@ -83,11 +83,14 @@ defmodule Clementine.Models.BootTest do
     Application.put_env(:clementine, :offer, ["claude-opus-5-5", "gpt-6-astra"])
 
     capture_log(fn ->
-      # Clementine's own start, then the runtime's.
+      # Clementine's own start, the runtime's, and an agent's first run.
       assert :ok = Clementine.Models.Warnings.log_start()
 
       assert {:ok, _pid} =
                start_supervised({Clementine, repo: TestRepo, agents: [Judge, Screener]})
+
+      assert :ok = Clementine.Models.Warnings.reset()
+      assert :ok = Clementine.Models.Warnings.log_first_run(Judge)
     end)
 
     refute_receive {:network, _method, _path}, 200
@@ -185,6 +188,18 @@ defmodule Clementine.Models.BootTest do
       end
     end
 
+    test "says which config a function that throws or exits came from, never its term" do
+      for {function, did} <- [throwing_offer: "threw", exiting_offer: "exited"] do
+        Application.put_env(:clementine, :offer, {__MODULE__, function, []})
+
+        error = assert_raise ArgumentError, fn -> Clementine.Models.offer() end
+
+        assert error.message ==
+                 "config :clementine, :offer: {Clementine.Models.BootTest, #{inspect(function)}, " <>
+                   "[]} #{did}"
+      end
+    end
+
     test "says which config a function that raises came from" do
       Application.put_env(:clementine, :offer, {__MODULE__, :raising_offer, []})
 
@@ -203,4 +218,6 @@ defmodule Clementine.Models.BootTest do
 
   def not_ids, do: [:sonnet]
   def raising_offer, do: Keyword.fetch!([], :models)
+  def throwing_offer, do: throw({:vault, "sk-offer-secret"})
+  def exiting_offer, do: exit({:vault, "sk-offer-secret"})
 end

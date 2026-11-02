@@ -144,7 +144,7 @@ defmodule Clementine.Models.WarningsTest do
           do: Application.put_env(:clementine, :offer, offer),
           else: Application.delete_env(:clementine, :offer)
 
-        for module <- [Judge, Screener], do: :persistent_term.erase({Warnings, :logged, module})
+        Warnings.reset()
       end)
     end
 
@@ -164,6 +164,26 @@ defmodule Clementine.Models.WarningsTest do
 
       assert log =~ "Clementine could not read its offer's dates: config :clementine, :offer: "
       assert log =~ "raised RuntimeError: the offer's table is not there yet"
+    end
+
+    test "log_start/0 never raises: an offer function that throws or exits warns" do
+      for function <- [:throwing_offer, :exiting_offer] do
+        Application.put_env(:clementine, :offer, {__MODULE__, function, []})
+
+        log = capture_log(fn -> assert :ok = Warnings.log_start() end)
+
+        assert log =~ "Clementine could not read its offer's dates: config :clementine, :offer: "
+        assert log =~ ~r/(threw|exited)/
+        refute log =~ "sk-offer-secret"
+      end
+    end
+
+    test "reset/0 lets an agent's next run log its warnings again" do
+      capture_log(fn -> Warnings.log_first_run(Screener) end)
+      assert capture_log(fn -> Warnings.log_first_run(Screener) end) == ""
+
+      assert :ok = Warnings.reset()
+      assert capture_log(fn -> Warnings.log_first_run(Screener) end) =~ "gpt-5 is deprecated"
     end
 
     test "log_agents/1 writes each agent's warnings, and its runs then log nothing more" do
@@ -205,6 +225,8 @@ defmodule Clementine.Models.WarningsTest do
   end
 
   def raising_offer, do: raise("the offer's table is not there yet")
+  def throwing_offer, do: throw({:vault, "sk-offer-secret"})
+  def exiting_offer, do: exit({:vault, "sk-offer-secret"})
 
   defp kinds(warnings), do: Enum.map(warnings, & &1.kind)
 end

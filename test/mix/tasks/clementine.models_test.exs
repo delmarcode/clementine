@@ -199,19 +199,41 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
 
     assert text =~
              "OpenAI's Models API: skipped; config :clementine, :platforms, openai: [api_key: ...] " <>
-               "is not set."
+               "is not set (platforms configured: ["
 
     refute text =~ "sk-ant-recorded"
   end
 
-  test "run/1 with --check exits 1 when it could read no vendor's API" do
-    TestPlatforms.put(anthropic: [], openai: [])
+  test "run/1 with --check exits 0 when no platform configured has a Models API to read" do
+    # Claude only through Bedrock: nothing for --check to compare.
+    TestPlatforms.put(anthropic: [], openai: [], bedrock: [region: "us-east-1", api_key: "b"])
 
-    assert catch_exit(Task.run(["--check", "--model", "claude-sonnet-5-5"])) == {:shutdown, 1}
+    assert Task.run(["--check", "--model", "claude-sonnet-5-5"]) == :ok
 
     assert_received {:mix_shell, :info, [text]}
     assert text =~ "Anthropic's Models API: skipped"
-    assert text =~ "--check read no vendor's Models API: configure a key for at least one."
+    assert text =~ "Bedrock, Vertex, and Foundry serve Claude with no Models API --check reads"
+    assert text =~ ":bedrock"
+
+    assert text =~
+             "--check compared nothing: neither anthropic: nor openai: under config " <>
+               ":clementine, :platforms has an api_key:"
+  end
+
+  test "--check never prints a credential function's arguments or what it threw" do
+    TestPlatforms.put(
+      anthropic: [api_key: {__MODULE__, :raising_key, ["sk-ant-mfa-secret"]}],
+      openai: [api_key: {__MODULE__, :throwing_key, ["sk-openai-mfa-secret"]}]
+    )
+
+    for argv <- [["--check"], ["--check", "--json"]] do
+      assert catch_exit(Task.run(argv ++ ["--model", "claude-sonnet-5-5"])) == {:shutdown, 1}
+
+      assert_received {:mix_shell, :info, [out]}
+      assert out =~ "Mix.Tasks.Clementine.ModelsTest.raising_key/1 raised RuntimeError"
+      assert out =~ "Mix.Tasks.Clementine.ModelsTest.throwing_key/1 threw"
+      refute out =~ "mfa-secret"
+    end
   end
 
   test "--check never prints a malformed key, as text or as --json" do
@@ -238,6 +260,9 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
     assert %{"models" => [%{"source" => "cli", "model" => "claude-sonnet-5-5"}]} =
              Jason.decode!(json)
   end
+
+  def raising_key(secret), do: raise("vault said #{secret} is sealed")
+  def throwing_key(secret), do: throw({:vault, secret})
 
   test "refuses an argument it does not take" do
     assert_raise Mix.Error, ~r/takes --check, --json, and --model ID; got: "--bogus"/, fn ->

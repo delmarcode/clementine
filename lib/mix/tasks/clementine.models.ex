@@ -58,10 +58,9 @@ defmodule Mix.Tasks.Clementine.Models do
       `{module, function, args}` resolved), at `<base_url>/v1/models` and
       `<base_url>/models`, and report where the shipped sheets differ: ids the sheets lack, lifecycle and
       retirement or shutdown date changes, and capability and ceiling
-      mismatches. Prices have no API and are not checked. A vendor
-      without a configured key is skipped; a key is trimmed, and one
-      holding anything but printable ASCII is refused without printing
-      it.
+      mismatches. Prices have no API and are not checked. A key is
+      trimmed, and one holding anything but printable ASCII is refused
+      without printing it; no redirect is followed.
     * `--json` - print the report as JSON, for CI. Run `mix compile`
       first, so that compiler output does not precede the JSON on stdout.
     * `--model ID` - add a row for a model id; repeatable.
@@ -69,8 +68,12 @@ defmodule Mix.Tasks.Clementine.Models do
   The task exits 1 when boot would refuse an agent's or an offered
   model (an unknown or retired id, a choice its sheet refuses, a
   platform with no credential configured), or when `--check` finds a
-  difference, cannot read an API, or reads none for want of a key.
-  Warnings never change the exit status.
+  difference or cannot read a vendor's API: an error, or an `api_key:`
+  that gives no usable key (an unset variable, a function that raises).
+  A vendor whose platform has no `api_key:` is skipped, and when both
+  are (an app that reaches Claude only through Bedrock, say), the task
+  says it compared nothing and exits 0. Warnings never change the exit
+  status.
   """
 
   use Mix.Task
@@ -138,10 +141,12 @@ defmodule Mix.Tasks.Clementine.Models do
     drifted? =
       Enum.any?(report.check || [], &(&1.status == :failed or &1.findings != []))
 
-    if failing? or drifted? or unchecked?(report.check), do: 1, else: 0
+    if failing? or drifted?, do: 1, else: 0
   end
 
-  # --check that read no vendor's API at all checked nothing.
+  # Every vendor skipped: no platform the app configured has a Models
+  # API to read (a Bedrock-only app), which is no failure; a configured
+  # key that gives no usable value failed its vendor instead.
   defp unchecked?([_ | _] = results), do: Enum.all?(results, &(&1.status == :skipped))
   defp unchecked?(_no_check), do: false
 
@@ -405,7 +410,10 @@ defmodule Mix.Tasks.Clementine.Models do
   defp check(results) do
     Enum.map(results, &vendor_check/1) ++
       if unchecked?(results),
-        do: ["--check read no vendor's Models API: configure a key for at least one."],
+        do: [
+          "--check compared nothing: neither anthropic: nor openai: under config :clementine, " <>
+            ":platforms has an api_key:, and no other platform has a Models API it reads."
+        ],
         else: []
   end
 

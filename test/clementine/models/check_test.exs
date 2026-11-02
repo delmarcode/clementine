@@ -155,33 +155,103 @@ defmodule Clementine.Models.CheckTest do
       assert reason =~ "answered 401: unknown key **redacted**"
     end
 
-    test "names a credential function that raises, never its message", %{bypass: bypass} do
-      put_key(bypass, {__MODULE__, :raising_key, []})
+    test "names a credential function that fails by Mod.fun/arity, never its args or term",
+         %{bypass: bypass} do
+      secret = "sk-ant-mfa-secret"
+      setting = "config :clementine, :platforms, anthropic: [api_key: ...] "
 
+      for {credential, why} <- [
+            {{__MODULE__, :raising_key, [secret]},
+             "Clementine.Models.CheckTest.raising_key/1 raised RuntimeError"},
+            {{Clementine.NoSuchVault, :key, [secret]},
+             "Clementine.NoSuchVault.key/1 raised UndefinedFunctionError"},
+            {{__MODULE__, :throwing_key, [secret]},
+             "Clementine.Models.CheckTest.throwing_key/1 threw"},
+            {{__MODULE__, :exiting_key, [secret]},
+             "Clementine.Models.CheckTest.exiting_key/1 exited"},
+            # Shapes a request refuses, refused here alike.
+            {{__MODULE__, :ok_tuple_key, [secret]},
+             "Clementine.Models.CheckTest.ok_tuple_key/1 returned an {:ok, value} tuple"},
+            {{__MODULE__, :list_key, [secret]},
+             "Clementine.Models.CheckTest.list_key/1 returned a list"}
+          ] do
+        put_key(bypass, credential)
+
+        assert %{status: :failed, reason: reason} = Check.check(:anthropic)
+        assert reason =~ setting <> why, reason
+        refute reason =~ "mfa-secret"
+      end
+    end
+
+    test "skips a platform with no api_key, naming those configured; fails one that resolves " <>
+           "to nothing",
+         %{bypass: bypass} do
+      TestPlatforms.put(
+        anthropic: [base_url: "http://localhost:#{bypass.port}"],
+        bedrock: [region: "us-east-1", api_key: "bedrock-key"]
+      )
+
+      assert %{status: :skipped, reason: reason} = Check.check(:anthropic)
+
+      assert reason =~
+               "config :clementine, :platforms, anthropic: [api_key: ...] is not set. Bedrock, " <>
+                 "Vertex, and Foundry serve Claude with no Models API --check reads (platforms " <>
+                 "configured: ["
+
+      assert reason =~ ":bedrock"
+
+      # Configured, but the variable is unset where --check runs: a failure.
+      put_key(bypass, {:system, "CLEMENTINE_UNSET_VAR"})
       assert %{status: :failed, reason: reason} = Check.check(:anthropic)
 
       assert reason ==
-               "config :clementine, :platforms, anthropic: [api_key: ...] " <>
-                 "{Clementine.Models.CheckTest, :raising_key, []} raised RuntimeError"
-    end
+               "config :clementine, :platforms, anthropic: [api_key: ...] resolved to no " <>
+                 "value: the environment variable CLEMENTINE_UNSET_VAR is unset or empty"
 
-    test "is skipped without a configured key, and reads a {:system, var} key", %{bypass: bypass} do
-      TestPlatforms.put(anthropic: [base_url: "http://localhost:#{bypass.port}"])
+      put_key(bypass, " \n")
 
-      assert %{status: :skipped, reason: reason} = Check.check(:anthropic)
-      assert reason == "config :clementine, :platforms, anthropic: [api_key: ...] is not set"
-
-      put_key(bypass, {:system, "CLEMENTINE_UNSET_VAR"})
-      assert %{status: :skipped, reason: reason} = Check.check(:anthropic)
-
-      assert reason ==
-               "config :clementine, :platforms, anthropic: [api_key: ...] resolved to no value"
+      assert %{
+               status: :failed,
+               reason: "config :clementine, :platforms, anthropic: [api_key: ...] is blank"
+             } =
+               Check.check(:anthropic)
 
       System.put_env("CLEMENTINE_CHECK_TEST_KEY", "sk-ant-recorded")
       on_exit(fn -> System.delete_env("CLEMENTINE_CHECK_TEST_KEY") end)
       put_key(bypass, {:system, "CLEMENTINE_CHECK_TEST_KEY"})
       serve_anthropic(bypass)
       assert %{status: :checked} = Check.check(:anthropic)
+    end
+
+    test "follows no redirect, so the key never reaches another host", %{bypass: bypass} do
+      elsewhere = Bypass.open()
+      test = self()
+
+      Bypass.stub(elsewhere, :any, :any, fn conn ->
+        send(test, {:elsewhere, Plug.Conn.get_req_header(conn, "x-api-key")})
+        Plug.Conn.resp(conn, 200, "{}")
+      end)
+
+      Bypass.expect_once(bypass, "GET", "/v1/models", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("location", "http://localhost:#{elsewhere.port}/v1/models")
+        |> Plug.Conn.resp(302, "")
+      end)
+
+      assert %{status: :failed, reason: reason} = Check.check(:anthropic)
+      assert reason =~ "/v1/models answered 302"
+      refute_receive {:elsewhere, _key}, 200
+    end
+
+    test "fails on a base_url with no scheme, as boot does" do
+      TestPlatforms.put(anthropic: [api_key: "sk-ant-recorded", base_url: "api.anthropic.com"])
+
+      assert %{status: :failed, reason: reason} = Check.check(:anthropic)
+      assert reason =~ "anthropic: base_url: needs an http or https scheme and a host"
+
+      assert_raise ArgumentError, ~r/base_url: needs an http or https scheme/, fn ->
+        Clementine.Platform.validate_config!()
+      end
     end
 
     test "fails on a platform entry that does not build, naming it" do
@@ -297,7 +367,11 @@ defmodule Clementine.Models.CheckTest do
              Check.compare(:anthropic, [entry])
   end
 
-  def raising_key, do: raise("vault said sk-ant-secret is sealed")
+  def raising_key(secret), do: raise("vault said #{secret} is sealed")
+  def throwing_key(secret), do: throw({:vault, secret})
+  def exiting_key(secret), do: exit({:vault, secret})
+  def ok_tuple_key(secret), do: {:ok, secret}
+  def list_key(secret), do: [secret]
 
   defp put_key(bypass, key) do
     TestPlatforms.put(anthropic: [api_key: key, base_url: "http://localhost:#{bypass.port}"])

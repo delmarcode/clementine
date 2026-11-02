@@ -358,6 +358,10 @@ defmodule Clementine.Models do
                     "#{inspect(exception.__struct__)}: #{Exception.message(exception)}"
               ],
               __STACKTRACE__
+  catch
+    # What it threw or exited with is not shown: it is the app's term.
+    :throw, _value -> raise ArgumentError, "config :clementine, :offer: #{inspect(mfa)} threw"
+    :exit, _reason -> raise ArgumentError, "config :clementine, :offer: #{inspect(mfa)} exited"
   end
 
   defp offer!(entries, what) when is_list(entries) do

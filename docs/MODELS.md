@@ -190,7 +190,10 @@ the same:
 - on an agent module's first `Clementine.run/3` or `Clementine.stream/3`
   in the node, unless the runtime logged it already: that agent's model.
   An app that runs agents only in process (evals, scripts) gets each
-  one's warnings once, on its first run.
+  one's warnings once, on its first run. The flag is per node, so a test
+  that asserts such a warning calls `Clementine.Models.Warnings.reset/0`
+  in its `setup`, or it passes or fails by which test ran the agent
+  first.
 
 | Warning | When |
 |---|---|
@@ -516,9 +519,9 @@ Clementine's model sheets were read 2026-11-01. mix clementine.models --check co
   so compiler output does not precede the JSON on stdout. The task
   exits 1 when boot would refuse an agent's or an offered model (an
   unknown or retired id, a choice the sheet refuses, a platform with no
-  credential configured), or when `--check` finds a difference, cannot
-  read an API, or reads none for want of a key. Warnings never change
-  the exit status.
+  credential configured), or when `--check` finds a difference or
+  cannot read a vendor's API, an `api_key:` that gives no usable key
+  included. Warnings never change the exit status.
 
 `--check` reads Anthropic's and OpenAI's Models APIs with the
 credentials of the `anthropic:` and `openai:` platforms
@@ -527,11 +530,16 @@ a request resolves them, at each platform's `base_url` (or default):
 `<base_url>/v1/models` on Anthropic's (`https://api.anthropic.com/v1/models`)
 and `<base_url>/models` on OpenAI's (`https://api.openai.com/v1/models`).
 It reports where the sheets differ, sheet then API. A vendor whose
-platform has no `api_key:` is skipped; Bedrock, Foundry, and the other
-platforms have no Models API it reads. A key is trimmed
-(a secret file's trailing newline), and one that still holds anything
-but printable ASCII is refused as "the key has non-printable
-characters"; no output, text or JSON, carries a key.
+platform has no `api_key:` is skipped: Bedrock, Vertex, Foundry, and
+the Chat Completions platforms have no Models API it reads, so an app
+that reaches Claude only through one of them gets a note that nothing
+was compared, and exit 0. An `api_key:` that gives no usable key (an
+unset variable, a function that raises, throws, or returns no string)
+fails its vendor, as a request would. A key is trimmed (a secret file's
+trailing newline), and one that still holds anything but printable
+ASCII is refused as "the key has non-printable characters". No output,
+text or JSON, carries a key, a credential function's arguments, or what
+it raised, and no redirect is followed.
 
 | | Anthropic | OpenAI |
 |---|---|---|

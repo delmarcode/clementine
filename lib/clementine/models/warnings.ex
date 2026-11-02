@@ -32,6 +32,8 @@ defmodule Clementine.Models.Warnings do
     in the node, unless the runtime already logged it: that agent's
     model. An app that runs agents only in process (an eval, a script)
     gets each agent's warnings once, on the run that first reaches it.
+    A test that asserts such a warning calls `reset/0` in its `setup`,
+    since an earlier test may have run that agent.
 
   Nothing here reads the network: the vendors' Models APIs are read only
   by `mix clementine.models --check`.
@@ -152,6 +154,11 @@ defmodule Clementine.Models.Warnings do
           )
 
           []
+      catch
+        kind, _reason ->
+          did = if kind == :throw, do: "threw", else: "exited"
+          Logger.warning("Clementine could not read its offer's dates: its function #{did}")
+          []
       end
 
     log(offer ++ Enum.map(registry(today), &{nil, &1}))
@@ -180,6 +187,20 @@ defmodule Clementine.Models.Warnings do
       :persistent_term.put(key, true)
       [module] |> for_agents(Date.utc_today()) |> log()
     end
+  end
+
+  @doc """
+  Forgets which agent modules have logged their warnings, so each logs
+  again on its next run. The flag is per node, so a test that asserts
+  an agent's warning in the log passes or fails by whether an earlier
+  test ran that agent; call this in its `setup` first.
+  """
+  @spec reset() :: :ok
+  def reset do
+    for {{__MODULE__, :logged, _module} = key, _value} <- :persistent_term.get(),
+        do: :persistent_term.erase(key)
+
+    :ok
   end
 
   defp log(warnings) do

@@ -286,55 +286,64 @@ defmodule Clementine.Models.Check do
   ## HTTP
 
   # Each vendor's own platform (`config :clementine, :platforms`), as
-  # the Messages and Responses clients read it: its credential, and the
+  # the Messages and Responses clients read it: its credential, resolved
+  # as a request resolves it (`Platform.resolve_credential/1`), and the
   # Models API under its base_url (`<base>/v1/models` on Anthropic's,
   # `<base>/models` on OpenAI's, whose base ends in `/v1`). The key comes
-  # back trimmed, with the value as configured for scrubbing.
+  # back trimmed, with the value as resolved for scrubbing. A vendor
+  # whose platform has no api_key is skipped: the app sends it nothing
+  # directly. One with an api_key that gives no usable key failed.
   defp credential(vendor) do
     setting = "config :clementine, :platforms, #{vendor}: [api_key: ...]"
 
     case Platform.fetch(vendor) do
-      {:ok, %Platform{api_key: nil}} -> {:skip, "#{setting} is not set"}
+      {:ok, %Platform{api_key: nil}} -> {:skip, skipped(vendor, setting)}
       {:ok, %Platform{api_key: credential}} -> key(credential, setting)
       {:error, message} -> {:error, message}
     end
   end
 
   defp key(credential, setting) do
-    case resolve(credential) do
-      {:raised, what} ->
-        {:error, "#{setting} #{what}"}
-
-      raw when is_binary(raw) ->
+    case Platform.resolve_credential(credential) do
+      {:ok, raw} ->
         case printable(raw) do
           {:ok, key} -> {:ok, key, raw}
-          :empty -> {:skip, "#{setting} is empty"}
+          :blank -> {:error, "#{setting} is blank"}
           :unprintable -> {:error, "#{setting}: the key has non-printable characters"}
         end
 
-      _nothing ->
-        {:skip, "#{setting} resolved to no value"}
+      {_none_or_error, why} ->
+        {:error, "#{setting} #{why}"}
     end
   end
 
-  defp resolve({:system, var}) when is_binary(var), do: System.get_env(var)
-
-  defp resolve({module, function, args} = mfa)
-       when is_atom(module) and is_atom(function) and is_list(args) do
-    apply(module, function, args)
-  rescue
-    # Its message is the app's, and could quote the credential.
-    exception -> {:raised, "#{inspect(mfa)} raised #{inspect(exception.__struct__)}"}
+  # Claude on Bedrock, Vertex, or Foundry, and every Chat Completions
+  # platform, has no Models API this reads.
+  defp skipped(:anthropic, setting) do
+    "#{setting} is not set. Bedrock, Vertex, and Foundry serve Claude with no Models API " <>
+      "--check reads" <> configured()
   end
 
-  defp resolve(value), do: value
+  defp skipped(:openai, setting), do: "#{setting} is not set" <> configured()
+
+  defp configured do
+    case Application.get_env(:clementine, :platforms, []) do
+      [_ | _] = platforms ->
+        if Keyword.keyword?(platforms),
+          do: " (platforms configured: #{inspect(Keyword.keys(platforms))})",
+          else: ""
+
+      _none ->
+        ""
+    end
+  end
 
   # Trimmed, as a secret file's trailing newline is no part of the key;
   # anything else outside printable ASCII is refused, since an HTTP
   # header cannot carry it and the transport's error would quote it.
   defp printable(raw) do
     case Regex.replace(~r/\A\s+|\s+\z/, raw, "") do
-      "" -> :empty
+      "" -> :blank
       key -> if Regex.match?(~r/\A[\x21-\x7E]+\z/, key), do: {:ok, key}, else: :unprintable
     end
   end
@@ -385,8 +394,16 @@ defmodule Clementine.Models.Check do
     end
   end
 
+  # No redirects: Req strips only `authorization` when one changes host,
+  # so following it would hand Anthropic's `x-api-key` to that host.
   defp get(url, headers, params) do
-    case Req.get(url, headers: headers, params: params, retry: false, receive_timeout: 30_000) do
+    case Req.get(url,
+           headers: headers,
+           params: params,
+           retry: false,
+           redirect: false,
+           receive_timeout: 30_000
+         ) do
       {:ok, %Req.Response{status: 200, body: body}} when is_map(body) ->
         {:ok, body}
 
@@ -396,6 +413,8 @@ defmodule Clementine.Models.Check do
       {:error, exception} ->
         {:error, "#{url}: #{transport_reason(exception)}"}
     end
+  rescue
+    exception -> {:error, "#{url}: #{inspect(exception.__struct__)}"}
   end
 
   # The vendor's own error message; never the request, which holds the key.
