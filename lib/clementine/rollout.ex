@@ -1174,7 +1174,11 @@ defmodule Clementine.Rollout do
     :telemetry.execute(
       [:clementine, :llm, :thinking_dropped],
       %{turns: dropped.turns, blocks: dropped.blocks},
-      Map.merge(identity(exec), %{first_index: dropped.first_index, iteration: exec.iteration})
+      Map.merge(identity(exec), %{
+        first_index: dropped.first_index,
+        iteration: exec.iteration,
+        cause: Map.get(dropped, :cause, :history)
+      })
     )
 
     Clementine.LLM.Anthropic.Binding.log_dropped(dropped, exec.agent_key || "An agent")

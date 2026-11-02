@@ -414,7 +414,9 @@ defmodule Clementine.Telemetry.MetricsTest do
              series(exports, "clementine_llm_cost_micros_total")
            )
 
-    assert {%{in_process | model: "claude-sonnet-5-5"}, 1} in sum_by(
+    # A history replayed from another conversation is the history's drop,
+    # labeled by its bounded cause.
+    assert {Map.put(%{in_process | model: "claude-sonnet-5-5"}, :cause, :history), 1} in sum_by(
              series(exports, "clementine_llm_thinking_dropped_total")
            )
 

@@ -220,7 +220,7 @@ defmodule Clementine.LLM.AnthropicBindingTest do
           context: 200_000,
           max_output: 64_000,
           thinking: [binding: :prefix],
-          features: [mid_conversation_system: true],
+          features: [mid_conversation_system: true, inline_tools: true],
           platforms: [anthropic: []]
         ]
       })
@@ -272,6 +272,83 @@ defmodule Clementine.LLM.AnthropicBindingTest do
       assert Enum.map(body["tools"], & &1["name"]) == ["echo"]
       assert [_user, %{"role" => "system"}] = body["messages"]
       assert "inline-tools-2026-09-15" in Anthropic.betas(body)
+    end
+
+    test "a platform that never takes inline tools withholds them whatever a declaration says" do
+      Application.put_env(:clementine, :models, %{
+        "my-claude" => [
+          vendor: :anthropic,
+          context: 200_000,
+          max_output: 64_000,
+          thinking: [binding: :prefix],
+          features: [mid_conversation_system: true, inline_tools: true],
+          platforms: [
+            anthropic: [],
+            bedrock: [id: "anthropic.my-claude", features: [inline_tools: true]],
+            foundry: [features: [mid_conversation_system: true]]
+          ]
+        ]
+      })
+
+      request = fn platform ->
+        Anthropic.request("my-claude", "Be brief.", skill_load(), [Echo, SafeEcho],
+          platform: platform
+        )
+      end
+
+      {inline, _stamp, nil} = request.(:anthropic)
+      assert Enum.map(inline["tools"], & &1["name"]) == ["echo"]
+      assert "inline-tools-2026-09-15" in Anthropic.betas(inline)
+
+      for platform <- [:bedrock, :foundry] do
+        {body, _stamp, nil} = request.(platform)
+        assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"], "#{platform}"
+        refute Enum.any?(body["messages"], &(&1["role"] == "system")), "#{platform}"
+        assert Anthropic.betas(body) == [], "#{platform}"
+      end
+
+      assert {:ok, %{features: %{inline_tools: false}}} =
+               Clementine.Models.for_platform("my-claude", :bedrock)
+
+      assert {:ok, %{features: %{mid_conversation_system: false, inline_tools: false}}} =
+               Clementine.Models.for_platform("my-claude", :foundry)
+    end
+
+    test "on Bedrock, its text in place and its tools in tools, with no inline beta" do
+      messages = [
+        UserMessage.new("Hi"),
+        SystemMessage.new(
+          [
+            Content.text("Use safe_echo."),
+            %Content.ToolAddition{definition: %{"name" => "safe_echo"}}
+          ],
+          skill: "notes"
+        )
+      ]
+
+      {body, stamp, nil} =
+        Anthropic.request("claude-sonnet-5-5", "Be brief.", messages, [Echo, SafeEcho],
+          platform: :bedrock
+        )
+
+      assert is_binary(stamp)
+      assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
+
+      assert [_user, %{"role" => "system", "content" => [%{"type" => "text", "text" => text}]}] =
+               body["messages"]
+
+      assert text == "Use safe_echo."
+      assert Anthropic.betas(body) == []
+
+      # A skill's load is tools and no text: nothing goes in its place.
+      {body, _stamp, nil} =
+        Anthropic.request("claude-sonnet-5-5", "Be brief.", skill_load(), [Echo, SafeEcho],
+          platform: :bedrock
+        )
+
+      assert Enum.map(body["tools"], & &1["name"]) == ["echo", "safe_echo"]
+      assert [%{"role" => "user"}] = body["messages"]
+      assert Anthropic.betas(body) == []
     end
   end
 
@@ -471,6 +548,83 @@ defmodule Clementine.LLM.AnthropicBindingTest do
 
       # Turn one's three calls, then this turn's first: nothing dropped.
       assert length(sent_thinking()) == 4
+    end
+
+    test "on Bedrock a load joins tools: the earlier thinking goes once, as the platform's drop" do
+      attach_dropped()
+      agent = agent(skills: [Notes], platform: :bedrock)
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :info], fn ->
+          thread =
+            turn!(agent, [], "Take a note.", [
+              [
+                {:thinking, "Load notes."},
+                {:tool_use, "toolu_1", "use_skill", %{"name" => "notes"}}
+              ],
+              [
+                {:thinking, "Now note."},
+                {:tool_use, "toolu_2", "safe_echo", %{"message" => "x"}}
+              ],
+              [{:thinking, "Noted."}, {:text, "Noted."}]
+            ])
+
+          {model, system_prompt, messages, tools, opts} = last_request()
+
+          {body, _binding, _dropped} =
+            Anthropic.request(model, system_prompt, messages, tools, opts)
+
+          assert Enum.map(body["tools"], & &1["name"]) |> Enum.sort() == [
+                   "echo",
+                   "safe_echo",
+                   "use_skill"
+                 ]
+
+          refute Enum.any?(body["messages"], &(&1["role"] == "system"))
+          assert Anthropic.betas(body) == []
+
+          # The strict fake takes it: the platform folded the load, the
+          # app edited nothing. The turn before the load lost its thinking.
+          assert_received {:thinking_dropped, %{turns: 1}, %{cause: :fold, platform: :bedrock}}
+          refute_received {:thinking_dropped, _, _}
+
+          flush_requests()
+
+          _thread =
+            turn!(agent, thread, "Another.", [
+              [{:thinking, "Note again."}, {:text, "Noted again."}]
+            ])
+
+          # Nothing more drops once the load is in the prefix.
+          refute_received {:thinking_dropped, _, _}
+        end)
+
+      refute log =~ "Replay the thread as the model saw it"
+      assert log =~ "on this platform the model takes no tool defined"
+    end
+
+    test "a history edit after a folded load is still the history's" do
+      attach_dropped()
+      agent = agent(skills: [Notes], platform: :bedrock)
+
+      thread =
+        turn!(agent, [], "Take a note.", [
+          [{:thinking, "Load."}, {:tool_use, "toolu_1", "use_skill", %{"name" => "notes"}}],
+          [{:thinking, "Noted."}, {:text, "Noted."}]
+        ])
+
+      thread = turn!(agent, thread, "Again.", answer("Again."))
+      flush_dropped()
+
+      # The turns after the load lose their thinking to a changed system
+      # prompt, which is the app's change.
+      changed = agent(skills: [Notes], platform: :bedrock, instructions: "Be terse.")
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        _thread = turn!(changed, thread, "Hi.", answer("Hi."), @lenient)
+      end)
+
+      assert_received {:thinking_dropped, _measurements, %{cause: :history}}
     end
 
     test "a turn of thinking only after a skill's system message stays valid once stale" do

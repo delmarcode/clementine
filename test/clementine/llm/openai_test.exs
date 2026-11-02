@@ -13,24 +13,16 @@ defmodule Clementine.LLM.OpenAITest do
   setup do
     bypass = Bypass.open()
 
-    prev_url = Application.get_env(:clementine, :openai_base_url)
-    prev_key = Application.get_env(:clementine, :openai_api_key)
     prev_models = Application.get_env(:clementine, :models)
     prev_retry = Application.get_env(:clementine, :retry)
 
-    Application.put_env(
-      :clementine,
-      :openai_base_url,
-      "http://localhost:#{bypass.port}/v1/responses"
+    Clementine.TestPlatforms.put(
+      openai: [api_key: "test-openai-key", base_url: "http://localhost:#{bypass.port}/v1"]
     )
-
-    Application.put_env(:clementine, :openai_api_key, "test-openai-key")
 
     Application.put_env(:clementine, :retry, max_attempts: 3, base_delay: 0, max_delay: 0)
 
     on_exit(fn ->
-      restore_env(:openai_base_url, prev_url)
-      restore_env(:openai_api_key, prev_key)
       restore_env(:models, prev_models)
       restore_env(:retry, prev_retry)
     end)
@@ -175,7 +167,7 @@ defmodule Clementine.LLM.OpenAITest do
       call.("gpt-7", [])
     end
 
-    assert_raise ArgumentError, ~r/goes to :anthropic, not :openai/, fn ->
+    assert_raise ArgumentError, ~r/goes to :anthropic over :messages, not Responses/, fn ->
       call.("claude-sonnet-5-5", [])
     end
   end

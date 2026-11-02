@@ -621,7 +621,7 @@ defmodule Clementine.Runs.CostTest do
           vendor: :qwen,
           context: 32_768,
           max_output: 8_192,
-          platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+          platforms: [openai_compatible: []]
         )
       )
 

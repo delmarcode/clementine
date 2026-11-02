@@ -1,69 +1,71 @@
 defmodule Clementine.LLM.Router do
   @moduledoc """
-  Routes a call to the client for the platform its model is served on
-  (`Clementine.Models.default_platform/1`): `"claude-sonnet-5-5"` to
-  `Clementine.LLM.Anthropic`, `"gpt-6.1-sol"` to `Clementine.LLM.OpenAI`,
-  and a model an app declares on OpenRouter, Bedrock, Vertex, or an
-  OpenAI-compatible server to `Clementine.LLM.ChatCompletions`.
+  Routes a call to the client for the wire its platform speaks
+  (`Clementine.Platform.protocol/2`): Messages to
+  `Clementine.LLM.Anthropic` (Claude on the Claude API, Bedrock, or
+  Foundry), Responses to `Clementine.LLM.OpenAI`, and Chat Completions to
+  `Clementine.LLM.ChatCompletions` (OpenRouter, the open models on
+  Bedrock and Vertex, an OpenAI-compatible server). The platform is the
+  request's `platform:` choice, else the model's default
+  (`Clementine.Models.default_platform/1`).
   """
 
   @behaviour Clementine.LLM.ClientBehaviour
-  alias Clementine.Models
+  alias Clementine.LLM.Policy
+  alias Clementine.{Models, Platform}
 
-  @default_provider_clients [
-    anthropic: Clementine.LLM.Anthropic,
-    openai: Clementine.LLM.OpenAI,
-    openrouter: Clementine.LLM.ChatCompletions,
-    bedrock: Clementine.LLM.ChatCompletions,
-    vertex: Clementine.LLM.ChatCompletions,
-    openai_compatible: Clementine.LLM.ChatCompletions
-  ]
+  @clients %{
+    messages: Clementine.LLM.Anthropic,
+    responses: Clementine.LLM.OpenAI,
+    chat_completions: Clementine.LLM.ChatCompletions
+  }
 
   @impl true
   def call(model_ref, system, messages, tools, opts \\ []) do
-    provider_client(model_ref).call(model_ref, system, messages, tools, opts)
+    client(model_ref, opts).call(model_ref, system, messages, tools, opts)
   end
 
   @impl true
   def stream(model_ref, system, messages, tools, opts \\ []) do
-    provider_client(model_ref).stream(model_ref, system, messages, tools, opts)
+    client(model_ref, opts).stream(model_ref, system, messages, tools, opts)
   end
 
   @doc false
-  # Whether the platform a resolved request goes to has a credential
-  # configured: present in config, not resolved, so `{:system, "VAR"}`
-  # passes before the variable is set. Boot checks it for every agent.
-  @spec credential(Clementine.LLM.Policy.t()) :: :ok | {:error, String.t()}
-  def credential(%Clementine.LLM.Policy{platform: :openai_compatible}), do: :ok
+  # Whether the platform a resolved request goes to is configured with
+  # the credential its wire needs: present in config, not resolved, so
+  # `{:system, "VAR"}` passes before the variable is set. Boot checks it
+  # for every agent.
+  @spec credential(Policy.t()) :: :ok | {:error, String.t()}
+  def credential(%Policy{platform: platform, model: model}), do: Platform.check(platform, model)
 
-  def credential(%Clementine.LLM.Policy{platform: platform, model: model}) do
-    key = credential_key(platform)
-    declared = model.platforms |> Keyword.get(platform, %{}) |> Map.get(:api_key)
+  # `:llm_provider_clients` (tests) sends one platform's requests to
+  # another client.
+  defp client(id, opts) do
+    model = Models.get!(id)
+    platform = Keyword.get(opts, :platform) || Models.default_platform(model)
 
-    if declared || Application.get_env(:clementine, key) do
-      :ok
+    overrides = Application.get_env(:clementine, :llm_provider_clients, [])
+
+    with nil <- List.keyfind(overrides, platform, 0),
+         {:ok, protocol} <- protocol(model, platform) do
+      Map.fetch!(@clients, protocol)
     else
+      {:error, message} -> raise ArgumentError, "#{inspect(id)}: #{message}"
+      {^platform, client} -> client
+    end
+  end
+
+  defp protocol(model, nil),
+    do:
       {:error,
-       "#{inspect(model.id)} goes to #{inspect(platform)}, and config :clementine, " <>
-         "#{key}: is not set"}
-    end
-  end
+       "is served on #{inspect(Keyword.keys(model.platforms))}, none of which Clementine can " <>
+         "send a #{inspect(model.vendor)} model to"}
 
-  defp credential_key(:anthropic), do: :anthropic_api_key
-  defp credential_key(:openai), do: :openai_api_key
-  defp credential_key(platform), do: Clementine.LLM.ChatCompletions.api_key_config(platform)
+  defp protocol(model, platform) when is_atom(platform),
+    do: Platform.protocol(platform, model.vendor)
 
-  defp provider_client(model) do
-    provider = model |> Models.get!() |> Models.default_platform()
-
-    clients = Application.get_env(:clementine, :llm_provider_clients, @default_provider_clients)
-
-    case Keyword.get(clients, provider) do
-      nil ->
-        raise "No LLM client configured for provider #{inspect(provider)}"
-
-      client when is_atom(client) ->
-        client
-    end
-  end
+  defp protocol(_model, other),
+    do:
+      {:error,
+       "platform: takes a platform's name, an atom such as :bedrock, got: #{inspect(other)}"}
 end

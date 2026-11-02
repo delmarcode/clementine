@@ -3,44 +3,26 @@ defmodule Clementine.LLM.ChatCompletions do
   OpenAI Chat Completions dialect client for OpenAI-compatible providers.
 
   One wire dialect covers every lane the open-model ecosystem serves
-  fine-tunes through. A model the app declares under
-  `config :clementine, :models` names its platform, and the platform
-  picks the endpoint and credentials:
+  fine-tunes through. The request's platform (`Clementine.Platform`)
+  gives the endpoint and the credential, a bearer token where one is
+  configured:
 
-  - `:openrouter` — `https://openrouter.ai/api/v1` with
-    `config :clementine, openrouter_api_key: ...`. Model ids are
-    OpenRouter's `vendor/model` slugs (e.g. `"deepseek/deepseek-v3.2"`,
-    `"qwen/qwen3-235b-a22b"`, `"z-ai/glm-4.7"`).
-  - `:bedrock` — Amazon Bedrock's Chat Completions endpoint,
-    `https://bedrock-mantle.{region}.api.aws/v1`, built from
-    `config :clementine, bedrock_region: ...` (or set
-    `bedrock_base_url` directly, e.g. to use `bedrock-runtime`).
-    Authenticates with `bedrock_api_key` — an Amazon Bedrock API key
-    (bearer token), no SigV4 required.
-  - `:vertex` — Google Vertex AI's OpenAI-compatible MaaS endpoint,
-    built from `vertex_project` and `vertex_region` (or set
-    `vertex_base_url` directly). Authenticates with `vertex_access_token`;
-    tokens are short-lived, so hosts typically configure an MFA tuple
-    (see below). Model ids are `publisher/model` (e.g.
-    `"deepseek-ai/deepseek-v3.2-maas"`, `"zai/glm-4.7-maas"`).
-  - `:openai_compatible` — any other OpenAI-compatible server: Tinker's
-    inference endpoint, Together, Fireworks, or self-hosted vLLM/SGLang.
-    Set `base_url:` (and optionally `api_key:`) per model, or
-    `config :clementine, openai_compatible_base_url: ...` app-wide.
-    `api_key` is optional — keyless local servers send no auth header.
-
-  A declared model's platform entry may carry `base_url:` and `api_key:`
-  (`platforms: [openai_compatible: [base_url: ..., api_key: ...]]`),
-  which override the platform's app config. API keys accept a literal
-  string, `{:system, "ENV_VAR"}`, or `{module, function, args}` resolved
-  per request — the MFA form suits short-lived credentials like Vertex
-  OAuth tokens:
-
-      config :clementine,
-        vertex_access_token: {MyApp.GcpAuth, :access_token, []}
-
-  `base_url` follows the OpenAI SDK convention: the client appends
-  `/chat/completions`.
+  - `:openrouter`: `https://openrouter.ai/api/v1/chat/completions`.
+    Model ids are OpenRouter's `vendor/model` slugs
+    (`"deepseek/deepseek-v3.2"`, `"qwen/qwen3-235b-a22b"`).
+  - `:bedrock`: Amazon Bedrock's Chat Completions endpoint,
+    `https://bedrock-mantle.{region}.api.aws/v1/chat/completions`, with
+    an Amazon Bedrock API key (no SigV4), for the open models Bedrock
+    serves; Claude goes to the same host's Messages endpoint instead
+    (`Clementine.LLM.Anthropic`).
+  - `:vertex`: Google Vertex AI's OpenAI-compatible MaaS endpoint, built
+    from `project:` and `region:`, with an OAuth `access_token:` (an
+    `{module, function, args}` that refreshes it hourly). Model ids are
+    `publisher/model` (`"deepseek-ai/deepseek-v3.2-maas"`).
+  - `:openai_compatible`, and any platform the app names with
+    `protocol: :chat_completions`: its `base_url:` (Tinker, Together,
+    Fireworks, a self-hosted vLLM or SGLang), with an optional
+    `api_key:`; a keyless local server gets no auth header.
 
   A JSON schema in the `:output_schema` request option goes as the
   dialect's `response_format` (`{"type": "json_schema", "json_schema":
@@ -73,7 +55,7 @@ defmodule Clementine.LLM.ChatCompletions do
 
   @behaviour Clementine.LLM.ClientBehaviour
 
-  alias Clementine.Model
+  alias Clementine.{Model, Platform}
   alias Clementine.LLM.{Cache, Policy, ProviderUsage}
   alias Clementine.LLM.ChatCompletions.{Messages, Tools}
   alias Clementine.LLM.ChatCompletionsStreamParser
@@ -81,7 +63,6 @@ defmodule Clementine.LLM.ChatCompletions do
   alias Clementine.LLM.Reasoning
   alias Clementine.LLM.Response
 
-  @platforms [:openrouter, :bedrock, :vertex, :openai_compatible]
   @retriable_statuses [429, 500, 502, 503, 504]
 
   @doc """
@@ -91,8 +72,7 @@ defmodule Clementine.LLM.ChatCompletions do
   def call(model, system, messages, tools, opts \\ []) do
     resolved = policy!(model, opts, stream: false)
     body = build_body(resolved, system, messages, tools, opts)
-    headers = build_headers(resolved)
-    url = request_url(resolved)
+    {url, headers} = endpoint(resolved)
 
     retry_opts = Application.get_env(:clementine, :retry, [])
     max_attempts = Keyword.get(retry_opts, :max_attempts, 3)
@@ -138,8 +118,7 @@ defmodule Clementine.LLM.ChatCompletions do
       |> Map.put("stream", true)
       |> Map.put("stream_options", %{"include_usage" => true})
 
-    headers = build_headers(resolved)
-    url = request_url(resolved)
+    {url, headers} = endpoint(resolved)
     # A runner caps this to the execution deadline's remaining budget. It
     # bounds the whole streaming call, not one attempt: per-attempt receive
     # timeout and retry backoff draw down the same window, and retries stop
@@ -264,7 +243,7 @@ defmodule Clementine.LLM.ChatCompletions do
   defp build_body(%Policy{} = policy, system, messages, tools, opts) do
     body =
       %{
-        "model" => Model.platform_id(policy.model),
+        "model" => Platform.model_id(policy.platform, policy.model),
         "messages" => encode_messages(system, messages, policy.cache),
         "max_tokens" => policy.max_tokens
       }
@@ -337,114 +316,21 @@ defmodule Clementine.LLM.ChatCompletions do
 
   defp maybe_put_output_schema(body, _model, _schema), do: body
 
-  defp build_headers(resolved) do
-    case api_key(resolved) do
-      nil -> [{"content-type", "application/json"}]
-      key -> [{"authorization", "Bearer #{key}"}, {"content-type", "application/json"}]
-    end
+  defp endpoint(%Policy{platform: name}) do
+    platform = Platform.fetch!(name)
+
+    {Platform.url(platform, :chat_completions),
+     Platform.auth_headers(platform, :chat_completions) ++
+       [{"content-type", "application/json"}]}
   end
-
-  defp request_url(%Policy{} = policy) do
-    base_url = endpoint(policy, :base_url) || provider_base_url(policy.platform)
-    String.trim_trailing(base_url, "/") <> "/chat/completions"
-  end
-
-  defp provider_base_url(:openrouter) do
-    Application.get_env(:clementine, :openrouter_base_url, "https://openrouter.ai/api/v1")
-  end
-
-  defp provider_base_url(:bedrock) do
-    case Application.get_env(:clementine, :bedrock_base_url) do
-      url when is_binary(url) and url != "" ->
-        url
-
-      _ ->
-        region = Application.get_env(:clementine, :bedrock_region)
-
-        unless is_binary(region) and region != "" do
-          raise "Missing :bedrock_base_url or :bedrock_region configuration for :clementine"
-        end
-
-        "https://bedrock-mantle.#{region}.api.aws/v1"
-    end
-  end
-
-  defp provider_base_url(:vertex) do
-    case Application.get_env(:clementine, :vertex_base_url) do
-      url when is_binary(url) and url != "" ->
-        url
-
-      _ ->
-        project = Application.get_env(:clementine, :vertex_project)
-        region = Application.get_env(:clementine, :vertex_region)
-
-        unless is_binary(project) and project != "" and is_binary(region) and region != "" do
-          raise "Missing :vertex_base_url or :vertex_project/:vertex_region configuration " <>
-                  "for :clementine"
-        end
-
-        "https://#{region}-aiplatform.googleapis.com/v1/projects/#{project}/locations/#{region}/endpoints/openapi"
-    end
-  end
-
-  defp provider_base_url(:openai_compatible) do
-    case Application.get_env(:clementine, :openai_compatible_base_url) do
-      url when is_binary(url) and url != "" ->
-        url
-
-      _ ->
-        raise "Missing :base_url in model config or :openai_compatible_base_url " <>
-                "configuration for :clementine"
-    end
-  end
-
-  defp api_key(%Policy{platform: platform} = policy) do
-    configured =
-      endpoint(policy, :api_key) || Application.get_env(:clementine, api_key_config(platform))
-
-    case resolve_credential(configured) do
-      key when is_binary(key) and key != "" ->
-        key
-
-      nil when platform == :openai_compatible ->
-        nil
-
-      _ ->
-        raise "Missing #{inspect(api_key_config(platform))} configuration for :clementine"
-    end
-  end
-
-  # A declared model's platform entry may name its own endpoint.
-  defp endpoint(%Policy{model: model, platform: platform}, key) do
-    model.platforms |> Keyword.get(platform, %{}) |> Map.get(key)
-  end
-
-  @doc false
-  # The app config key that holds a platform's credential.
-  def api_key_config(:openrouter), do: :openrouter_api_key
-  def api_key_config(:bedrock), do: :bedrock_api_key
-  def api_key_config(:vertex), do: :vertex_access_token
-  def api_key_config(:openai_compatible), do: :openai_compatible_api_key
-
-  defp resolve_credential({:system, env_var}) when is_binary(env_var) do
-    System.get_env(env_var)
-  end
-
-  defp resolve_credential({module, function, args})
-       when is_atom(module) and is_atom(function) and is_list(args) do
-    apply(module, function, args)
-  end
-
-  defp resolve_credential(key) when is_binary(key), do: key
-  defp resolve_credential(_), do: nil
 
   defp policy!(model, opts, checks) do
     policy = Policy.resolve!(model, opts, checks)
 
-    unless policy.platform in @platforms do
+    if policy.protocol != :chat_completions do
       raise ArgumentError,
-            "#{inspect(model)} goes to #{inspect(policy.platform)}, not a Chat Completions " <>
-              "platform (#{inspect(@platforms)})"
+            "#{inspect(model)} goes to #{inspect(policy.platform)} over " <>
+              "#{inspect(policy.protocol)}, not Chat Completions"
     end
 
     policy

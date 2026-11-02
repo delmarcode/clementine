@@ -27,7 +27,7 @@ defmodule Mix.Tasks.Clementine.InstallTest do
 
       config = content(igniter, "config/config.exs")
       assert config =~ "queues: [default: 10, agents: 10]"
-      assert config =~ ~s|anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}|
+      assert config =~ ~s|platforms: [anthropic: [api_key: {:system, "ANTHROPIC_API_KEY"}]]|
       # Agents name their models by id; there is no catalog to configure.
       refute config =~ ":models"
       assert config =~ "metadata: [:request_id, :run_id]"
@@ -101,7 +101,7 @@ defmodule Mix.Tasks.Clementine.InstallTest do
 
       config :my_app, Oban, repo: MyApp.Repo, queues: [default: 10, agents: 3]
 
-      config :clementine, anthropic_api_key: "from-vault"
+      config :clementine, platforms: [anthropic: [api_key: "from-vault"]]
 
       import_config "\#{config_env()}.exs"
       """
@@ -110,7 +110,7 @@ defmodule Mix.Tasks.Clementine.InstallTest do
 
       config = content(igniter, "config/config.exs")
       assert config =~ "queues: [default: 10, agents: 3]"
-      assert config =~ ~s|anthropic_api_key: "from-vault"|
+      assert config =~ ~s|platforms: [anthropic: [api_key: "from-vault"]]|
       refute config =~ "ANTHROPIC_API_KEY"
     end
   end

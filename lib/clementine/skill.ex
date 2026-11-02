@@ -7,13 +7,21 @@ defmodule Clementine.Skill do
   start the model sees each skill's name and description, in the
   description of a `use_skill` tool. When it loads one, it reads the
   skill's body as that call's result, and the skill's tools join the
-  ones it may call from its next turn on. The system prompt never
-  changes, and neither does the request's tool list: the load is
-  recorded after its result as a `Clementine.LLM.Message.SystemMessage`
-  naming the skill and carrying its tools, which a model that binds its
-  thinking receives as inline tool definitions (others get the tools in
-  the list). A later turn of the thread that replays that message has
-  the skill loaded from the start.
+  ones it may call from its next turn on. The load is recorded after its
+  result as a `Clementine.LLM.Message.SystemMessage` naming the skill and
+  carrying its tools. A later turn of the thread that replays that
+  message has the skill loaded from the start.
+
+  Where the model takes a tool defined inside a mid-conversation system
+  message (`features.inline_tools`, on the Claude API),
+  the tools go there as inline definitions, and neither the system
+  prompt nor the request's tool list changes, so a model that binds its
+  thinking keeps every earlier turn's. Elsewhere the tools join the
+  request's tool list: on Bedrock and Vertex, and on Foundry, where the
+  load also folds into the system prompt (`Clementine.Platform.withheld/1`).
+  There the load costs the prompt cache and, on a model that binds its
+  thinking, the earlier turns' thinking, once per load
+  (`[:clementine, :llm, :thinking_dropped]` with `cause: :fold`).
 
   Two forms, as agents have two. A skill written in code:
 

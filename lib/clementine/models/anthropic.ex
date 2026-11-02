@@ -52,13 +52,18 @@ defmodule Clementine.Models.Anthropic do
     ids are `anthropic.<id>`. A model Bedrock serves only through
     InvokeModel (Opus 4.6, Sonnet 4.6, the 4.5 snapshots, and older,
     with `-v1:0` ids behind an inference profile) has no `bedrock:`
-    entry, since Clementine's Bedrock client will send to the Messages
-    endpoint (OPS-195).
+    entry, since Clementine sends Claude to Bedrock's Messages endpoint
+    only (`Clementine.Platform`).
   - `vertex:` takes the dateless id from the 4.6 generation on and
     `<alias>@<date>` before it.
-  - `foundry:` takes the id as its default deployment name, and has no
-    mid-conversation system messages (the page lists the Claude API,
-    Bedrock, Google managed, and Claude Platform on AWS).
+  - `foundry:` takes the id as its default deployment name.
+
+  What a platform never takes on any model is the platform's
+  (`Clementine.Platform.withheld/1`), not a sheet's: Foundry has no
+  mid-conversation system messages (the page lists the Claude API,
+  Bedrock, Google managed, and Claude Platform on AWS), and Bedrock,
+  Vertex, and Foundry take no tool defined inside one (the page
+  documents `inline-tools-2026-09-15` on the Claude API only).
   - `claude_on_aws:` takes the Claude API's id.
 
   A retired id keeps a stub sheet (`lifecycle: [status: :retired]`) so
@@ -83,8 +88,9 @@ defmodule Clementine.Models.Anthropic do
 
   @features [tool_search: true, structured_outputs: true]
 
-  # Foundry has no mid-conversation system messages, on any model.
-  @foundry [features: [mid_conversation_system: false]]
+  # Mid-conversation system messages, and the tools a skill's load adds
+  # defined inside one (`inline-tools-2026-09-15`).
+  @mid_conversation [mid_conversation_system: true, inline_tools: true]
 
   # Anthropic's retired ids, with the dates and replacement the
   # deprecations page gives.
@@ -143,7 +149,7 @@ defmodule Clementine.Models.Anthropic do
          max_output: 128_000,
          thinking: binding_thinking([:adaptive], :high),
          rejects: @rejects_5_1,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(10, 50, 0.25, 12.50, 20),
          platforms: platforms("claude-fable-5-1"),
@@ -160,7 +166,7 @@ defmodule Clementine.Models.Anthropic do
          max_output: 128_000,
          thinking: binding_thinking([:adaptive], :high),
          rejects: @rejects_5_1,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(10, 50, 0.25, 12.50, 20),
          platforms: verified_platforms("claude-mythos-5-1"),
@@ -177,7 +183,7 @@ defmodule Clementine.Models.Anthropic do
          max_output: 128_000,
          thinking: binding_thinking([:adaptive], :medium),
          rejects: @rejects_5_1,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(4, 20, 0.20, 5, 8),
          platforms: platforms("claude-opus-5-5"),
@@ -197,7 +203,7 @@ defmodule Clementine.Models.Anthropic do
              max_effort: [between_tools: :high]
            ),
          rejects: @rejects_5_1,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(2, 10, 0.10, 2.50, 4),
          platforms: platforms("claude-sonnet-5-5"),
@@ -214,7 +220,7 @@ defmodule Clementine.Models.Anthropic do
          max_output: 128_000,
          thinking: binding_thinking([:adaptive, :off], :medium, max_effort: [off: :high]),
          rejects: @rejects_4_7,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices:
            prices(0.10, 0.50, 0.01, 0.125, 0.20,
@@ -240,7 +246,7 @@ defmodule Clementine.Models.Anthropic do
          max_output: 128_000,
          thinking: thinking(:adaptive, [:adaptive, :off], max_effort: [off: :high]),
          rejects: @rejects_4_7,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(5, 25, 0.50, 6.25, 10),
          platforms: platforms("claude-opus-5"),
@@ -274,7 +280,7 @@ defmodule Clementine.Models.Anthropic do
          max_output: 128_000,
          thinking: thinking(:adaptive, [:adaptive]),
          rejects: @rejects_4_7,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(10, 50, 1, 12.50, 20),
          platforms: platforms("claude-fable-5"),
@@ -291,7 +297,7 @@ defmodule Clementine.Models.Anthropic do
          max_output: 128_000,
          thinking: thinking(:adaptive, [:adaptive]),
          rejects: @rejects_4_7,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(10, 50, 1, 12.50, 20),
          platforms: verified_platforms("claude-mythos-5"),
@@ -309,7 +315,7 @@ defmodule Clementine.Models.Anthropic do
          max_output: 128_000,
          thinking: thinking(:off, [:adaptive, :off]),
          rejects: @rejects_4_7,
-         features: [mid_conversation_system: true] ++ @features,
+         features: @mid_conversation ++ @features,
          cache: [min_prefix: 1024, ttls: @ttls],
          prices: prices(5, 25, 0.50, 6.25, 10),
          platforms: platforms("claude-opus-4-8"),
@@ -349,7 +355,7 @@ defmodule Clementine.Models.Anthropic do
          platforms: [
            anthropic: [],
            vertex: [lifecycle: :partner],
-           foundry: @foundry,
+           foundry: [],
            claude_on_aws: []
          ],
          source: "#{@models}/opus-4-6/overview"
@@ -371,7 +377,7 @@ defmodule Clementine.Models.Anthropic do
          platforms: [
            anthropic: [],
            vertex: [lifecycle: :partner],
-           foundry: @foundry,
+           foundry: [],
            claude_on_aws: []
          ],
          source: "#{@models}/sonnet-4-6/overview"
@@ -489,7 +495,7 @@ defmodule Clementine.Models.Anthropic do
       anthropic: [],
       bedrock: [id: "anthropic." <> id, lifecycle: :partner],
       vertex: [lifecycle: :partner],
-      foundry: @foundry,
+      foundry: [],
       claude_on_aws: []
     ]
   end
@@ -590,7 +596,7 @@ defmodule Clementine.Models.Anthropic do
     platforms = [
       anthropic: [],
       vertex: [id: "#{alias_id}@#{date}", lifecycle: :partner],
-      foundry: [id: alias_id] ++ @foundry,
+      foundry: [id: alias_id],
       claude_on_aws: [id: alias_id]
     ]
 
