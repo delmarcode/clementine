@@ -39,10 +39,19 @@ the drain at shutdown.
   every rate, its own `over:` or none, and a `source` and `read` date.
   Never derive a cache read price from the input price.
 - An `agent/1` that picks a model per run (an eval's `--model`) passes
-  `model: run.metadata["model"] || __model__()`; the runtime fills the
-  rest of the policy from `use`.
+  `model: run.metadata["model"] || __model__()`. `use`'s choices are for
+  `use`'s model: the runtime fills them in when `agent/1` leaves the
+  model to `use` or names the same one, and a different model runs on
+  its own defaults and whatever `agent/1` sets.
+- A model the vendor shipped today goes under `config :clementine,
+  :models` with `based_on:` a shipped sheet (`docs/MODELS.md`), rather
+  than as a bare declaration that knows none of the base's facts.
 - A boot error naming a model says what it takes instead; change the
   agent, not Clementine.
+- To run an agent module in process (an eval, a test), pass the module:
+  `Clementine.run(MyApp.Agents.Triage, prompt, run: run)` completes its
+  `agent/1` from `use` as the runtime does. A bare `Agent.new/1` with no
+  model raises before anything runs.
 
 `mix clementine.install` writes the glue, and `mix clementine.gen.agent
 Triage` adds an agent with a tool and a test. Never copy a worker, a

@@ -10,9 +10,11 @@ defmodule Clementine.LLM.Policy do
     Default `min(16_000, model.max_output)`; over `max_output` is an
     error.
   - `effort`: one of the model's `thinking.efforts`. Default the model's
-    `default_effort`, sent explicitly; a model with none sends none.
+    `default_effort`, sent explicitly; a model with none sends none. A
+    declared level Clementine does not name goes to the wire as written.
   - `thinking`: `:adaptive`, `:enabled` (with
-    `provider_options: [budget_tokens: n]`), `:between_tools`, or `:off`,
+    `provider_options: [budget_tokens: n]`, at least 1,024 and below
+    `max_tokens`), `:between_tools`, or `:off`,
     one of the model's `thinking.types`. Default `:adaptive` where the
     model takes it, else the model's own default. A setting the model
     refuses is an error that names what it takes instead: `:off` on a
@@ -27,12 +29,21 @@ defmodule Clementine.LLM.Policy do
     `[ttl: ttl]`, one of the model's `cache.ttls` on its platform.
   - `provider_options`: what one vendor's wire takes and no other does:
     `budget_tokens` and `prefix_mismatch` (`:error` or `:drop_block`)
-    for Anthropic; `summary` and `generate_summary` (`:auto`,
-    `:concise`, `:detailed`) for OpenAI; `max_tokens`, `exclude`, and
-    `enabled` for OpenRouter's `reasoning`.
+    for Anthropic; `summary` (`:auto`, `:concise`, `:detailed`;
+    `:concise` only where the sheet does not reject `:concise_summary`)
+    for OpenAI; `max_tokens`, `exclude`, and `enabled` for OpenRouter's
+    `reasoning`.
+
+  A model whose sheet says it does not stream (`features.streaming:
+  false`) is refused for an agent, whose runs always stream; a direct
+  `Clementine.LLM.call/5` may still use it.
 
   `resolve/2` is the one check, and it runs wherever a model is named:
-  `Clementine.Agent.new/1`, the child spec at boot, and each request.
+  the child spec at boot, the start of every run (a claim on the
+  durable runtime, `Clementine.run/3` in process), and each request.
+  `Clementine.Agent.new/1` runs it too, leaving out what needs a choice
+  the agent left unset, since the runtime may still fill that choice
+  from the module's `use` (`Clementine.Agent`).
   Every error comes from the sheet and the app's config, never from the
   date, so a node that restarts after a vendor's shutdown date still
   boots; the vendor's own error ends the run that reaches it.
@@ -51,8 +62,7 @@ defmodule Clementine.LLM.Policy do
       prefix_mismatch: [type: {:in, [:error, :drop_block]}]
     ],
     openai: [
-      summary: [type: {:in, [:auto, :concise, :detailed]}],
-      generate_summary: [type: {:in, [:auto, :concise, :detailed]}]
+      summary: [type: {:in, [:auto, :concise, :detailed]}]
     ],
     openrouter: [
       max_tokens: [type: :pos_integer],
@@ -102,24 +112,28 @@ defmodule Clementine.LLM.Policy do
   def resolve(model, opts \\ []), do: resolve(model, opts, prices: true)
 
   @doc false
-  # `prices: false` leaves out the check that the model's per-TTL prices
-  # name the agent's TTL: for an agent built before the runtime fills its
-  # `cache:` from its module's `use` (`Clementine.Agent.new/1`).
+  # `checks`: `partial: true` leaves out every check that needs a choice
+  # `opts` leaves unset, for an agent built before the runtime fills its
+  # choices from its module's `use` (`Clementine.Agent.new/1`);
+  # `stream: false` is a request that does not stream (`call/5`).
   @spec resolve(String.t() | Model.t(), keyword(), keyword()) ::
           {:ok, t()} | {:error, String.t()}
   def resolve(%Model{} = model, opts, checks) when is_list(opts) do
     opts = Keyword.take(opts, @keys)
+    unset = if Keyword.get(checks, :partial, false), do: unset(opts), else: []
 
     with :ok <- servable(model),
          {:ok, platform} <- platform(model),
          {:ok, model} <- Models.for_platform(model, platform),
+         :ok <- streams(model, Keyword.get(checks, :stream, true)),
          {:ok, provider_options} <- provider_options(model, platform, opts[:provider_options]),
-         {:ok, thinking} <- thinking(model, opts[:thinking], provider_options),
-         {:ok, effort} <- effort(model, opts[:effort], thinking),
+         {:ok, thinking} <- thinking(model, opts[:thinking], provider_options, unset),
+         {:ok, effort} <- effort(model, opts[:effort], thinking, unset),
          {:ok, max_tokens} <- max_tokens(model, opts[:max_tokens]),
-         {:ok, display} <- display(model, opts[:display], thinking, provider_options),
+         :ok <- budget_fits(provider_options, max_tokens, unset),
+         {:ok, display} <- display(model, opts[:display], thinking, provider_options, unset),
          {:ok, cache} <- cache(model, opts[:cache]),
-         :ok <- priced(model, cache, Keyword.get(checks, :prices, true)) do
+         :ok <- priced(model, cache, :cache in unset) do
       {:ok,
        %__MODULE__{
          model: model,
@@ -142,12 +156,28 @@ defmodule Clementine.LLM.Policy do
 
   @doc "As `resolve/2`, raising `ArgumentError`."
   @spec resolve!(String.t() | Model.t(), keyword()) :: t()
-  def resolve!(model, opts \\ []) do
-    case resolve(model, opts) do
+  def resolve!(model, opts \\ []), do: resolve!(model, opts, [])
+
+  @doc false
+  @spec resolve!(String.t() | Model.t(), keyword(), keyword()) :: t()
+  def resolve!(model, opts, checks) do
+    case resolve(model, opts, checks) do
       {:ok, policy} -> policy
       {:error, message} -> raise ArgumentError, message
     end
   end
+
+  # The choices `opts` leaves unset, which a partial check does not
+  # assume the defaults of.
+  defp unset(opts), do: for(key <- @keys, is_nil(opts[key]), do: key)
+
+  defp streams(%Model{features: %{streaming: false}}, true) do
+    {:error,
+     "does not stream, and an agent's runs always do; call it with " <>
+       "Clementine.LLM.call/5, or pick a model that streams"}
+  end
+
+  defp streams(_model, _stream?), do: :ok
 
   # A retired sheet is a fact of this Clementine release, not a date
   # passing: the vendor no longer serves it.
@@ -187,7 +217,7 @@ defmodule Clementine.LLM.Policy do
       {:ok, schema} ->
         case NimbleOptions.validate(options, schema) do
           {:ok, validated} ->
-            budget(model, validated)
+            with {:ok, validated} <- budget(model, validated), do: summary(model, validated)
 
           {:error, error} ->
             {:error, "provider_options: #{Exception.message(error)}"}
@@ -214,7 +244,25 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(model, nil, options) do
+  defp summary(model, options) do
+    cond do
+      options[:summary] == nil ->
+        {:ok, options}
+
+      model.thinking.types == [:off] ->
+        {:error, "does not reason, so takes no provider_options: [summary: ...]"}
+
+      options[:summary] == :concise and :concise_summary in model.rejects ->
+        {:error,
+         "refuses provider_options: [summary: :concise]; it takes :auto or :detailed " <>
+           "(OpenAI: concise summaries are for reasoning models after gpt-5)"}
+
+      true ->
+        {:ok, options}
+    end
+  end
+
+  defp thinking(model, nil, options, _unset) do
     cond do
       Keyword.has_key?(options, :budget_tokens) -> {:ok, :enabled}
       :adaptive in model.thinking.types -> {:ok, :adaptive}
@@ -222,12 +270,16 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(model, type, options) when type in [:adaptive, :enabled, :between_tools, :off] do
+  defp thinking(model, type, options, unset)
+       when type in [:adaptive, :enabled, :between_tools, :off] do
     budget? = Keyword.has_key?(options, :budget_tokens)
 
     cond do
       type not in model.thinking.types ->
         {:error, refused_thinking(model, type)}
+
+      type == :enabled and not budget? and :provider_options in unset ->
+        {:ok, type}
 
       type == :enabled and not budget? ->
         {:error, "thinking: :enabled needs provider_options: [budget_tokens: n]"}
@@ -240,7 +292,7 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(_model, other, _options) do
+  defp thinking(_model, other, _options, _unset) do
     {:error, "thinking: takes one of #{inspect(Model.thinking_types())}, got: #{inspect(other)}"}
   end
 
@@ -291,20 +343,30 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp effort(model, nil, thinking), do: capped(model, model.thinking.default_effort, thinking)
+  # A cap ties an effort to a thinking setting, so a partial check that
+  # lacks either leaves it to the run's.
+  defp effort(model, nil, thinking, unset) do
+    if :thinking in unset,
+      do: {:ok, model.thinking.default_effort},
+      else: capped(model, model.thinking.default_effort, thinking)
+  end
 
-  defp effort(model, effort, thinking) do
+  defp effort(model, effort, thinking, unset) do
     efforts = model.thinking.efforts
 
     cond do
-      effort not in Model.efforts() ->
-        {:error, "effort: takes one of #{inspect(Model.efforts())}, got: #{inspect(effort)}"}
+      not is_atom(effort) or is_boolean(effort) ->
+        {:error,
+         "effort: takes one of the model's levels #{inspect(efforts)}, got: #{inspect(effort)}"}
 
       efforts == [] ->
         {:error, "takes no effort setting, got: effort: #{inspect(effort)}"}
 
       effort not in efforts ->
         {:error, "takes effort #{inspect(efforts)}, got: #{inspect(effort)}"}
+
+      :thinking in unset ->
+        {:ok, effort}
 
       true ->
         capped(model, effort, thinking)
@@ -313,10 +375,12 @@ defmodule Clementine.LLM.Policy do
 
   defp capped(_model, nil, _thinking), do: {:ok, nil}
 
+  # Levels rank in the order the sheet lists them, lowest first, so a
+  # declared level Clementine does not name ranks too.
   defp capped(model, effort, thinking) do
     case model.thinking.max_effort do
       %{^thinking => cap} ->
-        if Model.effort_rank(effort) > Model.effort_rank(cap),
+        if Model.effort_rank(model, effort) > Model.effort_rank(model, cap),
           do:
             {:error,
              "thinking: #{inspect(thinking)} takes effort up to #{inspect(cap)}, got: " <>
@@ -343,20 +407,41 @@ defmodule Clementine.LLM.Policy do
     {:error, "max_tokens: takes a positive integer, got: #{inspect(other)}"}
   end
 
-  defp display(%Model{thinking: %{display: nil}}, nil, _thinking, _options), do: {:ok, nil}
+  # Anthropic takes 1,024 thinking tokens at the least, and fewer than
+  # the response's max_tokens, which they count against.
+  defp budget_fits(options, max_tokens, unset) do
+    case Keyword.fetch(options, :budget_tokens) do
+      {:ok, budget} when budget < 1024 ->
+        {:error, "provider_options: [budget_tokens: #{budget}] is under the minimum of 1024"}
 
-  defp display(%Model{thinking: %{display: nil}}, display, _thinking, _options) do
+      {:ok, budget} when budget >= max_tokens ->
+        if :max_tokens in unset,
+          do: :ok,
+          else:
+            {:error,
+             "provider_options: [budget_tokens: #{budget}] must be below max_tokens " <>
+               "(#{max_tokens}), which thinking counts against; raise max_tokens: or lower the budget"}
+
+      _below_or_none ->
+        :ok
+    end
+  end
+
+  defp display(%Model{thinking: %{display: nil}}, nil, _thinking, _options, _unset),
+    do: {:ok, nil}
+
+  defp display(%Model{thinking: %{display: nil}}, display, _thinking, _options, _unset) do
     {:error, "returns no thinking to display, got: display: #{inspect(display)}"}
   end
 
-  defp display(model, display, thinking, options) do
+  defp display(model, display, thinking, options, unset) do
     explicit? = display != nil or Keyword.has_key?(options, :prefix_mismatch)
 
     cond do
       display != nil and display not in @displays ->
         {:error, "display: takes one of #{inspect(@displays)}, got: #{inspect(display)}"}
 
-      explicit? and thinking not in [:adaptive, :enabled] ->
+      explicit? and thinking not in [:adaptive, :enabled] and :thinking not in unset ->
         {:error,
          "display: and provider_options: [prefix_mismatch: ...] need thinking :adaptive or " <>
            ":enabled, got: #{inspect(thinking)}"}
@@ -417,10 +502,11 @@ defmodule Clementine.LLM.Policy do
     do: "on #{inspect(platform)} it offers #{inspect(ttls)}"
 
   # A price per cache TTL names the rate for the TTL the agent's writes
-  # are billed at: its own, or with caching off the model's shortest.
-  defp priced(_model, _cache, false), do: :ok
+  # are billed at: its own, or with caching off the shortest the model
+  # offers and its prices name (`Pricing.billed_ttl/2`).
+  defp priced(_model, _cache, true = _cache_unset), do: :ok
 
-  defp priced(model, cache, true) do
+  defp priced(model, cache, false) do
     case Pricing.validate_ttl(model.prices, Pricing.billed_ttl(model, cache.ttl)) do
       :ok -> :ok
       {:error, message} -> {:error, "prices: #{message}"}

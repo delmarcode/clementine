@@ -15,8 +15,9 @@ defmodule Clementine.OutputSchema do
   turn wrote last (after any tool search or thinking, and across a
   paused turn's continuation), and checks it here as well, because a provider's constraint gives way when the model
   refuses or runs out of tokens, and an OpenAI-compatible server may not
-  constrain at all (nor is it asked to, for a model whose catalog entry
-  sets `structured_output: :instructions`; see `Clementine.LLM.ChatCompletions`). An answer that is not JSON, or does not match, fails
+  constrain at all (nor is it asked to, for a declared model whose sheet
+  leaves `features.structured_outputs` off; see
+  `Clementine.LLM.ChatCompletions`). An answer that is not JSON, or does not match, fails
   the run with a `Clementine.Error` of code `:invalid_output`.
 
   The check covers the schema's structure: `type`, `properties`,
@@ -219,8 +220,8 @@ defmodule Clementine.OutputSchema do
     end
   end
 
-  # A model the provider does not constrain (a Chat Completions model set
-  # to `structured_output: :instructions`) may wrap its JSON in one
+  # A model the provider does not constrain (a declared Chat Completions
+  # model without `features.structured_outputs`) may wrap its JSON in one
   # markdown fence. A constrained answer is an object, so it never starts
   # with one.
   defp unfence(text) do

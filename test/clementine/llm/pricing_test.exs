@@ -324,10 +324,16 @@ defmodule Clementine.LLM.PricingTest do
   end
 
   describe "the shipped sheets" do
-    test "every sheet carries list prices in USD, with the page and the day they were read" do
+    test "every sheet a request can go to carries list prices, with the page and the day read" do
       put_models(nil)
 
-      for model <- Models.list() do
+      # Mythos Preview's page gives no cache rates; a retired sheet serves
+      # nothing, and carries prices only where the page still lists them.
+      unpriced = ["claude-mythos-preview"]
+
+      for model <- Models.list(),
+          model.lifecycle.status != :retired,
+          model.id not in unpriced do
         assert %Pricing{currency: "USD", source: source, read: ~D[2026-11-01]} = model.prices,
                "#{model.id} ships no prices"
 
@@ -336,12 +342,28 @@ defmodule Clementine.LLM.PricingTest do
                  "https://developers.openai.com/api/docs/pricing"
                ]
       end
+
+      assert Models.get!("claude-mythos-preview").prices == nil
+
+      retired_priced =
+        for %{lifecycle: %{status: :retired}, prices: %Pricing{}, id: id} <- Models.list(),
+            do: id
+
+      assert Enum.sort(retired_priced) ==
+               Enum.sort([
+                 "claude-opus-4-1-20250805",
+                 "claude-opus-4-20250514",
+                 "claude-sonnet-4-20250514",
+                 "claude-3-5-haiku-20241022",
+                 "o4-mini",
+                 "gpt-4.1-nano"
+               ])
     end
 
     test "each sheet prices exactly the TTLs its model offers" do
       put_models(nil)
 
-      for model <- Models.list() do
+      for %{prices: %Pricing{}} = model <- Models.list() do
         assert Enum.sort(Pricing.priced_ttls(model.prices)) == Enum.sort(model.cache.ttls),
                "#{model.id} prices other TTLs than it offers"
       end
@@ -381,10 +403,15 @@ defmodule Clementine.LLM.PricingTest do
                "gpt-6.1-terra" => 272_000,
                "gpt-6.1-sol" => 272_000,
                "gpt-6-luna" => 272_000,
+               "gpt-6-sol" => 272_000,
                "gpt-6-astra" => 272_000,
                "gpt-5.6-sol" => 272_000,
+               "gpt-5.6-terra" => 272_000,
+               "gpt-5.6-luna" => 272_000,
                "gpt-5.5" => 272_000,
-               "gpt-5.5-pro" => 272_000
+               "gpt-5.5-pro" => 272_000,
+               "gpt-5.4" => 272_000,
+               "gpt-5.4-pro" => 272_000
              }
 
       assert %{
@@ -534,6 +561,31 @@ defmodule Clementine.LLM.PricingTest do
       # Asking for a TTL it has no rate for is still refused.
       assert {:error, message} = Policy.resolve("claude-sonnet-5")
       assert message =~ "names no rate for :five_minutes"
+    end
+
+    test "an agent with caching off runs on a model with per-TTL prices" do
+      put_models(%{
+        "claude-opus-5-5" => [
+          prices: [
+            currency: "USD",
+            input: 3.60,
+            output: 18.00,
+            cache_read: 0.18,
+            cache_write: [one_hour: 7.20, five_minutes: 4.50]
+          ]
+        ]
+      })
+
+      agent = Agent.new(model: "claude-opus-5-5", cache: false)
+      assert Agent.policy(agent) == [cache: false]
+
+      assert %{pricing: %Pricing{cache_write: 4_500_000}} =
+               Trace.resolve_model(agent.model, Agent.policy(agent))
+
+      # A write the provider reports anyway costs the five-minute rate.
+      usage = %Clementine.Usage{input_tokens: 1_000_000, cache_write_tokens: 1_000_000}
+      %{pricing: pricing} = Trace.resolve_model(agent.model, cache: false)
+      assert %Clementine.Cost{micros: 4_500_000} = Clementine.Cost.price(usage, pricing)
     end
 
     test "a per-TTL cache_write on a model that offers no TTL fails the agent and boot" do

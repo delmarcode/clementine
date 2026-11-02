@@ -294,7 +294,7 @@ defmodule Clementine.LLM.ChatCompletionsTest do
     end
 
     test "call/5 refuses an effort the sheet does not offer, before sending" do
-      assert_raise ArgumentError, ~r/effort: takes one of/, fn ->
+      assert_raise ArgumentError, ~r/takes effort \[:low, :medium, :high\], got: :ultra/, fn ->
         ChatCompletions.call(@qwen, "system", [UserMessage.new("Hi")], [], effort: :ultra)
       end
 

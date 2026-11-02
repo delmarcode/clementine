@@ -416,6 +416,24 @@ defmodule Clementine.LLM.AnthropicBindingTest do
       assert "thinking-binding-controls-2026-08-01" in Anthropic.betas(body)
 
       assert {:error, {:api_error, 400, _}} = Fake.check(model, "Be brief.", spliced, [Echo], [])
+
+      # The fake reads the model's facts by its id, not the id it goes by
+      # on its platform, so an override of that id keeps the check on.
+      models = Application.get_env(:clementine, :models)
+
+      try do
+        Application.put_env(:clementine, :models, %{
+          model => [platforms: [anthropic: [id: "sonnet-deployment"]]]
+        })
+
+        {body, _binding, nil} = Anthropic.request(model, "Be brief.", spliced, [Echo], [])
+        assert body["model"] == "sonnet-deployment"
+
+        assert {:error, {:api_error, 400, _}} =
+                 Fake.check(model, "Be brief.", spliced, [Echo], [])
+      after
+        Application.put_env(:clementine, :models, models)
+      end
     end
   end
 

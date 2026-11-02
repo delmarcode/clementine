@@ -194,15 +194,8 @@ defmodule Clementine.LLM.ReasoningTest do
     test "sends the agent's effort and its summary options" do
       assert openai("gpt-6.1-terra", effort: :none) == %{"reasoning" => %{"effort" => "none"}}
 
-      assert openai("gpt-6.1-sol",
-               effort: :high,
-               provider_options: [summary: :auto, generate_summary: :detailed]
-             ) == %{
-               "reasoning" => %{
-                 "effort" => "high",
-                 "summary" => "auto",
-                 "generate_summary" => "detailed"
-               }
+      assert openai("gpt-6.1-sol", effort: :high, provider_options: [summary: :auto]) == %{
+               "reasoning" => %{"effort" => "high", "summary" => "auto"}
              }
 
       assert openai("gpt-6-astra", provider_options: [summary: :concise]) ==

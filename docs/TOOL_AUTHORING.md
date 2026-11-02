@@ -30,7 +30,7 @@ Register it with an agent:
 ```elixir
 agent =
   Clementine.Agent.new(
-    model: :claude_sonnet,
+    model: "claude-sonnet-5-5",
     instructions: "You can check network connectivity.",
     tools: [MyApp.Tools.Ping]
   )

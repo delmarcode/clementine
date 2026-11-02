@@ -148,7 +148,7 @@ defmodule Clementine.LLM.AnthropicTest do
         Anthropic.call(model, "system", [UserMessage.new("Hi")], [], opts)
       end
 
-      assert_raise ArgumentError, ~r/effort: takes one of/, fn ->
+      assert_raise ArgumentError, ~r/takes effort \[:low, .*\], got: :ultra/, fn ->
         call.(@model, effort: :ultra)
       end
 

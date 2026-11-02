@@ -33,8 +33,9 @@ defmodule Clementine.Model do
   - `thinking`: `default`, what the API does with no thinking field
     (`:adaptive` or `:off`); `types`, the thinking settings it accepts
     (`:adaptive`, `:enabled` with a token budget, `:between_tools`,
-    `:off`); `efforts`, the effort levels it accepts, and
-    `default_effort`; `max_effort`, a thinking setting that accepts only
+    `:off`); `efforts`, the effort levels it accepts, lowest first, and
+    `default_effort` (a declaration may name a level Clementine does not,
+    which goes to the wire as written); `max_effort`, a thinking setting that accepts only
     efforts up to a level (`between_tools: :high`); `binding`, `:prefix`
     where the model binds each thinking block to the conversation it was
     produced after (the runtime guide's "Models that bind their
@@ -43,11 +44,13 @@ defmodule Clementine.Model do
     such field).
   - `rejects`: request features the API refuses on this model:
     `:temperature`, `:top_p`, `:top_k`, `:prefill`, `:forced_tool_choice`,
-    `:budget_tokens`.
+    `:budget_tokens`, and `:concise_summary` (OpenAI's `summary:
+    :concise`).
   - `features`: `tool_search` (deferred tools go with `defer_loading`),
-    `structured_outputs`, and `mid_conversation_system` (a skill's load
+    `structured_outputs`, `mid_conversation_system` (a skill's load
     goes inline as a system message rather than folding into `system`
-    and `tools`).
+    and `tools`), and `streaming` (default `true`; an agent's runs
+    always stream, so one on a model that does not is refused).
   - `cache`: `min_prefix`, the fewest tokens a cached prefix holds
     (`nil` where the vendor states none), and
     `ttls`, the cache lifetimes it offers, shortest first. Which TTLs
@@ -62,7 +65,11 @@ defmodule Clementine.Model do
   - `platforms`: where the model is served, each with the id it goes by
     there and how its facts differ there: `[anthropic: [id: ...],
     bedrock: [id: "anthropic.claude-...", lifecycle: :partner], ...]`.
-    `:partner` marks a platform that sets its own retirement dates.
+    `:partner` marks a platform that sets its own retirement dates. A
+    declared model's `openrouter`, `bedrock`, `vertex`, or
+    `openai_compatible` entry may carry `base_url:` and `api_key:` until
+    platforms own their endpoints (OPS-195); `inspect/2` redacts a
+    literal key.
   - `source` and `read`: the page the sheet was read from, and when.
 
   `platform` is set only on a sheet `Clementine.Models.for_platform/2`
@@ -73,7 +80,15 @@ defmodule Clementine.Model do
 
   @thinking_types [:adaptive, :enabled, :between_tools, :off]
   @efforts [:none, :minimal, :low, :medium, :high, :xhigh, :max]
-  @rejects [:temperature, :top_p, :top_k, :prefill, :forced_tool_choice, :budget_tokens]
+  @rejects [
+    :temperature,
+    :top_p,
+    :top_k,
+    :prefill,
+    :forced_tool_choice,
+    :budget_tokens,
+    :concise_summary
+  ]
   @marker_ttls [:five_minutes, :one_hour]
   @option_ttls [:thirty_minutes, :twelve_hours]
   @ttls @marker_ttls ++ @option_ttls
@@ -112,7 +127,8 @@ defmodule Clementine.Model do
   ]
 
   @type thinking_type :: :adaptive | :enabled | :between_tools | :off
-  @type effort :: :none | :minimal | :low | :medium | :high | :xhigh | :max
+  @typedoc "An effort level: one Clementine names, or a declared model's own."
+  @type effort :: :none | :minimal | :low | :medium | :high | :xhigh | :max | atom()
   @type ttl :: :five_minutes | :one_hour | :thirty_minutes | :twelve_hours
   @type platform :: atom()
 
@@ -144,7 +160,8 @@ defmodule Clementine.Model do
           features: %{
             tool_search: boolean(),
             structured_outputs: boolean(),
-            mid_conversation_system: boolean()
+            mid_conversation_system: boolean(),
+            streaming: boolean()
           },
           cache: %{min_prefix: non_neg_integer() | nil, ttls: [ttl()]},
           prices: Pricing.t() | nil,
@@ -181,8 +198,8 @@ defmodule Clementine.Model do
       keys: [
         default: [type: {:in, @thinking_types}],
         types: [type: {:list, {:in, @thinking_types}}],
-        efforts: [type: {:list, {:in, @efforts}}],
-        default_effort: [type: {:or, [{:in, @efforts}, nil]}],
+        efforts: [type: {:list, {:custom, __MODULE__, :validate_effort, []}}],
+        default_effort: [type: {:or, [{:custom, __MODULE__, :validate_effort, []}, nil]}],
         max_effort: [type: :keyword_list],
         binding: [type: {:in, [:prefix, :none]}],
         display: [type: {:in, [:omitted, :summarized, nil]}]
@@ -195,7 +212,8 @@ defmodule Clementine.Model do
       keys: [
         tool_search: [type: :boolean],
         structured_outputs: [type: :boolean],
-        mid_conversation_system: [type: :boolean]
+        mid_conversation_system: [type: :boolean],
+        streaming: [type: :boolean]
       ]
     ],
     cache: [
@@ -221,7 +239,8 @@ defmodule Clementine.Model do
       keys: [
         tool_search: [type: :boolean],
         structured_outputs: [type: :boolean],
-        mid_conversation_system: [type: :boolean]
+        mid_conversation_system: [type: :boolean],
+        streaming: [type: :boolean]
       ]
     ],
     cache: [
@@ -257,7 +276,8 @@ defmodule Clementine.Model do
   @feature_defaults %{
     tool_search: false,
     structured_outputs: false,
-    mid_conversation_system: false
+    mid_conversation_system: false,
+    streaming: true
   }
   @cache_defaults %{min_prefix: nil, ttls: []}
 
@@ -272,7 +292,7 @@ defmodule Clementine.Model do
   @spec platforms() :: [platform()]
   def platforms, do: @platforms
 
-  @doc "The effort levels, lowest first."
+  @doc "The effort levels Clementine names, lowest first."
   @spec efforts() :: [effort()]
   def efforts, do: @efforts
 
@@ -331,10 +351,22 @@ defmodule Clementine.Model do
   end
 
   @doc """
-  The order of `effort` among the levels, lowest first, for comparing two.
+  The order of `effort` among `model`'s levels, lowest first, for
+  comparing two, or `nil` for a level the model does not take.
   """
-  @spec effort_rank(effort()) :: non_neg_integer()
-  def effort_rank(effort), do: Enum.find_index(@efforts, &(&1 == effort))
+  @spec effort_rank(t(), effort()) :: non_neg_integer() | nil
+  def effort_rank(%__MODULE__{thinking: %{efforts: efforts}}, effort),
+    do: Enum.find_index(efforts, &(&1 == effort))
+
+  @doc false
+  # Any atom but a boolean or nil: a declaration may name a vendor's new
+  # level before Clementine does.
+  @spec validate_effort(term()) :: {:ok, atom()} | {:error, String.t()}
+  def validate_effort(effort) when is_atom(effort) and effort not in [nil, true, false],
+    do: {:ok, effort}
+
+  def validate_effort(other),
+    do: {:error, "expected an effort level atom (#{inspect(@efforts)}), got: #{inspect(other)}"}
 
   @doc false
   # The caching mechanism a TTL list implies: `:markers`
@@ -344,6 +376,19 @@ defmodule Clementine.Model do
 
   def cache_mechanism([ttl | _rest]) when ttl in @marker_ttls, do: :markers
   def cache_mechanism([ttl | _rest]) when ttl in @option_ttls, do: :options
+
+  @doc false
+  # `term` with every literal `api_key:` replaced, for an error message.
+  @spec redact(term()) :: term()
+  def redact({:api_key, key}) when is_binary(key), do: {:api_key, "**redacted**"}
+  def redact(list) when is_list(list), do: Enum.map(list, &redact/1)
+  def redact(%{__struct__: _} = struct), do: struct
+
+  def redact(map) when is_map(map),
+    do: Map.new(map, fn {key, value} -> redact({key, value}) end)
+
+  def redact({key, value}), do: {key, redact(value)}
+  def redact(other), do: other
 
   @doc false
   @spec validate_credential(term()) :: {:ok, term()} | {:error, String.t()}
@@ -480,4 +525,22 @@ defmodule Clementine.Model do
 
   defp bad_cap?({type, effort}, thinking),
     do: type not in thinking.types or effort not in thinking.efforts
+end
+
+defimpl Inspect, for: Clementine.Model do
+  # A declared model's platform entry may hold a literal API key until
+  # platforms own their credentials (OPS-195); inspecting the model, or a
+  # policy or error that carries it, never prints it.
+  def inspect(%Clementine.Model{} = model, opts) do
+    platforms =
+      Enum.map(model.platforms, fn
+        {name, %{api_key: key} = entry} when is_binary(key) ->
+          {name, %{entry | api_key: "**redacted**"}}
+
+        other ->
+          other
+      end)
+
+    Inspect.Any.inspect(%{model | platforms: platforms}, opts)
+  end
 end

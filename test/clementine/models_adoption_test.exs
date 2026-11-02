@@ -65,10 +65,12 @@ defmodule Clementine.ModelsAdoptionTest do
     assistant = Agent.declared!(Yakky.PatientAssistant, Yakky.PatientAssistant.agent(%{}))
     assert %Agent{model: "claude-sonnet-5", cache: [ttl: :one_hour]} = assistant
 
-    # mix yakky.eval --model claude-opus-5-5: the id rides in run metadata.
+    # mix yakky.eval --model claude-opus-5-5: the id rides in run
+    # metadata. use's choices are for its own model, so the eval's model
+    # runs on its own defaults.
     opus = %{metadata: %{"model" => "claude-opus-5-5"}}
 
-    assert %Agent{model: "claude-opus-5-5", effort: :high} =
+    assert %Agent{model: "claude-opus-5-5", effort: nil, max_tokens: nil} =
              Agent.declared!(Yakky.Screener, Yakky.Screener.agent(opus))
   end
 

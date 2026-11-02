@@ -89,7 +89,7 @@ defmodule Clementine.LLM.ChatCompletions do
   """
   @impl true
   def call(model, system, messages, tools, opts \\ []) do
-    resolved = policy!(model, opts)
+    resolved = policy!(model, opts, stream: false)
     body = build_body(resolved, system, messages, tools, opts)
     headers = build_headers(resolved)
     url = request_url(resolved)
@@ -129,7 +129,7 @@ defmodule Clementine.LLM.ChatCompletions do
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
-    resolved = policy!(model, opts)
+    resolved = policy!(model, opts, stream: true)
 
     # Usage arrives in the stream's last chunk only when asked for.
     body =
@@ -438,8 +438,8 @@ defmodule Clementine.LLM.ChatCompletions do
   defp resolve_credential(key) when is_binary(key), do: key
   defp resolve_credential(_), do: nil
 
-  defp policy!(model, opts) do
-    policy = Policy.resolve!(model, opts)
+  defp policy!(model, opts, checks) do
+    policy = Policy.resolve!(model, opts, checks)
 
     unless policy.platform in @platforms do
       raise ArgumentError,

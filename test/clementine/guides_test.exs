@@ -42,10 +42,11 @@ defmodule Clementine.GuidesTest do
 
   @extras Path.wildcard("guides/*.md") ++ ["usage-rules.md"]
 
-  # The README is the repository's front door on GitHub. It is not a docs
-  # extra (`mix docs` lands on Getting Started), so it is checked here but
-  # not listed in mix.exs.
-  @guides @extras ++ ["README.md"]
+  # The README is the repository's front door on GitHub, and
+  # docs/MODELS.md the model reference the README and usage rules point
+  # to. Neither is a docs extra (`mix docs` lands on Getting Started), so
+  # they are checked here but not listed in mix.exs.
+  @guides @extras ++ ["README.md", "docs/MODELS.md"]
 
   @parse_only_marker ~r/^<!--\s*guide-sample:\s*parse-only\s*-->\s*$/
   @run_marker ~r/^<!--\s*guide-sample:\s*run\s*-->\s*$/
