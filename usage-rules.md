@@ -12,7 +12,9 @@ the drain at shutdown.
 - One migration calling `Clementine.Migration.up(version: 6)`. Each
   version stamps the table, and the runtime refuses to start against a
   table behind the code's version, naming the migration to write
-  (`Clementine.Migration.up(from: 5, version: 6)`).
+  (`Clementine.Migration.up(from: 5, version: 6)`). Stop every node on
+  version 5 before migrating to 6: v5 code starts against a v6 table and
+  then fails every trace insert on the dropped `alias` column.
 - Agent modules, each listed in `agents:`:
   `use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", instructions: "...", tools: [...]`.
   Every run row stores the key, so never rename a key that has runs. An

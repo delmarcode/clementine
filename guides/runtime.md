@@ -61,7 +61,10 @@ Each version's DDL is frozen in `Clementine.Migration`, and each stamps
 its number on the table. The runtime checks the stamp as it starts and
 refuses to start against a table behind the code's version, naming the
 migration to write: a host on version 5 adds one calling
-`Clementine.Migration.up(from: 5, version: 6)`.
+`Clementine.Migration.up(from: 5, version: 6)`. Stop every node on
+version 5 before that migration runs, since a table ahead of the code
+passes the check: v5 code starts against a v6 table and then fails every
+trace insert on the dropped `alias` column.
 
 An agent is a module with a stable key, the string its run rows store:
 
