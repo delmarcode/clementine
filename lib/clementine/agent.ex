@@ -55,6 +55,11 @@ defmodule Clementine.Agent do
         max_tokens: 16_000,
         cache: [ttl: :one_hour]
 
+  - `platform:` where its requests go (`Clementine.Platform`): one the
+    model's sheet lists, such as `:bedrock` or `:foundry` for Claude;
+    default the vendor's own (`:anthropic`, `:openai`). Moving an agent
+    is this one line, and the platform's credentials under
+    `config :clementine, :platforms`.
   - `max_tokens:` the output ceiling of one response, thinking included;
     default `min(16_000, the model's max_output)`.
   - `effort:` one of the model's effort levels; default the model's own,
@@ -83,8 +88,9 @@ defmodule Clementine.Agent do
   unset (and `provider_options:` key by key: `c:agent/1` overrides a key
   `use` gives but cannot remove one). When `c:agent/1` picks
   another model for a run, an eval's, say, none of `use`'s choices
-  apply, and the agent runs on that model's defaults and its own
-  choices:
+  apply but `platform:`, which says where the app's credentials are
+  rather than what the model takes, and the agent runs on that model's
+  defaults and its own choices:
 
       use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", effort: :xhigh
 
@@ -273,6 +279,7 @@ defmodule Clementine.Agent do
 
   defstruct id: nil,
             model: nil,
+            platform: nil,
             max_tokens: nil,
             effort: nil,
             thinking: nil,
@@ -293,6 +300,7 @@ defmodule Clementine.Agent do
   @type t :: %__MODULE__{
           id: term(),
           model: String.t() | nil,
+          platform: atom() | nil,
           max_tokens: pos_integer() | nil,
           effort: Clementine.Model.effort() | nil,
           thinking: Clementine.Model.thinking_type() | nil,
@@ -495,9 +503,9 @@ defmodule Clementine.Agent do
     ships a sheet for or `config :clementine, :models` declares. An agent
     the runtime builds from a module may leave it out and take the
     module's `__model__/0`
-  - `:max_tokens`, `:effort`, `:thinking`, `:display`, `:cache`,
-    `:provider_options` - the agent's choices for its model (see "The
-    model and its policy" above)
+  - `:platform`, `:max_tokens`, `:effort`, `:thinking`, `:display`,
+    `:cache`, `:provider_options` - the agent's choices for its model
+    (see "The model and its policy" above)
   - `:id` - host-app identifier, kept for audit trails
   - `:instructions` - system prompt
   - `:tools` - tool modules
@@ -613,10 +621,12 @@ defmodule Clementine.Agent do
         end)
 
       true ->
-        check!(agent, fn message ->
+        agent
+        |> fill(Keyword.take(declared, [:platform]))
+        |> check!(fn message ->
           "#{inspect(module)}.agent/1 picked #{inspect(agent.model)} for this run, not the " <>
             "#{inspect(model)} its use Clementine.Agent declares, so only agent/1's own " <>
-            "choices apply: #{message}"
+            "choices apply, and use's platform: #{message}"
         end)
     end
   end

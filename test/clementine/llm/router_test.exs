@@ -8,7 +8,7 @@ defmodule Clementine.LLM.RouterTest do
 
   setup :verify_on_exit!
 
-  @env_keys [:models, :llm_provider_clients, :anthropic_api_key, :openrouter_api_key]
+  @env_keys [:models, :llm_provider_clients, :platforms]
 
   setup do
     previous = Enum.map(@env_keys, &{&1, Application.get_env(:clementine, &1)})
@@ -57,11 +57,11 @@ defmodule Clementine.LLM.RouterTest do
   test "routes chat completions platforms to the ChatCompletions client by default" do
     declare("deepseek/deepseek-v3.2", :deepseek, openrouter: [])
     Application.delete_env(:clementine, :llm_provider_clients)
-    Application.delete_env(:clementine, :openrouter_api_key)
+    Application.put_env(:clementine, :platforms, [])
 
     # Reaching the ChatCompletions client's credential check proves the
     # default platform mapping dispatched there.
-    assert_raise RuntimeError, ~r/Missing :openrouter_api_key/, fn ->
+    assert_raise ArgumentError, ~r/:platforms, openrouter: \[api_key: ...\] is not set/, fn ->
       Router.call("deepseek/deepseek-v3.2", "sys", [UserMessage.new("hi")], [])
     end
   end
@@ -100,61 +100,109 @@ defmodule Clementine.LLM.RouterTest do
     end
   end
 
-  test "raises for a platform with no client configured" do
-    Application.put_env(:clementine, :llm_provider_clients, anthropic: Clementine.LLM.MockClient)
+  test "routes to the platform the request names, over the wire its model takes there" do
+    Application.put_env(:clementine, :llm_provider_clients, bedrock: Clementine.LLM.MockClient)
 
-    assert_raise RuntimeError, ~r/No LLM client configured for provider :openai/, fn ->
-      Router.call("gpt-5", "sys", [UserMessage.new("hi")], [])
+    Clementine.LLM.MockClient
+    |> expect(:call, fn "claude-sonnet-5-5", "sys", [%UserMessage{}], [], [platform: :bedrock] ->
+      {:ok, %Response{}}
+    end)
+
+    assert {:ok, %Response{}} =
+             Router.call("claude-sonnet-5-5", "sys", [UserMessage.new("hi")], [],
+               platform: :bedrock
+             )
+  end
+
+  test "Claude on Bedrock and Foundry goes to the Messages client, an open model to Chat Completions" do
+    Application.put_env(:clementine, :platforms, [])
+    declare("qwen.qwen3-235b-a22b-2507-v1:0", :qwen, bedrock: [])
+
+    # Each client's own platform check proves where the request went.
+    for platform <- [:bedrock, :foundry] do
+      assert_raise ArgumentError, ~r/#{platform}: needs/, fn ->
+        Router.call("claude-sonnet-5-5", "sys", [UserMessage.new("hi")], [], platform: platform)
+      end
+    end
+
+    assert_raise ArgumentError, ~r/bedrock: needs region:/, fn ->
+      Router.call("qwen.qwen3-235b-a22b-2507-v1:0", "sys", [UserMessage.new("hi")], [])
+    end
+  end
+
+  test "a platform no request can reach yet raises, naming the issue that builds it" do
+    assert_raise ArgumentError, ~r/does not send Claude to :vertex yet \(OPS-199\)/, fn ->
+      Router.call("claude-sonnet-5-5", "sys", [UserMessage.new("hi")], [], platform: :vertex)
+    end
+
+    assert_raise ArgumentError, ~r/does not send to :claude_on_aws yet/, fn ->
+      Router.call("claude-sonnet-5-5", "sys", [UserMessage.new("hi")], [],
+        platform: :claude_on_aws
+      )
     end
   end
 
   describe "credential/1" do
-    test "passes where app config holds the platform's key, even one not yet resolved" do
-      Application.put_env(:clementine, :anthropic_api_key, "test-anthropic-key")
-      assert :ok = Router.credential(Policy.resolve!("claude-sonnet-5"))
-
-      declare("deepseek/deepseek-v3.2", :deepseek, openrouter: [])
-
-      Application.put_env(
-        :clementine,
-        :openrouter_api_key,
-        {:system, "CLEMENTINE_ROUTER_TEST_UNSET_KEY"}
+    test "passes where the platform's config holds its key, even one not yet resolved" do
+      Application.put_env(:clementine, :platforms,
+        anthropic: [api_key: "test-anthropic-key"],
+        openrouter: [api_key: {:system, "CLEMENTINE_ROUTER_TEST_UNSET_KEY"}],
+        bedrock: [region: "us-east-1", api_key: {__MODULE__, :token, []}],
+        foundry: [resource: "example", access_token: {__MODULE__, :token, []}]
       )
 
+      assert :ok = Router.credential(Policy.resolve!("claude-sonnet-5"))
+      assert :ok = Router.credential(Policy.resolve!("claude-sonnet-5-5", platform: :bedrock))
+      assert :ok = Router.credential(Policy.resolve!("claude-sonnet-5-5", platform: :foundry))
+
+      declare("deepseek/deepseek-v3.2", :deepseek, openrouter: [])
       assert :ok = Router.credential(Policy.resolve!("deepseek/deepseek-v3.2"))
     end
 
     test "names the config key the model's platform lacks" do
-      Application.delete_env(:clementine, :anthropic_api_key)
+      Application.put_env(:clementine, :platforms, bedrock: [region: "us-east-1"])
 
       assert {:error, message} = Router.credential(Policy.resolve!("claude-sonnet-5"))
 
       assert message ==
-               ~s("claude-sonnet-5" goes to :anthropic, and config :clementine, ) <>
-                 "anthropic_api_key: is not set"
+               ~s("claude-sonnet-5" goes to :anthropic, and config :clementine, :platforms, ) <>
+                 "anthropic: [api_key: ...] is not set"
 
-      declare("deepseek/deepseek-v3.2", :deepseek, openrouter: [])
-      Application.delete_env(:clementine, :openrouter_api_key)
+      assert {:error, message} =
+               Router.credential(Policy.resolve!("claude-sonnet-5-5", platform: :bedrock))
 
-      assert {:error, message} = Router.credential(Policy.resolve!("deepseek/deepseek-v3.2"))
-      assert message =~ "goes to :openrouter"
-      assert message =~ "openrouter_api_key: is not set"
+      assert message =~ "goes to :bedrock"
+      assert message =~ "bedrock: [api_key: ...] is not set"
+
+      Application.put_env(:clementine, :platforms, foundry: [resource: "example"])
+
+      assert {:error, message} =
+               Router.credential(Policy.resolve!("claude-sonnet-5-5", platform: :foundry))
+
+      assert message =~ "foundry: sets none of [:api_key, :access_token]"
     end
 
-    test "a declared platform entry's api_key stands in for app config" do
-      Application.delete_env(:clementine, :openrouter_api_key)
+    test "names what a platform's entry lacks to know where to send" do
+      Application.put_env(:clementine, :platforms, bedrock: [api_key: "k"])
 
-      declare("deepseek/deepseek-v3.2", :deepseek,
-        openrouter: [api_key: {:system, "CLEMENTINE_ROUTER_TEST_UNSET_KEY"}]
+      assert {:error, "bedrock: needs region:" <> _} =
+               Router.credential(Policy.resolve!("claude-sonnet-5-5", platform: :bedrock))
+    end
+
+    test "an OpenAI-compatible server may take no key, but needs its base_url" do
+      declare("qwen3", :qwen, openai_compatible: [])
+      Application.put_env(:clementine, :platforms, [])
+
+      assert {:error, "openai_compatible: needs base_url:" <> _} =
+               Router.credential(Policy.resolve!("qwen3"))
+
+      Application.put_env(:clementine, :platforms,
+        openai_compatible: [base_url: "http://localhost:8000/v1"]
       )
-
-      assert :ok = Router.credential(Policy.resolve!("deepseek/deepseek-v3.2"))
-    end
-
-    test "an OpenAI-compatible server may take no key" do
-      declare("qwen3", :qwen, openai_compatible: [base_url: "http://localhost:8000/v1"])
 
       assert :ok = Router.credential(Policy.resolve!("qwen3"))
     end
   end
+
+  def token, do: "a-short-lived-token"
 end

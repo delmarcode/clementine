@@ -52,8 +52,8 @@ defmodule Clementine.Models.Anthropic do
     ids are `anthropic.<id>`. A model Bedrock serves only through
     InvokeModel (Opus 4.6, Sonnet 4.6, the 4.5 snapshots, and older,
     with `-v1:0` ids behind an inference profile) has no `bedrock:`
-    entry, since Clementine's Bedrock client will send to the Messages
-    endpoint (OPS-195).
+    entry, since Clementine sends Claude to Bedrock's Messages endpoint
+    only (`Clementine.Platform`).
   - `vertex:` takes the dateless id from the 4.6 generation on and
     `<alias>@<date>` before it.
   - `foundry:` takes the id as its default deployment name, and has no

@@ -13,21 +13,7 @@ defmodule Clementine.LLM.PromptCachingTest do
   alias Clementine.Test.Tools.{Add, Echo, GatedDeploy}
   alias Clementine.Usage
 
-  @env_keys [
-    :models,
-    :retry,
-    :anthropic_base_url,
-    :anthropic_api_key,
-    :openai_base_url,
-    :openai_api_key,
-    :openrouter_base_url,
-    :openrouter_api_key,
-    :bedrock_base_url,
-    :bedrock_api_key,
-    :vertex_base_url,
-    :vertex_access_token,
-    :openai_compatible_base_url
-  ]
+  @env_keys [:models, :retry]
 
   @key "clementine-0123456789abcdef0123456789abcdef"
   @claude "claude-sonnet-5"
@@ -39,17 +25,16 @@ defmodule Clementine.LLM.PromptCachingTest do
     base = "http://localhost:#{bypass.port}"
 
     Application.put_env(:clementine, :retry, max_attempts: 1, base_delay: 0, max_delay: 0)
-    Application.put_env(:clementine, :anthropic_base_url, base <> "/v1/messages")
-    Application.put_env(:clementine, :anthropic_api_key, "test-anthropic-key")
-    Application.put_env(:clementine, :openai_base_url, base <> "/v1/responses")
-    Application.put_env(:clementine, :openai_api_key, "test-openai-key")
-    Application.put_env(:clementine, :openrouter_base_url, base <> "/api/v1")
-    Application.put_env(:clementine, :openrouter_api_key, "test-openrouter-key")
-    Application.put_env(:clementine, :bedrock_base_url, base <> "/bedrock/v1")
-    Application.put_env(:clementine, :bedrock_api_key, "test-bedrock-key")
-    Application.put_env(:clementine, :vertex_base_url, base <> "/vertex/v1")
-    Application.put_env(:clementine, :vertex_access_token, "test-vertex-token")
-    Application.put_env(:clementine, :openai_compatible_base_url, base <> "/oai/v1")
+
+    Clementine.TestPlatforms.put(
+      anthropic: [api_key: "test-anthropic-key", base_url: base],
+      openai: [api_key: "test-openai-key", base_url: base <> "/v1"],
+      openrouter: [api_key: "test-openrouter-key", base_url: base <> "/api/v1"],
+      # Bedrock's base_url is the Mantle host both of its wires share.
+      bedrock: [api_key: "test-bedrock-key", base_url: base <> "/bedrock"],
+      vertex: [access_token: "test-vertex-token", base_url: base <> "/vertex/v1"],
+      openai_compatible: [base_url: base <> "/oai/v1"]
+    )
 
     # Shipped sheets ("claude-sonnet-5", "gpt-5", "gpt-5.6-sol",
     # "gpt-6.1-sol") carry their own cache facts; the models below are

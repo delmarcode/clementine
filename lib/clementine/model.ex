@@ -66,10 +66,9 @@ defmodule Clementine.Model do
     there and how its facts differ there: `[anthropic: [id: ...],
     bedrock: [id: "anthropic.claude-...", lifecycle: :partner], ...]`.
     `:partner` marks a platform that sets its own retirement dates. A
-    declared model's `openrouter`, `bedrock`, `vertex`, or
-    `openai_compatible` entry may carry `base_url:` and `api_key:` until
-    platforms own their endpoints (OPS-195); `inspect/2` redacts a
-    literal key.
+    platform is one Clementine ships (`platforms/0`) or one the app names
+    under `config :clementine, :platforms` (`Clementine.Platform`), which
+    holds its endpoint and credential.
   - `source` and `read`: the page the sheet was read from, and when.
 
   `platform` is set only on a sheet `Clementine.Models.for_platform/2`
@@ -250,9 +249,7 @@ defmodule Clementine.Model do
         min_prefix: [type: {:or, [:non_neg_integer, nil]}],
         ttls: [type: {:list, {:in, @ttls}}]
       ]
-    ],
-    base_url: [type: :string],
-    api_key: [type: {:custom, __MODULE__, :validate_credential, []}]
+    ]
   ]
 
   @lifecycle_defaults %{
@@ -281,13 +278,6 @@ defmodule Clementine.Model do
   }
   @cache_defaults %{min_prefix: nil, ttls: []}
 
-  # The platforms a request can go to before `Clementine.Platform`
-  # (OPS-195): each has a client. The rest are facts a sheet carries.
-  @served [:anthropic, :openai, :openrouter, :bedrock, :vertex, :openai_compatible]
-
-  # Only these may carry an endpoint on the sheet, until platforms do.
-  @endpoint_platforms [:openrouter, :bedrock, :vertex, :openai_compatible]
-
   @doc "The platforms a sheet may name."
   @spec platforms() :: [platform()]
   def platforms, do: @platforms
@@ -303,12 +293,6 @@ defmodule Clementine.Model do
   @doc "The cache TTLs a sheet may offer and a price may be keyed by."
   @spec ttls() :: [ttl()]
   def ttls, do: @ttls
-
-  @doc false
-  # The platforms a request can reach today, in the order a model's
-  # default is picked among them.
-  @spec served() :: [platform()]
-  def served, do: @served
 
   @doc """
   Builds a sheet from its keyword form, or explains what is wrong with it.
@@ -437,9 +421,10 @@ defmodule Clementine.Model do
       platforms == [] ->
         {:error, "platforms: names none; a model is served somewhere"}
 
-      (unknown = Keyword.keys(platforms) -- @platforms) != [] ->
+      (unknown = Enum.reject(Keyword.keys(platforms), &known_platform?/1)) != [] ->
         {:error,
-         "platforms: names #{inspect(unknown)}, which Clementine does not know; it knows " <>
+         "platforms: names #{inspect(unknown)}, which Clementine does not ship and " <>
+           "config :clementine, :platforms does not name; Clementine ships " <>
            inspect(@platforms)}
 
       true ->
@@ -457,9 +442,12 @@ defmodule Clementine.Model do
     end
   end
 
-  defp platform_entry(name, entry) when is_list(entry) do
-    with {:ok, validated} <- validate(entry, @platform_schema),
-         :ok <- endpoint_allowed(name, validated) do
+  # Shipped sheets name only shipped platforms, so building them at
+  # compile time never reads the app's config.
+  defp known_platform?(name), do: name in @platforms or Clementine.Platform.app_named?(name)
+
+  defp platform_entry(_name, entry) when is_list(entry) do
+    with {:ok, validated} <- validate(entry, @platform_schema) do
       {:ok,
        validated
        |> Map.new()
@@ -473,17 +461,6 @@ defmodule Clementine.Model do
       {:error,
        "expected a keyword list (id:, lifecycle:, features:, cache:), got: " <>
          inspect(redact(other))}
-
-  defp endpoint_allowed(name, entry) do
-    if name not in @endpoint_platforms and
-         (Keyword.has_key?(entry, :base_url) or Keyword.has_key?(entry, :api_key)) do
-      {:error,
-       "base_url: and api_key: go only on #{inspect(@endpoint_platforms)}; " <>
-         "#{inspect(name)} takes its endpoint from app config"}
-    else
-      :ok
-    end
-  end
 
   defp build(opts, platforms) do
     %__MODULE__{
@@ -544,22 +521,4 @@ defmodule Clementine.Model do
 
   defp bad_cap?({type, effort}, thinking),
     do: type not in thinking.types or effort not in thinking.efforts
-end
-
-defimpl Inspect, for: Clementine.Model do
-  # A declared model's platform entry may hold a literal API key until
-  # platforms own their credentials (OPS-195); inspecting the model, or a
-  # policy or error that carries it, never prints it.
-  def inspect(%Clementine.Model{} = model, opts) do
-    platforms =
-      Enum.map(model.platforms, fn
-        {name, %{api_key: key} = entry} when is_binary(key) ->
-          {name, %{entry | api_key: "**redacted**"}}
-
-        other ->
-          other
-      end)
-
-    Inspect.Any.inspect(%{model | platforms: platforms}, opts)
-  end
 end

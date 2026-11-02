@@ -72,7 +72,7 @@ defmodule Clementine.Models do
   """
 
   alias Clementine.LLM.Pricing
-  alias Clementine.Model
+  alias Clementine.{Model, Platform}
   alias Clementine.Models.{Anthropic, OpenAI}
 
   @shipped_sheets Anthropic.sheets() ++ OpenAI.sheets()
@@ -207,19 +207,19 @@ defmodule Clementine.Models do
   end
 
   @doc """
-  The platform a request for `model` goes to: the vendor's own where the
-  model lists it, else the first platform it lists that Clementine can
-  send to, else `nil`. An agent's `platform:` choice arrives with
-  `Clementine.Platform`.
+  The platform a request for `model` goes to when its agent names none:
+  the vendor's own where the model lists it (`:anthropic`, `:openai`),
+  else the first platform it lists that Clementine can send a model of
+  its vendor to (`Clementine.Platform.protocol/2`), else `nil`.
   """
   @spec default_platform(Model.t()) :: atom() | nil
   def default_platform(%Model{} = model) do
-    listed = Keyword.keys(model.platforms)
+    servable = Enum.filter(Keyword.keys(model.platforms), &servable?(&1, model.vendor))
 
-    if model.vendor in Model.served() and model.vendor in listed,
-      do: model.vendor,
-      else: Enum.find(listed, &(&1 in Model.served()))
+    if model.vendor in servable, do: model.vendor, else: List.first(servable)
   end
+
+  defp servable?(platform, vendor), do: match?({:ok, _}, Platform.protocol(platform, vendor))
 
   @doc """
   Checks `config :clementine, :models`: every override and declaration
@@ -240,8 +240,8 @@ defmodule Clementine.Models do
           unless default_platform(model) do
             raise ArgumentError,
                   "Invalid :clementine, :models entry #{inspect(model.id)}: it is served on " <>
-                    "#{inspect(Keyword.keys(model.platforms))}, and Clementine can send to " <>
-                    "#{inspect(Model.served())}"
+                    "#{inspect(Keyword.keys(model.platforms))}, none of which Clementine can " <>
+                    "send a #{inspect(model.vendor)} model to"
           end
 
         {:error, message} ->

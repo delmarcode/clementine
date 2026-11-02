@@ -14,8 +14,10 @@ config :clementine, Clementine.TestRepo,
 
 # Test-specific configuration
 config :clementine,
-  anthropic_api_key: "test-anthropic-key",
-  openai_api_key: "test-openai-key",
+  platforms: [
+    anthropic: [api_key: "test-anthropic-key"],
+    openai: [api_key: "test-openai-key"]
+  ],
   log_level: :warning,
   # Use mock LLM in tests
   llm_client: Clementine.LLM.MockClient

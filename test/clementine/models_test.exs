@@ -103,7 +103,7 @@ defmodule Clementine.ModelsTest do
           vendor: :qwen,
           context: 128_000,
           max_output: 16_000,
-          platforms: [foundry: [], openai_compatible: [base_url: "http://localhost:8000/v1"]]
+          platforms: [foundry: [], openai_compatible: []]
         ]
       })
 
@@ -155,12 +155,12 @@ defmodule Clementine.ModelsTest do
             {%{"mine" => [vendor: :me, platforms: [openrouter: []]]},
              ~r/context: and max_output:/},
             {%{"mine" => [vendor: :me, context: 1, max_output: 1, platforms: [tinker: []]]},
-             ~r/does not know/},
+             ~r/does not ship and config :clementine, :platforms does not name/},
             {%{"mine" => [vendor: :me, context: 1, max_output: 1, platforms: [foundry: []]]},
-             ~r/Clementine can send to/},
+             ~r/none of which Clementine can send a :me model to/},
             {%{"claude-sonnet-5" => [id: "other"]}, ~r/no other id/},
             {%{"claude-sonnet-5" => [platforms: [anthropic: [base_url: "http://x"]]]},
-             ~r/base_url: and api_key: go only on/},
+             ~r/unknown options \[:base_url\]/},
             {%{
                "claude-sonnet-5" => [
                  prices: [
@@ -336,41 +336,16 @@ defmodule Clementine.ModelsTest do
     end
   end
 
-  describe "a literal API key on a declared platform" do
-    test "is redacted wherever the model is inspected" do
-      put_models(%{
-        "qwen3" => [
-          vendor: :qwen,
-          context: 32_000,
-          max_output: 8_000,
-          platforms: [
-            openai_compatible: [base_url: "http://localhost:1/v1", api_key: "sk-not-a-real-key"]
-          ]
-        ],
-        "qwen3-env" => [
-          vendor: :qwen,
-          context: 32_000,
-          max_output: 8_000,
-          platforms: [
-            openai_compatible: [base_url: "http://localhost:1/v1", api_key: {:system, "QWEN_KEY"}]
-          ]
-        ]
-      })
-
-      model = Models.get!("qwen3")
-      assert model.platforms[:openai_compatible].api_key == "sk-not-a-real-key"
-      refute inspect(model) =~ "sk-not-a-real-key"
-      assert inspect(model) =~ "**redacted**"
-      refute inspect(Clementine.LLM.Policy.resolve!("qwen3")) =~ "sk-not-a-real-key"
-      assert inspect(Models.get!("qwen3-env")) =~ "QWEN_KEY"
-
-      # A malformed entry's error does not print it either: facts not a
-      # keyword list, a platform entry written as a map, or platforms
-      # written as a map, each raised at boot.
+  describe "a literal API key left on a model's platform entry" do
+    # Endpoints and credentials are the platform's
+    # (`config :clementine, :platforms`); a key an app still writes on a
+    # model fails boot, and no error prints it.
+    test "fails boot without printing it" do
       base = [vendor: :qwen, context: 32_000, max_output: 8_000]
       key = [base_url: "http://localhost:1/v1", api_key: "sk-not-a-real-key"]
 
       for facts <- [
+            base ++ [platforms: [openai_compatible: key]],
             %{platforms: [openai_compatible: key]},
             base ++ [platforms: [openai_compatible: Map.new(key)]],
             base ++ [platforms: %{openai_compatible: key}]

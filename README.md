@@ -72,8 +72,8 @@ mix clementine.gen.agent Weather  # an agent, a tool, and a test that runs them
 - a migration calling `Clementine.Migration.up(version: 6)`, which builds
   `agent_runs`, the loop inbox `agent_run_inbox`, and the run trace
   `agent_run_trace`;
-- config: an `agents` Oban queue, `anthropic_api_key: {:system,
-  "ANTHROPIC_API_KEY"}`, and the `run_id` logger metadata key;
+- config: an `agents` Oban queue, `platforms: [anthropic: [api_key:
+  {:system, "ANTHROPIC_API_KEY"}]]`, and the `run_id` logger metadata key;
 - `MyApp.Agents.LLMMock` as the model client in `config/test.exs`,
   `MyApp.AgentsCase`, whose helpers script it in tests, and `mox`.
 
@@ -91,7 +91,7 @@ Configure a key:
 
 ```elixir
 # config/config.exs
-config :clementine, anthropic_api_key: {:system, "ANTHROPIC_API_KEY"}
+config :clementine, :platforms, anthropic: [api_key: {:system, "ANTHROPIC_API_KEY"}]
 ```
 
 Write a tool, build an agent, and run it:
@@ -349,8 +349,11 @@ and an agent whose model or choices the sheet refuses fails to build
 and to boot, naming what the model takes instead. An app overrides a
 shipped fact, or declares a model Clementine does not ship (an open
 model on OpenRouter, a fine-tune on a self-hosted server), under
-`config :clementine, :models`, keyed by id. Keys are config
-(`openai_api_key`, `openrouter_api_key`, ...).
+`config :clementine, :models`, keyed by id. Where a model runs is a
+platform with its endpoint and credential under
+`config :clementine, :platforms` (`anthropic: [api_key: ...]`,
+`bedrock: [region: ..., api_key: ...]`, ...), and an agent moves to
+another with one line, `platform: :bedrock`.
 [docs/MODELS.md](docs/MODELS.md) has the sheets, the agent's choices,
 declarations, and how to adopt a new model.
 

@@ -38,8 +38,9 @@ defmodule Clementine.Telemetry do
   - `provider` — the model's vendor (`:anthropic`, `:openai`,
     `:deepseek`, ...), `Clementine.Model`'s `vendor`
   - `platform` — where the model's requests go (`:anthropic`, `:openai`,
-    `:openrouter`, `:bedrock`, ...): the model's default platform
-    (`Clementine.Models.default_platform/1`) until an agent can name one
+    `:openrouter`, `:bedrock`, `:foundry`, ...): the agent's
+    `platform:`, else the model's default
+    (`Clementine.Models.default_platform/1`)
   - `model` — the model's id (`"claude-sonnet-5"`, `Clementine.Model`)
 
   An id no sheet holds, or choices its sheet refuses (a test's, on a

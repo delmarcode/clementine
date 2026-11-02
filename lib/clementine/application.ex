@@ -11,6 +11,7 @@ defmodule Clementine.Application do
     # config :clementine, :models. Each agent's own model and choices are
     # checked when it is built, and again at the child spec's start.
     Clementine.Models.validate_config!()
+    Clementine.Platform.validate_config!()
 
     children = [
       # Task supervisor for tool execution
