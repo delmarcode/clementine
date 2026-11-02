@@ -158,6 +158,19 @@ defmodule Clementine.Models.CheckTest do
     end
   end
 
+  test "an app's own read date never moves OpenAI's cutoff for new ids" do
+    models = Application.get_env(:clementine, :models)
+    on_exit(fn -> Application.put_env(:clementine, :models, models) end)
+
+    Application.put_env(:clementine, :models, %{"gpt-6.1-sol" => [read: ~D[2026-12-31]]})
+
+    new = %{"id" => "gpt-6.2-sol", "created" => 1_794_960_000, "owned_by" => "openai"}
+    assert DateTime.to_date(DateTime.from_unix!(new["created"])) == ~D[2026-11-18]
+
+    assert %{findings: [%{id: "gpt-6.2-sol", kind: :unknown}], unshipped: []} =
+             Check.compare(:openai, [new])
+  end
+
   test "the Models API sits beside the configured endpoint" do
     Application.put_env(
       :clementine,

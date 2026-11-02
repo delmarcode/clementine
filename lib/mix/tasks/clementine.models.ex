@@ -4,7 +4,8 @@ defmodule Mix.Tasks.Clementine.Models do
   @moduledoc """
   The adoption report: for each agent the app runs, its model, the
   platform its requests go to, the model's lifecycle, the newest active
-  model in its line, and the facts that differ between the two.
+  model in its line that platform serves, and the facts that differ
+  between the two.
 
       $ mix clementine.models
       agent    model              platform   lifecycle                              newest in line     differs on the newest

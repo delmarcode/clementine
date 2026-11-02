@@ -131,8 +131,9 @@ The read side:
   override merged in.
 - `list/1`: every model, filtered by `line:`, `vendor:`, `lifecycle:`
   (a status), or `platform:`.
-- `newest/1`: the active model in a line released last
-  (`Clementine.Models.newest(:sonnet)`).
+- `newest/2`: the active model in a line released last
+  (`Clementine.Models.newest(:sonnet)`), or the last one a platform
+  serves (`newest(:sonnet, platform: :bedrock)`).
 - `for_platform/2`: a model's facts on one platform, with that
   platform's id (`Clementine.Model.platform_id/1`) and deltas.
 
@@ -358,8 +359,8 @@ test's mock client.
 
 `mix clementine.models` is the adoption report. For every agent the app
 runs, it shows the agent's model, the platform its requests go to, the
-model's lifecycle, the newest active model in its line, and the facts
-that differ between the two. For the installer's sample app:
+model's lifecycle, the newest active model in its line that platform
+serves, and the facts that differ between the two. For the installer's sample app:
 
 ```
 $ mix clementine.models

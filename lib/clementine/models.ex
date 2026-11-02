@@ -80,7 +80,9 @@ defmodule Clementine.Models do
   # Built at compile time, so a malformed shipped sheet fails the build.
   @shipped Map.new(@shipped_sheets, &{Keyword.fetch!(&1, :id), Model.new!(&1)})
   @order Enum.map(@shipped_sheets, &Keyword.fetch!(&1, :id))
-  @shipped_read @shipped_sheets |> Enum.map(&Keyword.fetch!(&1, :read)) |> Enum.max(Date)
+  @shipped_reads @shipped_sheets
+                 |> Enum.group_by(&Keyword.fetch!(&1, :vendor), &Keyword.fetch!(&1, :read))
+                 |> Map.new(fn {vendor, reads} -> {vendor, Enum.max(reads, Date)} end)
 
   # Facts an override merges into key by key; every other fact it
   # replaces.
@@ -160,11 +162,12 @@ defmodule Clementine.Models do
   @doc """
   The active model in `line` released last, or `nil`. A model with no
   release date counts as older than any with one; two on the same day
-  go by the order their vendor module lists them.
+  go by the order their vendor module lists them. `platform:` counts
+  only the models served there.
   """
-  @spec newest(atom()) :: Model.t() | nil
-  def newest(line) do
-    [line: line, lifecycle: :active]
+  @spec newest(atom(), keyword()) :: Model.t() | nil
+  def newest(line, opts \\ []) do
+    ([line: line, lifecycle: :active] ++ Keyword.take(opts, [:platform]))
     |> list()
     |> Enum.with_index()
     |> Enum.max_by(
@@ -335,9 +338,12 @@ defmodule Clementine.Models do
   end
 
   @doc false
-  # The newest `read` date among the sheets this release ships.
-  @spec shipped_read() :: Date.t()
-  def shipped_read, do: @shipped_read
+  # The newest `read` date among the sheets this release ships, or
+  # among one vendor's. An app's declarations never move it.
+  @spec shipped_read(atom() | nil) :: Date.t()
+  def shipped_read(vendor \\ nil)
+  def shipped_read(nil), do: @shipped_reads |> Map.values() |> Enum.max(Date)
+  def shipped_read(vendor), do: Map.fetch!(@shipped_reads, vendor)
 
   @doc false
   # Whether `id` names a shipped sheet or a model the app's config (as

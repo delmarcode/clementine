@@ -19,7 +19,7 @@ defmodule Clementine.Model do
     atom for a model it declares).
   - `line`: the family it belongs to (Anthropic's Models API `line`:
     `:haiku`, `:sonnet`, `:opus`, `:fable`, `:mythos`; OpenAI's tier:
-    `:astra`, `:sol`, `:terra`, `:luna`), or `nil`. `Clementine.Models.newest/1`
+    `:astra`, `:sol`, `:terra`, `:luna`), or `nil`. `Clementine.Models.newest/2`
     reads it.
   - `display_name`, `released_on`.
   - `lifecycle`: `status` (`:active`, `:deprecated`, or `:retired`),

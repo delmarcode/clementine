@@ -152,24 +152,28 @@ defmodule Clementine.Models.Report do
     %{row | error: message}
   end
 
-  # The newest active model in the model's line, on the same platform
-  # where it is served there; nil when the model is the newest, or has
-  # no line.
+  # The newest active model in the model's line that its platform
+  # serves, with that platform's facts; nil when the model is the
+  # newest there, or has no line. A model on no platform Clementine can
+  # send to (a row boot refuses) is compared across the line.
   defp newest(%Model{line: nil}, _platform), do: nil
 
   defp newest(%Model{line: line, id: id}, platform) do
-    case Models.newest(line) do
+    opts = if platform, do: [platform: platform], else: []
+
+    case Models.newest(line, opts) do
       nil ->
         nil
 
       %Model{id: ^id} ->
         nil
 
+      newest when is_nil(platform) ->
+        newest
+
       newest ->
-        case platform && Models.for_platform(newest, platform) do
-          {:ok, on_platform} -> on_platform
-          _not_served_there -> newest
-        end
+        {:ok, on_platform} = Models.for_platform(newest, platform)
+        on_platform
     end
   end
 

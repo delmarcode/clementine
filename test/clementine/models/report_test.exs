@@ -90,6 +90,35 @@ defmodule Clementine.Models.ReportTest do
                Report.model_row(:cli, "claude-sonnet-5-5", ~D[2026-11-02])
     end
 
+    test "the newest is the newest its platform serves, or none" do
+      declared = fn released_on ->
+        [
+          vendor: :anthropic,
+          line: :sonnet,
+          released_on: released_on,
+          context: 200_000,
+          max_output: 16_000,
+          platforms: [openrouter: []]
+        ]
+      end
+
+      # Sonnet 5.5 is the line's newest, but OpenRouter does not serve it.
+      Application.put_env(:clementine, :models, %{
+        "anthropic/claude-sonnet-x" => declared.(~D[2026-01-01])
+      })
+
+      assert %{platform: :openrouter, newest: nil, differs: []} =
+               Report.model_row(:cli, "anthropic/claude-sonnet-x", ~D[2026-11-02])
+
+      Application.put_env(:clementine, :models, %{
+        "anthropic/claude-sonnet-x" => declared.(~D[2026-01-01]),
+        "anthropic/claude-sonnet-y" => declared.(~D[2026-02-01])
+      })
+
+      assert %{platform: :openrouter, newest: "anthropic/claude-sonnet-y"} =
+               Report.model_row(:cli, "anthropic/claude-sonnet-x", ~D[2026-11-02])
+    end
+
     test "an agent that picks its model per run has a row without one" do
       assert %{agent: "per_row", model: nil, platform: nil, error: nil} =
                Report.agent_row(PerRow, ~D[2026-11-02])

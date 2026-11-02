@@ -86,7 +86,9 @@ defmodule Clementine.Models.Check do
   end
 
   def compare(:openai, listed) do
-    read = read(:openai)
+    # When Clementine last read OpenAI's pages; a date an app's own
+    # declaration carries never moves it.
+    read = Models.shipped_read(:openai)
 
     {findings, unshipped} =
       Enum.reduce(listed, {[], []}, fn entry, {findings, unshipped} ->
@@ -226,16 +228,6 @@ defmodule Clementine.Models.Check do
       {:ok, on_platform} -> on_platform
       {:error, _not_served} -> model
     end
-  end
-
-  # When the sheets of a vendor were last read: the newest `read` among
-  # its models, the app's declarations included.
-  defp read(vendor) do
-    [vendor: vendor]
-    |> Models.list()
-    |> Enum.map(& &1.read)
-    |> Enum.reject(&is_nil/1)
-    |> Enum.max(Date, fn -> Models.shipped_read() end)
   end
 
   defp date(nil), do: nil
