@@ -519,6 +519,23 @@ defmodule Clementine.LLM.PricingTest do
       assert %Clementine.Agent{} = Agent.new(model: "claude-haiku-5-5", cache: false)
     end
 
+    test "caching off bills at the shortest TTL the prices name, so any priced model serves it" do
+      # An app that prices only the hour's writes.
+      put_models(%{
+        "claude-sonnet-5" => [prices: Keyword.put(@card, :cache_write, one_hour: 6.0)]
+      })
+
+      assert :ok = Models.validate_config!()
+      assert {:ok, _policy} = Policy.resolve("claude-sonnet-5", cache: false)
+
+      assert %{cache_ttl: :one_hour, pricing: %Pricing{cache_write: 6_000_000}} =
+               Trace.resolve_model("claude-sonnet-5", cache: false)
+
+      # Asking for a TTL it has no rate for is still refused.
+      assert {:error, message} = Policy.resolve("claude-sonnet-5")
+      assert message =~ "names no rate for :five_minutes"
+    end
+
     test "a per-TTL cache_write on a model that offers no TTL fails the agent and boot" do
       put_models(%{
         "qwen.qwen3-235b-a22b-2507-v1:0" => [

@@ -169,12 +169,18 @@ defmodule Clementine.LLM.Pricing do
   @doc """
   The cache TTL a call to `model` (its sheet on the call's platform,
   `Clementine.Models.for_platform/2`) is billed at, given the TTL the
-  agent writes with (`ttl`, `nil` with caching off): the agent's, else
-  the model's shortest, which is what a write the provider makes on its
-  own lives for. `nil` for a model that offers no TTL.
+  agent writes with (`ttl`, `nil` with caching off): the agent's. With
+  caching off, the shortest the model offers and its prices name, since
+  a write the provider still makes on its own is a short one; so an
+  agent with caching off runs on any priced model. `nil` for a model
+  that offers no TTL.
   """
   @spec billed_ttl(Model.t(), ttl() | nil) :: ttl() | nil
-  def billed_ttl(%Model{cache: %{ttls: ttls}}, nil), do: List.first(ttls)
+  def billed_ttl(%Model{cache: %{ttls: ttls}, prices: prices}, nil) do
+    priced = priced_ttls(prices)
+    Enum.find(ttls, &(&1 in priced)) || List.first(ttls)
+  end
+
   def billed_ttl(%Model{}, ttl), do: ttl
 
   @doc """
