@@ -137,6 +137,10 @@ defmodule Clementine.AgentServer do
                   "Clementine.AgentServer or to start_link/1 (model: \"claude-sonnet-5-5\")"
         end
 
+        # The model is the agent's one choice here: checked whole once, as
+        # a run's start checks it.
+        Clementine.Agent.for_run!(%Clementine.Agent{model: model}, nil, inspect(__MODULE__))
+
         context =
           Keyword.get(opts, :context, %{})
           |> Map.put_new(:working_dir, Keyword.get(opts, :working_dir, File.cwd!()))

@@ -329,7 +329,8 @@ defmodule Clementine.LLM.Anthropic do
   # and `Clementine.LLM.Anthropic.Fake` both build requests here, so a
   # test sees exactly what the API would.
   def request(model, system, messages, tools, opts, checks \\ [stream: true]) do
-    policy = policy!(model, opts, checks)
+    schema? = Keyword.get(opts, :output_schema) != nil
+    policy = policy!(model, opts, [output_schema: schema?] ++ checks)
     facts = policy.model
     binds? = facts.thinking.binding == :prefix
     inline? = facts.features.mid_conversation_system

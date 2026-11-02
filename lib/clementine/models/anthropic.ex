@@ -127,17 +127,8 @@ defmodule Clementine.Models.Anthropic do
   # The sheets in keyword form, newest first within each line.
   @spec sheets() :: [keyword()]
   def sheets do
-    # Not on Claude Platform on AWS.
-    # The same model as Fable 5, for verified customers.
-    # Not on Claude Platform on AWS.
-    # An invitation-only research preview with no model page; the
-    # deprecations page sets no retirement date and names no
-    # replacement. Its system-message support is in the page's table
-    # but not its prose, so skill loads fold here.
     # Over 100,000 prompt tokens, cache reads and writes counted, the
-    # whole request pays these.
-    # Its page (anthropic.com/glasswing) gives $25/$125 in and out and
-    # no cache rates, so it is unpriced rather than half-priced.
+    # whole request pays the tier.
     ([
        [
          id: "claude-fable-5-1",
@@ -170,7 +161,7 @@ defmodule Clementine.Models.Anthropic do
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(10, 50, 0.25, 12.50, 20),
-         platforms: Keyword.delete(platforms("claude-mythos-5-1"), :claude_on_aws),
+         platforms: verified_platforms("claude-mythos-5-1"),
          source: "#{@models}/mythos-5-1/overview"
        ],
        [
@@ -301,30 +292,10 @@ defmodule Clementine.Models.Anthropic do
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
          prices: prices(10, 50, 1, 12.50, 20),
-         platforms: Keyword.delete(platforms("claude-mythos-5"), :claude_on_aws),
+         platforms: verified_platforms("claude-mythos-5"),
          source: "#{@models}/mythos-5/overview"
        ],
-       [
-         id: "claude-mythos-preview",
-         vendor: :anthropic,
-         line: :mythos,
-         display_name: "Claude Mythos Preview",
-         released_on: ~D[2026-04-07],
-         lifecycle: [status: :deprecated, deprecated_on: ~D[2026-06-09]],
-         context: 1_000_000,
-         max_output: 128_000,
-         thinking:
-           thinking(:adaptive, [:adaptive, :enabled], efforts: [:low, :medium, :high, :max]),
-         rejects: [:temperature, :top_p, :top_k, :prefill],
-         features: [mid_conversation_system: false] ++ @features,
-         cache: [min_prefix: 2048, ttls: @ttls],
-         prices: nil,
-         platforms: [
-           anthropic: [],
-           bedrock: [id: "anthropic.claude-mythos-preview", lifecycle: :partner]
-         ],
-         source: @deprecations
-       ],
+       mythos_preview(),
        [
          id: "claude-opus-4-8",
          vendor: :anthropic,
@@ -473,6 +444,39 @@ defmodule Clementine.Models.Anthropic do
        ))
     |> Enum.map(&Keyword.put(&1, :read, @read))
   end
+
+  # An invitation-only research preview with no model page; the
+  # deprecations page sets no retirement date and names no replacement.
+  # Its system-message support is in that page's table but not its
+  # prose, so skill loads fold here.
+  defp mythos_preview do
+    [
+      id: "claude-mythos-preview",
+      vendor: :anthropic,
+      line: :mythos,
+      display_name: "Claude Mythos Preview",
+      released_on: ~D[2026-04-07],
+      lifecycle: [status: :deprecated, deprecated_on: ~D[2026-06-09]],
+      context: 1_000_000,
+      max_output: 128_000,
+      thinking: thinking(:adaptive, [:adaptive, :enabled], efforts: [:low, :medium, :high, :max]),
+      rejects: [:temperature, :top_p, :top_k, :prefill],
+      features: [mid_conversation_system: false] ++ @features,
+      cache: [min_prefix: 2048, ttls: @ttls],
+      # Its page (anthropic.com/glasswing) gives $25/$125 in and out and
+      # no cache rates, so it is unpriced rather than half-priced.
+      prices: nil,
+      platforms: [
+        anthropic: [],
+        bedrock: [id: "anthropic.claude-mythos-preview", lifecycle: :partner]
+      ],
+      source: @deprecations
+    ]
+  end
+
+  # Mythos 5 and 5.1, for verified customers: not on Claude Platform on
+  # AWS.
+  defp verified_platforms(id), do: Keyword.delete(platforms(id), :claude_on_aws)
 
   # Opus 4.7 on: dateless ids everywhere, `anthropic.<id>` on Bedrock's
   # Messages endpoint.

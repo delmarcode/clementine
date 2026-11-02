@@ -36,7 +36,13 @@ defmodule Clementine.LLM.Policy do
 
   A model whose sheet says it does not stream (`features.streaming:
   false`) is refused for an agent, whose runs always stream; a direct
-  `Clementine.LLM.call/5` may still use it.
+  `Clementine.LLM.call/5` may still use it. An agent with an
+  `output_schema:` is refused on a model whose sheet has no structured
+  outputs (`features.structured_outputs: false`) where the request goes
+  to Anthropic or OpenAI, whose clients send the schema whatever the
+  sheet says. A Chat Completions platform instead withholds
+  `response_format` for such a model and the engine checks the answer,
+  so a declared model there keeps its output schema.
 
   `resolve/2` is the one check, and it runs wherever a model is named:
   the child spec at boot, the start of every run (a claim on the
@@ -109,25 +115,28 @@ defmodule Clementine.LLM.Policy do
   for the model `id` names, or explains what the model's facts refuse.
   """
   @spec resolve(String.t() | Model.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
-  def resolve(model, opts \\ []), do: resolve(model, opts, prices: true)
+  def resolve(model, opts \\ []), do: resolve(model, opts, [])
 
   @doc false
   # `checks`: `partial: true` leaves out every check that needs a choice
   # `opts` leaves unset, for an agent built before the runtime fills its
   # choices from its module's `use` (`Clementine.Agent.new/1`);
-  # `stream: false` is a request that does not stream (`call/5`).
+  # `stream: false` is a request that does not stream (`call/5`);
+  # `output_schema: true` is one whose answer has a schema.
   @spec resolve(String.t() | Model.t(), keyword(), keyword()) ::
           {:ok, t()} | {:error, String.t()}
   def resolve(%Model{} = model, opts, checks) when is_list(opts) do
     opts = Keyword.take(opts, @keys)
-    unset = if Keyword.get(checks, :partial, false), do: unset(opts), else: []
+    partial? = Keyword.get(checks, :partial, false)
+    unset = if partial?, do: unset(opts), else: []
 
     with :ok <- servable(model),
          {:ok, platform} <- platform(model),
          {:ok, model} <- Models.for_platform(model, platform),
          :ok <- streams(model, Keyword.get(checks, :stream, true)),
+         :ok <- structured(model, platform, Keyword.get(checks, :output_schema, false)),
          {:ok, provider_options} <- provider_options(model, platform, opts[:provider_options]),
-         {:ok, thinking} <- thinking(model, opts[:thinking], provider_options, unset),
+         {:ok, thinking} <- thinking(model, opts[:thinking], provider_options, partial?),
          {:ok, effort} <- effort(model, opts[:effort], thinking, unset),
          {:ok, max_tokens} <- max_tokens(model, opts[:max_tokens]),
          :ok <- budget_fits(provider_options, max_tokens, unset),
@@ -178,6 +187,18 @@ defmodule Clementine.LLM.Policy do
   end
 
   defp streams(_model, _stream?), do: :ok
+
+  # The Messages and Responses clients send an output schema as given; a
+  # model without structured outputs answers it with a 400.
+  defp structured(%Model{features: %{structured_outputs: false}}, platform, true)
+       when platform in [:anthropic, :openai] do
+    {:error,
+     "has no structured outputs, and an output_schema: goes to #{inspect(platform)} as " <>
+       "given; pick a model whose sheet has them (features.structured_outputs), or leave " <>
+       "output_schema: out and read the answer as text"}
+  end
+
+  defp structured(_model, _platform, _schema?), do: :ok
 
   # A retired sheet is a fact of this Clementine release, not a date
   # passing: the vendor no longer serves it.
@@ -262,7 +283,7 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(model, nil, options, _unset) do
+  defp thinking(model, nil, options, _partial?) do
     cond do
       Keyword.has_key?(options, :budget_tokens) -> {:ok, :enabled}
       :adaptive in model.thinking.types -> {:ok, :adaptive}
@@ -270,7 +291,9 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(model, type, options, unset)
+  # `use`'s provider_options merge into agent/1's key by key, so a
+  # partial check never knows a budget is missing.
+  defp thinking(model, type, options, partial?)
        when type in [:adaptive, :enabled, :between_tools, :off] do
     budget? = Keyword.has_key?(options, :budget_tokens)
 
@@ -278,7 +301,7 @@ defmodule Clementine.LLM.Policy do
       type not in model.thinking.types ->
         {:error, refused_thinking(model, type)}
 
-      type == :enabled and not budget? and :provider_options in unset ->
+      type == :enabled and not budget? and partial? ->
         {:ok, type}
 
       type == :enabled and not budget? ->
@@ -292,7 +315,7 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(_model, other, _options, _unset) do
+  defp thinking(_model, other, _options, _partial?) do
     {:error, "thinking: takes one of #{inspect(Model.thinking_types())}, got: #{inspect(other)}"}
   end
 

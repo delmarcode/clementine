@@ -269,13 +269,21 @@ defmodule Clementine.ModelsTest do
       assert model.released_on == nil
       assert model.source == nil
 
-      # Each platform takes the new id.
+      # The base's platforms, each under the new id as its scheme gives it.
+      assert Keyword.keys(model.platforms) == Keyword.keys(base.platforms)
       assert Model.platform_id(model, :anthropic) == "claude-sonnet-6"
-      assert Model.platform_id(model, :bedrock) == "claude-sonnet-6"
+      assert Model.platform_id(model, :bedrock) == "anthropic.claude-sonnet-6"
+      assert Model.platform_id(model, :vertex) == "claude-sonnet-6"
 
       assert {:ok, policy} = Clementine.LLM.Policy.resolve("claude-sonnet-6", effort: :xhigh)
       assert policy.thinking == :adaptive
       assert policy.model.thinking.binding == :prefix
+
+      # A base from before 4.6 drops its Vertex @date and snapshot ids.
+      put_models(%{"claude-haiku-4-6" => [based_on: "claude-haiku-4-5-20251001"]})
+      haiku = Models.get!("claude-haiku-4-6")
+      assert Model.platform_id(haiku, :vertex) == "claude-haiku-4-6"
+      assert Model.platform_id(haiku, :foundry) == "claude-haiku-4-6"
     end
 
     test "names a shipped sheet" do
@@ -286,6 +294,13 @@ defmodule Clementine.ModelsTest do
                    fn ->
                      Models.validate_config!()
                    end
+    end
+
+    test "refuses a retired sheet, naming its replacement" do
+      put_models(%{"claude-opus-4-2" => [based_on: "claude-opus-4-20250514"]})
+      error = assert_raise ArgumentError, fn -> Models.validate_config!() end
+      assert error.message =~ ~s(based_on: names "claude-opus-4-20250514", which is retired)
+      assert error.message =~ ~s(base it on its replacement, "claude-opus-4-8")
     end
   end
 
@@ -349,10 +364,22 @@ defmodule Clementine.ModelsTest do
       refute inspect(Clementine.LLM.Policy.resolve!("qwen3")) =~ "sk-not-a-real-key"
       assert inspect(Models.get!("qwen3-env")) =~ "QWEN_KEY"
 
-      # A malformed entry's error does not print it either.
-      put_models(%{"qwen3" => %{platforms: [openai_compatible: [api_key: "sk-not-a-real-key"]]}})
-      assert {:error, message} = Models.fetch("qwen3")
-      refute message =~ "sk-not-a-real-key"
+      # A malformed entry's error does not print it either: facts not a
+      # keyword list, a platform entry written as a map, or platforms
+      # written as a map, each raised at boot.
+      base = [vendor: :qwen, context: 32_000, max_output: 8_000]
+      key = [base_url: "http://localhost:1/v1", api_key: "sk-not-a-real-key"]
+
+      for facts <- [
+            %{platforms: [openai_compatible: key]},
+            base ++ [platforms: [openai_compatible: Map.new(key)]],
+            base ++ [platforms: %{openai_compatible: key}]
+          ] do
+        put_models(%{"qwen3" => facts})
+        error = assert_raise ArgumentError, fn -> Models.validate_config!() end
+        assert error.message =~ ~s("qwen3")
+        refute error.message =~ "sk-not-a-real-key", error.message
+      end
     end
   end
 
