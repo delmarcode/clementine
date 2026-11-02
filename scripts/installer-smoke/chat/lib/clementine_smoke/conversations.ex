@@ -37,6 +37,7 @@ defmodule ClementineSmoke.Conversations do
       on_conflict: :nothing,
       conflict_target: [:conversation_id, :turn]
     )
+
     :ok
   end
 

@@ -73,7 +73,7 @@ defmodule ClementineSmoke.Agents.ChatTest do
     :ok =
       Host.run_finished(
         %{run | id: Ecto.UUID.generate()},
-        Result.completed(input_message: prompt, messages: [AssistantMessage.new("Hi.")])
+        Result.completed(input_message: prompt, messages: [AssistantMessage.text("Hi.")])
       )
 
     assert [%UserMessage{content: "Hello?"}, %AssistantMessage{} = reply] =
