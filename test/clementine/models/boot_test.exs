@@ -11,17 +11,11 @@ defmodule Clementine.Models.BootTest do
 
   import ExUnit.CaptureLog
 
+  alias Clementine.TestPlatforms
+
   @moduletag runtime: false
 
-  @env [
-    :models,
-    :offer,
-    :anthropic_base_url,
-    :openai_base_url,
-    :anthropic_api_key,
-    :openai_api_key,
-    :llm_client
-  ]
+  @env [:models, :offer, :llm_client]
 
   setup do
     saved = Map.new(@env, &{&1, Application.get_env(:clementine, &1)})
@@ -78,8 +72,12 @@ defmodule Clementine.Models.BootTest do
     end)
 
     base = "http://localhost:#{bypass.port}"
-    Application.put_env(:clementine, :anthropic_base_url, base <> "/v1/messages")
-    Application.put_env(:clementine, :openai_base_url, base <> "/v1/responses")
+
+    TestPlatforms.put(
+      anthropic: [api_key: "sk-ant-boot", base_url: base],
+      openai: [api_key: "sk-openai-boot", base_url: base <> "/v1"]
+    )
+
     # The real router, as an app runs it, not the test's mock client.
     Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
     Application.put_env(:clementine, :offer, ["claude-opus-5-5", "gpt-6-astra"])
@@ -129,12 +127,38 @@ defmodule Clementine.Models.BootTest do
 
     test "fails boot for an offered model whose platform has no credential" do
       Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
-      Application.delete_env(:clementine, :openai_api_key)
+      TestPlatforms.put(openai: [])
       Application.put_env(:clementine, :offer, ["claude-sonnet-5-5", "gpt-6-astra"])
 
       assert_raise ArgumentError,
                    ~r/offered model \(config :clementine, :offer\): "gpt-6-astra" goes to :openai/,
                    fn -> Clementine.Runs.Config.new!(repo: TestRepo) end
+    end
+
+    test "checks an entry's credential on the platform its choices name" do
+      Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
+      Application.put_env(:clementine, :offer, [{"claude-opus-5-5", platform: :bedrock}])
+
+      # Bedrock serves Opus 5.5; the Claude API's key is no credential there.
+      TestPlatforms.put(bedrock: [region: "us-east-1"])
+
+      assert_raise ArgumentError,
+                   ~r/offered model \(config :clementine, :offer\): "claude-opus-5-5" goes to :bedrock, and config :clementine, :platforms, bedrock: \[api_key: \.\.\.\] is not set/,
+                   fn -> Clementine.Runs.Config.new!(repo: TestRepo) end
+
+      # A Bedrock-only app: no Claude API key, and its offer boots.
+      TestPlatforms.put(anthropic: [], bedrock: [region: "us-east-1", api_key: "bedrock-key"])
+
+      assert %{offer: [{"claude-opus-5-5", [platform: :bedrock]}]} =
+               Clementine.Runs.Config.new!(repo: TestRepo)
+    end
+
+    test "refuses an entry whose platform does not serve the model" do
+      Application.put_env(:clementine, :offer, [{"gpt-6-astra", platform: :foundry}])
+
+      assert_raise ArgumentError, ~r/"gpt-6-astra": platform: :foundry does not serve it/, fn ->
+        Clementine.Runs.Config.new!(repo: TestRepo)
+      end
     end
 
     test "is a list of ids and {id, choices}" do

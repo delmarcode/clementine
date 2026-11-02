@@ -368,6 +368,13 @@ defmodule Clementine.Platform do
   def url(%__MODULE__{} = platform, :responses), do: base(platform) <> "/responses"
   def url(%__MODULE__{} = platform, :chat_completions), do: base(platform) <> "/chat/completions"
 
+  @doc false
+  # The part before the wire's path, on a platform with a default
+  # endpoint (`:anthropic`, `:openai`, `:openrouter`) or a `base_url:`:
+  # `mix clementine.models --check` puts the Models API under it.
+  @spec base_url(t()) :: String.t()
+  def base_url(%__MODULE__{} = platform), do: base(platform)
+
   @doc """
   The headers that carry `platform`'s credential on `protocol`, the
   credential resolved now. Raises naming the config key (never the

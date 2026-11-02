@@ -34,7 +34,7 @@ defmodule Clementine.Models.Check do
   # reason's name only (Mint's `{:invalid_header_value, name, value}`
   # message quotes the header), and the key is scrubbed from every reason.
 
-  alias Clementine.{Model, Models}
+  alias Clementine.{Model, Models, Platform}
 
   @vendors [:anthropic, :openai]
   @lifecycles ["active", "deprecated", "retired"]
@@ -285,14 +285,23 @@ defmodule Clementine.Models.Check do
 
   ## HTTP
 
-  # The credentials and endpoints the Messages and Responses clients
-  # use; the Models API is beside each endpoint (`.../v1/models`). The
-  # key comes back trimmed, with the value as configured for scrubbing.
+  # Each vendor's own platform (`config :clementine, :platforms`), as
+  # the Messages and Responses clients read it: its credential, and the
+  # Models API under its base_url (`<base>/v1/models` on Anthropic's,
+  # `<base>/models` on OpenAI's, whose base ends in `/v1`). The key comes
+  # back trimmed, with the value as configured for scrubbing.
   defp credential(vendor) do
-    config_key = credential_key(vendor)
-    setting = "config :clementine, #{config_key}:"
+    setting = "config :clementine, :platforms, #{vendor}: [api_key: ...]"
 
-    case resolve(Application.get_env(:clementine, config_key)) do
+    case Platform.fetch(vendor) do
+      {:ok, %Platform{api_key: nil}} -> {:skip, "#{setting} is not set"}
+      {:ok, %Platform{api_key: credential}} -> key(credential, setting)
+      {:error, message} -> {:error, message}
+    end
+  end
+
+  defp key(credential, setting) do
+    case resolve(credential) do
       {:raised, what} ->
         {:error, "#{setting} #{what}"}
 
@@ -300,16 +309,13 @@ defmodule Clementine.Models.Check do
         case printable(raw) do
           {:ok, key} -> {:ok, key, raw}
           :empty -> {:skip, "#{setting} is empty"}
-          :unprintable -> {:error, "#{setting} the key has non-printable characters"}
+          :unprintable -> {:error, "#{setting}: the key has non-printable characters"}
         end
 
-      _unset ->
-        {:skip, "#{setting} is not set, or names an unset variable"}
+      _nothing ->
+        {:skip, "#{setting} resolved to no value"}
     end
   end
-
-  defp credential_key(:anthropic), do: :anthropic_api_key
-  defp credential_key(:openai), do: :openai_api_key
 
   defp resolve({:system, var}) when is_binary(var), do: System.get_env(var)
 
@@ -334,24 +340,10 @@ defmodule Clementine.Models.Check do
   end
 
   @doc false
-  # The Models API URL beside a vendor's configured endpoint.
+  # The Models API URL on a vendor's configured platform.
   @spec url(:anthropic | :openai) :: String.t()
-  def url(:anthropic) do
-    :clementine
-    |> Application.get_env(:anthropic_base_url, "https://api.anthropic.com/v1/messages")
-    |> beside("models")
-  end
-
-  def url(:openai) do
-    :clementine
-    |> Application.get_env(:openai_base_url, "https://api.openai.com/v1/responses")
-    |> beside("models")
-  end
-
-  defp beside(endpoint, name) do
-    uri = URI.parse(endpoint)
-    %{uri | path: Path.join(Path.dirname(uri.path || "/"), name), query: nil} |> URI.to_string()
-  end
+  def url(:anthropic), do: Platform.base_url(Platform.fetch!(:anthropic)) <> "/v1/models"
+  def url(:openai), do: Platform.base_url(Platform.fetch!(:openai)) <> "/models"
 
   defp fetch(:anthropic, key) do
     headers = [{"x-api-key", key}, {"anthropic-version", "2023-06-01"}]

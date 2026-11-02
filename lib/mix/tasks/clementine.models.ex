@@ -53,8 +53,10 @@ defmodule Mix.Tasks.Clementine.Models do
   ## Options
 
     * `--check` - also read Anthropic's and OpenAI's Models APIs, with
-      the configured `anthropic_api_key` and `openai_api_key`, and report
-      where the shipped sheets differ: ids the sheets lack, lifecycle and
+      the credentials of the `anthropic:` and `openai:` platforms under
+      `config :clementine, :platforms` (`{:system, ...}` and
+      `{module, function, args}` resolved), at `<base_url>/v1/models` and
+      `<base_url>/models`, and report where the shipped sheets differ: ids the sheets lack, lifecycle and
       retirement or shutdown date changes, and capability and ceiling
       mismatches. Prices have no API and are not checked. A vendor
       without a configured key is skipped; a key is trimmed, and one

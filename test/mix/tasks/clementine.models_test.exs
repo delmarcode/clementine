@@ -1,10 +1,11 @@
 defmodule Mix.Tasks.Clementine.ModelsTest do
   use ExUnit.Case, async: false
 
+  alias Clementine.TestPlatforms
   alias Mix.Tasks.Clementine.Models, as: Task
 
   @fixtures Path.expand("../../fixtures/models_api", __DIR__)
-  @env [:offer, :anthropic_api_key, :anthropic_base_url, :openai_api_key, :openai_base_url]
+  @env [:offer]
 
   setup do
     saved = Map.new(@env, &{&1, Application.get_env(:clementine, &1)})
@@ -165,10 +166,11 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
   test "run/1 with --check: the findings, and exit 1 on a difference" do
     bypass = Bypass.open()
     base = "http://localhost:#{bypass.port}"
-    Application.put_env(:clementine, :anthropic_base_url, base <> "/v1/messages")
-    Application.put_env(:clementine, :openai_base_url, base <> "/v1/responses")
-    Application.put_env(:clementine, :anthropic_api_key, "sk-ant-recorded")
-    Application.delete_env(:clementine, :openai_api_key)
+
+    TestPlatforms.put(
+      anthropic: [api_key: "sk-ant-recorded", base_url: base],
+      openai: [base_url: base <> "/v1"]
+    )
 
     Bypass.expect(bypass, "GET", "/v1/models", fn conn ->
       conn = Plug.Conn.fetch_query_params(conn)
@@ -195,13 +197,15 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
     assert text =~
              ~r/claude-haiku-5-5 +thinking \[adaptive, off\] -> \[adaptive, between_tools, off\]/
 
-    assert text =~ "OpenAI's Models API: skipped; config :clementine, openai_api_key: is not set"
+    assert text =~
+             "OpenAI's Models API: skipped; config :clementine, :platforms, openai: [api_key: ...] " <>
+               "is not set."
+
     refute text =~ "sk-ant-recorded"
   end
 
   test "run/1 with --check exits 1 when it could read no vendor's API" do
-    Application.delete_env(:clementine, :anthropic_api_key)
-    Application.delete_env(:clementine, :openai_api_key)
+    TestPlatforms.put(anthropic: [], openai: [])
 
     assert catch_exit(Task.run(["--check", "--model", "claude-sonnet-5-5"])) == {:shutdown, 1}
 
@@ -211,15 +215,17 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
   end
 
   test "--check never prints a malformed key, as text or as --json" do
-    Application.put_env(:clementine, :anthropic_api_key, "sk-ant-leak\r\nmore")
-    Application.put_env(:clementine, :openai_api_key, "sk-openai-leak\a")
+    TestPlatforms.put(
+      anthropic: [api_key: "sk-ant-leak\r\nmore"],
+      openai: [api_key: "sk-openai-leak\a"]
+    )
 
     for argv <- [["--check"], ["--check", "--json"]] do
       assert catch_exit(Task.run(argv ++ ["--model", "claude-sonnet-5-5"])) == {:shutdown, 1}
 
       assert_received {:mix_shell, :info, [out]}
-      assert out =~ "anthropic_api_key: the key has non-printable characters"
-      assert out =~ "openai_api_key: the key has non-printable characters"
+      assert out =~ "anthropic: [api_key: ...]: the key has non-printable characters"
+      assert out =~ "openai: [api_key: ...]: the key has non-printable characters"
       refute out =~ "leak"
     end
   end

@@ -312,21 +312,22 @@ defmodule Clementine.Models do
 
       config :clementine, :offer, [
         "claude-sonnet-5-5",
-        {"claude-opus-5-5", max_tokens: 64_000}
+        {"claude-opus-5-5", max_tokens: 64_000, platform: :bedrock}
       ]
 
       config :clementine, :offer, {MyApp.Models, :offer, []}
 
-  An entry is a model id, which runs with the model's defaults, or
-  `{id, choices}`, with an agent's choices for it
-  (`Clementine.LLM.Policy.keys/0`). Each comes back as `{id, choices}`,
+  An entry is a model id, which runs with the model's defaults on its
+  default platform, or `{id, choices}`, with an agent's choices for it
+  (`Clementine.LLM.Policy.keys/0`, `platform:` among them). Each comes back as `{id, choices}`,
   a bare id with `[]`. The function is called with nothing of the app's
   started (when Clementine starts, and in `mix clementine.models`), so it
   reads config, not a Repo or a process.
 
   `{Clementine, ...}` checks each entry when it starts, as it checks an
   agent's model and choices (an unknown or retired id, a choice the
-  model refuses, or a platform with no credential fails boot);
+  model refuses, or no credential on the platform it resolves to fails
+  boot);
   Clementine warns for each when it starts, as for an agent's model
   (`Clementine.Models.Warnings`); and `mix clementine.models` reports
   each beside the agents. Without the config the offer is empty.

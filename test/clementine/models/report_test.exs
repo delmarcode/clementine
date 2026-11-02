@@ -131,21 +131,16 @@ defmodule Clementine.Models.ReportTest do
 
     test "a model whose platform has no credential is one boot refuses" do
       client = Application.get_env(:clementine, :llm_client)
-      key = Application.get_env(:clementine, :anthropic_api_key)
-
-      on_exit(fn ->
-        Application.put_env(:clementine, :llm_client, client)
-        Application.put_env(:clementine, :anthropic_api_key, key)
-      end)
+      on_exit(fn -> Application.put_env(:clementine, :llm_client, client) end)
 
       # The real router, as the task runs in an app, with no Anthropic key.
       Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
-      Application.delete_env(:clementine, :anthropic_api_key)
+      Clementine.TestPlatforms.put(anthropic: [])
 
       assert %{model: "claude-sonnet-5", platform: :anthropic, error: error} =
                Report.agent_row(Chat, ~D[2026-11-02])
 
-      assert error =~ "anthropic_api_key: is not set"
+      assert error =~ "config :clementine, :platforms, anthropic: [api_key: ...] is not set"
     end
 
     test "a model with no line names no newest" do

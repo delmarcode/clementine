@@ -216,13 +216,14 @@ Clementine.Agent`; `agent/1` names the row's. The app's offer, the ids a
 row may hold, stays the app's (it validates rows against it). Point
 Clementine at it, as a list or a function that returns one. An entry is
 a model id, which runs on the model's defaults, or `{id, choices}`, with
-the choices its agents make for that model (`Clementine.LLM.Policy`):
+the choices its agents make for that model (`Clementine.LLM.Policy`),
+`platform:` among them:
 
 ```elixir
 # config/config.exs
 config :my_app, :models,
   offered: [
-    {"claude-opus-5-5", max_tokens: 64_000},
+    {"claude-opus-5-5", max_tokens: 64_000, platform: :bedrock},
     {"claude-sonnet-5-5", max_tokens: 64_000},
     "gpt-6-astra"
   ]
@@ -238,7 +239,10 @@ config, not a Repo or a process; an error it raises names
 
 Boot (`{Clementine, ...}`) then checks each entry as an agent's model
 and choices: an unknown or retired id, a choice the model refuses, or a
-platform with no credential fails boot. Clementine warns for each
+platform with no credential fails boot. The credential checked is the
+one of the platform the entry resolves to, so an app that reaches
+Claude only through Bedrock or Foundry offers Claude ids with
+`platform:` and configures no Claude API key. Clementine warns for each
 offered model when it starts, as for an agent's, and
 `mix clementine.models` reports each entry beside the agents
 (`Clementine.Models.offer/0`).
@@ -516,10 +520,15 @@ Clementine's model sheets were read 2026-11-01. mix clementine.models --check co
   read an API, or reads none for want of a key. Warnings never change
   the exit status.
 
-`--check` reads Anthropic's and OpenAI's Models APIs with the configured
-`anthropic_api_key` and `openai_api_key`, at the endpoint beside each
-client's (`.../v1/models`), and reports where the sheets differ, sheet
-then API. A vendor with no key configured is skipped. A key is trimmed
+`--check` reads Anthropic's and OpenAI's Models APIs with the
+credentials of the `anthropic:` and `openai:` platforms
+([Platforms and credentials](#platforms-and-credentials)), resolved as
+a request resolves them, at each platform's `base_url` (or default):
+`<base_url>/v1/models` on Anthropic's (`https://api.anthropic.com/v1/models`)
+and `<base_url>/models` on OpenAI's (`https://api.openai.com/v1/models`).
+It reports where the sheets differ, sheet then API. A vendor whose
+platform has no `api_key:` is skipped; Bedrock, Foundry, and the other
+platforms have no Models API it reads. A key is trimmed
 (a secret file's trailing newline), and one that still holds anything
 but printable ASCII is refused as "the key has non-printable
 characters"; no output, text or JSON, carries a key.

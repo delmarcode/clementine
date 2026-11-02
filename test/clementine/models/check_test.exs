@@ -25,26 +25,17 @@ defmodule Clementine.Models.CheckTest do
   use ExUnit.Case, async: false
 
   alias Clementine.Models.Check
+  alias Clementine.TestPlatforms
 
   @fixtures Path.expand("../../fixtures/models_api", __DIR__)
-  @keys [:anthropic_api_key, :anthropic_base_url, :openai_api_key, :openai_base_url]
-
   setup do
-    saved = Map.new(@keys, &{&1, Application.get_env(:clementine, &1)})
-
-    on_exit(fn ->
-      Enum.each(saved, fn
-        {key, nil} -> Application.delete_env(:clementine, key)
-        {key, value} -> Application.put_env(:clementine, key, value)
-      end)
-    end)
-
     bypass = Bypass.open()
     base = "http://localhost:#{bypass.port}"
-    Application.put_env(:clementine, :anthropic_base_url, base <> "/v1/messages")
-    Application.put_env(:clementine, :openai_base_url, base <> "/v1/responses")
-    Application.put_env(:clementine, :anthropic_api_key, "sk-ant-recorded")
-    Application.put_env(:clementine, :openai_api_key, "sk-openai-recorded")
+
+    TestPlatforms.put(
+      anthropic: [api_key: "sk-ant-recorded", base_url: base],
+      openai: [api_key: "sk-openai-recorded", base_url: base <> "/v1"]
+    )
 
     {:ok, bypass: bypass}
   end
@@ -117,7 +108,7 @@ defmodule Clementine.Models.CheckTest do
 
     test "trims a key's trailing newline before it goes", %{bypass: bypass} do
       # A Kubernetes secret made with --from-file keeps the file's newline.
-      Application.put_env(:clementine, :anthropic_api_key, "sk-ant-recorded\n")
+      put_key(bypass, "sk-ant-recorded\n")
       test = self()
 
       Bypass.expect(bypass, "GET", "/v1/models", fn conn ->
@@ -131,14 +122,15 @@ defmodule Clementine.Models.CheckTest do
       assert_received {:key, ["sk-ant-recorded"]}
     end
 
-    test "refuses a key with a non-printable character, never printing it" do
+    test "refuses a key with a non-printable character, never printing it", %{bypass: bypass} do
       for key <- ["sk-ant-rec\norded", "sk-ant-rec\0orded", "sk-ant-récorded"] do
-        Application.put_env(:clementine, :anthropic_api_key, key)
+        put_key(bypass, key)
 
         assert %{status: :failed, reason: reason} = Check.check(:anthropic)
 
         assert reason ==
-                 "config :clementine, anthropic_api_key: the key has non-printable characters"
+                 "config :clementine, :platforms, anthropic: [api_key: ...]: the key has " <>
+                   "non-printable characters"
       end
     end
 
@@ -163,24 +155,40 @@ defmodule Clementine.Models.CheckTest do
       assert reason =~ "answered 401: unknown key **redacted**"
     end
 
-    test "names a credential function that raises, never its message" do
-      Application.put_env(:clementine, :anthropic_api_key, {__MODULE__, :raising_key, []})
+    test "names a credential function that raises, never its message", %{bypass: bypass} do
+      put_key(bypass, {__MODULE__, :raising_key, []})
 
       assert %{status: :failed, reason: reason} = Check.check(:anthropic)
 
       assert reason ==
-               "config :clementine, anthropic_api_key: {Clementine.Models.CheckTest, " <>
-                 ":raising_key, []} raised RuntimeError"
+               "config :clementine, :platforms, anthropic: [api_key: ...] " <>
+                 "{Clementine.Models.CheckTest, :raising_key, []} raised RuntimeError"
     end
 
-    test "is skipped without a configured key" do
-      Application.delete_env(:clementine, :anthropic_api_key)
+    test "is skipped without a configured key, and reads a {:system, var} key", %{bypass: bypass} do
+      TestPlatforms.put(anthropic: [base_url: "http://localhost:#{bypass.port}"])
 
       assert %{status: :skipped, reason: reason} = Check.check(:anthropic)
-      assert reason =~ "anthropic_api_key"
+      assert reason == "config :clementine, :platforms, anthropic: [api_key: ...] is not set"
 
-      Application.put_env(:clementine, :anthropic_api_key, {:system, "CLEMENTINE_UNSET_VAR"})
-      assert %{status: :skipped} = Check.check(:anthropic)
+      put_key(bypass, {:system, "CLEMENTINE_UNSET_VAR"})
+      assert %{status: :skipped, reason: reason} = Check.check(:anthropic)
+
+      assert reason ==
+               "config :clementine, :platforms, anthropic: [api_key: ...] resolved to no value"
+
+      System.put_env("CLEMENTINE_CHECK_TEST_KEY", "sk-ant-recorded")
+      on_exit(fn -> System.delete_env("CLEMENTINE_CHECK_TEST_KEY") end)
+      put_key(bypass, {:system, "CLEMENTINE_CHECK_TEST_KEY"})
+      serve_anthropic(bypass)
+      assert %{status: :checked} = Check.check(:anthropic)
+    end
+
+    test "fails on a platform entry that does not build, naming it" do
+      TestPlatforms.put(anthropic: [api_key: 42])
+
+      assert %{status: :failed, reason: reason} = Check.check(:anthropic)
+      assert reason =~ "anthropic"
     end
   end
 
@@ -257,17 +265,16 @@ defmodule Clementine.Models.CheckTest do
              Check.compare(:openai, [new])
   end
 
-  test "the Models API sits beside the configured endpoint" do
-    Application.put_env(
-      :clementine,
-      :anthropic_base_url,
-      "https://proxy.example/anthropic/v1/messages"
+  test "the Models API is under each platform's base_url" do
+    TestPlatforms.put(
+      anthropic: [api_key: "k", base_url: "https://proxy.example/anthropic/"],
+      openai: [api_key: "k", base_url: "https://proxy.example/openai/v1"]
     )
 
     assert Check.url(:anthropic) == "https://proxy.example/anthropic/v1/models"
+    assert Check.url(:openai) == "https://proxy.example/openai/v1/models"
 
-    Application.delete_env(:clementine, :anthropic_base_url)
-    Application.delete_env(:clementine, :openai_base_url)
+    TestPlatforms.put(anthropic: [api_key: "k"], openai: [api_key: "k"])
     assert Check.url(:anthropic) == "https://api.anthropic.com/v1/models"
     assert Check.url(:openai) == "https://api.openai.com/v1/models"
   end
@@ -291,6 +298,10 @@ defmodule Clementine.Models.CheckTest do
   end
 
   def raising_key, do: raise("vault said sk-ant-secret is sealed")
+
+  defp put_key(bypass, key) do
+    TestPlatforms.put(anthropic: [api_key: key, base_url: "http://localhost:#{bypass.port}"])
+  end
 
   defp serve_anthropic(bypass) do
     Bypass.expect(bypass, "GET", "/v1/models", fn conn ->
