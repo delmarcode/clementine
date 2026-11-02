@@ -160,15 +160,23 @@ defmodule Clementine.OutputSchemaTest do
       assert error.raw["output"] == ~s({"verdict": "maybe", "score": "high"})
     end
 
-    test "a final answer that is not JSON fails the run, naming a cut-off answer as such" do
+    test "a final answer cut off at max_tokens fails the run as truncated, before decoding" do
       expect_turn([
         {:text_delta, ~s({"verdict": "pa)},
         {:message_delta, %{"stop_reason" => "max_tokens"},
          %{"input_tokens" => 7, "output_tokens" => 3}}
       ])
 
-      assert {:error, %Clementine.Error{code: :invalid_output} = error} =
+      assert {:error, %Clementine.Error{kind: :rollout, code: :truncated} = error} =
                Rollout.execute(rollout(tools: [], output_schema: @verdict))
+
+      assert error.message =~ "cut off at max_tokens"
+      assert error.raw == %{"stop_reason" => "max_tokens"}
+    end
+
+    test "decoding names a cut-off answer as such, for a caller that decodes one itself" do
+      assert {:error, %Clementine.Error{code: :invalid_output} = error} =
+               Clementine.OutputSchema.decode(@verdict, ~s({"verdict": "pa), "max_tokens")
 
       assert error.message =~ "the answer is not JSON"
       assert error.message =~ "hit max_tokens"
@@ -261,7 +269,7 @@ defmodule Clementine.OutputSchemaTest do
       end
     end
 
-    test "an OpenAI refusal fails the run as a refusal, with its text in raw" do
+    test "an OpenAI refusal fails the run as a refusal, before decoding" do
       sse =
         Enum.map_join(
           [
@@ -279,12 +287,11 @@ defmodule Clementine.OutputSchemaTest do
 
       expect_turn(events)
 
-      assert {:error, %Clementine.Error{code: :invalid_output} = error} =
+      assert {:error, %Clementine.Error{kind: :rollout, code: :refused} = error} =
                Rollout.execute(rollout(tools: [], output_schema: @verdict))
 
-      assert error.message =~ "(the model refused)"
-      assert error.raw["output"] == "I can't grade that."
-      assert error.raw["stop_reason"] == "refusal"
+      assert error.message =~ "refused"
+      assert error.raw == %{"stop_reason" => "refusal"}
     end
 
     test "fails as a Result.Failed through the runner" do

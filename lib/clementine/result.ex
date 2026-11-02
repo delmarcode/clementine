@@ -19,19 +19,46 @@ defmodule Clementine.Result do
     `output` is the answer's text, or, for an agent with an
     `output_schema:`, the answer decoded: a map with string keys that
     matched the schema (`Clementine.OutputSchema`).
+
+    `stop_reason` is the final turn's, as the provider client normalized
+    it: `"end_turn"`, `"stop_sequence"`, or `nil` when the stream named
+    none (a scripted one, say). It is `"empty"` when the run called tools
+    and its final turn wrote no text (Claude's empty `end_turn`, most
+    often after tool results), and `output` is `""`: an agent whose
+    answer is its tool calls is done, and a chat must show that the
+    assistant did not reply, never silence. That final turn is in
+    `messages` as an assistant message of no content, so the exchange
+    before it reads as closed; no provider is sent it as one.
+
+    A run never completes on a final turn the provider refused or cut
+    off (`:refused`, `:truncated`, `Clementine.Error.stopped/2`), or on
+    one that wrote nothing when the run called no tools (`:empty`,
+    `Clementine.Error.empty/1`).
     """
-    defstruct input_message: nil, messages: [], output: nil, usage: %Clementine.Usage{}
+    defstruct input_message: nil,
+              messages: [],
+              output: nil,
+              stop_reason: nil,
+              usage: %Clementine.Usage{}
 
     @type t :: %__MODULE__{
             input_message: Clementine.LLM.Message.message() | nil,
             messages: [Clementine.LLM.Message.message()],
             output: String.t() | map() | nil,
+            stop_reason: String.t() | nil,
             usage: Clementine.Usage.t()
           }
   end
 
   defmodule Failed do
-    @moduledoc "The rollout failed with a normalized error."
+    @moduledoc """
+    The rollout failed with a normalized error.
+
+    A final turn the provider refused fails the run with `code: :refused`,
+    and one it cut off with `code: :truncated` (`Clementine.Error.stopped/2`).
+    A run that wrote nothing and called no tools fails with `code: :empty`
+    (`Clementine.Error.empty/1`).
+    """
     @enforce_keys [:error]
     defstruct error: nil, usage: %Clementine.Usage{}
 

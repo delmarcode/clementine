@@ -310,11 +310,20 @@ defmodule Clementine.Delegation do
   @doc """
   What the model reads for the end of a child of `agent`: a completed
   child's output (as is when it is text, JSON-encoded when it is anything
-  else, such as a map from `output_schema:`), or an error result naming
-  how it ended otherwise. The runtime builds the
+  else, such as a map from `output_schema:`), a sentence saying so when
+  it completed without writing anything (`stop_reason: "empty"`), or an
+  error result naming how it ended otherwise. The runtime builds the
   `{:delegated, %{tool_use_id => outcome}}` resume payload from these.
   """
   @spec outcome(String.t(), Result.t()) :: outcome()
+  def outcome(agent, %Result.Completed{stop_reason: "empty"}) do
+    %{
+      "status" => "completed",
+      "content" => "The #{agent} run finished its tool calls and wrote no answer.",
+      "is_error" => false
+    }
+  end
+
   def outcome(_agent, %Result.Completed{output: output}) do
     %{"status" => "completed", "content" => render(output), "is_error" => false}
   end

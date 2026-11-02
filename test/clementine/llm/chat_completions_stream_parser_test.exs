@@ -200,7 +200,7 @@ defmodule Clementine.LLM.ChatCompletionsStreamParserTest do
     assert {:message_delta, %{"stop_reason" => "max_tokens"}, %{}} in events
   end
 
-  test "passes through unknown finish_reasons" do
+  test "a content filter's finish stops with content_filter, which fails a final turn :refused" do
     events =
       parse_all([
         delta_chunk(%{"content" => "x"}, finish_reason: "content_filter"),
@@ -208,6 +208,63 @@ defmodule Clementine.LLM.ChatCompletionsStreamParserTest do
       ])
 
     assert {:message_delta, %{"stop_reason" => "content_filter"}, %{}} in events
+  end
+
+  test "a finish reason Clementine does not know stops incomplete, naming it" do
+    # OpenRouter's "error": the generation failed partway, never a whole answer.
+    events =
+      parse_all([
+        delta_chunk(%{"content" => "Half an"}, finish_reason: "error"),
+        "data: [DONE]\n\n"
+      ])
+
+    assert {:message_delta,
+            %{"stop_reason" => "incomplete", "stop_details" => %{"finish_reason" => "error"}},
+            %{}} in events
+
+    assert %Clementine.Error{code: :truncated} =
+             error = Clementine.Error.stopped("incomplete", %{"finish_reason" => "error"})
+
+    assert error.message =~ "finish_reason: error"
+    assert Parser.stop_reason("function_call") == "tool_use"
+  end
+
+  test "a length stop leaves the call it cut open, so the turn fails :truncated, and none runs" do
+    alias Clementine.LLM.StreamParser.Accumulator
+
+    events =
+      parse_all([
+        delta_chunk(%{
+          "tool_calls" => [
+            %{
+              "index" => 0,
+              "id" => "call_a",
+              "function" => %{"name" => "echo", "arguments" => ~s({"message":"hi"})}
+            },
+            %{
+              "index" => 1,
+              "id" => "call_b",
+              "function" => %{"name" => "echo", "arguments" => ~s({"message":"hel)}
+            }
+          ]
+        }),
+        delta_chunk(%{}, finish_reason: "length"),
+        "data: [DONE]\n\n"
+      ])
+
+    # The call before the cut closes; the one the cut fell in does not.
+    assert {:content_block_stop, 0} in events
+    refute {:content_block_stop, 1} in events
+    assert {:message_delta, %{"stop_reason" => "max_tokens"}, %{}} in events
+
+    acc = Enum.reduce(events, Accumulator.new(), &Accumulator.process(&2, &1))
+
+    assert %{
+             "tool_use_id" => "call_b",
+             "tool_name" => "echo",
+             "reason" => "Its input never closed."
+           } =
+             Accumulator.unfinished_call(acc)
   end
 
   test "ignores SSE comment payloads" do

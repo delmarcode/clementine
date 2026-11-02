@@ -404,7 +404,7 @@ defmodule Clementine.Runs.TraceTest do
     assert Runs.trace("not-a-uuid") == []
   end
 
-  test "a loop's inbox holds a child's output and usage, never its transcript" do
+  test "a loop's inbox holds a child's output, stop reason, and usage, never its transcript" do
     {:ok, loop} = Runs.start_loop(Thread, %{"agent" => "test_chat"}, subject: @subject)
     {:ok, :appended} = Runs.send(loop.id, %{"prompt" => "hi", "id" => "m1"})
     assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
@@ -428,6 +428,7 @@ defmodule Clementine.Runs.TraceTest do
 
     assert Codec.decode_term(stored) == %Result.Completed{
              output: "Hello there.",
+             stop_reason: "end_turn",
              usage: %Usage{input_tokens: 10, output_tokens: 5},
              messages: [],
              input_message: nil

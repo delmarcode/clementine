@@ -120,4 +120,87 @@ defmodule Clementine.ErrorTest do
     assert error.message =~ ":oops"
     refute error.retryable?
   end
+
+  describe "stopped/2" do
+    test "a refusal, and a content filter's stop, fail the run :refused" do
+      for reason <- ["refusal", "content_filter"] do
+        assert %Error{kind: :rollout, code: :refused, retryable?: false} =
+                 error = Error.stopped(reason)
+
+        assert error.raw == %{"stop_reason" => reason}
+        assert error.message =~ "stop_reason: #{reason}"
+      end
+    end
+
+    test "an answer cut off fails the run :truncated" do
+      for reason <- ["max_tokens", "model_context_window_exceeded", "incomplete"] do
+        assert %Error{kind: :rollout, code: :truncated, retryable?: false} =
+                 error = Error.stopped(reason)
+
+        assert error.raw == %{"stop_reason" => reason}
+      end
+    end
+
+    test "a turn that ended as the model meant it to is no error" do
+      for reason <- ["end_turn", "stop_sequence", "tool_use", "pause_turn", "eos", nil] do
+        assert Error.stopped(reason) == nil
+      end
+    end
+
+    test "keeps what the provider said about the stop, and names its category" do
+      details = %{
+        "type" => "refusal",
+        "category" => "cyber",
+        "explanation" => "Could enable harm."
+      }
+
+      error = Error.stopped("refusal", details)
+
+      assert error.raw == %{"stop_reason" => "refusal", "stop_details" => details}
+
+      assert error.message ==
+               "The model refused to answer (stop_reason: refusal, category: cyber)."
+
+      # A refusal with no named category says nothing more.
+      unnamed = %{"type" => "refusal", "category" => nil, "explanation" => nil}
+      assert Error.stopped("refusal", unnamed).message =~ "(stop_reason: refusal)."
+    end
+  end
+
+  describe "empty/1" do
+    test "a run that wrote nothing and called no tools fails :empty, not retryable" do
+      assert %Error{kind: :rollout, code: :empty, retryable?: false} =
+               error = Error.empty("end_turn")
+
+      assert error.raw == %{"stop_reason" => "end_turn"}
+      assert error.message =~ "stop_reason: end_turn"
+      assert Error.empty(nil).message =~ "stop_reason: none"
+    end
+  end
+
+  describe "normalize/2 for an error event mid-stream" do
+    test "takes the code its status would have" do
+      for {type, code, retryable?} <- [
+            {"overloaded_error", :overloaded, true},
+            {"rate_limit_error", :rate_limited, true},
+            {"api_error", :provider_unavailable, true},
+            {"invalid_request_error", :invalid_request, false},
+            {"authentication_error", :auth, false}
+          ] do
+        event = %{"type" => type, "message" => "Something."}
+
+        assert %Error{kind: :provider, code: ^code, retryable?: ^retryable?} =
+                 error = Error.normalize(event, :anthropic)
+
+        assert error.provider == :anthropic
+        assert error.message == "#{type} mid-stream: Something."
+        assert error.raw == event
+      end
+    end
+
+    test "a type it does not know stays unknown" do
+      assert %Error{kind: :runtime, code: :unknown} =
+               Error.normalize(%{"type" => "stream_parse_error"})
+    end
+  end
 end
