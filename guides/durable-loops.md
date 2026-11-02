@@ -272,9 +272,13 @@ defmodule MyApp.Chat.Threads do
       message = MyApp.Chat.insert_message!(conversation, content)
       loop = Runs.active({"conversation", conversation.id}, kind: :loop)
 
-      case Runs.send(loop.id, %{"id" => message.id, "prompt" => content},
-             dedup_key: "message:#{message.id}"
-           ) do
+      message_args = %{
+        "id" => message.id,
+        "prompt" => content,
+        "metadata" => %{"message_id" => message.id}
+      }
+
+      case Runs.send(loop.id, message_args, dedup_key: "message:#{message.id}") do
         {:ok, :appended} -> message
         {:ok, :duplicate} -> message
         {:ok, :dead_lettered} -> MyApp.Repo.rollback(:conversation_closed)

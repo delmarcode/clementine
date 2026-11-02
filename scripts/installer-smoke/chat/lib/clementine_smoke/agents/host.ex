@@ -1,9 +1,9 @@
 defmodule ClementineSmoke.Agents.Host do
   @moduledoc """
   The agents' host. A chat turn's messages commit with its end (a
-  failed turn's: the steps it completed), its prompt once per turn, and
-  a conversation's runs stream on its PubSub topic: text as it arrives,
-  each change of status, and the end.
+  failed turn's: the steps it completed), after the user's message it
+  answers, and a conversation's runs stream on its PubSub topic: text as
+  it arrives, each change of status, and the end.
   """
 
   @behaviour Clementine.Host
@@ -26,13 +26,13 @@ defmodule ClementineSmoke.Agents.Host do
 
   def run_transition(_run, _transition), do: :ok
 
-  # The prompt is stored once per turn: a thread's retry runs a failed
-  # turn again under the same key, with the same prompt.
+  # The user's message was stored when it arrived, so a thread's retry
+  # of a failed turn never stores it twice, and an interrupted or
+  # cancelled turn never loses it. The turn stores what it said.
   @impl true
   def run_finished(%{agent_key: "chat"} = run, %ended{} = result)
       when ended in [Result.Completed, Result.Failed] do
-    Conversations.put_prompt!(run.subject_id, Conversations.turn_key(run), result.input_message)
-    Conversations.append!(run.subject_id, result.messages)
+    Conversations.append_reply!(run.subject_id, run.metadata["message_id"], result.messages)
   end
 
   def run_finished(_run, _result), do: :ok

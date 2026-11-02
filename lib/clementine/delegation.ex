@@ -40,7 +40,9 @@ defmodule Clementine.Delegation do
   declared `retry: :safe` raises its parent's effect fence when it
   ends, and a parent ended while it waits is fenced when a child acted
   or one still running can, so a `Clementine.Thread` never retries a
-  turn whose delegate acted.
+  turn whose delegate acted. The fence is cumulative, as for the
+  parent's own calls before it parked: a drain interrupts a resumed
+  parent whose child had effects rather than requeue it.
 
   Calls in one batch run side by side, and their answers return to the
   model together, with the batch's other results. A batch that also

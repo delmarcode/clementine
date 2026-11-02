@@ -110,13 +110,17 @@ defmodule MyApp.Agents.Chat do
     model: "claude-sonnet-5-5",
     instructions: "You are a helpful assistant. Be brief."
 
+  # The thread before this turn's message, which the app stored when it
+  # arrived: the run adds the message itself, as its prompt.
   @impl true
-  def history(run), do: MyApp.Chat.messages(run.subject_id)
+  def history(run), do: MyApp.Chat.messages(run.subject_id, before: run.metadata["message_id"])
 end
 ```
 
-A turn is a run on a thread: its subject is the thread, and the host's
-`run_finished/2` appends what it said (below). A turn agent without
+A turn is a run on a thread: its subject is the thread. The app stores
+each user message when it arrives and names it in the turn's metadata
+(`"message_id"`, as a thread's message does), and the host's
+`run_finished/2` appends what the turn said after it (below). A turn agent without
 `history/1` fails the build; any other agent is a task, and may define
 one too.
 
@@ -265,16 +269,13 @@ says so; a run that did nothing at all fails:
 - Keep the user's message that drew a refusal in the thread too: it is
   what the user said, and two user messages in a row are valid on
   every provider.
-- Store a turn's prompt once per turn, not once per run. A thread's
-  `"retry"` runs a failed turn again under the same tag, with the same
-  prompt, so appending `[input_message | messages]` at every end stores
-  the prompt twice. Store the user's message when it arrives, or insert
-  `input_message` keyed on the turn, `run.tag_id` (the message's id, the
-  same for the retry), skipping one already stored; then append only
-  `messages`. Either way the prompt can be stored before the turn runs
-  (again), so `history/1` leaves out the turn's own rows, from its
-  prompt on: the run adds the prompt itself, and a model that read it
-  twice would answer it twice.
+- Store the user's message when it arrives, and from `run_finished/2`
+  only the turn's `messages` (a completed turn's, and a failed turn's
+  kept steps); `history/1` reads what came before the turn's message.
+  Storing the prompt at the turn's end (`[input_message | messages]`)
+  stores a retried turn's prompt twice, since a thread's `"retry"` ends
+  the same turn again, and never stores an interrupted or cancelled
+  turn's, since neither result carries `input_message`.
 - A refusal is usually not the last word. Anthropic's advice is to send
   the same request to another Claude model, which usually answers it.
   Its server-side fallback (`fallbacks: "default"`, a beta) does that
@@ -504,7 +505,7 @@ What the app does:
 @impl true
 def history(run) do
   run.subject_id
-  |> MyApp.Chat.messages()
+  |> MyApp.Chat.messages(before: run.metadata["message_id"])
   |> Clementine.History.window(max: 100)
 end
 ```
@@ -732,15 +733,13 @@ defmodule MyApp.Agents.Host do
   # What must happen when a run ends. Inside the transaction that ends
   # it: these writes, and the mail job, commit with the run's end or not
   # at all. A chat turn stores its messages here, and a failed one the
-  # steps it completed (its tool calls and their results). The prompt is
-  # stored once per turn, keyed on its tag: a thread's retry runs the
-  # turn again under the same tag, with the same prompt. A run with no
-  # tag (Runs.start/3) is never retried, so its own id keys it.
+  # steps it completed (its tool calls and their results), after the
+  # user's message, which the app stored when it arrived: a retry never
+  # stores it twice, and an interrupted or cancelled turn never loses it.
   @impl true
   def run_finished(%{agent_key: "chat"} = run, %ended{} = result)
       when ended in [Result.Completed, Result.Failed] do
-    MyApp.Chat.put_prompt!(run.subject_id, run.tag_id || run.id, result.input_message)
-    MyApp.Chat.append!(run.subject_id, result.messages)
+    MyApp.Chat.append_reply!(run.subject_id, run.metadata["message_id"], result.messages)
   end
 
   def run_finished(run, %Result.Completed{output: output}) do

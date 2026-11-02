@@ -71,8 +71,11 @@ defmodule Clementine.Result do
     message. `messages` is `[]` when no step completed, and when the run
     raised. `input_message` is the run's prompt, as on a completed run,
     so a failed one folds the same way (`history ++ [input_message] ++
-    messages`); a host that stored the user's message when it arrived
-    stores `messages` alone.
+    messages`) into a history held in memory (`Clementine.AgentServer`).
+    A host that stores a thread stores the user's message when it
+    arrives and `messages` alone at the end: a thread's retry ends the
+    same turn twice, so storing `input_message` at each end stores the
+    prompt twice, and an interrupted or cancelled turn carries none.
 
     `effects?` is the run's effect fence as its lifecycle stored it
     (`agent_runs.effects` on the runtime): `true` once a tool not

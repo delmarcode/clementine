@@ -220,8 +220,9 @@ defmodule MyApp.Agents.Chat do
     model: "claude-sonnet-5-5",
     instructions: "You are a helpful assistant. Be brief."
 
+  # The thread before this turn's message, stored when it arrived.
   @impl true
-  def history(run), do: MyApp.Chat.messages(run.subject_id)
+  def history(run), do: MyApp.Chat.messages(run.subject_id, before: run.metadata["message_id"])
 end
 ```
 
@@ -240,7 +241,9 @@ one per conversation, and send it each message:
   )
 
 {:ok, :appended} =
-  Clementine.Runs.send(loop.id, %{"prompt" => content, "id" => message.id},
+  Clementine.Runs.send(
+    loop.id,
+    %{"prompt" => content, "id" => message.id, "metadata" => %{"message_id" => message.id}},
     dedup_key: message.id
   )
 ```

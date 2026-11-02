@@ -1,90 +1,78 @@
 defmodule ClementineSmoke.Conversations do
   @moduledoc """
-  A conversation's messages: the app's own data. The chat agent reads them
-  as its history, and the agents' host appends each finished turn.
+  A conversation's messages: the app's own data. A user's message is
+  stored when it arrives, and its id names the turn that answers it; the
+  agents' host stores what each turn said after the message it answers.
+  The chat agent reads what came before its turn's message as its
+  history.
   """
 
-  import Ecto.Query, only: [from: 2, select: 3]
+  import Ecto.Query, only: [from: 2, where: 3]
 
   alias Clementine.LLM.Message
+  alias Clementine.LLM.Message.UserMessage
   alias ClementineSmoke.Conversations.Entry
   alias ClementineSmoke.Repo
 
-  @doc "The conversation's messages, oldest first."
-  def messages(conversation_id) do
-    conversation_id |> entries() |> read()
-  end
+  @doc "The conversation's messages, in the order the model saw them."
+  def messages(conversation_id), do: conversation_id |> entries() |> read()
 
   @doc """
-  What came before a turn, oldest first: the conversation up to the
-  turn's stored prompt, when a failed attempt of the turn stored it. The
-  turn's run adds the prompt itself.
+  What came before the turn that answers `message_id`: every earlier
+  message, each followed by what its turn said. The turn's run adds the
+  message itself, as its prompt.
   """
-  def before_turn(conversation_id, turn) do
-    query = entries(conversation_id)
-
-    prompt =
-      Repo.one(
-        from(e in Entry,
-          where: e.conversation_id == ^conversation_id and e.turn == ^turn,
-          select: e.id
-        )
-      )
-
-    if prompt, do: read(from(e in query, where: e.id < ^prompt)), else: read(query)
+  def messages(conversation_id, before: message_id) do
+    conversation_id
+    |> entries()
+    |> where([e], coalesce(e.reply_to, e.id) < ^message_id)
+    |> read()
   end
 
-  @doc """
-  The key a run's turn stores its prompt under: its tag, which a
-  thread's retry of the turn keeps, or, for a run with no tag (never
-  retried), its own id.
-  """
-  def turn_key(run), do: run.tag_id || run.id
+  @doc "Stores a user's message as it arrives. Its id names the turn that answers it."
+  def add_message!(conversation_id, text) do
+    entry =
+      Repo.insert!(%Entry{
+        conversation_id: conversation_id,
+        message: Message.to_map(UserMessage.new(text))
+      })
 
-  @doc """
-  Stores a turn's prompt, unless the turn's is stored already: `turn`
-  keys it, and a retry of the turn has the same key and the same prompt.
-  """
-  def put_prompt!(conversation_id, turn, message) do
-    entry = %{
-      conversation_id: conversation_id,
-      turn: turn,
-      message: Message.to_map(message),
-      inserted_at: DateTime.utc_now()
-    }
-
-    Repo.insert_all(Entry, [entry],
-      on_conflict: :nothing,
-      conflict_target: [:conversation_id, :turn]
-    )
-
-    :ok
+    entry.id
   end
 
-  @doc "Appends `messages` to the conversation, in order."
-  def append!(conversation_id, messages) do
+  @doc "Stores what a turn said, after the message it answers."
+  def append_reply!(conversation_id, message_id, messages) do
     now = DateTime.utc_now()
 
     entries =
       Enum.map(messages, fn message ->
-        %{conversation_id: conversation_id, message: Message.to_map(message), inserted_at: now}
+        %{
+          conversation_id: conversation_id,
+          reply_to: message_id,
+          message: Message.to_map(message),
+          inserted_at: now
+        }
       end)
 
     Repo.insert_all(Entry, entries)
     :ok
   end
 
+  @doc "The PubSub topic a conversation's runs broadcast on."
+  def topic(conversation_id), do: "conversation:" <> conversation_id
+
+  # Each message, then what its turn said: a message that arrived while
+  # a turn ran goes after that turn's reply, wherever its row sorts.
   defp entries(conversation_id) do
-    from(e in Entry, where: e.conversation_id == ^conversation_id, order_by: e.id)
+    from(e in Entry,
+      where: e.conversation_id == ^conversation_id,
+      order_by: [coalesce(e.reply_to, e.id), e.id]
+    )
   end
 
   defp read(query) do
     query
-    |> select([e], e.message)
     |> Repo.all()
-    |> Enum.map(&Message.from_map/1)
+    |> Enum.map(&Message.from_map(&1.message))
   end
-
-  @doc "The PubSub topic a conversation's runs broadcast on."
-  def topic(conversation_id), do: "conversation:" <> conversation_id
 end
