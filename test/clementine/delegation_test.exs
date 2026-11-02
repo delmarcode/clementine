@@ -90,6 +90,15 @@ defmodule Clementine.DelegationTest do
       assert %{"content" => "{1, 2}"} = Delegation.outcome("a", Result.completed(output: {1, 2}))
     end
 
+    test "says a child that completed empty wrote no answer, never an empty result" do
+      assert Delegation.outcome("researcher", Result.completed(output: "", stop_reason: "empty")) ==
+               %{
+                 "status" => "completed",
+                 "content" => "The researcher run finished its tool calls and wrote no answer.",
+                 "is_error" => false
+               }
+    end
+
     test "settles a failed, cancelled, or interrupted child as an error naming what happened" do
       assert Delegation.outcome("a", Result.failed(%Error{message: "boom"})) ==
                %{"status" => "failed", "content" => "The a run failed: boom", "is_error" => true}

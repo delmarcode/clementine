@@ -19,7 +19,7 @@ defmodule Clementine.OutputSchema do
   sets `structured_output: :instructions`; see `Clementine.LLM.ChatCompletions`). An answer that is not JSON, or does not match, fails
   the run with a `Clementine.Error` of code `:invalid_output`. A final
   turn the provider refused or cut off fails the run before it is
-  decoded, `:refused` or `:truncated` (`Clementine.Error.stopped/1`).
+  decoded, `:refused` or `:truncated` (`Clementine.Error.stopped/2`).
 
   The check covers the schema's structure: `type`, `properties`,
   `required`, `additionalProperties`, `items`, `enum`, `const`, `anyOf`,

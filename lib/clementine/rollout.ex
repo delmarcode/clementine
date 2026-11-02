@@ -934,6 +934,11 @@ defmodule Clementine.Rollout do
         record_model_call(exec, call, nil, partial.content)
         conclude(exec, unwind(signal))
 
+      {:stopped, error, response, call} ->
+        exec = record_usage(exec, response)
+        record_model_call(exec, call, response.stop_reason, response.content)
+        fail(exec, error)
+
       {:error, reason, usage, call} ->
         exec = record_usage(exec, %{usage: usage})
         record_model_call(exec, call, nil, nil)
@@ -1011,6 +1016,7 @@ defmodule Clementine.Rollout do
       end
 
     duration = System.monotonic_time() - started
+    stopped = stopped_inside_call(acc)
 
     cond do
       signal != nil ->
@@ -1021,6 +1027,15 @@ defmodule Clementine.Rollout do
         emit_llm_stop(metadata, call, nil)
         emit_llm_usage(metadata, call, :aborted, nil)
         {:signal, signal, Accumulator.to_response(acc), call}
+
+      stopped != nil ->
+        # The provider ended the call as it does any other; the turn fails
+        # on its stop, not on the half call the stop fell inside.
+        response = Accumulator.to_response(acc)
+        call = metered(model, duration, response.usage)
+        emit_llm_stop(metadata, call, response.stop_reason)
+        emit_llm_usage(metadata, call, :stop, response.stop_reason)
+        {:stopped, stopped, response, call}
 
       Accumulator.error?(acc) ->
         # What the stream reported before the error burned too, and the
@@ -1048,6 +1063,27 @@ defmodule Clementine.Rollout do
         emit_llm_stop(metadata, call, response.stop_reason)
         emit_llm_usage(metadata, call, :stop, response.stop_reason)
         {:ok, response, call}
+    end
+  end
+
+  # A refusal or a cut that fell inside a tool call (revy's extractor and
+  # yakky's screener answer in tool input, so it is the likeliest cut)
+  # fails the turn on its stop reason, with the unfinished call in `raw`:
+  # its input is half-written at best, and the turn's other calls were
+  # part of the same unfinished answer, so none of them runs.
+  defp stopped_inside_call(acc) do
+    alias Clementine.LLM.StreamParser.Accumulator
+
+    with %Clementine.Error{} = error <-
+           Clementine.Error.stopped(acc.stop_reason, acc.stop_details),
+         %{} = call <- Accumulator.unfinished_call(acc) do
+      %{
+        error
+        | message: "#{error.message} It stopped inside a call to #{call["tool_name"]}.",
+          raw: Map.put(error.raw, "unfinished_call", call)
+      }
+    else
+      _whole -> nil
     end
   end
 
@@ -1163,14 +1199,14 @@ defmodule Clementine.Rollout do
   # assistant message and the output is the whole turn's text.
   #
   # A final turn the provider refused or cut off fails the run
-  # (Clementine.Error.stopped/1), so no refused or partial answer reads
+  # (Clementine.Error.stopped/2), so no refused or partial answer reads
   # as a completed one, and a host that stores a thread's turns from
   # Completed never replays it. A refused turn runs none of its tools:
   # the provider stopped the turn, a tool call it began included.
   defp act(%Execution{} = exec, response) do
     turn = turn(exec, response)
-    exec = %{exec | messages: put_turn(exec, turn, response), paused?: false}
-    stopped = Clementine.Error.stopped(response.stop_reason)
+    exec = %{exec | messages: put_turn(exec, turn), paused?: false}
+    stopped = Clementine.Error.stopped(response.stop_reason, response.stop_details)
 
     cond do
       match?(%Clementine.Error{code: :refused}, stopped) ->
@@ -1186,25 +1222,47 @@ defmodule Clementine.Rollout do
         fail(exec, stopped)
 
       true ->
+        messages = Enum.drop(exec.messages, exec.prefix_len)
+
+        # A final turn that wrote no text completes "empty" when the run
+        # called tools (an agent whose answer is its tool calls is done;
+        # a chat shows that the assistant did not reply), and fails
+        # :empty when it did nothing at all.
         case final_output(exec, turn, response) do
           {:ok, output} ->
-            conclude(
-              exec,
-              {:ok,
-               Clementine.Result.completed(
-                 input_message: exec.input_message,
-                 messages: Enum.drop(exec.messages, exec.prefix_len),
-                 output: output,
-                 stop_reason: completed_stop_reason(output, response.stop_reason),
-                 usage: exec.usage
-               )}
-            )
+            cond do
+              not (is_binary(output) and String.trim(output) == "") ->
+                complete(exec, messages, output, response.stop_reason)
+
+              Enum.any?(messages, &called_tools?/1) ->
+                complete(exec, messages, "", "empty")
+
+              true ->
+                fail(exec, Clementine.Error.empty(response.stop_reason))
+            end
 
           {:error, %Clementine.Error{} = error} ->
             fail(exec, error)
         end
     end
   end
+
+  defp complete(exec, messages, output, stop_reason) do
+    conclude(
+      exec,
+      {:ok,
+       Clementine.Result.completed(
+         input_message: exec.input_message,
+         messages: messages,
+         output: output,
+         stop_reason: stop_reason,
+         usage: exec.usage
+       )}
+    )
+  end
+
+  defp called_tools?(%AssistantMessage{} = message), do: AssistantMessage.has_tool_use?(message)
+  defp called_tools?(_message), do: false
 
   # The paused turn keeps its binding: the continuation answered a request
   # that ended with the turn itself, and the joined turn replays after
@@ -1217,28 +1275,19 @@ defmodule Clementine.Rollout do
   defp turn(%Execution{}, response),
     do: %{AssistantMessage.new(response.content) | binding: response.binding}
 
-  # A final turn of no blocks (a model that ends at once after its tools'
-  # results) is no message: the API refuses an empty assistant message
-  # before the last one, and an empty text block anywhere, so history
-  # never holds one. The next user message follows the turn before it,
-  # which the API accepts. A paused turn is kept, empty or not: it goes
-  # back as the request's last message, and its continuation joins it.
-  defp put_turn(%Execution{paused?: paused?, messages: messages}, turn, response) do
-    messages = if paused?, do: Enum.drop(messages, -1), else: messages
+  # Every turn is a message, a final turn of no blocks too (Claude's
+  # empty end_turn, which it sends most after tool results): it closes
+  # the exchange before it, so a window or an app's trim that drops an
+  # open exchange at a thread's end (Clementine.History) keeps the calls
+  # it made, and a skill's system message is followed by an assistant
+  # turn. No provider is sent an empty message: Anthropic's encoder drops
+  # it, or, after a system message, sends its stand-in
+  # (Clementine.LLM.Anthropic.Binding), and the others encode it to
+  # nothing.
+  defp put_turn(%Execution{paused?: true, messages: messages}, turn),
+    do: List.replace_at(messages, -1, turn)
 
-    if turn.content == [] and not LLM.paused?(response),
-      do: messages,
-      else: messages ++ [turn]
-  end
-
-  # A final turn that wrote no text (Claude's empty end_turn, which it
-  # sends most after tool results) completes as "empty": an agent whose
-  # answer is its tool calls is done, and one whose answer is its text
-  # said nothing, which the host must not show as a reply.
-  defp completed_stop_reason(output, stop_reason) when is_binary(output),
-    do: if(String.trim(output) == "", do: "empty", else: stop_reason)
-
-  defp completed_stop_reason(_decoded, stop_reason), do: stop_reason
+  defp put_turn(%Execution{messages: messages}, turn), do: messages ++ [turn]
 
   # The output is the final turn's text, the paused turn's included. An
   # agent with an output_schema answers in JSON: the output is the decoded

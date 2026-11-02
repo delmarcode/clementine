@@ -84,6 +84,32 @@ defmodule Clementine.Runs.StopsDurableTest do
     end
   end
 
+  test "a cut inside a tool call fails the run :truncated, and the trace keeps the stop reason" do
+    {:ok, run} = Runs.start(Echo, "Answer this.")
+    claude_turn([{:unfinished_tool_use, "toolu_1", "echo", ~s({"message": "hal)}], [])
+    assert :ok = perform_job(Worker, %{"run_id" => run.id})
+
+    assert %AgentRun{status: "failed", error: %{"code" => "truncated"}} = Runs.get(run.id)
+
+    assert %Result.Failed{
+             error: %Error{raw: %{"unfinished_call" => %{"tool_use_id" => "toolu_1"}}}
+           } =
+             Lifecycle.terminal_result(Runs.get(run.id))
+
+    assert %Entry{payload: %{"stop_reason" => "max_tokens"}} = last_model_call(run.id)
+  end
+
+  test "a run that writes nothing and calls no tools fails :empty" do
+    {:ok, run} = Runs.start(Echo, "Answer this.")
+    claude_turn([], [])
+    assert :ok = perform_job(Worker, %{"run_id" => run.id})
+
+    assert %AgentRun{status: "failed", error: %{"code" => "empty", "kind" => "rollout"}} =
+             Runs.get(run.id)
+
+    assert_received {:telemetry, [:clementine, :rollout, :exception], %{error_code: :empty}}
+  end
+
   test "a whole answer stores its stop reason beside its output, and reads back with it" do
     {:ok, run} = Runs.start(Echo, "Answer this.")
     claude_turn([{:text, "Done."}], stop_reason: "stop_sequence")

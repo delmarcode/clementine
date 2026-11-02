@@ -121,7 +121,7 @@ defmodule Clementine.ErrorTest do
     refute error.retryable?
   end
 
-  describe "stopped/1" do
+  describe "stopped/2" do
     test "a refusal, and a content filter's stop, fail the run :refused" do
       for reason <- ["refusal", "content_filter"] do
         assert %Error{kind: :rollout, code: :refused, retryable?: false} =
@@ -145,6 +145,36 @@ defmodule Clementine.ErrorTest do
       for reason <- ["end_turn", "stop_sequence", "tool_use", "pause_turn", "eos", nil] do
         assert Error.stopped(reason) == nil
       end
+    end
+
+    test "keeps what the provider said about the stop, and names its category" do
+      details = %{
+        "type" => "refusal",
+        "category" => "cyber",
+        "explanation" => "Could enable harm."
+      }
+
+      error = Error.stopped("refusal", details)
+
+      assert error.raw == %{"stop_reason" => "refusal", "stop_details" => details}
+
+      assert error.message ==
+               "The model refused to answer (stop_reason: refusal, category: cyber)."
+
+      # A refusal with no named category says nothing more.
+      unnamed = %{"type" => "refusal", "category" => nil, "explanation" => nil}
+      assert Error.stopped("refusal", unnamed).message =~ "(stop_reason: refusal)."
+    end
+  end
+
+  describe "empty/1" do
+    test "a run that wrote nothing and called no tools fails :empty, not retryable" do
+      assert %Error{kind: :rollout, code: :empty, retryable?: false} =
+               error = Error.empty("end_turn")
+
+      assert error.raw == %{"stop_reason" => "end_turn"}
+      assert error.message =~ "stop_reason: end_turn"
+      assert Error.empty(nil).message =~ "stop_reason: none"
     end
   end
 

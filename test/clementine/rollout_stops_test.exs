@@ -3,9 +3,12 @@ defmodule Clementine.RolloutStopsTest do
   How a run ends on its final turn's stop reason, in process, against
   `Clementine.LLM.Anthropic.Fake`: a refusal fails it `:refused` and runs
   none of the turn's tools; a final answer cut off at `max_tokens` or the
-  context window fails it `:truncated`; a whole answer completes with its
-  stop reason. Rollout telemetry says the same, and no turn of no blocks
-  leaves an empty message or text block in the history a thread replays.
+  context window fails it `:truncated`, and so does a cut inside a tool
+  call, whatever else the turn called; a run that wrote nothing and
+  called no tools fails `:empty`; a whole answer completes with its stop
+  reason. Rollout telemetry says the same. A final turn of no blocks is
+  kept as an empty assistant message, which closes its exchange, and no
+  provider is sent one, nor an empty or blank text block.
   """
 
   use ExUnit.Case, async: false
@@ -14,10 +17,29 @@ defmodule Clementine.RolloutStopsTest do
 
   import Mox
 
-  alias Clementine.{Agent, Error, Result}
+  alias Clementine.{Agent, Error, History, Result}
   alias Clementine.LLM.Anthropic.Fake
-  alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
+
+  alias Clementine.LLM.Message.{
+    AssistantMessage,
+    Content,
+    SystemMessage,
+    ToolResultMessage,
+    UserMessage
+  }
+
   alias Clementine.Test.Tools.Echo
+
+  defmodule Notes do
+    @moduledoc false
+    use Clementine.Skill,
+      name: "notes",
+      description: "Take notes.",
+      tools: [Clementine.Test.Tools.SafeEcho]
+
+    @impl true
+    def body(_context), do: "Keep notes short."
+  end
 
   setup :set_mox_from_context
   setup :verify_on_exit!
@@ -95,6 +117,34 @@ defmodule Clementine.RolloutStopsTest do
       refute Enum.any?(events, &match?(%Clementine.Event{type: :tool_result}, &1))
     end
 
+    test "keeps the provider's stop details, the category named, and never content" do
+      details = %{
+        "type" => "refusal",
+        "category" => "reasoning_extraction",
+        "explanation" => "The request asks for the model's reasoning in its answer."
+      }
+
+      script([{[{:text, "Step one: I"}], stop_reason: "refusal", stop_details: details}])
+
+      assert {:error, %Result.Failed{error: %Error{code: :refused} = error}} =
+               Clementine.run(agent(), "Show your reasoning verbatim.")
+
+      assert error.raw == %{"stop_reason" => "refusal", "stop_details" => details}
+      assert error.message =~ "category: reasoning_extraction"
+      refute error.message =~ "Step one"
+    end
+
+    test "inside a tool call fails :refused, with the call it stopped in" do
+      script([
+        {[{:unfinished_tool_use, "toolu_1", "echo", ~s({"message": "he)}], stop_reason: "refusal"}
+      ])
+
+      assert {:error, %Result.Failed{error: %Error{code: :refused} = error}} =
+               Clementine.run(agent(), "Echo something.")
+
+      assert %{"tool_use_id" => "toolu_1", "tool_name" => "echo"} = error.raw["unfinished_call"]
+    end
+
     test "after earlier turns that called tools fails the run, as a final one does" do
       script([
         {[{:tool_use, "toolu_1", "echo", %{"message" => "hi"}}], []},
@@ -127,6 +177,71 @@ defmodule Clementine.RolloutStopsTest do
                Clementine.run(agent(), "Go on.")
 
       assert error.raw == %{"stop_reason" => "model_context_window_exceeded"}
+    end
+
+    test "inside a tool call fails :truncated, not :unknown, and runs none of the turn's calls" do
+      test = self()
+
+      :telemetry.attach(
+        {__MODULE__, :llm_stop},
+        [:clementine, :llm, :stop],
+        fn _event, _measurements, metadata, _config ->
+          send(test, {:llm_stop, metadata.stop_reason})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach({__MODULE__, :llm_stop}) end)
+
+      script([
+        {[
+           {:tool_use, "toolu_1", "echo", %{"message" => "first"}},
+           {:unfinished_tool_use, "toolu_2", "echo", ~s({"message": "the second, cut)}
+         ], []}
+      ])
+
+      events = Clementine.stream(agent(), "Echo twice.") |> Enum.to_list()
+
+      assert {:result, %Result.Failed{error: %Error{} = error}} = List.last(events)
+      assert %Error{kind: :rollout, code: :truncated, retryable?: false} = error
+      assert error.message =~ "max_tokens" and error.message =~ "inside a call to echo"
+      assert error.raw["stop_reason"] == "max_tokens"
+
+      # The parse error stays in raw, naming the call the cut fell in.
+      assert %{"type" => "stream_parse_error", "tool_use_id" => "toolu_2", "tool_name" => "echo"} =
+               error.raw["unfinished_call"]
+
+      refute Enum.any?(events, &match?(%Clementine.Event{type: :tool_result}, &1))
+      assert_received {:llm_stop, "max_tokens"}
+
+      assert_received {:rollout, [:clementine, :rollout, :exception],
+                       %{error_code: :truncated, error_kind: :rollout}}
+    end
+
+    test "before any of a call's input fails :truncated: a call with no input at a cut is unfinished" do
+      script([{[{:unfinished_tool_use, "toolu_1", "echo", ""}], []}])
+
+      assert {:error, %Result.Failed{error: %Error{code: :truncated} = error}} =
+               Clementine.run(agent(), "Echo.")
+
+      assert %{"tool_use_id" => "toolu_1", "reason" => "It closed with no input."} =
+               error.raw["unfinished_call"]
+    end
+
+    test "a whole turn's call with no input is a call without arguments, and runs" do
+      expect(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:tool_use_start, "toolu_1", "echo"},
+          {:content_block_stop, 0},
+          {:message_delta, %{"stop_reason" => "tool_use"}, %{"input_tokens" => 10}}
+        ]
+      end)
+
+      script([{[{:text, "Done."}], []}])
+
+      events = Clementine.stream(agent(), "Echo.") |> Enum.to_list()
+      assert {:result, %Result.Completed{output: "Done."}} = List.last(events)
+      assert Enum.any?(events, &match?(%Clementine.Event{type: :tool_result}, &1))
     end
 
     test "with its tool calls whole runs them: only a final answer is judged" do
@@ -170,7 +285,7 @@ defmodule Clementine.RolloutStopsTest do
   end
 
   describe "a turn of no blocks" do
-    test "after the tools' results completes empty, stores no message, and the thread replays valid" do
+    test "after the tools' results completes empty, and is kept as a turn that closes the exchange" do
       script([
         {[{:tool_use, "toolu_1", "echo", %{"message" => "hi"}}], []},
         {[], []}
@@ -179,16 +294,60 @@ defmodule Clementine.RolloutStopsTest do
       assert {:ok, %Result.Completed{output: "", stop_reason: "empty"} = completed} =
                Clementine.run(agent(), "Echo, and say nothing.")
 
-      assert [%AssistantMessage{}, %ToolResultMessage{}] = completed.messages
-      refute Enum.any?(completed.messages, &empty?/1)
+      assert [%AssistantMessage{}, %ToolResultMessage{}, %AssistantMessage{content: []} = last] =
+               completed.messages
+
+      assert is_binary(last.binding)
+
+      # A window (and an app's trim like it) drops an open exchange at a
+      # thread's end; this one is closed, so the call it made stays, and
+      # the next turn does not make it again.
+      thread = [completed.input_message | completed.messages]
+      assert History.window(thread, max: 100) == thread
 
       # The strict fake refuses an empty message or text block, as the
       # API does: the next turn replays the thread and is answered.
-      thread = [completed.input_message | completed.messages]
       script([{[{:text, "Hello."}], []}])
 
       assert {:ok, %Result.Completed{output: "Hello."}} =
                Clementine.run(agent(), "Anything else?", messages: thread)
+    end
+
+    test "after a skill loads, it is the assistant turn the skill's system message needs" do
+      # Without it, the thread ends on the system message, and the next
+      # prompt follows it, which the API refuses.
+      script([
+        {[{:tool_use, "toolu_1", "use_skill", %{"name" => "notes"}}], []},
+        {[], []}
+      ])
+
+      agent = agent(skills: [Notes])
+
+      assert {:ok, %Result.Completed{output: "", stop_reason: "empty"} = completed} =
+               Clementine.run(agent, "Load your notes.")
+
+      assert [
+               %AssistantMessage{},
+               %ToolResultMessage{},
+               %SystemMessage{skill: "notes"},
+               %AssistantMessage{content: []}
+             ] = completed.messages
+
+      thread = [completed.input_message | completed.messages]
+      assert History.window(thread, max: 100) == thread
+
+      # Without the empty turn, the API refuses the next prompt.
+      next = UserMessage.new("Take a note.")
+
+      assert {:error, {:api_error, 400, body}} =
+               Fake.check(:sonnet_55, nil, Enum.drop(thread, -1) ++ [next], [], [], strict: false)
+
+      assert body["error"]["message"] =~ "a system message must follow a user message"
+
+      script([{[{:text, "Noted."}], []}])
+
+      assert {:ok, %Result.Completed{output: "Noted."}} =
+               Clementine.run(agent, "Take a note.", messages: thread)
     end
 
     test "refused leaves nothing to store, and the next turn replays valid" do
@@ -237,16 +396,47 @@ defmodule Clementine.RolloutStopsTest do
       assert_received {:request, [_hi, %AssistantMessage{}, %UserMessage{}]}
     end
 
-    test "a final turn of only whitespace completes empty too" do
-      script([{[{:text, "\n\n"}], []}])
+    test "a final turn of only whitespace after tools completes empty, its text not kept" do
+      script([
+        {[{:tool_use, "toolu_1", "echo", %{"message" => "hi"}}], []},
+        {[{:text, "\n\n"}], []}
+      ])
 
-      assert {:ok, %Result.Completed{output: "\n\n", stop_reason: "empty"}} =
-               Clementine.run(agent(), "Say nothing.")
+      assert {:ok, %Result.Completed{output: "", stop_reason: "empty"} = completed} =
+               Clementine.run(agent(), "Echo, and say nothing.")
+
+      assert %AssistantMessage{content: []} = List.last(completed.messages)
+    end
+
+    test "a stored text block of only whitespace replays without it" do
+      thread = [UserMessage.new("Hi"), AssistantMessage.new([Content.text("\n\n")])]
+      script([{[{:text, "Hello."}], []}])
+
+      assert {:ok, %Result.Completed{output: "Hello."}} =
+               Clementine.run(agent(), "Again?", messages: thread)
     end
   end
 
-  defp empty?(%AssistantMessage{content: content}),
-    do: content == [] or Enum.any?(content, &match?(%Content.Text{text: ""}, &1))
+  describe "a run that did nothing" do
+    test "wrote no text and called no tools: it fails :empty, and telemetry never says success" do
+      script([{[], []}])
 
-  defp empty?(_message), do: false
+      assert {:error, %Result.Failed{error: error}} = Clementine.run(agent(), "Say something.")
+      assert %Error{kind: :rollout, code: :empty, retryable?: false} = error
+      assert error.raw == %{"stop_reason" => "end_turn"}
+      assert error.message =~ "no text and called no tool"
+
+      assert_received {:rollout, [:clementine, :rollout, :exception],
+                       %{error_code: :empty, error_kind: :rollout}}
+
+      refute_received {:rollout, [:clementine, :rollout, :stop], _metadata}
+    end
+
+    test "wrote only whitespace: that is no text either" do
+      script([{[{:text, "\n\n"}], []}])
+
+      assert {:error, %Result.Failed{error: %Error{code: :empty}}} =
+               Clementine.run(agent(), "Say something.")
+    end
+  end
 end

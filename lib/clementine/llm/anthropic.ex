@@ -166,8 +166,11 @@ defmodule Clementine.LLM.Anthropic do
 
   @doc false
   # The wait before the attempt after `attempt`, as a retry sleeps it:
-  # `Clementine.LLM.Anthropic.Fake` retries a scripted 429 or 529 here.
-  def retry_wait(attempt), do: retry_sleep(calculate_backoff(attempt))
+  # its backoff, capped to the `remaining` milliseconds of the call's
+  # budget. `Clementine.LLM.Anthropic.Fake` retries a scripted 429 or 529
+  # here.
+  def retry_wait(attempt, remaining),
+    do: retry_sleep(min(calculate_backoff(attempt), remaining))
 
   @doc """
   Makes a streaming call to the Anthropic API.
@@ -309,7 +312,7 @@ defmodule Clementine.LLM.Anthropic do
 
     if remaining > 0 do
       send(parent, {ref, :retry_reset})
-      retry_sleep(min(calculate_backoff(attempt), remaining))
+      retry_wait(attempt, remaining)
       do_stream_request(body, headers, parent, ref, budget_ends, max_attempts, attempt + 1)
     else
       send(parent, {ref, fail_message})

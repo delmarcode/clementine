@@ -8,6 +8,14 @@ defmodule Clementine.Error do
   provider payloads. `message` is safe for operators; hosts decide
   user-facing copy. `raw` preserves the original payload for logs and is
   never for display.
+
+  A provider's error takes its code from the provider
+  (`normalize/2`). The engine's own, all `kind: :rollout`, are a closed
+  set: `:refused` and `:truncated` (`stopped/2`), `:empty` (`empty/1`),
+  `:max_iterations`, `:deadline_exceeded`, `:invalid_output`,
+  `:invalid_output_schema`, `:invalid_skills`, `:invalid_delegates`,
+  `:incompatible_checkpoint`, and `:invalid_resume_payload`. A tool's or
+  a host's error keeps whatever code it set.
   """
 
   defstruct kind: :runtime,
@@ -63,39 +71,75 @@ defmodule Clementine.Error do
   answer was cut off fails `:truncated`: `"max_tokens"` (OpenAI's
   `max_output_tokens` too), `"model_context_window_exceeded"`, and
   `"incomplete"`. Both are `kind: :rollout` and not retryable: the same
-  request mostly gets the same answer. `raw` is
-  `%{"stop_reason" => reason}`.
-  """
-  @spec stopped(String.t() | nil) :: t() | nil
-  def stopped(reason) when reason in @refused, do: stopped(:refused, reason)
-  def stopped(reason) when reason in @truncated, do: stopped(:truncated, reason)
-  def stopped(_reason), do: nil
+  request to the same model mostly gets the same answer.
 
-  defp stopped(code, reason) do
+  `raw` is `%{"stop_reason" => reason}`, and `"stop_details"` when the
+  provider said more (`details`, `Clementine.LLM.Response`'s): on an
+  Anthropic refusal, its `"category"` (`"cyber"`, `"bio"`,
+  `"reasoning_extraction"`, ...) and `"explanation"`, never content. The
+  message names the category.
+  """
+  @spec stopped(String.t() | nil, map() | nil) :: t() | nil
+  def stopped(reason, details \\ nil)
+  def stopped(reason, details) when reason in @refused, do: stopped(:refused, reason, details)
+  def stopped(reason, details) when reason in @truncated, do: stopped(:truncated, reason, details)
+  def stopped(_reason, _details), do: nil
+
+  defp stopped(code, reason, details) do
+    raw = %{"stop_reason" => reason}
+
     %__MODULE__{
       kind: :rollout,
       code: code,
-      message: stop_message(reason),
+      message: stop_message(reason, details),
+      retryable?: false,
+      raw: if(is_map(details), do: Map.put(raw, "stop_details", details), else: raw)
+    }
+  end
+
+  defp stop_message(reason, details) do
+    said = Enum.join(["stop_reason: #{reason}" | said(details)], ", ")
+    "#{stop_text(reason)} (#{said})."
+  end
+
+  defp said(%{} = details) do
+    for key <- ["category", "finish_reason"],
+        is_binary(details[key]),
+        do: "#{key}: #{details[key]}"
+  end
+
+  defp said(_details), do: []
+
+  defp stop_text("refusal"), do: "The model refused to answer"
+  defp stop_text("content_filter"), do: "The provider's content filter stopped the answer"
+  defp stop_text("max_tokens"), do: "The model's answer was cut off at max_tokens"
+
+  defp stop_text("model_context_window_exceeded"),
+    do: "The model's answer was cut off at its context window"
+
+  defp stop_text("incomplete"), do: "The provider ended the answer incomplete"
+
+  @doc """
+  The error of a run that ended without an answer: its final turn wrote
+  no text, and no turn of the run called a tool. `kind: :rollout`, code
+  `:empty`, not retryable. A run that called tools and then ended empty
+  is done (an agent whose answer is its tool calls) and completes with
+  `stop_reason: "empty"` instead (`Clementine.Result.Completed`). `raw`
+  is `%{"stop_reason" => reason}`, the provider's (`"end_turn"`, most
+  often).
+  """
+  @spec empty(String.t() | nil) :: t()
+  def empty(reason) do
+    %__MODULE__{
+      kind: :rollout,
+      code: :empty,
+      message:
+        "The model ended the run without an answer: it wrote no text and called no tool " <>
+          "(stop_reason: #{reason || "none"}).",
       retryable?: false,
       raw: %{"stop_reason" => reason}
     }
   end
-
-  defp stop_message("refusal"), do: "The model refused to answer (stop_reason: refusal)."
-
-  defp stop_message("content_filter"),
-    do: "The provider's content filter stopped the answer (stop_reason: content_filter)."
-
-  defp stop_message("max_tokens"),
-    do: "The model's answer was cut off at max_tokens (stop_reason: max_tokens)."
-
-  defp stop_message("model_context_window_exceeded"),
-    do:
-      "The model's answer was cut off at its context window " <>
-        "(stop_reason: model_context_window_exceeded)."
-
-  defp stop_message("incomplete"),
-    do: "The provider ended the answer incomplete (stop_reason: incomplete)."
 
   @doc """
   Normalizes any error reason the engine can produce.

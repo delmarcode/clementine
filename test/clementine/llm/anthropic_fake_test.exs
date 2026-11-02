@@ -207,6 +207,39 @@ defmodule Clementine.LLM.AnthropicFakeTest do
       refute_received {:slept, _ms}
     end
 
+    test "a backoff sleeps no longer than the call's budget has left, and a spent one is not retried" do
+      assert [_binding | _turn] =
+               Fake.stream(
+                 :priced,
+                 nil,
+                 [UserMessage.new("Hi")],
+                 [],
+                 [receive_timeout: 400],
+                 [
+                   {:text, "Hi."}
+                 ],
+                 api_errors: [529]
+               )
+
+      assert_received {:slept, ms}
+      assert ms <= 400
+
+      assert [{:error, {:api_error, 529, _body}}] =
+               Fake.stream(
+                 :priced,
+                 nil,
+                 [UserMessage.new("Hi")],
+                 [],
+                 [receive_timeout: 0],
+                 [
+                   {:text, "Hi."}
+                 ],
+                 api_errors: [529]
+               )
+
+      refute_received {:slept, _ms}
+    end
+
     test "a status the client does not retry fails the run at once" do
       claude_turn([{:text, "Hi."}], api_errors: [400])
 
@@ -227,6 +260,19 @@ defmodule Clementine.LLM.AnthropicFakeTest do
   end
 
   describe "the API's refusals" do
+    test "a text block of only whitespace anywhere the encoder sends one" do
+      history = [%UserMessage{content: [Content.text("Hi"), Content.text("\n\n")]}]
+
+      assert {:error, {:api_error, 400, body}} = Fake.check(:priced, nil, history, [])
+
+      assert body["error"]["message"] =~
+               "messages.0.content.1.text: text content blocks must contain non-whitespace text"
+
+      # A stored assistant turn's blank block never goes.
+      history = [UserMessage.new("Hi"), AssistantMessage.new([Content.text(" \n")])]
+      assert :ok = Fake.check(:priced, nil, history ++ [UserMessage.new("Again?")], [])
+    end
+
     test "an empty text block anywhere the encoder sends one" do
       history = [%UserMessage{content: [Content.text("Hi"), Content.text("")]}]
 
@@ -251,13 +297,32 @@ defmodule Clementine.LLM.AnthropicFakeTest do
     end
   end
 
-  test "the client's retry wait is the one the fake retries with" do
+  test "the client's retry wait is the one the fake retries with, capped to what is left" do
     test = self()
     Application.put_env(:clementine, :retry_sleep, &send(test, {:slept, &1}))
     on_exit(fn -> Application.delete_env(:clementine, :retry_sleep) end)
 
-    Anthropic.retry_wait(3)
+    Anthropic.retry_wait(3, 60_000)
     assert_received {:slept, 4000}
+
+    Anthropic.retry_wait(3, 1500)
+    assert_received {:slept, 1500}
+  end
+
+  test "an unfinished call ends the script: no step may follow it" do
+    assert_raise ArgumentError, ~r/unfinished_tool_use/, fn ->
+      Fake.stream(:priced, nil, [UserMessage.new("Hi")], [], [], [
+        {:unfinished_tool_use, "toolu_1", "echo", "{"},
+        {:text, "More."}
+      ])
+    end
+
+    assert [_start | events] =
+             Fake.stream(:priced, nil, [UserMessage.new("Hi")], [], [], [
+               {:unfinished_tool_use, "toolu_1", "echo", ~s({"mess)}
+             ])
+
+    assert {:message_delta, %{"stop_reason" => "max_tokens"}, _usage} = List.last(events)
   end
 
   defp sse(type, data),

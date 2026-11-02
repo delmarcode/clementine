@@ -76,7 +76,8 @@ defmodule <%= @app_module %>.AgentsCase do
 
   - `stop_reason:` any the API sends. `"refusal"` fails the run
     `:refused`, and `"max_tokens"` on a final answer fails it
-    `:truncated`.
+    `:truncated`. `stop_details:` adds a refusal's
+    `%{"category" => ..., "explanation" => ...}`.
   - `usage:` in the API's keys (`input_tokens`, `output_tokens`,
     `cache_read_input_tokens`, `cache_creation_input_tokens`,
     `cache_creation`), over the default of 10 input and 5 output
@@ -86,7 +87,11 @@ defmodule <%= @app_module %>.AgentsCase do
     and answered; `[529, 529, 529]` fails the run `:overloaded`.
 
   A `{:error, "overloaded_error"}` step in `script` ends the turn
-  mid-stream.
+  mid-stream, and `{:unfinished_tool_use, id, name, "{\"note\": \"Pa"}`
+  ends it cut off inside a call's input (`:truncated`; none of the
+  turn's calls runs). A final turn that writes nothing completes with
+  `stop_reason: "empty"` after tool calls, and fails the run `:empty`
+  without them: script both for a chat agent.
 
       expect_claude_turn([{:text, "I can't help with"}], stop_reason: "refusal")
   """

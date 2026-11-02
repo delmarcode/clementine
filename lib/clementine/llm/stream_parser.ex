@@ -363,6 +363,10 @@ defmodule Clementine.LLM.StreamParser do
     carried (the input count), under whatever its end reports. A stream
     cut off before its end, by a cancel or a provider error, still has
     the input it burned.
+
+    Text of only whitespace is no block: the Messages API refuses one in
+    a replayed history ("text content blocks must contain non-whitespace
+    text").
     """
 
     alias Clementine.LLM.Message.Content
@@ -370,12 +374,16 @@ defmodule Clementine.LLM.StreamParser do
 
     # `blocks` holds finished content blocks, newest first. `text` is the
     # open text run: any other block's start closes it into `blocks`.
+    # `inputless` holds the ids of calls that closed with no input at
+    # all, which is a call without arguments, or one a cut fell before.
     defstruct blocks: [],
               text: "",
               current_thinking: nil,
               open_tools: %{},
               open_tool_ids: [],
+              inputless: MapSet.new(),
               stop_reason: nil,
+              stop_details: nil,
               usage: %{},
               error: nil,
               binding: nil
@@ -448,6 +456,8 @@ defmodule Clementine.LLM.StreamParser do
       {tool, open_tools} = Map.pop(acc.open_tools, id)
       acc = %{acc | open_tools: open_tools, open_tool_ids: rest}
 
+      acc = if tool.input == "", do: %{acc | inputless: MapSet.put(acc.inputless, id)}, else: acc
+
       case decode_tool_input(tool.input) do
         {:ok, parsed_input} ->
           push(acc, tool_block(tool, parsed_input))
@@ -477,8 +487,9 @@ defmodule Clementine.LLM.StreamParser do
       %{acc | usage: Map.merge(usage, acc.usage)}
     end
 
-    def process(%__MODULE__{} = acc, {:message_delta, %{"stop_reason" => reason}, usage}) do
-      %{acc | stop_reason: reason, usage: Map.merge(acc.usage, usage)}
+    def process(%__MODULE__{} = acc, {:message_delta, %{"stop_reason" => reason} = delta, usage}) do
+      details = with %{} = details <- delta["stop_details"], do: details, else: (_ -> nil)
+      %{acc | stop_reason: reason, stop_details: details, usage: Map.merge(acc.usage, usage)}
     end
 
     def process(%__MODULE__{} = acc, {:message_delta, _, usage}) do
@@ -530,10 +541,10 @@ defmodule Clementine.LLM.StreamParser do
 
     defp push(%__MODULE__{} = acc, block), do: %{acc | blocks: [block | acc.blocks]}
 
-    defp close_text(%__MODULE__{text: ""} = acc), do: acc
-
     defp close_text(%__MODULE__{} = acc) do
-      %{push(acc, Content.text(acc.text)) | text: ""}
+      if String.trim(acc.text) == "",
+        do: %{acc | text: ""},
+        else: %{push(acc, Content.text(acc.text)) | text: ""}
     end
 
     defp decode_tool_input(""), do: {:ok, %{}}
@@ -573,6 +584,43 @@ defmodule Clementine.LLM.StreamParser do
     def error?(%__MODULE__{}), do: true
 
     @doc """
+    The tool call the turn left unfinished, if a refusal or a cut fell
+    inside one, or nil. It names the call (`"tool_use_id"`,
+    `"tool_name"`) and why it is unfinished (`"reason"`):
+
+    - its input did not parse: the stream's parse error, as `error/1`
+      would report it;
+    - its stop never arrived;
+    - it is the turn's last block and closed with no input at all.
+
+    Only a turn the provider refused or cut off can leave a call
+    unfinished, so only such a turn asks: in a whole turn the first is
+    the stream's error, the second never happens, and the third is a
+    call without arguments.
+    """
+    def unfinished_call(%__MODULE__{error: %{"tool_use_id" => _} = error}), do: error
+
+    def unfinished_call(%__MODULE__{open_tool_ids: [id | _]} = acc) do
+      %{"tool_name" => acc.open_tools[id].name}
+      |> unfinished(id, "Its input never closed.")
+    end
+
+    def unfinished_call(%__MODULE__{} = acc) do
+      case close_text(acc).blocks do
+        [%Content.ToolUse{id: id, name: name} | _] ->
+          if MapSet.member?(acc.inputless, id),
+            do: unfinished(%{"tool_name" => name}, id, "It closed with no input."),
+            else: nil
+
+        _blocks ->
+          nil
+      end
+    end
+
+    defp unfinished(call, id, reason),
+      do: Map.merge(call, %{"tool_use_id" => id, "reason" => reason})
+
+    @doc """
     Returns the accumulated response as a Response struct: the finished
     blocks in the order they streamed, then any text still open. A call
     or thinking block whose stop never arrived is left out. A turn of no
@@ -584,6 +632,7 @@ defmodule Clementine.LLM.StreamParser do
       %Response{
         content: Enum.reverse(close_text(acc).blocks),
         stop_reason: acc.stop_reason,
+        stop_details: acc.stop_details,
         usage: acc.usage,
         binding: acc.binding
       }

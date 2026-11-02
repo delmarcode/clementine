@@ -202,43 +202,64 @@ text, or, for an agent with `output_schema:`, the decoded answer
 
 A run whose final turn the provider refused, or cut off, fails. It never
 completes, so no app reads a refusal or half an answer as the answer. A
-final turn that wrote nothing completes, and says so:
+final turn that wrote nothing completes when the run called tools, and
+says so; a run that did nothing at all fails:
 
 | The final turn | The run | `error.code` |
 |----------------|---------|--------------|
-| Anthropic's `stop_reason: "refusal"`; OpenAI's refusal content, or its content filter | `failed` | `:refused` |
-| `"max_tokens"` (OpenAI's `max_output_tokens`), `"model_context_window_exceeded"`, an OpenAI response left incomplete | `failed` | `:truncated` |
+| Anthropic's `stop_reason: "refusal"`; OpenAI's refusal content, or a content filter (`"content_filter"`) | `failed` | `:refused` |
+| `"max_tokens"` (OpenAI's `max_output_tokens`, Chat Completions' `length`), `"model_context_window_exceeded"`, an OpenAI response left incomplete, a Chat Completions finish reason Clementine does not know (`"incomplete"`) | `failed` | `:truncated` |
+| Either of those inside a tool call's input | `failed`, and none of the turn's calls runs | `:refused` or `:truncated` |
 | `"end_turn"`, `"stop_sequence"` | `completed`, with that `stop_reason` | |
-| No text: an empty `"end_turn"`, which Claude sends most after tool results | `completed`, `stop_reason: "empty"`, `output: ""` | |
+| No text, after the run called tools: an empty `"end_turn"`, which Claude sends most after tool results | `completed`, `stop_reason: "empty"`, `output: ""` | |
+| No text, and the run called no tools | `failed` | `:empty` |
 
-- The error is `kind: :rollout` and not retryable: the same request
-  mostly gets the same answer. `run_finished/2` receives
+- The error is `kind: :rollout` and not retryable: the same request to
+  the same model mostly gets the same answer. `run_finished/2` receives
   `%Result.Failed{error: %Clementine.Error{code: :refused}}`, the row says
   `status: "failed"` and `error["code"] == "refused"`, a loop hears the
   `Result.Failed`, and `clementine_rollout_exceptions_total` counts it
   by `error_code`, never as `clementine_rollout_stops_total{status="success"}`.
   The trace's last `:model_call` keeps the stop reason, and, under
   `trace: :content`, what the model wrote before it stopped.
+- `error.raw` says what stopped it: `"stop_reason"`; on an Anthropic
+  refusal, `"stop_details"`, its `"category"` (`"cyber"`, `"bio"`,
+  `"reasoning_extraction"`, ...) and `"explanation"`, never content,
+  and the message names the category; on a stop inside a tool call,
+  `"unfinished_call"`, naming the call (`"tool_use_id"`, `"tool_name"`)
+  and why it is unfinished.
 - Only a final answer is judged. A turn that calls tools runs them
-  whatever it stopped on, except a refused one, which runs none: the
-  provider stopped the turn, a tool call it began included. A paused
-  turn (`"pause_turn"`) goes back to the provider and continues.
+  whatever it stopped on, except a refused one, or one cut off inside a
+  call: the provider stopped the turn, and its calls were one answer,
+  of which the last is half-written. That is the likeliest cut for an
+  agent that answers in a tool's input. A paused turn (`"pause_turn"`)
+  goes back to the provider and continues.
 - A completed run names its final turn's stop reason:
   `Result.Completed`'s `stop_reason`, and `result["stop_reason"]` on the
   row. An empty answer completes because an agent whose answer is its
   tool calls (a screener's submission, an email reply sent through a
   tool) is done; one whose answer is its text said nothing.
-- No history holds an empty message or an empty text block, which the
-  API refuses on every later turn: an empty final turn is no message,
-  and a turn stored as one empty text block (as Clementine stored a turn
-  of no blocks before) replays without it.
+- The empty final turn is in `messages`, as an assistant message of no
+  content. It closes the exchange before it: `Clementine.History.window/2`
+  (and an app's own trim of an open exchange at a thread's end) keeps the
+  calls the turn made, so the next turn does not make them again, and a
+  skill's system message is followed by an assistant turn, as the API
+  requires. No provider is sent it as an empty message, and no history
+  sends a text block that is empty or only whitespace, which the API
+  refuses on every later turn.
 - A failed turn returns no messages, so a host that stores a thread's
-  turns from `Result.Completed` stores nothing of it. Anthropic's advice
-  after a refusal is to drop the turn that drew it, since the same
-  conversation will likely be refused again: leave the refused prompt
-  out of `history/1`. Two user messages in a row are valid on every
-  provider, so keeping it is never an error, only a likely second
-  refusal.
+  turns from `Result.Completed` stores nothing of it. Keep the user's
+  message that drew a refusal in the thread: it is what the user said,
+  and two user messages in a row are valid on every provider.
+- A refusal is usually not the last word. Anthropic's advice is to send
+  the same request to another Claude model, which usually answers it.
+  Its server-side fallback (`fallbacks: "default"`, a beta) does that
+  inside one call, and an agent's own fallbacks within a run are
+  planned (OPS-200); Clementine sends neither yet, so retry the run on
+  an agent with another `model:`. A `"reasoning_extraction"` refusal
+  has no fallback: the prompt asked the model to write out its
+  reasoning. Ask for a short explanation instead, or read the thinking
+  blocks under `display: :summarized`.
 - There is no switch that completes a cut-off answer. Raise the model's
   `max_tokens` (its catalog entry's `defaults:`), or ask for less. An
   app that wants what the model wrote before the cut reads the streamed
@@ -248,26 +269,33 @@ What each kind of agent does with it:
 
 - **A task whose answer is its tool calls** (yakky's screener, which
   submits an assessment through a tool). The run fails; the tool calls
-  before the final turn stand. Keep the path for a run that ends
-  without its submission: the screen fails closed and goes to a person.
-  Name the code to staff, since a refusal and a cut-off answer need
-  different fixes.
+  before the final turn stand, and a submission the cut fell inside
+  did not run. Keep the path for a run that ends without its
+  submission: the screen fails closed and goes to a person. Name the
+  code to staff, since a refusal and a cut-off answer need different
+  fixes.
 - **An extractor** (revy's, which records statements through a tool and
   ignores its final text). A failed run means the packet was not read
-  to the end, never that it documents nothing. Record the extraction as
-  incomplete with the code: a refusal goes to a person, a cut-off answer
-  is retried with a larger `max_tokens` or a smaller packet. Statements
-  recorded before the failure are partial evidence; never conclude an
-  absence from them.
+  to the end, never that it documents nothing. On `:refused`, send the
+  packet to another model first: that usually answers it. A
+  `"reasoning_extraction"` refusal needs a prompt change instead, and
+  one still refused goes to a person. On `:truncated` (most often a cut
+  inside a call's input), retry with a larger `max_tokens` or a smaller
+  packet. On `:empty`, the model neither recorded nor said anything;
+  that is not "no statements" either, so have the model say so when a
+  packet has none. Statements recorded before a failure are partial
+  evidence; never conclude an absence from them.
 - **A chat turn** (yakky's patient assistant, Meli). The turn fails and
   the thread moves on (`on_failure: "surface"`). Show a refusal as the
   assistant declining, not as a crash, and take down the text the turn
-  streamed before it: the provider stopped on it. Show a cut-off answer
-  as cut off; the streamed text is all there is of it, so store it
-  yourself if the app keeps a record of what the user read. On
-  `stop_reason: "empty"`, show that the assistant did not reply (with a
-  way to ask again), never silence; the turn's tool calls, if any, are
-  in `messages` as usual.
+  streamed before it: Anthropic says to discard it. Keep the user's
+  message, and offer to try again (on another model, once you can). Show
+  a cut-off answer as cut off; the streamed text is all there is of it,
+  so store it yourself if the app keeps a record of what the user read.
+  On `stop_reason: "empty"`, show that the assistant did not reply (with
+  a way to ask again), never silence, and store the turn's messages as
+  usual: the empty turn is what closes its tool calls (a sent email, a
+  flagged emergency). `:empty` (a turn that did nothing) shows the same.
   `"on_failure": "retry"` runs a refused or cut-off turn again, which
   is likely refused or cut off again, and repeats what its tools did (a
   sent email): keep it for turns whose tools are safe to repeat.
@@ -277,9 +305,16 @@ In tests, script the stop through the Anthropic fake
 
 <!-- guide-sample: parse-only -->
 ```elixir
-expect_claude_turn([{:text, "I can't help with"}], stop_reason: "refusal")
+expect_claude_turn([{:text, "I can't help with"}],
+  stop_reason: "refusal",
+  stop_details: %{"type" => "refusal", "category" => "cyber", "explanation" => "..."}
+)
+
 assert :ok = perform_job(Clementine.Runs.Worker, %{"run_id" => run.id})
 assert %{status: "failed", error: %{"code" => "refused"}} = Clementine.Runs.get(run.id)
+
+# A cut inside a call's input: none of the turn's calls runs.
+expect_claude_turn([{:unfinished_tool_use, "toolu_1", "submit", ~s({"tier": "hi)}])
 ```
 
 ## Asking other agents
@@ -784,13 +819,16 @@ assert %{status: "completed"} = Clementine.Runs.get(run.id)
 `Clementine.LLM.Anthropic.Fake`, which fails a turn whose replayed
 history lost the model's earlier reasoning
 ([Models that bind their thinking](#models-that-bind-their-thinking))
-or holds what the API refuses (an empty text block). Its options script
-the rest of a real response: `stop_reason:` (`"refusal"`,
-`"max_tokens"`, `"pause_turn"`, ...), `usage:` in the API's keys, cache
-tokens included, which reach the token and cost series as a real
-response's would, and `api_errors:`, the 429s and 529s the client
-retries before the answer, or a status it gives up on. A
-`{:error, "overloaded_error"}` step ends the turn mid-stream.
+or holds what the API refuses (a text block empty or only whitespace).
+Its options script the rest of a real response: `stop_reason:`
+(`"refusal"`, `"max_tokens"`, `"pause_turn"`, ...) and a refusal's
+`stop_details:`, `usage:` in the API's keys, cache tokens included,
+which reach the token and cost series as a real response's would, and
+`api_errors:`, the 429s and 529s the client retries before the answer
+(each backoff capped to the call's budget), or a status it gives up on.
+A `{:error, "overloaded_error"}` step ends the turn mid-stream, and an
+`{:unfinished_tool_use, id, name, json}` step ends it cut off inside a
+call's input.
 
 <!-- guide-sample: parse-only -->
 ```elixir

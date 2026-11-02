@@ -629,10 +629,18 @@ defmodule Clementine.Telemetry.MetricsTest do
     rollout_code =
       &by_name["clementine_rollout_exceptions_total"].tag_values.(%{error_code: &1}).error_code
 
-    for reason <- ["refusal", "content_filter", "max_tokens", "model_context_window_exceeded"] do
+    for reason <- [
+          "refusal",
+          "content_filter",
+          "max_tokens",
+          "model_context_window_exceeded",
+          "incomplete"
+        ] do
       %Clementine.Error{code: error_code} = Clementine.Error.stopped(reason)
       assert rollout_code.(error_code) == error_code
     end
+
+    assert rollout_code.(Clementine.Error.empty("end_turn").code) == :empty
 
     for engine_code <- [:max_iterations, :deadline_exceeded, :invalid_output] do
       assert rollout_code.(engine_code) == engine_code

@@ -39,9 +39,9 @@ defmodule Clementine.LLM.Anthropic.Fake do
   `prefix_mismatch: :drop_block`, the block and every later one
   dropped. Either way the fake refuses what the API refuses in any
   history: a mid-conversation system message that does not follow a
-  user message, or that a user message follows; an empty text block;
-  and an empty message anywhere but last. On a model that does not bind
-  its thinking, only those are checked.
+  user message, or that a user message follows; a text block that is
+  empty or only whitespace; and an empty message anywhere but last. On
+  a model that does not bind its thinking, only those are checked.
 
   A script is a list of steps, answered in order:
 
@@ -52,6 +52,13 @@ defmodule Clementine.LLM.Anthropic.Fake do
     `thinking: :between_tools`; under the default display it is empty.
   - `{:text, text}`: answer text.
   - `{:tool_use, id, name, input}`: a tool call.
+  - `{:unfinished_tool_use, id, name, json}`: a tool call cut off
+    inside its input, which streams only `json` (a prefix of its
+    arguments, or `""`) before its block closes, as the API closes one
+    at `max_tokens`. The turn ends there, on `"max_tokens"` unless
+    `stop_reason:` says otherwise, and the run fails on that stop
+    (`:truncated`, or `:refused`), with the call in the error's
+    `raw["unfinished_call"]`. No step may follow it.
   - `{:error, type}`: an `error` event mid-stream, after the steps
     before it, as the API sends one after its 200 (`"overloaded_error"`,
     `"api_error"`, ...; or the event's whole map). The turn ends there,
@@ -69,6 +76,10 @@ defmodule Clementine.LLM.Anthropic.Fake do
     tools), `"max_tokens"` (a final turn fails `:truncated`),
     `"pause_turn"` (the engine sends the turn back, and the next
     scripted turn continues it), `"model_context_window_exceeded"`.
+  - `stop_details:` the stop's details, as the API sends them on a
+    refusal: `%{"type" => "refusal", "category" => "cyber",
+    "explanation" => "..."}`. The `:refused` error keeps them in
+    `raw["stop_details"]`.
   - `usage:` the usage the turn reports, in the API's keys:
     `input_tokens` (the uncached input), `output_tokens`,
     `cache_read_input_tokens`, `cache_creation_input_tokens`, and
@@ -84,12 +95,14 @@ defmodule Clementine.LLM.Anthropic.Fake do
   - `api_errors:` the HTTP statuses the request meets before the turn
     answers it, in order, as the client meets them: it retries a `429`
     or a `529` after `:retry`'s backoff, through the `:retry_sleep`
-    seam, until `:retry`'s `max_attempts` attempts are spent; any other
-    status, or the attempt that spends them, ends the turn with the
-    error the client gives up with, `{:error, {:api_error, status,
-    body}}` (`:rate_limited`, `:overloaded`, ...). `api_errors: [529]`
-    answers after one retry; `[529, 529, 529]` fails under the default
-    three attempts.
+    seam, until `:retry`'s `max_attempts` attempts are spent or the
+    call's budget is (the request's `:receive_timeout`, which the
+    engine caps to the run's deadline; a backoff sleeps no longer than
+    what is left of it); any other status, or the attempt that spends
+    them, ends the turn with the error the client gives up with,
+    `{:error, {:api_error, status, body}}` (`:rate_limited`,
+    `:overloaded`, ...). `api_errors: [529]` answers after one retry;
+    `[529, 529, 529]` fails under the default three attempts.
   - `strict:` as above.
 
       expect_claude_turn([{:text, "Sunny."}],
@@ -125,6 +138,7 @@ defmodule Clementine.LLM.Anthropic.Fake do
           | {:update, String.t()}
           | {:text, String.t()}
           | {:tool_use, String.t(), String.t(), map()}
+          | {:unfinished_tool_use, String.t(), String.t(), String.t()}
           | {:error, String.t() | map()}
 
   @doc """
@@ -133,20 +147,26 @@ defmodule Clementine.LLM.Anthropic.Fake do
   lost an earlier turn's thinking (`strict: true`, the default) or
   sends what the API would refuse. Takes the arguments the mock's
   `stream/5` receives, then the script, then the fake's options:
-  `strict:`, `stop_reason:`, `usage:`, `api_errors:`.
+  `strict:`, `stop_reason:`, `stop_details:`, `usage:`, `api_errors:`.
   """
   @spec stream(term(), String.t() | nil, list(), list(), keyword(), [step()], keyword()) ::
           list()
   def stream(model, system, messages, tools, opts, script, fake_opts \\ [])
       when is_list(script) do
     fake_opts =
-      Keyword.validate!(fake_opts, strict: true, stop_reason: nil, usage: [], api_errors: [])
+      Keyword.validate!(fake_opts,
+        strict: true,
+        stop_reason: nil,
+        stop_details: nil,
+        usage: [],
+        api_errors: []
+      )
 
     {body, binding, dropped} = Anthropic.request(model, system, messages, tools || [], opts)
 
     # The client reports what it dropped before the API answers, so the
     # engine's telemetry sees a drop the strict check then refuses.
-    with :ok <- answered(fake_opts[:api_errors]),
+    with :ok <- answered(fake_opts[:api_errors], Keyword.get(opts, :receive_timeout, 300_000)),
          {:ok, body} <- checked(body, dropped, fake_opts[:strict]) do
       Binding.events(binding, dropped) ++ turn(body, script, fake_opts)
     else
@@ -171,16 +191,20 @@ defmodule Clementine.LLM.Anthropic.Fake do
   ## HTTP errors before the answer
 
   # The attempts the client makes, each meeting the next scripted status:
-  # a 429 or a 529 it retries after its backoff while attempts remain;
+  # a 429 or a 529 it retries after its backoff while attempts and the
+  # call's budget remain, the backoff capped to what is left of it;
   # anything else ends the turn with the error it gives up with.
-  defp answered(statuses) do
+  defp answered(statuses, budget) do
     max_attempts = Keyword.get(Application.get_env(:clementine, :retry, []), :max_attempts, 3)
+    budget_ends = System.monotonic_time(:millisecond) + budget
 
     statuses
     |> Enum.with_index(1)
     |> Enum.reduce_while(:ok, fn {status, attempt}, :ok ->
-      if status in [429, 529] and attempt < max_attempts do
-        Anthropic.retry_wait(attempt)
+      remaining = max(budget_ends - System.monotonic_time(:millisecond), 0)
+
+      if status in [429, 529] and attempt < max_attempts and remaining > 0 do
+        Anthropic.retry_wait(attempt, remaining)
         {:cont, :ok}
       else
         {:halt, {:error, {:api_error, status, api_error_body(status)}}}
@@ -209,9 +233,9 @@ defmodule Clementine.LLM.Anthropic.Fake do
     end
   end
 
-  # The API refuses an empty text block anywhere in the history, and an
-  # empty message anywhere but last, where only an assistant's may be
-  # empty.
+  # The API refuses a text block that is empty or only whitespace
+  # anywhere in the history, and an empty message anywhere but last,
+  # where only an assistant's may be empty.
   defp check_content(messages) do
     last = length(messages) - 1
 
@@ -219,6 +243,9 @@ defmodule Clementine.LLM.Anthropic.Fake do
     |> Enum.with_index()
     |> Enum.find_value(:ok, fn {message, index} ->
       empty_text = &match?(%{"type" => "text", "text" => ""}, &1)
+
+      blank_text =
+        &(match?(%{"type" => "text", "text" => _}, &1) and String.trim(&1["text"]) == "")
 
       case message["content"] do
         empty when empty in ["", []] ->
@@ -230,11 +257,21 @@ defmodule Clementine.LLM.Anthropic.Fake do
           end
 
         blocks when is_list(blocks) ->
-          if position = Enum.find_index(blocks, empty_text) do
-            refuse(
-              "messages.#{index}.content.#{position}.text: text content blocks must be " <>
-                "non-empty"
-            )
+          cond do
+            position = Enum.find_index(blocks, empty_text) ->
+              refuse(
+                "messages.#{index}.content.#{position}.text: text content blocks must be " <>
+                  "non-empty"
+              )
+
+            position = Enum.find_index(blocks, blank_text) ->
+              refuse(
+                "messages.#{index}.content.#{position}.text: text content blocks must " <>
+                  "contain non-whitespace text"
+              )
+
+            true ->
+              nil
           end
 
         _text ->
@@ -408,8 +445,14 @@ defmodule Clementine.LLM.Anthropic.Fake do
     ending =
       case error do
         nil ->
-          {:message_delta, %{"stop_reason" => fake_opts[:stop_reason] || stop_reason(steps)},
-           ProviderUsage.anthropic(usage)}
+          delta = %{"stop_reason" => fake_opts[:stop_reason] || stop_reason(steps)}
+
+          delta =
+            if details = fake_opts[:stop_details],
+              do: Map.put(delta, "stop_details", details),
+              else: delta
+
+          {:message_delta, delta, ProviderUsage.anthropic(usage)}
 
         error ->
           {:error, error}
@@ -419,6 +462,15 @@ defmodule Clementine.LLM.Anthropic.Fake do
   end
 
   defp until_error(script) do
+    case Enum.split_while(script, &(not match?({:unfinished_tool_use, _, _, _}, &1))) do
+      {_steps, [_unfinished, _next | _rest]} ->
+        raise ArgumentError,
+              "a script's {:unfinished_tool_use, ...} step ends the turn: no step may follow it"
+
+      _last ->
+        :ok
+    end
+
     case Enum.split_while(script, &(not match?({:error, _}, &1))) do
       {steps, []} ->
         {steps, nil}
@@ -445,7 +497,11 @@ defmodule Clementine.LLM.Anthropic.Fake do
   end
 
   defp stop_reason(steps) do
-    if Enum.any?(steps, &match?({:tool_use, _, _, _}, &1)), do: "tool_use", else: "end_turn"
+    cond do
+      match?({:unfinished_tool_use, _, _, _}, List.last(steps)) -> "max_tokens"
+      Enum.any?(steps, &match?({:tool_use, _, _, _}, &1)) -> "tool_use"
+      true -> "end_turn"
+    end
   end
 
   # The usage the API reports, in its keys: the scripted keys over the
@@ -506,6 +562,13 @@ defmodule Clementine.LLM.Anthropic.Fake do
 
   defp step_events({:text, text}, _index, _digest, previous, _display) do
     {[{:text_delta, text}], previous}
+  end
+
+  defp step_events({:unfinished_tool_use, id, name, json}, index, _digest, previous, _display)
+       when is_binary(json) do
+    {[{:tool_use_start, id, name}] ++
+       if(json == "", do: [], else: [{:input_json_delta, id, json}]) ++
+       [{:content_block_stop, index}], previous}
   end
 
   defp step_events({:tool_use, id, name, input}, index, _digest, previous, _display) do

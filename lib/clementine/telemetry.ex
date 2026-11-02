@@ -71,7 +71,8 @@ defmodule Clementine.Telemetry do
 
   Emitted when the engine returns a non-error branch of its closed set.
   `:success` is a final answer: a final turn the provider refused or cut
-  off is an error (`:refused`, `:truncated`), never a success.
+  off is an error (`:refused`, `:truncated`), and so is a run that wrote
+  nothing and called no tools (`:empty`), never a success.
 
   - Measurements: `%{duration: native_time, iterations: integer}`
   - Metadata: `%{agent_key, provider, model, alias, status: :success | :suspended | :cancelled | :drained | :lost_lease}`
@@ -89,7 +90,8 @@ defmodule Clementine.Telemetry do
     a returned error carries `kind: :error, reason: %Clementine.Error{}`,
     and its `kind` and `code` as `error_kind` and `error_code` (`:refused`
     and `:truncated` for a final turn the provider refused or cut off,
-    `Clementine.Error.stopped/1`); a raise carries the raise's `kind`,
+    `Clementine.Error.stopped/2`, `:empty` for a run that did nothing,
+    `Clementine.Error.empty/1`); a raise carries the raise's `kind`,
     `reason`, and `stacktrace`, and `error_kind: :runtime` and
     `error_code: :exception`, what the runner's rescue gives it
 
@@ -488,14 +490,15 @@ defmodule Clementine.Telemetry do
   `not_found`, `timeout`, `rate_limited`, `overloaded`,
   `invalid_request`, `provider_unavailable`, `network`, `exception`,
   `unknown`) or the engine's own rollout errors (`refused`, `truncated`,
-  `max_iterations`, `deadline_exceeded`, `invalid_output`,
+  `empty`, `max_iterations`, `deadline_exceeded`, `invalid_output`,
   `invalid_output_schema`, `invalid_skills`, `invalid_delegates`,
   `incompatible_checkpoint`, `invalid_resume_payload`), else `other`: an
   error's `code` is any atom an app's tool or host sets. `error_kind` is
   `Clementine.Error`'s `kind` (`provider`, `tool`, `rollout`,
   `runtime`), else `other`. A run whose final turn the provider refused
   counts in `clementine_rollout_exceptions_total{error_code="refused"}`,
-  and one it cut off in `{error_code="truncated"}`; neither counts as
+  one it cut off in `{error_code="truncated"}`, and one that did nothing
+  in `{error_code="empty"}`; none counts as
   `clementine_rollout_stops_total{status="success"}`.
 
   The run metrics are labeled `agent_key`:
@@ -605,6 +608,7 @@ defmodule Clementine.Telemetry do
     :unknown,
     :refused,
     :truncated,
+    :empty,
     :max_iterations,
     :deadline_exceeded,
     :invalid_output,
