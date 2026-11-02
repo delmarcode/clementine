@@ -44,7 +44,9 @@ agents that share a choice share a module attribute. `use` defines
 
 `use`'s choices are for `use`'s model. The runtime fills them in when an
 `agent/1` leaves the model to `use` or names the same one: each choice
-`agent/1` leaves unset, and `provider_options` key by key. When
+`agent/1` leaves unset, and `provider_options` key by key. `agent/1`
+overrides a key `use` gives but cannot remove one; a key some runs go
+without belongs in `agent/1`, not on `use`. When
 `agent/1` picks another model for a run (an eval's `--model`), none of
 them applies, since an effort or a TTL one model takes another may
 refuse; that run takes the model's defaults and whatever `agent/1`
@@ -222,17 +224,26 @@ An override merges key by key into `lifecycle`, `thinking`, `features`,
 `cache`, and each entry of `platforms`, and replaces any other fact
 (`prices` whole). A declaration needs `vendor`, `context`, `max_output`,
 and `platforms`. The rest default to a model that does not think, binds
-nothing, takes no system message in place, has no structured outputs
-(so no `response_format` goes; the agent's instructions describe its
-answer, and the engine checks it), and caches on its own. Say what is
-true of it:
+nothing, takes no system message in place, has no structured outputs,
+and caches on its own. Without structured outputs, a Chat Completions
+platform sends no `response_format` (the agent's instructions describe
+its answer, and the engine checks it); on `:anthropic` or `:openai`,
+whose clients send the schema as given, an agent with an
+`output_schema:` is refused. Say what is true of it:
 
 - A model that reasons: `thinking: [default: :adaptive, types:
   [:adaptive], efforts: [...]]`, and `default_effort:` if it has one.
 - A Claude model Clementine lacks (5.1 or later):
   `thinking: [binding: :prefix]`, and
   `features: [mid_conversation_system: true]` where its platform takes
-  them.
+  them, and `features: [structured_outputs: true]`, or an agent with an
+  `output_schema:` is refused on `:anthropic`. Better, declare it
+  `based_on:` the sheet it succeeds (below), which carries all of these.
+- An OpenAI model Clementine lacks, on `:openai`: its efforts and
+  default, `cache: [min_prefix: 1024, ttls: [:thirty_minutes,
+  :twelve_hours]]` from GPT-5.6 on, and `features: [structured_outputs:
+  true]`, or an agent with an `output_schema:` is refused; `based_on:`
+  the nearest shipped sheet carries them.
 - A Claude model behind OpenRouter or a proxy:
   `cache: [ttls: [:five_minutes, :one_hour]]`, so `cache_control`
   markers go.
@@ -271,9 +282,12 @@ config :clementine, :models, %{
 ```
 
 What names the base model stays behind: its `display_name`,
-`released_on`, `lifecycle`, `prices`, `source`, and `read`, and the id
-each platform gives it, so every platform takes the new id unless the
-declaration gives one (`platforms: [bedrock: [id: "anthropic.claude-sonnet-6"]]`).
+`released_on`, `lifecycle`, `prices`, `source`, and `read`. It keeps the
+base's platforms, each under the new id as that platform's scheme gives
+it: `anthropic.claude-sonnet-6` on Bedrock's Messages endpoint, and
+`claude-sonnet-6` itself elsewhere (a new Claude model is dateless on
+Vertex). A platform entry in the declaration overrides that. A retired
+sheet is no base: `based_on:` one fails and names its replacement.
 A bare declaration, without `based_on:`, knows none of a Claude model's
 facts: no efforts, no binding, no tool search, no TTLs. When the next
 Clementine release ships the model's sheet, delete the declaration.

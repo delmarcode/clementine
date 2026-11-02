@@ -314,10 +314,14 @@ defmodule Clementine.Model do
          model = build(opts, platforms),
          :ok <- consistent(model) do
       {:ok, model}
+    else
+      # A message may quote what failed, a literal key included.
+      {:error, message} -> {:error, scrub(message, sheet)}
     end
   end
 
-  def new(other), do: {:error, "expected a keyword list of facts, got: #{inspect(other)}"}
+  def new(other),
+    do: {:error, "expected a keyword list of facts, got: #{inspect(redact(other))}"}
 
   @doc "As `new/1`, raising `ArgumentError`."
   @spec new!(keyword()) :: t()
@@ -384,6 +388,20 @@ defmodule Clementine.Model do
   def redact({key, value}), do: {key, redact(value)}
   def redact(other), do: other
 
+  # `message` with every literal `api_key:` in `term` replaced.
+  defp scrub(message, term) do
+    term
+    |> literal_keys()
+    |> Enum.reduce(message, &String.replace(&2, &1, "**redacted**"))
+  end
+
+  defp literal_keys({:api_key, key}) when is_binary(key) and key != "", do: [key]
+  defp literal_keys(list) when is_list(list), do: Enum.flat_map(list, &literal_keys/1)
+  defp literal_keys(%{__struct__: _}), do: []
+  defp literal_keys(map) when is_map(map), do: Enum.flat_map(map, &literal_keys/1)
+  defp literal_keys({_key, value}), do: literal_keys(value)
+  defp literal_keys(_other), do: []
+
   @doc false
   @spec validate_credential(term()) :: {:ok, term()} | {:error, String.t()}
   def validate_credential(key) when is_binary(key), do: {:ok, key}
@@ -447,7 +465,8 @@ defmodule Clementine.Model do
   defp platform_entry(_name, other),
     do:
       {:error,
-       "expected a keyword list (id:, lifecycle:, features:, cache:), got: #{inspect(other)}"}
+       "expected a keyword list (id:, lifecycle:, features:, cache:), got: " <>
+         inspect(redact(other))}
 
   defp endpoint_allowed(name, entry) do
     if name not in @endpoint_platforms and

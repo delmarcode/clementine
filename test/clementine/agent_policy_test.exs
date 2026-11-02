@@ -394,4 +394,93 @@ defmodule Clementine.AgentPolicyTest do
       assert %Agent{} = Agent.new(model: "qwen3", output_schema: @schema)
     end
   end
+
+  describe "a run-start error from the default agent/1" do
+    test "blames use's choices, and boot names use's schema" do
+      [{hour, _}] =
+        Code.compile_string("""
+        defmodule Clementine.AgentPolicyTest.HourSonnet do
+          use Clementine.Agent, key: "hour_sonnet", model: "claude-sonnet-5", cache: [ttl: :one_hour]
+        end
+        """)
+
+      [{schema, _}] =
+        Code.compile_string("""
+        defmodule Clementine.AgentPolicyTest.Schema54Default do
+          use Clementine.Agent,
+            key: "schema_54_default",
+            model: "gpt-5.4",
+            output_schema: %{"type" => "object", "properties" => %{}}
+        end
+        """)
+
+      # Runtime config takes the one-hour TTL and structured outputs away.
+      Application.put_env(:clementine, :models, %{
+        "claude-sonnet-5" => [cache: [ttls: [:five_minutes]]],
+        "gpt-5.4" => [features: [structured_outputs: false]]
+      })
+
+      message = assert_raise ArgumentError, fn -> Agent.declared!(hour, hour.agent(%{})) end
+
+      assert message.message =~
+               "HourSonnet's use Clementine.Agent choices [cache: [ttl: :one_hour]]:"
+
+      refute message.message =~ "agent/1's"
+
+      message = assert_raise ArgumentError, fn -> Agent.declared!(schema, schema.agent(%{})) end
+      assert message.message =~ "Schema54Default's use Clementine.Agent choices an output_schema:"
+      refute message.message =~ "agent/1's"
+
+      assert {:error, message} = Agent.check_declared(schema)
+      assert message =~ "its use Clementine.Agent declares an output_schema:"
+    end
+  end
+
+  describe "a partial check and use's provider_options" do
+    test "a thinking: :enabled whose budget use may add passes new/1 with other options set" do
+      agent =
+        Agent.new(
+          model: "claude-opus-4-6",
+          thinking: :enabled,
+          provider_options: [prefix_mismatch: :error]
+        )
+
+      # Budgeted's use adds the budget key by key.
+      assert %Agent{provider_options: options} = Agent.declared!(Budgeted, agent)
+      assert Keyword.get(options, :budget_tokens) == 20_000
+      assert Keyword.get(options, :prefix_mismatch) == :error
+    end
+  end
+
+  describe "the other in-process starts" do
+    defmodule RetiredServer do
+      @moduledoc false
+      use Clementine.AgentServer, name: "retired", model: "claude-opus-4-1-20250805"
+    end
+
+    test "AgentServer checks its model whole when it starts" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: message}, _stack}} = RetiredServer.start_link()
+
+      assert message =~
+               ~s("claude-opus-4-1-20250805": is retired; its replacement is "claude-opus-4-8")
+    end
+
+    test "run_local checks a child's agent whole when build_child returns it" do
+      build = fn _tag, args ->
+        {:ok, Clementine.Rollout.new(agent: %Agent{instructions: "x"}, input: args["prompt"])}
+      end
+
+      message =
+        assert_raise ArgumentError, fn ->
+          Clementine.Loop.run_local(Clementine.Test.JudgeLoop, %{"prompt" => "2 + 2?"},
+            build_child: build
+          )
+        end
+
+      assert message.message =~ "run_local/3's build_child for"
+      assert message.message =~ "the agent names no model"
+    end
+  end
 end

@@ -115,7 +115,7 @@ defmodule Clementine.LLM.Policy do
   for the model `id` names, or explains what the model's facts refuse.
   """
   @spec resolve(String.t() | Model.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
-  def resolve(model, opts \\ []), do: resolve(model, opts, prices: true)
+  def resolve(model, opts \\ []), do: resolve(model, opts, [])
 
   @doc false
   # `checks`: `partial: true` leaves out every check that needs a choice
@@ -127,7 +127,8 @@ defmodule Clementine.LLM.Policy do
           {:ok, t()} | {:error, String.t()}
   def resolve(%Model{} = model, opts, checks) when is_list(opts) do
     opts = Keyword.take(opts, @keys)
-    unset = if Keyword.get(checks, :partial, false), do: unset(opts), else: []
+    partial? = Keyword.get(checks, :partial, false)
+    unset = if partial?, do: unset(opts), else: []
 
     with :ok <- servable(model),
          {:ok, platform} <- platform(model),
@@ -135,7 +136,7 @@ defmodule Clementine.LLM.Policy do
          :ok <- streams(model, Keyword.get(checks, :stream, true)),
          :ok <- structured(model, platform, Keyword.get(checks, :output_schema, false)),
          {:ok, provider_options} <- provider_options(model, platform, opts[:provider_options]),
-         {:ok, thinking} <- thinking(model, opts[:thinking], provider_options, unset),
+         {:ok, thinking} <- thinking(model, opts[:thinking], provider_options, partial?),
          {:ok, effort} <- effort(model, opts[:effort], thinking, unset),
          {:ok, max_tokens} <- max_tokens(model, opts[:max_tokens]),
          :ok <- budget_fits(provider_options, max_tokens, unset),
@@ -282,7 +283,7 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(model, nil, options, _unset) do
+  defp thinking(model, nil, options, _partial?) do
     cond do
       Keyword.has_key?(options, :budget_tokens) -> {:ok, :enabled}
       :adaptive in model.thinking.types -> {:ok, :adaptive}
@@ -290,7 +291,9 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(model, type, options, unset)
+  # `use`'s provider_options merge into agent/1's key by key, so a
+  # partial check never knows a budget is missing.
+  defp thinking(model, type, options, partial?)
        when type in [:adaptive, :enabled, :between_tools, :off] do
     budget? = Keyword.has_key?(options, :budget_tokens)
 
@@ -298,7 +301,7 @@ defmodule Clementine.LLM.Policy do
       type not in model.thinking.types ->
         {:error, refused_thinking(model, type)}
 
-      type == :enabled and not budget? and :provider_options in unset ->
+      type == :enabled and not budget? and partial? ->
         {:ok, type}
 
       type == :enabled and not budget? ->
@@ -312,7 +315,7 @@ defmodule Clementine.LLM.Policy do
     end
   end
 
-  defp thinking(_model, other, _options, _unset) do
+  defp thinking(_model, other, _options, _partial?) do
     {:error, "thinking: takes one of #{inspect(Model.thinking_types())}, got: #{inspect(other)}"}
   end
 

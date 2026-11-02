@@ -40,8 +40,10 @@ defmodule Clementine.Models do
   facts, the declaration's merged over them as an override's are, under
   the new id. What names the base model itself does not carry over: its
   `display_name`, `released_on`, `lifecycle`, `prices`, `source`, and
-  `read`, and the id each platform gives it (each platform takes the new
-  id unless the declaration gives one):
+  `read`. It keeps the base's platforms, each under the new id as that
+  platform's scheme gives it (`anthropic.<id>` on Bedrock, the id itself
+  elsewhere) unless the declaration gives one. A retired sheet is no
+  base; its replacement is:
 
       config :clementine, :models, %{
         "claude-sonnet-6" => [
@@ -317,7 +319,16 @@ defmodule Clementine.Models do
          {base, facts} when not is_nil(base) <- Keyword.pop(facts, :based_on) do
       case is_binary(base) && Map.fetch(@sheets, base) do
         {:ok, sheet} ->
-          build(id, &(sheet |> based_on(id) |> override(&1)), facts)
+          case Keyword.get(sheet, :lifecycle, [])[:status] do
+            :retired ->
+              {:error,
+               "Invalid :clementine, :models entry #{inspect(id)}: based_on: names " <>
+                 "#{inspect(base)}, which is retired; base it on its replacement, " <>
+                 inspect(Keyword.fetch!(sheet, :lifecycle)[:replacement])}
+
+            _servable ->
+              build(id, &(sheet |> based_on(id) |> override(&1)), facts)
+          end
 
         _unknown ->
           {:error,
@@ -330,13 +341,24 @@ defmodule Clementine.Models do
   end
 
   # A shipped sheet as the base of a new id: its facts, without the ones
-  # that name the base model, and with each platform taking the new id.
+  # that name the base model, on the same platforms under the new id as
+  # each platform's scheme gives it (`Clementine.Models.Anthropic`):
+  # Bedrock's Messages endpoint takes `anthropic.<id>`, every other
+  # platform the id itself (a new Claude model is dateless on Vertex).
   defp based_on(sheet, id) do
+    vendor = Keyword.fetch!(sheet, :vendor)
+
     sheet
     |> Keyword.drop(@identity)
     |> Keyword.put(:id, id)
     |> Keyword.update!(:platforms, fn platforms ->
-      Enum.map(platforms, fn {name, entry} -> {name, Keyword.delete(entry, :id)} end)
+      Enum.map(platforms, fn
+        {:bedrock, entry} when vendor == :anthropic ->
+          {:bedrock, Keyword.put(entry, :id, "anthropic." <> id)}
+
+        {name, entry} ->
+          {name, Keyword.delete(entry, :id)}
+      end)
     end)
   end
 
