@@ -143,6 +143,9 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:none | @gpt_6_efforts], :medium),
+        # Promotional: the pricing page holds these rates "at least through
+        # November 21, 2026" and gives no regular price; GPT-5.5 lists
+        # $5/$30. Re-read the page after that date.
         prices: prices({4, 20, 0.40, {5, 10}}, {8, 30, 0.80, {10, 20}}),
         cache: @cache
       ],

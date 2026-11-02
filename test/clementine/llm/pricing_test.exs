@@ -327,23 +327,30 @@ defmodule Clementine.LLM.PricingTest do
     test "every sheet a request can go to carries list prices, with the page and the day read" do
       put_models(nil)
 
-      # Mythos Preview's page gives no cache rates; a retired sheet serves
-      # nothing, and carries prices only where the page still lists them.
-      unpriced = ["claude-mythos-preview"]
-
-      for model <- Models.list(),
-          model.lifecycle.status != :retired,
-          model.id not in unpriced do
+      # A retired sheet serves nothing, and carries prices only where the
+      # page still lists them. Mythos Preview's input and output rates are
+      # on its own page.
+      for model <- Models.list(), model.lifecycle.status != :retired do
         assert %Pricing{currency: "USD", source: source, read: ~D[2026-11-01]} = model.prices,
                "#{model.id} ships no prices"
 
         assert source in [
                  "https://platform.claude.com/docs/en/about-claude/pricing",
-                 "https://developers.openai.com/api/docs/pricing"
+                 "https://developers.openai.com/api/docs/pricing",
+                 "https://anthropic.com/glasswing"
                ]
       end
 
-      assert Models.get!("claude-mythos-preview").prices == nil
+      # $25/$125, with the pricing page's multipliers for every model it
+      # names no other rate for: 0.1x hits, 1.25x and 2x writes.
+      assert %Pricing{
+               input: 25_000_000,
+               output: 125_000_000,
+               cache_read: 2_500_000,
+               cache_write: %{five_minutes: 31_250_000, one_hour: 50_000_000},
+               over: nil,
+               source: "https://anthropic.com/glasswing"
+             } = Models.get!("claude-mythos-preview").prices
 
       retired_priced =
         for %{lifecycle: %{status: :retired}, prices: %Pricing{}, id: id} <- Models.list(),
@@ -370,10 +377,35 @@ defmodule Clementine.LLM.PricingTest do
     end
 
     test "an override that narrows a model's TTLs keeps its shipped prices" do
+      put_models(nil)
+      hour = Pricing.of("claude-sonnet-5", cache_ttl: :one_hour)
+
       put_models(%{"claude-sonnet-5" => [cache: [ttls: [:five_minutes]]]})
 
       assert :ok = Models.validate_config!()
       assert %Pricing{cache_write: 2_500_000} = Pricing.of("claude-sonnet-5")
+
+      # A trace entry written at the hour before the app narrowed still
+      # reprices: its TTL is one the prices name.
+      assert %Pricing{cache_write: 4_000_000} = hour
+      assert Pricing.of("claude-sonnet-5", cache_ttl: "one_hour") == hour
+      assert Pricing.of("claude-sonnet-5", cache_ttl: :twelve_hours) == nil
+    end
+
+    test "one cache_write rate reprices an entry at any TTL" do
+      put_models(%{
+        "my-qwen" => [
+          vendor: :qwen,
+          context: 32_768,
+          max_output: 8_192,
+          cache: [ttls: [:five_minutes]],
+          prices: [currency: "USD", input: 1, output: 2, cache_read: 0.1, cache_write: 1.25],
+          platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+        ]
+      })
+
+      assert %Pricing{cache_write: 1_250_000} = Pricing.of("my-qwen", cache_ttl: "one_hour")
+      assert Pricing.of("my-qwen", cache_ttl: "forever") == nil
     end
 
     test "each model's cache hit rate is its own, never derived from its input rate" do
@@ -387,6 +419,7 @@ defmodule Clementine.LLM.PricingTest do
       assert read.("claude-sonnet-5") == 0.1
       assert read.("claude-haiku-5-5") == 0.1
       assert read.("gpt-6.1-terra") == 0.05
+      assert read.("gpt-6.1-sol") == 0.05
       assert read.("gpt-6-astra") == 0.1
     end
 
@@ -546,7 +579,8 @@ defmodule Clementine.LLM.PricingTest do
         input: 2.0,
         output: 8.0,
         cache_read: 0.2,
-        cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0]
+        cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0],
+        over: nil
       ]
 
       put_models(%{
@@ -663,7 +697,14 @@ defmodule Clementine.LLM.PricingTest do
       error =
         boot_error(%{
           "gpt-6.1-sol" => [
-            prices: [currency: "EUR", input: 1, output: 8, cache_read: 0.1, cache_write: 1]
+            prices: [
+              currency: "EUR",
+              input: 1,
+              output: 8,
+              cache_read: 0.1,
+              cache_write: 1,
+              over: nil
+            ]
           ]
         })
 

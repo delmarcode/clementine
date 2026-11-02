@@ -97,6 +97,21 @@ defmodule Clementine.CostTest do
       assert %Cost{currency: "USD", micros: 0} =
                Cost.price(%Usage{}, at_ttl(@card, :five_minutes))
     end
+
+    test "prices still per TTL, as a sheet holds them, fail naming the way to reduce them" do
+      put_models(nil)
+      usage = %Usage{input_tokens: 1_000, cache_write_tokens: 500, output_tokens: 100}
+      sheet = Clementine.Models.get!("claude-sonnet-5").prices
+
+      assert_raise ArgumentError,
+                   ~r/per TTL \(\[:five_minutes, :one_hour\]\).*Pricing\.of/s,
+                   fn ->
+                     Cost.price(usage, sheet)
+                   end
+
+      assert Cost.price(usage, Pricing.at_ttl(sheet, :one_hour)) ==
+               Cost.price(usage, Pricing.of("claude-sonnet-5", cache_ttl: :one_hour))
+    end
   end
 
   # Each test starts from the provider's own usage object, normalized as
@@ -135,7 +150,8 @@ defmodule Clementine.CostTest do
         input: 2.0,
         output: 8.0,
         cache_read: 0.2,
-        cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0]
+        cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0],
+        over: nil
       ]
 
       put_models(%{"gpt-5.6-sol" => [prices: card]})
@@ -167,7 +183,8 @@ defmodule Clementine.CostTest do
             input: 1.25,
             output: 10.0,
             cache_read: 0.125,
-            cache_write: 1.25
+            cache_write: 1.25,
+            over: nil
           ]
         ]
       })
@@ -346,22 +363,66 @@ defmodule Clementine.CostTest do
       assert Cost.of(haiku(100_001, 50_000, 10_000, 2_000), "claude-haiku-5-5") ==
                %Cost{currency: "USD", micros: 27_000}
 
-      # An override without a tier prices every call at its one set of
-      # rates: the sheet's tier is replaced with the rest of its prices.
-      put_models(%{
-        "claude-haiku-5-5" => [
-          prices: [
-            currency: "USD",
-            input: 0.08,
-            output: 0.40,
-            cache_read: 0.008,
-            cache_write: [five_minutes: 0.10, one_hour: 0.16]
-          ]
-        ]
-      })
+      # An override that clears the tier with over: nil prices every call
+      # at its one set of rates.
+      flat = [
+        currency: "USD",
+        input: 0.08,
+        output: 0.40,
+        cache_read: 0.008,
+        cache_write: [five_minutes: 0.10, one_hour: 0.16]
+      ]
+
+      put_models(%{"claude-haiku-5-5" => [prices: flat ++ [over: nil]]})
+
+      assert :ok = Clementine.Models.validate_config!()
 
       assert Cost.of(haiku(100_001, 50_000, 10_000, 2_000), "claude-haiku-5-5") ==
                %Cost{currency: "USD", micros: 5_400}
+    end
+
+    test "an override that leaves out a shipped tier fails, rather than undercount long calls" do
+      flat = [
+        currency: "USD",
+        input: 0.08,
+        output: 0.40,
+        cache_read: 0.008,
+        cache_write: [five_minutes: 0.10, one_hour: 0.16]
+      ]
+
+      # Without over:, a 200,000-token Haiku 5.5 call would pay the base
+      # rates, a fifth of the tier's.
+      put_models(%{"claude-haiku-5-5" => [prices: flat]})
+
+      assert_raise ArgumentError,
+                   ~r/"claude-haiku-5-5".*over 100000 prompt tokens.*restate the tier, or write over: nil/s,
+                   fn -> Clementine.Models.validate_config!() end
+
+      assert {:error, _message} = Clementine.Models.fetch("claude-haiku-5-5")
+      assert Cost.of(haiku(200_000, 0, 0, 1_000), "claude-haiku-5-5") == nil
+
+      assert_raise ArgumentError, ~r/restate the tier/, fn ->
+        Agent.new(model: "claude-haiku-5-5")
+      end
+
+      # The GPT-6 family's 272,000 line holds the same way.
+      gpt = [currency: "USD", input: 9, output: 45, cache_read: 0.9]
+      writes = [cache_write: [thirty_minutes: 11.25, twelve_hours: 22.5]]
+      put_models(%{"gpt-6-astra" => [prices: gpt ++ writes]})
+
+      assert_raise ArgumentError, ~r/"gpt-6-astra".*over 272000 prompt tokens/s, fn ->
+        Clementine.Models.validate_config!()
+      end
+
+      # A sheet with no tier takes an override without over:, and
+      # prices: nil opts out whatever the sheet has.
+      put_models(%{
+        "claude-sonnet-5" => [prices: flat],
+        "claude-haiku-5-5" => [prices: nil]
+      })
+
+      assert :ok = Clementine.Models.validate_config!()
+      assert Cost.of(haiku(200_000, 0, 0, 1_000), "claude-haiku-5-5") == nil
     end
 
     test "GPT-6 Astra over 272,000 input tokens, cached ones counted, as OpenAI counts them" do

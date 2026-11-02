@@ -509,16 +509,20 @@ config :clementine, :models, %{
 }
 ```
 
-An override replaces `prices` whole: it names every rate, and its own
-tier or none. `Clementine.Models.get!(id).prices` shows what a model is
-priced at.
+An override replaces `prices` whole: it names every rate, and a tier
+must be restated or cleared explicitly. Overriding a sheet that has one
+(the table under "Tiers"), it writes its own `over:`, or `over: nil` if
+its rates have no tier; leaving `over:` out fails boot, since every long
+call would otherwise pay the base rates. `Clementine.Models.get!(id).prices`
+shows what a model is priced at; to price usage at them, take them for
+the call's TTL with `Clementine.LLM.Pricing.of/2`.
 
 | Key | Meaning |
 |---|---|
 | `currency` | An ISO 4217 code, `"USD"`. Every priced model, shipped and the app's, names the same one, so costs add up: an app that pays in another prices every model it runs in it, and sets `prices: nil` on the rest. |
 | `input` | Uncached input. |
 | `output` | Output, reasoning included. |
-| `cache_read` | Input read from the provider's prompt cache. The sheet's own rate: 0.025x input on Fable and Mythos 5.1, 0.05x on Opus and Sonnet 5.5 and GPT-6.1 Terra, 0.1x on most others. Never derive it from `input`. |
+| `cache_read` | Input read from the provider's prompt cache. The sheet's own rate: 0.025x input on Fable and Mythos 5.1, 0.05x on Opus and Sonnet 5.5 and GPT-6.1 Terra and Sol, 0.1x on most others. Never derive it from `input`. |
 | `cache_write` | Input written to it: one rate, or a rate per cache TTL. |
 | `over` | A tier: `prompt_tokens`, and the four rates a call whose prompt is over it pays (below). |
 | `source`, `read` | Where the numbers came from, and when (optional on an override). |
@@ -588,8 +592,19 @@ The tiers the shipped sheets carry, read 2026-11-01:
 Every other Claude 4.6 and later model bills its whole 1M window at one
 rate, the older Claude models have 200,000-token windows, and OpenAI
 lists no long rates for GPT-5.4 mini and nano, GPT-5.2, GPT-5.1, the
-GPT-5 models, or GPT-4.1 and its mini. Claude Mythos Preview ships
-unpriced: its page gives input and output rates and no cache rates.
+GPT-5 models, or GPT-4.1 and its mini.
+
+Two shipped prices come with a caveat:
+
+- **GPT-5.6 Sol's are promotional.** OpenAI's pricing page holds $4/$20
+  "at least through November 21, 2026" and gives no regular price
+  (GPT-5.5 lists $5/$30). After that date, re-read the page, or override
+  `prices:` with what the app is billed.
+- **Claude Mythos Preview's** input and output rates ($25/$125) are on
+  its own page (anthropic.com/glasswing), for after the research
+  preview. Its cache rates are the pricing page's multipliers for every
+  model it names no other rate for: 1.25x input for a 5-minute write,
+  2x for an hour, 0.1x for a hit.
 
 ### How a call is priced
 

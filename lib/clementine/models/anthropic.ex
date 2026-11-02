@@ -26,8 +26,9 @@ defmodule Clementine.Models.Anthropic do
     later model bills its whole window at one rate, and the older ones
     have 200,000-token windows). Bedrock and Google Cloud price
     themselves, regional endpoints 10% higher; an app on them overrides
-    `prices`. Mythos Preview's page gives no cache rates, so it ships
-    unpriced.
+    `prices`. Mythos Preview's input and output rates are on its own
+    page (anthropic.com/glasswing), and its cache rates are this page's
+    multipliers for every model it names no other rate for.
   - [Tool search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
     and [Structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs):
     which models have them.
@@ -68,6 +69,7 @@ defmodule Clementine.Models.Anthropic do
   @models "https://platform.claude.com/docs/en/models"
   @pricing "https://platform.claude.com/docs/en/about-claude/pricing"
   @deprecations "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+  @glasswing "https://anthropic.com/glasswing"
 
   @efforts [:low, :medium, :high, :xhigh, :max]
   @ttls [:five_minutes, :one_hour]
@@ -463,9 +465,11 @@ defmodule Clementine.Models.Anthropic do
       rejects: [:temperature, :top_p, :top_k, :prefill],
       features: [mid_conversation_system: false] ++ @features,
       cache: [min_prefix: 2048, ttls: @ttls],
-      # Its page (anthropic.com/glasswing) gives $25/$125 in and out and
-      # no cache rates, so it is unpriced rather than half-priced.
-      prices: nil,
+      # Input and output are its own page's, the rates after the research
+      # preview. Its cache rates are the pricing page's multipliers for
+      # "all other models": 1.25x input for a 5-minute write, 2x for an
+      # hour, 0.1x for a hit.
+      prices: Keyword.put(prices(25, 125, 2.50, 31.25, 50), :source, @glasswing),
       platforms: [
         anthropic: [],
         bedrock: [id: "anthropic.claude-mythos-preview", lifecycle: :partner]

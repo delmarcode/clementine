@@ -56,6 +56,12 @@ defmodule Clementine.Cost do
   single rate for the TTL the call wrote with (`Clementine.LLM.Pricing.of/2`
   returns prices in that form). A call whose prompt, `usage.input_tokens`,
   is over the tier's `prompt_tokens` pays the tier's rates for all of it.
+
+  Raises `ArgumentError` for prices that still name a write rate per TTL,
+  as a sheet's do (`Clementine.Models.get!(id).prices`): which rate
+  applies depends on the call's TTL, so reduce them with
+  `Clementine.LLM.Pricing.of/2` or `Clementine.LLM.Pricing.at_ttl/2`
+  first.
   """
   @spec price(Usage.t(), Pricing.t()) :: t()
   def price(%Usage{} = usage, %Pricing{cache_write: cache_write} = pricing)
@@ -72,6 +78,14 @@ defmodule Clementine.Cost do
         usage.output_tokens * rates.output
 
     %__MODULE__{currency: pricing.currency, micros: div(exact + div(@million, 2), @million)}
+  end
+
+  def price(%Usage{}, %Pricing{cache_write: rates}) when is_map(rates) do
+    raise ArgumentError,
+          "Clementine.Cost.price/2 takes prices with one cache_write rate, and these name one " <>
+            "per TTL (#{inspect(Map.keys(rates))}): reduce them to the call's TTL first, with " <>
+            "Clementine.LLM.Pricing.of(id, cache_ttl: ttl) or " <>
+            "Clementine.LLM.Pricing.at_ttl(prices, ttl)"
   end
 
   # The rates a call pays: its tier's once its prompt, every input token

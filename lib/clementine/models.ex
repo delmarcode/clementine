@@ -31,10 +31,11 @@ defmodule Clementine.Models do
 
   An override merges key by key into `lifecycle`, `thinking`, `features`,
   `cache`, and each entry of `platforms`, and replaces any other fact
-  (`prices` whole). A declaration needs `vendor`, `context`, `max_output`,
-  and `platforms`; the rest default to a model that does not think,
-  binds nothing, has no structured outputs, and caches on its own
-  (`Clementine.Model`). `docs/MODELS.md` has every key.
+  (`prices` whole, so an override of a sheet with a tier restates its
+  `over:` or clears it with `over: nil`). A declaration needs `vendor`,
+  `context`, `max_output`, and `platforms`; the rest default to a model
+  that does not think, binds nothing, has no structured outputs, and
+  caches on its own (`Clementine.Model`). `docs/MODELS.md` has every key.
 
   ## A new model the day it ships
 
@@ -121,7 +122,9 @@ defmodule Clementine.Models do
         {:ok, Map.fetch!(@shipped, id)}
 
       {{:ok, sheet}, {:ok, facts}} ->
-        memo(id, facts, fn -> build(id, &override(sheet, &1), facts) end)
+        memo(id, facts, fn ->
+          with :ok <- tier_restated(id, sheet, facts), do: build(id, &override(sheet, &1), facts)
+        end)
 
       {:error, {:ok, facts}} ->
         memo(id, facts, fn -> declare(id, facts) end)
@@ -398,6 +401,27 @@ defmodule Clementine.Models do
     {:error,
      "Invalid :clementine, :models entry #{inspect(id)}: expected a keyword list of facts " <>
        "(and no other id:), got: #{inspect(Model.redact(facts))}"}
+  end
+
+  # An override replaces `prices` whole, so one that leaves out the
+  # sheet's tier would price every long call at the base rates, a 5x
+  # undercount on Haiku 5.5 that nobody sees. It restates the tier, or
+  # clears it with `over: nil`.
+  defp tier_restated(id, sheet, facts) do
+    with true <- Keyword.keyword?(facts),
+         prices when is_list(prices) <- Keyword.get(facts, :prices),
+         true <- Keyword.keyword?(prices),
+         false <- Keyword.has_key?(prices, :over),
+         shipped when is_list(shipped) <- Keyword.get(sheet, :prices),
+         [_ | _] = tier <- Keyword.get(shipped, :over) do
+      {:error,
+       "Invalid :clementine, :models entry #{inspect(id)}: prices: the shipped prices bill a " <>
+         "call over #{tier[:prompt_tokens]} prompt tokens at a higher tier (over:), and an " <>
+         "override replaces prices whole: restate the tier, or write over: nil if your rates " <>
+         "have none"}
+    else
+      _no_tier_dropped -> :ok
+    end
   end
 
   defp override(sheet, facts) do

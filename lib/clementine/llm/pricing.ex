@@ -24,8 +24,10 @@ defmodule Clementine.LLM.Pricing do
       }
 
   An override replaces `prices` whole: it names every rate, and a tier
-  if it has one. `source:` and `read:` say where the numbers came from
-  and when; neither is required.
+  if it has one. Overriding a sheet that has a tier, it restates the
+  tier or clears it with `over: nil`; leaving `over:` out fails, since
+  every long call would otherwise pay the base rates. `source:` and
+  `read:` say where the numbers came from and when; neither is required.
 
   Every rate is in the named `currency` per million tokens, as a provider's
   price card states it, to six decimal places at most (a finer rate fails
@@ -220,8 +222,10 @@ defmodule Clementine.LLM.Pricing do
     platform (`Clementine.Models.default_platform/1`), the only one a
     request goes to until `Clementine.Platform` arrives (OPS-195).
   - `:cache_ttl` — the TTL the call's writes are billed at, an atom or
-    its name, as a trace `:model_call` entry records it. Default the
-    model's shortest on that platform.
+    its name, as a trace `:model_call` entry records it: any TTL the
+    prices name, so an entry written at a TTL the app has since dropped
+    from `cache: [ttls:]` still reprices. Default the model's shortest
+    on that platform.
   """
   @spec of(String.t(), keyword()) :: t() | nil
   def of(id, opts \\ [])
@@ -248,8 +252,18 @@ defmodule Clementine.LLM.Pricing do
 
   defp platform(model, platform), do: named(Keyword.keys(model.platforms), platform)
 
+  # A stored entry's TTL is checked against the TTLs the prices name, not
+  # the ones the model offers now: an app that narrows `cache: [ttls:]`
+  # still reprices an entry written at a TTL it no longer uses. One
+  # cache_write rate serves any TTL.
   defp ttl(model, nil), do: {:ok, billed_ttl(model, nil)}
-  defp ttl(model, ttl), do: named(model.cache.ttls, ttl)
+
+  defp ttl(model, ttl) do
+    case priced_ttls(model.prices) do
+      [] -> named(Model.ttls(), ttl)
+      priced -> named(priced, ttl)
+    end
+  end
 
   # An atom among `names`, or one's name as the trace stores it.
   defp named(names, name) when is_atom(name) do
