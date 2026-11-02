@@ -27,8 +27,10 @@ defmodule Clementine.LLM.Pricing do
   `cache_read`, and `cache_write`. `cache_write` is one rate, or a rate per
   cache TTL where the provider charges more to keep a cache entry longer;
   the TTL the agent writes with (its resolved `cache.ttl`, `cache_ttl/1`)
-  picks one. A call whose writes carry no TTL (caching off, or a model
-  that offers none) takes one rate.
+  picks one. Prices belong to the model and caching to the agent, so an
+  agent with caching off runs on a model with per-TTL prices, and any
+  writes its provider still reports are priced at the shortest TTL the
+  prices name. A model that offers no TTL takes one rate.
 
   Prices are the host's for now: Clementine's sheets carry none yet. A
   model without `prices:` costs `nil`. A partial price list, or a per-TTL
@@ -72,6 +74,7 @@ defmodule Clementine.LLM.Pricing do
 
   # Clementine.LLM.Cache's TTLs, every provider's.
   @ttls [:five_minutes, :one_hour, :thirty_minutes, :twelve_hours]
+  @by_duration [:five_minutes, :thirty_minutes, :one_hour, :twelve_hours]
 
   @micro 1_000_000
 
@@ -99,13 +102,15 @@ defmodule Clementine.LLM.Pricing do
   # What a model's prices need from the agent's caching: a per-TTL
   # cache_write names the rate for the TTL the agent writes with.
   @spec validate_for_model(%{pricing: t() | nil, cache: map()}) :: :ok | {:error, String.t()}
+  def validate_for_model(%{cache: %{enabled: false}}), do: :ok
+
   def validate_for_model(%{pricing: %__MODULE__{cache_write: rates}} = model)
       when is_map(rates) do
     case cache_ttl(model) do
       nil ->
         {:error,
-         "cache_write is per TTL, but these cache writes carry no TTL (caching is off, " <>
-           "or the model offers none): give one cache_write rate"}
+         "cache_write is per TTL, but the model offers no TTL to write at: give one " <>
+           "cache_write rate"}
 
       ttl ->
         if Map.has_key?(rates, ttl),
@@ -130,7 +135,7 @@ defmodule Clementine.LLM.Pricing do
   def of(%{pricing: %__MODULE__{cache_write: rate} = pricing}) when is_integer(rate), do: pricing
 
   def of(%{pricing: %__MODULE__{cache_write: rates} = pricing} = model) do
-    case Map.fetch(rates, cache_ttl(model)) do
+    case Map.fetch(rates, cache_ttl(model) || shortest(rates)) do
       {:ok, rate} -> %{pricing | cache_write: rate}
       :error -> nil
     end
@@ -144,6 +149,10 @@ defmodule Clementine.LLM.Pricing do
   end
 
   def of(_model), do: nil
+
+  # With caching off a call asks for no TTL; writes a provider reports
+  # anyway are priced at the shortest.
+  defp shortest(rates), do: Enum.find(@by_duration, &Map.has_key?(rates, &1))
 
   @doc """
   The cache TTL a resolved `model` writes with, which its writes are billed

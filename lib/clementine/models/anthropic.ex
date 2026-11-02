@@ -24,11 +24,36 @@ defmodule Clementine.Models.Anthropic do
     and [Structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs):
     which models have them.
 
+  - [Claude in Amazon Bedrock](https://platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock)
+    and its [legacy page](https://platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy),
+    [Google managed](https://platform.claude.com/docs/en/build-with-claude/claude-models-on-google-cloud/google-managed),
+    [Microsoft Foundry](https://platform.claude.com/docs/en/build-with-claude/claude-in-microsoft-foundry),
+    and [Claude Platform on AWS](https://platform.claude.com/docs/en/build-with-claude/claude-platform-on-aws):
+    which platforms serve each model, under which id.
+
   `line` is the model's family as its name and Anthropic's Models API
   give it. Bedrock and Google Cloud set their own retirement dates
   (`lifecycle: :partner` on those platforms); Foundry and Claude
-  Platform on AWS follow Anthropic's. Platform entries carry ids only
-  where a page gave one; Bedrock's are its Messages endpoint's.
+  Platform on AWS follow Anthropic's.
+
+  The platform ids follow one scheme, the endpoint each platform's
+  Messages client sends to:
+
+  - `bedrock:` is Bedrock's Messages endpoint (`bedrock-mantle`), whose
+    ids are `anthropic.<id>`. A model Bedrock serves only through
+    InvokeModel (Opus 4.6, Sonnet 4.6, the 4.5 snapshots, and older,
+    with `-v1:0` ids behind an inference profile) has no `bedrock:`
+    entry, since Clementine's Bedrock client will send to the Messages
+    endpoint (OPS-195).
+  - `vertex:` takes the dateless id from the 4.6 generation on and
+    `<alias>@<date>` before it.
+  - `foundry:` takes the id as its default deployment name, and has no
+    mid-conversation system messages (the page lists the Claude API,
+    Bedrock, Google managed, and Claude Platform on AWS).
+  - `claude_on_aws:` takes the Claude API's id.
+
+  A retired id keeps a stub sheet (`lifecycle: [status: :retired]`) so
+  naming it fails with the replacement Anthropic names.
   """
 
   @read ~D[2026-11-01]
@@ -47,10 +72,49 @@ defmodule Clementine.Models.Anthropic do
 
   @features [tool_search: true, structured_outputs: true]
 
+  # Foundry has no mid-conversation system messages, on any model.
+  @foundry [features: [mid_conversation_system: false]]
+
+  # Anthropic's retired ids, with the dates and replacement the
+  # deprecations page gives.
+  @retired [
+    {"claude-opus-4-1-20250805", "Claude Opus 4.1", :opus, ~D[2026-06-05], ~D[2026-08-05],
+     "claude-opus-4-8"},
+    {"claude-opus-4-20250514", "Claude Opus 4", :opus, ~D[2026-04-14], ~D[2026-06-15],
+     "claude-opus-4-8"},
+    {"claude-sonnet-4-20250514", "Claude Sonnet 4", :sonnet, ~D[2026-04-14], ~D[2026-06-15],
+     "claude-sonnet-5-5"},
+    {"claude-3-7-sonnet-20250219", "Claude Sonnet 3.7", :sonnet, ~D[2025-10-28], ~D[2026-02-19],
+     "claude-sonnet-5-5"},
+    {"claude-3-5-haiku-20241022", "Claude Haiku 3.5", :haiku, ~D[2025-12-19], ~D[2026-02-19],
+     "claude-haiku-4-5-20251001"},
+    {"claude-3-haiku-20240307", "Claude Haiku 3", :haiku, ~D[2026-02-19], ~D[2026-04-20],
+     "claude-haiku-4-5-20251001"},
+    {"claude-3-5-sonnet-20241022", "Claude Sonnet 3.5", :sonnet, ~D[2025-08-13], ~D[2025-10-28],
+     "claude-sonnet-5-5"},
+    {"claude-3-5-sonnet-20240620", "Claude Sonnet 3.5", :sonnet, ~D[2025-08-13], ~D[2025-10-28],
+     "claude-sonnet-5-5"},
+    {"claude-3-opus-20240229", "Claude Opus 3", :opus, ~D[2025-06-30], ~D[2026-01-05],
+     "claude-opus-4-8"},
+    {"claude-3-sonnet-20240229", "Claude Sonnet 3", :sonnet, ~D[2025-01-21], ~D[2025-07-21],
+     "claude-sonnet-5-5"},
+    {"claude-2.1", "Claude 2.1", nil, ~D[2025-01-21], ~D[2025-07-21], "claude-opus-4-8"},
+    {"claude-2.0", "Claude 2.0", nil, ~D[2025-01-21], ~D[2025-07-21], "claude-opus-4-8"}
+  ]
+  @retired_1 ["claude-1.0", "claude-1.1", "claude-1.2", "claude-1.3"] ++
+               ["claude-instant-1.0", "claude-instant-1.1", "claude-instant-1.2"]
+
   @doc false
   # The sheets in keyword form, newest first within each line.
   @spec sheets() :: [keyword()]
   def sheets do
+    # Not on Claude Platform on AWS.
+    # The same model as Fable 5, for verified customers.
+    # Not on Claude Platform on AWS.
+    # An invitation-only research preview with no model page; the
+    # deprecations page sets no retirement date and names no
+    # replacement. Its system-message support is in the page's table
+    # but not its prose, so skill loads fold here.
     ([
        [
          id: "claude-fable-5-1",
@@ -81,9 +145,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_5_1,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
-         platforms:
-           [anthropic: [], bedrock: [id: "anthropic.claude-mythos-5-1", lifecycle: :partner]] ++
-             [vertex: [lifecycle: :partner], foundry: []],
+         platforms: Keyword.delete(platforms("claude-mythos-5-1"), :claude_on_aws),
          source: "#{@models}/mythos-5-1/overview"
        ],
        [
@@ -170,6 +232,58 @@ defmodule Clementine.Models.Anthropic do
          source: "#{@models}/sonnet-5/overview"
        ],
        [
+         id: "claude-fable-5",
+         vendor: :anthropic,
+         line: :fable,
+         display_name: "Claude Fable 5",
+         released_on: ~D[2026-06-09],
+         lifecycle: [status: :active, retires_not_before: ~D[2027-06-09]],
+         context: 1_000_000,
+         max_output: 128_000,
+         thinking: thinking(:adaptive, [:adaptive]),
+         rejects: @rejects_4_7,
+         features: [mid_conversation_system: true] ++ @features,
+         cache: [min_prefix: 512, ttls: @ttls],
+         platforms: platforms("claude-fable-5"),
+         source: "#{@models}/fable-5/overview"
+       ],
+       [
+         id: "claude-mythos-5",
+         vendor: :anthropic,
+         line: :mythos,
+         display_name: "Claude Mythos 5",
+         released_on: ~D[2026-06-09],
+         lifecycle: [status: :active, retires_not_before: ~D[2027-06-09]],
+         context: 1_000_000,
+         max_output: 128_000,
+         thinking: thinking(:adaptive, [:adaptive]),
+         rejects: @rejects_4_7,
+         features: [mid_conversation_system: true] ++ @features,
+         cache: [min_prefix: 512, ttls: @ttls],
+         platforms: Keyword.delete(platforms("claude-mythos-5"), :claude_on_aws),
+         source: "#{@models}/mythos-5/overview"
+       ],
+       [
+         id: "claude-mythos-preview",
+         vendor: :anthropic,
+         line: :mythos,
+         display_name: "Claude Mythos Preview",
+         released_on: ~D[2026-04-07],
+         lifecycle: [status: :deprecated, deprecated_on: ~D[2026-06-09]],
+         context: 1_000_000,
+         max_output: 128_000,
+         thinking:
+           thinking(:adaptive, [:adaptive, :enabled], efforts: [:low, :medium, :high, :max]),
+         rejects: [:temperature, :top_p, :top_k, :prefill],
+         features: [mid_conversation_system: false] ++ @features,
+         cache: [min_prefix: 2048, ttls: @ttls],
+         platforms: [
+           anthropic: [],
+           bedrock: [id: "anthropic.claude-mythos-preview", lifecycle: :partner]
+         ],
+         source: @deprecations
+       ],
+       [
          id: "claude-opus-4-8",
          vendor: :anthropic,
          line: :opus,
@@ -186,6 +300,22 @@ defmodule Clementine.Models.Anthropic do
          source: "#{@models}/opus-4-8/overview"
        ],
        [
+         id: "claude-opus-4-7",
+         vendor: :anthropic,
+         line: :opus,
+         display_name: "Claude Opus 4.7",
+         released_on: ~D[2026-04-16],
+         lifecycle: [status: :active, retires_not_before: ~D[2027-04-16]],
+         context: 1_000_000,
+         max_output: 128_000,
+         thinking: thinking(:off, [:adaptive, :off]),
+         rejects: @rejects_4_7,
+         features: [mid_conversation_system: false] ++ @features,
+         cache: [min_prefix: 2048, ttls: @ttls],
+         platforms: platforms("claude-opus-4-7"),
+         source: "#{@models}/opus-4-7/overview"
+       ],
+       [
          id: "claude-opus-4-6",
          vendor: :anthropic,
          line: :opus,
@@ -198,7 +328,12 @@ defmodule Clementine.Models.Anthropic do
          rejects: [:prefill],
          features: @features,
          cache: [min_prefix: 4096, ttls: @ttls],
-         platforms: [anthropic: [], vertex: [lifecycle: :partner], foundry: [], claude_on_aws: []],
+         platforms: [
+           anthropic: [],
+           vertex: [lifecycle: :partner],
+           foundry: @foundry,
+           claude_on_aws: []
+         ],
          source: "#{@models}/opus-4-6/overview"
        ],
        [
@@ -214,7 +349,12 @@ defmodule Clementine.Models.Anthropic do
          rejects: [:prefill],
          features: @features,
          cache: [min_prefix: 1024, ttls: @ttls],
-         platforms: [anthropic: [], vertex: [lifecycle: :partner], foundry: [], claude_on_aws: []],
+         platforms: [
+           anthropic: [],
+           vertex: [lifecycle: :partner],
+           foundry: @foundry,
+           claude_on_aws: []
+         ],
          source: "#{@models}/sonnet-4-6/overview"
        ]
      ] ++
@@ -273,62 +413,47 @@ defmodule Clementine.Models.Anthropic do
            source: "#{@models}/haiku-4-5/overview"
          ],
          "20251001",
-         bedrock: [id: "anthropic.claude-haiku-4-5", lifecycle: :partner]
+         # Bedrock's Messages endpoint serves the alias only; the
+         # snapshot is InvokeModel's.
+         alias: [bedrock: [id: "anthropic.claude-haiku-4-5", lifecycle: :partner]]
        ) ++
-       [
-         # Retired on the Claude API; Bedrock and Google Cloud still serve
-         # them on their own schedules. No page still lists their ceilings.
-         [
-           id: "claude-opus-4-1-20250805",
-           vendor: :anthropic,
-           line: :opus,
-           display_name: "Claude Opus 4.1",
-           lifecycle: [
-             status: :retired,
-             deprecated_on: ~D[2026-06-05],
-             retires_on: ~D[2026-08-05],
-             replacement: "claude-opus-4-8"
-           ],
-           features: [tool_search: false],
-           cache: [min_prefix: 1024],
-           platforms: [
-             anthropic: [],
-             bedrock: [id: "anthropic.claude-opus-4-1-20250805-v1:0", lifecycle: :partner]
-           ],
-           source: @deprecations
-         ],
-         [
-           id: "claude-sonnet-4-20250514",
-           vendor: :anthropic,
-           line: :sonnet,
-           display_name: "Claude Sonnet 4",
-           lifecycle: [
-             status: :retired,
-             deprecated_on: ~D[2026-04-14],
-             retires_on: ~D[2026-06-15],
-             replacement: "claude-sonnet-5-5"
-           ],
-           features: [tool_search: false],
-           cache: [min_prefix: 1024],
-           platforms: [
-             anthropic: [],
-             bedrock: [id: "anthropic.claude-sonnet-4-20250514-v1:0", lifecycle: :partner]
-           ],
-           source: @deprecations
-         ]
-       ])
+       Enum.map(@retired, &retired/1) ++
+       Enum.map(
+         @retired_1,
+         &retired({&1, nil, nil, ~D[2024-09-04], ~D[2024-11-06], "claude-haiku-4-5-20251001"})
+       ))
     |> Enum.map(&Keyword.put(&1, :read, @read))
   end
 
-  # The 4.8 generation on: dateless ids everywhere, `anthropic.<id>` on
-  # Bedrock's Messages endpoint.
+  # Opus 4.7 on: dateless ids everywhere, `anthropic.<id>` on Bedrock's
+  # Messages endpoint.
   defp platforms(id) do
     [
       anthropic: [],
       bedrock: [id: "anthropic." <> id, lifecycle: :partner],
       vertex: [lifecycle: :partner],
-      foundry: [],
+      foundry: @foundry,
       claude_on_aws: []
+    ]
+  end
+
+  # A stub for an id Anthropic retired: naming it fails with the
+  # replacement. Bedrock and Google Cloud may still serve some, on their
+  # own schedules, through endpoints Clementine does not send to.
+  defp retired({id, display_name, line, deprecated_on, retired_on, replacement}) do
+    [
+      id: id,
+      vendor: :anthropic,
+      line: line,
+      display_name: display_name,
+      lifecycle: [
+        status: :retired,
+        deprecated_on: deprecated_on,
+        retires_on: retired_on,
+        replacement: replacement
+      ],
+      platforms: [anthropic: []],
+      source: @deprecations
     ]
   end
 
@@ -373,22 +498,23 @@ defmodule Clementine.Models.Anthropic do
   # A model before the 4.6 generation goes by a dateless alias and a
   # dated snapshot: two ids, one set of facts. Vertex takes
   # `<alias>@<date>`; Foundry and Claude Platform on AWS take the alias.
-  defp dated(sheet, date, extra \\ []) do
+  # `alias:` names platforms that serve the alias only.
+  defp dated(sheet, date, opts \\ []) do
     alias_id = Keyword.fetch!(sheet, :id)
     snapshot = "#{alias_id}-#{date}"
 
-    platforms =
-      [
-        vertex: [id: "#{alias_id}@#{date}", lifecycle: :partner],
-        foundry: [id: alias_id],
-        claude_on_aws: [id: alias_id]
-      ] ++ extra
+    platforms = [
+      anthropic: [],
+      vertex: [id: "#{alias_id}@#{date}", lifecycle: :partner],
+      foundry: [id: alias_id] ++ @foundry,
+      claude_on_aws: [id: alias_id]
+    ]
 
     [
-      Keyword.put(sheet, :platforms, [{:anthropic, []} | platforms]),
+      Keyword.put(sheet, :platforms, platforms ++ Keyword.get(opts, :alias, [])),
       sheet
       |> Keyword.put(:id, snapshot)
-      |> Keyword.put(:platforms, [{:anthropic, []} | platforms])
+      |> Keyword.put(:platforms, platforms)
     ]
   end
 end

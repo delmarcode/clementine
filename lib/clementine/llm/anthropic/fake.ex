@@ -83,8 +83,8 @@ defmodule Clementine.LLM.Anthropic.Fake do
 
     # The client reports what it dropped before the API answers, so the
     # engine's telemetry sees a drop the strict check then refuses.
-    case checked(body, dropped, fake_opts) do
-      {:ok, body} -> Binding.events(binding, dropped) ++ turn(body, script)
+    case checked(model, body, dropped, fake_opts) do
+      {:ok, body} -> Binding.events(binding, dropped) ++ turn(model, body, script)
       {:error, error} -> Binding.events(nil, dropped) ++ [{:error, error}]
     end
   end
@@ -98,17 +98,17 @@ defmodule Clementine.LLM.Anthropic.Fake do
   def check(model, system, messages, tools, opts \\ [], fake_opts \\ []) do
     {body, _binding, dropped} = Anthropic.request(model, system, messages, tools || [], opts)
 
-    with {:ok, _body} <- checked(body, dropped, fake_opts), do: :ok
+    with {:ok, _body} <- checked(model, body, dropped, fake_opts), do: :ok
   end
 
   ## The check
 
-  defp checked(body, dropped, fake_opts) do
+  defp checked(model, body, dropped, fake_opts) do
     fake_opts = Keyword.validate!(fake_opts, strict: true)
 
     with :ok <- check_dropped(dropped, fake_opts[:strict]),
          :ok <- check_system_messages(body["messages"]) do
-      if facts(body).binding == :prefix, do: check_thinking(body), else: {:ok, body}
+      if facts(model).binding == :prefix, do: check_thinking(body), else: {:ok, body}
     end
   end
 
@@ -246,8 +246,8 @@ defmodule Clementine.LLM.Anthropic.Fake do
 
   ## The turn
 
-  defp turn(body, script) do
-    display = display(body)
+  defp turn(model, body, script) do
+    display = display(model, body)
     request = without_continuation(body["messages"])
     digest = Enum.reduce(request, start(body), &chain(&2, &1))
     previous = last_signature(body["messages"])
@@ -297,13 +297,15 @@ defmodule Clementine.LLM.Anthropic.Fake do
      ], previous}
   end
 
-  defp display(%{"thinking" => %{"type" => "between_tools"}}), do: "between_tools"
-  defp display(%{"thinking" => %{"display" => display}}), do: display
+  defp display(_model, %{"thinking" => %{"type" => "between_tools"}}), do: "between_tools"
+  defp display(_model, %{"thinking" => %{"display" => display}}), do: display
 
-  defp display(body), do: to_string(facts(body).display || :summarized)
+  defp display(model, _body), do: to_string(facts(model).display || :summarized)
 
-  # The thinking facts of the model a request names (`Clementine.Model`).
-  defp facts(%{"model" => id}) do
+  # The thinking facts of the model the request is for, by its id: the
+  # body names the id it goes by on its platform, which an override may
+  # change.
+  defp facts(id) do
     case Clementine.Models.get(id) do
       %Clementine.Model{thinking: thinking} -> thinking
       nil -> %{binding: :none, display: nil}

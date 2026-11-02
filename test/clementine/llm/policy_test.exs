@@ -127,7 +127,12 @@ defmodule Clementine.LLM.PolicyTest do
     test "an effort the model lacks, and between_tools above high" do
       assert refused("gpt-6-astra", effort: :none) =~ "takes effort [:low, :medium"
       assert refused("claude-haiku-4-5", effort: :low) =~ "takes no effort setting"
-      assert refused("claude-sonnet-5", effort: :extreme) =~ "effort: takes one of"
+
+      assert refused("claude-sonnet-5", effort: :extreme) =~
+               "takes effort [:low, :medium, :high, :xhigh, :max], got: :extreme"
+
+      assert refused("claude-sonnet-5", effort: "high") =~
+               "effort: takes one of the model's levels"
 
       assert refused("claude-sonnet-5-5", thinking: :between_tools, effort: :xhigh) =~
                "thinking: :between_tools takes effort up to :high, got: :xhigh"
@@ -308,7 +313,9 @@ defmodule Clementine.LLM.PolicyTest do
 
     test "every shipped model that is not retired resolves with no choices at all" do
       for model <- Models.list(), model.lifecycle.status != :retired do
-        assert {:ok, %Policy{}} = Policy.resolve(model), model.id
+        # A model that does not stream resolves for a call that does not.
+        stream? = model.features.streaming
+        assert {:ok, %Policy{}} = Policy.resolve(model, [], stream: stream?), model.id
       end
     end
 
@@ -345,6 +352,34 @@ defmodule Clementine.LLM.PolicyTest do
 
       assert {:ok, %Policy{max_tokens: 16_000, effort: nil}} = Policy.resolve("gpt-6-astra")
       assert {:ok, %Policy{max_tokens: 16_000, thinking: :off}} = Policy.resolve("gpt-4.1")
+    end
+  end
+
+  describe "OpenAI facts read 2026-11-01" do
+    test "a model that does not stream is refused for an agent, not for call/5" do
+      assert refused("gpt-5.5-pro") =~ "does not stream, and an agent's runs always do"
+
+      assert_raise ArgumentError, ~r/new\/1: "gpt-5.5-pro": does not stream/, fn ->
+        Clementine.Agent.new(model: "gpt-5.5-pro")
+      end
+
+      assert {:ok, %Policy{}} = Policy.resolve("gpt-5.5-pro", [], stream: false)
+    end
+
+    test "summary: :concise is for reasoning models after gpt-5; generate_summary is gone" do
+      assert {:ok, %Policy{}} = Policy.resolve("gpt-5.1", provider_options: [summary: :concise])
+
+      for id <- ~w(gpt-5 gpt-5-mini gpt-5-pro) do
+        assert refused(id, provider_options: [summary: :concise]) =~
+                 "refuses provider_options: [summary: :concise]"
+
+        assert {:ok, %Policy{}} = Policy.resolve(id, provider_options: [summary: :detailed])
+      end
+
+      assert refused("gpt-4.1", provider_options: [summary: :auto]) =~ "does not reason"
+
+      assert refused("gpt-6.1-sol", provider_options: [generate_summary: :auto]) =~
+               "unknown options"
     end
   end
 end

@@ -263,10 +263,41 @@ defmodule Clementine.LLM.PricingTest do
       assert {:error, message} = Policy.resolve("openai.gpt-5.6", cache: [ttl: :twelve_hours])
       assert message =~ "is not sent on :bedrock"
 
+      # Prices are the model's and caching the agent's: an agent with
+      # caching off runs, and writes its provider still reports are
+      # priced at the shortest TTL.
       for id <- ["gpt-5.6-sol", "openai.gpt-5.6"] do
-        assert {:error, message} = Policy.resolve(id, cache: false)
-        assert message =~ "give one cache_write rate"
+        assert {:ok, %Policy{cache: %{enabled: false, ttl: nil}}} =
+                 Policy.resolve(id, cache: false)
+
+        assert %Pricing{cache_write: 2_500_000} =
+                 Pricing.of(Trace.resolve_model(id, cache: false))
       end
+    end
+
+    test "an agent with caching off runs on a model with per-TTL prices" do
+      put_models(%{
+        "claude-opus-5-5" => [
+          prices: [
+            currency: "USD",
+            input: 3.60,
+            output: 18.00,
+            cache_read: 0.18,
+            cache_write: [one_hour: 7.20, five_minutes: 4.50]
+          ]
+        ]
+      })
+
+      agent = Agent.new(model: "claude-opus-5-5", cache: false)
+      assert Agent.policy(agent) == [cache: false]
+
+      assert %Pricing{cache_write: 4_500_000} =
+               Pricing.of(Trace.resolve_model(agent.model, Agent.policy(agent)))
+
+      # A write the provider reports anyway costs the five-minute rate.
+      usage = %Clementine.Usage{input_tokens: 1_000_000, cache_write_tokens: 1_000_000}
+      pricing = Pricing.of(Trace.resolve_model(agent.model, cache: false))
+      assert %Clementine.Cost{micros: 4_500_000} = Clementine.Cost.price(usage, pricing)
     end
 
     test "a per-TTL cache_write on a model whose writes carry no TTL fails the agent" do

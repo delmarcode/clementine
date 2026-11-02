@@ -14,8 +14,8 @@ defmodule Clementine.LLM.Reasoning do
     `budget_tokens`; `:between_tools` takes no other field. Effort goes
     whenever the policy has one, so a vendor's recalibrated default
     never moves an agent.
-  - OpenAI's Responses API: `reasoning.effort`, `reasoning.summary`, and
-    `reasoning.generate_summary`.
+  - OpenAI's Responses API: `reasoning.effort` and `reasoning.summary`
+    (the reference deprecates `generate_summary` for it).
   - Chat Completions: OpenRouter's `reasoning` object (`effort`, and its
     `max_tokens`, `exclude`, and `enabled`); every other platform's
     `reasoning_effort`.
@@ -73,7 +73,6 @@ defmodule Clementine.LLM.Reasoning do
       %{}
       |> put("effort", policy.effort && to_string(policy.effort))
       |> put_option(policy, :summary)
-      |> put_option(policy, :generate_summary)
 
     put(%{}, "reasoning", if(reasoning != %{}, do: reasoning))
   end

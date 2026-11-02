@@ -40,9 +40,29 @@ end
 There is no alias, no job registry, and no default model. The agent is
 the job: its key labels its runs, its traces, and its metrics, and two
 agents that share a choice share a module attribute. `use` defines
-`__model__/0`, and the runtime fills the model and any choice an
-`agent/1` leaves unset from the module's `use`, so an eval passes a
-model per run and keeps the agent's policy.
+`__model__/0`.
+
+`use`'s choices are for `use`'s model. The runtime fills them in when an
+`agent/1` leaves the model to `use` or names the same one: each choice
+`agent/1` leaves unset, and `provider_options` key by key. When
+`agent/1` picks another model for a run (an eval's `--model`), none of
+them applies, since an effort or a TTL one model takes another may
+refuse; that run takes the model's defaults and whatever `agent/1`
+sets. An error says where the refused choice came from: `use`,
+`Agent.new/1`, or the model `agent/1` picked for the run.
+
+`Clementine.run/3` and `stream/3` take the module as well as a struct
+(`Clementine.run(MyApp.Agents.Triage, prompt, run: run)`), and complete
+its agent the same way. Either form is checked whole before anything
+runs; an agent with no model raises there rather than at the first
+call.
+
+Where each check runs: `use` at compile time, with compile-time config,
+so a model only `config/runtime.exs` declares compiles and is checked at
+boot; `Agent.new/1` as far as the choices it has allow (a
+`thinking: :enabled` whose `budget_tokens` `use` gives passes there);
+boot, for every agent's `use`; the start of every run, whole; and each
+request.
 
 | Choice | Default | Checked against the sheet |
 |---|---|---|
@@ -52,7 +72,7 @@ model per run and keeps the agent's policy.
 | `thinking` | `:adaptive` where the model takes it, else the model's own default | `thinking.types`; a refusal names what to use instead |
 | `display` | the model's own (`:omitted` from Claude 4.7 on, `:summarized` before) | `:omitted`, `:summarized`, `:updates` (sends its beta), with adaptive or enabled thinking |
 | `cache` | `true`: the model's shortest TTL on its platform | `cache.ttls`, and the model's prices per TTL |
-| `provider_options` | `[]` | per vendor: Anthropic's `budget_tokens` (implies `thinking: :enabled`) and `prefix_mismatch`; OpenAI's `summary` and `generate_summary`; OpenRouter's `max_tokens`, `exclude`, `enabled` |
+| `provider_options` | `[]` | per vendor: Anthropic's `budget_tokens` (implies `thinking: :enabled`; at least 1,024 and below `max_tokens`) and `prefix_mismatch`; OpenAI's `summary` (`:concise` only after GPT-5; the reference deprecates `generate_summary`, which Clementine no longer takes); OpenRouter's `max_tokens`, `exclude`, `enabled` |
 
 `Clementine.LLM.call/5` and `stream/5` take the same keys as per-call
 opts, for scripts and evals.
@@ -82,7 +102,8 @@ Clementine.Models.get!("claude-sonnet-5-5")
 #=>               efforts: [:low, :medium, :high, :xhigh, :max], default_effort: :high,
 #=>               max_effort: %{between_tools: :high}, binding: :prefix, display: :omitted},
 #=>   rejects: [:temperature, :top_p, :top_k, :prefill, :forced_tool_choice, :budget_tokens],
-#=>   features: %{tool_search: true, structured_outputs: true, mid_conversation_system: true},
+#=>   features: %{tool_search: true, structured_outputs: true, mid_conversation_system: true,
+#=>               streaming: true},
 #=>   cache: %{min_prefix: 512, ttls: [:five_minutes, :one_hour]},
 #=>   platforms: [anthropic: %{...}, bedrock: %{id: "anthropic.claude-sonnet-5-5", lifecycle: :partner}, ...],
 #=>   source: "https://platform.claude.com/docs/en/models/sonnet-5-5/overview", read: ~D[2026-11-01]
@@ -95,8 +116,8 @@ the facts. Shipped today, read 2026-11-01:
 
 | Vendor | Active | Deprecated | Retired |
 |---|---|---|---|
-| Anthropic | `claude-fable-5-1`, `claude-mythos-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-opus-4-5` (and `-20251101`), `claude-haiku-4-5` (and `-20251001`) | `claude-sonnet-4-5` (and `-20250929`), retiring 2026-11-30 | `claude-opus-4-1-20250805`, `claude-sonnet-4-20250514` |
-| OpenAI | `gpt-6.1-terra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4-mini` | `gpt-5` (shuts down 2026-12-11), `gpt-4.1` (2027-01-14) | |
+| Anthropic | `claude-fable-5-1`, `claude-mythos-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`, `claude-mythos-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-opus-4-5` (and `-20251101`), `claude-haiku-4-5` (and `-20251001`) | `claude-mythos-preview` (no date set), `claude-sonnet-4-5` (and `-20250929`), retiring 2026-11-30 | `claude-opus-4-1-20250805`, `claude-opus-4-20250514`, `claude-sonnet-4-20250514`, and every older id the deprecations page lists (Claude 3.x, 2.x, 1.x, Instant), each naming its replacement |
+| OpenAI | `gpt-6.1-terra`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro` (does not stream, so no agent runs it), `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.2`, `gpt-5.2-pro` | `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro` (shut down 2026-12-11), `gpt-4.1`, `gpt-4.1-mini` (2027-01-14), `gpt-5.1`, `gpt-5.4-nano` (2027-04-01) | `o4-mini`, `gpt-4.1-nano` (shut down 2026-10-23) |
 
 The read side:
 
@@ -114,7 +135,14 @@ or, for a model an app declares, the first platform it lists that
 Clementine can send to: `:openrouter`, `:bedrock`, `:vertex`, or
 `:openai_compatible`. The `bedrock`, `vertex`, `foundry`, and
 `claude_on_aws` entries on Claude sheets are facts for now; an agent
-picks a platform when `Clementine.Platform` arrives.
+picks a platform when `Clementine.Platform` arrives. Their ids follow
+one scheme, the endpoint each platform's Messages client will send to:
+`bedrock:` is Bedrock's Messages endpoint (`anthropic.<id>`), so a
+model Bedrock serves only through InvokeModel (Opus 4.6, Sonnet 4.6,
+the 4.5 snapshots, older) has no entry; `vertex:` is the dateless id
+from the 4.6 generation on and `<alias>@<date>` before it; `foundry:`
+is the default deployment name, and takes no mid-conversation system
+messages; `claude_on_aws:` is the Claude API's id.
 
 ## Boot, build, and the clock
 
@@ -219,7 +247,42 @@ true of it:
 A platform entry takes `id:` (default: the model's id), `features:` and
 `cache:` deltas, `lifecycle: :partner` (the platform sets its own
 retirement dates), and, on the Chat Completions platforms, `base_url:`
-and `api_key:` over the platform's app config.
+and `api_key:` over the platform's app config. Those two are a stopgap
+until platforms own their endpoints and credentials (OPS-195): prefer
+`{:system, "VAR"}` to a literal key, which `inspect/2` on the model
+redacts but which still sits in config.
+
+### A new model the day it ships
+
+A vendor's new model needs no Clementine release. Declare it with
+`based_on:` the shipped sheet it succeeds: the declaration starts from
+that sheet's facts (thinking, efforts, binding, rejects, features,
+cache, platforms), overrides what it names, and goes by the new id.
+
+```elixir
+config :clementine, :models, %{
+  "claude-sonnet-6" => [
+    based_on: "claude-sonnet-5-5",
+    display_name: "Claude Sonnet 6",
+    released_on: ~D[2027-01-12],
+    thinking: [default_effort: :medium]
+  ]
+}
+```
+
+What names the base model stays behind: its `display_name`,
+`released_on`, `lifecycle`, `prices`, `source`, and `read`, and the id
+each platform gives it, so every platform takes the new id unless the
+declaration gives one (`platforms: [bedrock: [id: "anthropic.claude-sonnet-6"]]`).
+A bare declaration, without `based_on:`, knows none of a Claude model's
+facts: no efforts, no binding, no tool search, no TTLs. When the next
+Clementine release ships the model's sheet, delete the declaration.
+
+A declaration may name an effort level Clementine does not
+(`thinking: [efforts: [..., :ultra]]`): it goes to the wire as written,
+and ranks where the sheet lists it. Thinking types, TTLs, platforms,
+and rejected features stay closed, because each needs the client to do
+something new; a vendor's new one waits for a Clementine release.
 
 ## Platforms and credentials
 
@@ -431,7 +494,10 @@ config :clementine, :models, %{
   none takes one rate.
 
   A per-TTL `cache_write` without the rate for an agent's TTL, or naming
-  a TTL the model does not offer, fails the build and boot.
+  a TTL the model does not offer, fails the build and boot. Prices are
+  the model's and caching the agent's, so an agent with `cache: false`
+  runs on a model priced per TTL, and writes its provider reports anyway
+  are priced at the shortest TTL the prices name.
 
 **How a call is priced.** `input_tokens` counts every input token, cached
 or not, and the cache reads and writes are parts of it

@@ -34,9 +34,36 @@ defmodule Clementine.Models do
   binds nothing, has no structured outputs, and caches on its own
   (`Clementine.Model`). `docs/MODELS.md` has every key.
 
+  ## A new model the day it ships
+
+  A declaration with `based_on:` starts from a shipped sheet: the base's
+  facts, the declaration's merged over them as an override's are, under
+  the new id. What names the base model itself does not carry over: its
+  `display_name`, `released_on`, `lifecycle`, `prices`, `source`, and
+  `read`, and the id each platform gives it (each platform takes the new
+  id unless the declaration gives one):
+
+      config :clementine, :models, %{
+        "claude-sonnet-6" => [
+          based_on: "claude-sonnet-5-5",
+          display_name: "Claude Sonnet 6",
+          released_on: ~D[2027-01-12],
+          thinking: [default_effort: :medium]
+        ]
+      }
+
+  The next Clementine release ships the model's own sheet, and the
+  declaration can go.
+
   An id with no sheet and no declaration is an error wherever it is
-  named: at `Clementine.Agent.new/1`, at boot, and at request time.
-  Config is read when a model is asked for, so a test may change it.
+  named: at `Clementine.Agent.new/1`, at boot, and at request time. A
+  `use Clementine.Agent` builds its agent at compile time, when only
+  compile-time config is read, so there an id it does not know is left
+  to boot: a model declared in `config/runtime.exs` compiles.
+
+  Config is read when a model is asked for, so a test may change it. A
+  process keeps the last model it built for each declared or overridden
+  id, and builds it again only when that id's config changes.
   """
 
   alias Clementine.Model
@@ -51,6 +78,9 @@ defmodule Clementine.Models do
   # Facts an override merges into key by key; every other fact it
   # replaces.
   @nested [:lifecycle, :thinking, :features, :cache]
+
+  # The facts of a `based_on:` base that name the base model itself.
+  @identity [:display_name, :released_on, :lifecycle, :prices, :source, :read]
 
   @doc """
   The model `id` names, with the app's override merged in, or `nil` for
@@ -82,10 +112,17 @@ defmodule Clementine.Models do
     config = config!()
 
     case {Map.fetch(@sheets, id), Map.fetch(config, id)} do
-      {{:ok, _sheet}, :error} -> {:ok, Map.fetch!(@shipped, id)}
-      {{:ok, sheet}, {:ok, facts}} -> build(id, &override(sheet, &1), facts)
-      {:error, {:ok, facts}} -> build(id, &Keyword.put(&1, :id, id), facts)
-      {:error, :error} -> {:error, unknown(id, config)}
+      {{:ok, _sheet}, :error} ->
+        {:ok, Map.fetch!(@shipped, id)}
+
+      {{:ok, sheet}, {:ok, facts}} ->
+        memo(id, facts, fn -> build(id, &override(sheet, &1), facts) end)
+
+      {:error, {:ok, facts}} ->
+        memo(id, facts, fn -> declare(id, facts) end)
+
+      {:error, :error} ->
+        {:error, unknown(id, config)}
     end
   end
 
@@ -234,6 +271,12 @@ defmodule Clementine.Models do
   defp priced_ttls!(_model), do: :ok
 
   @doc false
+  # Whether `id` names a shipped sheet or a model the app's config (as
+  # read now) overrides or declares.
+  @spec known?(term()) :: boolean()
+  def known?(id), do: Map.has_key?(@sheets, id) or Map.has_key?(config!(), id)
+
+  @doc false
   # The app's overrides and declarations, as config holds them.
   @spec config!() :: %{String.t() => keyword()}
   def config! do
@@ -249,6 +292,52 @@ defmodule Clementine.Models do
               "Invalid :clementine, :models configuration: expected a map from model id to " <>
                 "facts (%{\"claude-sonnet-5-5\" => [...]}), got: #{inspect(other)}"
     end
+  end
+
+  # Building a sheet from config validates every fact, which costs about
+  # a hundred times a shipped lookup; a request names its model twice
+  # (the router, then the client). The process keeps the last build per
+  # id, keyed by that id's config term.
+  defp memo(id, facts, build) do
+    key = {__MODULE__, id}
+
+    case Process.get(key) do
+      {^facts, result} ->
+        result
+
+      _stale_or_none ->
+        result = build.()
+        Process.put(key, {facts, result})
+        result
+    end
+  end
+
+  defp declare(id, facts) do
+    with true <- Keyword.keyword?(facts),
+         {base, facts} when not is_nil(base) <- Keyword.pop(facts, :based_on) do
+      case is_binary(base) && Map.fetch(@sheets, base) do
+        {:ok, sheet} ->
+          build(id, &(sheet |> based_on(id) |> override(&1)), facts)
+
+        _unknown ->
+          {:error,
+           "Invalid :clementine, :models entry #{inspect(id)}: based_on: names " <>
+             "#{inspect(base)}, which is not a shipped sheet (#{inspect(hd(@order))}, say)"}
+      end
+    else
+      _plain -> build(id, &Keyword.put(&1, :id, id), facts)
+    end
+  end
+
+  # A shipped sheet as the base of a new id: its facts, without the ones
+  # that name the base model, and with each platform taking the new id.
+  defp based_on(sheet, id) do
+    sheet
+    |> Keyword.drop(@identity)
+    |> Keyword.put(:id, id)
+    |> Keyword.update!(:platforms, fn platforms ->
+      Enum.map(platforms, fn {name, entry} -> {name, Keyword.delete(entry, :id)} end)
+    end)
   end
 
   defp build(id, merge, facts) when is_list(facts) do
@@ -268,7 +357,7 @@ defmodule Clementine.Models do
   defp build(id, _merge, facts) do
     {:error,
      "Invalid :clementine, :models entry #{inspect(id)}: expected a keyword list of facts " <>
-       "(and no other id:), got: #{inspect(facts)}"}
+       "(and no other id:), got: #{inspect(Model.redact(facts))}"}
   end
 
   defp override(sheet, facts) do

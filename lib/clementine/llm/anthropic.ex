@@ -109,7 +109,7 @@ defmodule Clementine.LLM.Anthropic do
   """
   @impl true
   def call(model, system, messages, tools, opts \\ []) do
-    {body, binding, dropped} = request(model, system, messages, tools, opts)
+    {body, binding, dropped} = request(model, system, messages, tools, opts, stream: false)
     Binding.log_dropped(dropped, inspect(model))
     headers = build_headers(body)
 
@@ -320,8 +320,8 @@ defmodule Clementine.LLM.Anthropic do
   # it sent without its thinking (`Binding.encode/3`). The real client
   # and `Clementine.LLM.Anthropic.Fake` both build requests here, so a
   # test sees exactly what the API would.
-  def request(model, system, messages, tools, opts) do
-    policy = policy!(model, opts)
+  def request(model, system, messages, tools, opts, checks \\ [stream: true]) do
+    policy = policy!(model, opts, checks)
     facts = policy.model
     binds? = facts.thinking.binding == :prefix
     inline? = facts.features.mid_conversation_system
@@ -535,8 +535,8 @@ defmodule Clementine.LLM.Anthropic do
 
   # The agent's choices, checked against the model's sheet; a model
   # Anthropic's client cannot serve is refused before anything is sent.
-  defp policy!(model, opts) do
-    policy = Policy.resolve!(model, opts)
+  defp policy!(model, opts, checks) do
+    policy = Policy.resolve!(model, opts, checks)
 
     if policy.platform != :anthropic do
       raise ArgumentError,

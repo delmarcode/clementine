@@ -49,7 +49,7 @@ defmodule Clementine.LLM.OpenAI do
   """
   @impl true
   def call(model, system, messages, tools, opts \\ []) do
-    body = build_body(model, system, messages, tools, opts)
+    body = build_body(model, system, messages, tools, opts, stream: false)
     headers = build_headers()
 
     retry_opts = Application.get_env(:clementine, :retry, [])
@@ -84,7 +84,9 @@ defmodule Clementine.LLM.OpenAI do
   """
   @impl true
   def stream(model, system, messages, tools, opts \\ []) do
-    body = build_body(model, system, messages, tools, opts) |> Map.put("stream", true)
+    body =
+      build_body(model, system, messages, tools, opts, stream: true) |> Map.put("stream", true)
+
     headers = build_headers()
     # A runner caps this to the execution deadline's remaining budget. It
     # bounds the whole streaming call, not one attempt: per-attempt receive
@@ -207,8 +209,8 @@ defmodule Clementine.LLM.OpenAI do
     min(delay, max_delay)
   end
 
-  defp build_body(model, system, messages, tools, opts) do
-    policy = Policy.resolve!(model, opts)
+  defp build_body(model, system, messages, tools, opts, checks) do
+    policy = Policy.resolve!(model, opts, checks)
 
     if policy.platform != :openai do
       raise ArgumentError, "#{inspect(model)} goes to #{inspect(policy.platform)}, not :openai"

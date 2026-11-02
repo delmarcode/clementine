@@ -144,6 +144,14 @@ defmodule Clementine do
     back to the agent's defaults
   - `:events` - a `Clementine.Events` sink for execution events (default
     `Clementine.Events.Null`)
+  - `:run` - with an agent module, the run its `c:Clementine.Agent.agent/1`
+    builds for (default: a row with only the agent's key and `turn`)
+
+  `agent` is a `Clementine.Agent` struct, or a `use Clementine.Agent`
+  module, whose `c:Clementine.Agent.agent/1` builds the agent and whose
+  `use` completes it as the durable runtime does. Either is checked
+  against its model's sheet before anything runs, and an agent with no
+  model, or a choice the sheet refuses, raises `ArgumentError`.
 
   ## Returns
 
@@ -159,10 +167,11 @@ defmodule Clementine do
 
       result.output
   """
-  @spec run(Clementine.Agent.t(), String.t(), keyword()) ::
+  @spec run(Clementine.Agent.t() | module(), String.t(), keyword()) ::
           {:ok, Result.Completed.t()}
           | {:error, Result.Failed.t() | Result.Cancelled.t() | Result.Interrupted.t()}
-  def run(%Clementine.Agent{} = agent, prompt, opts \\ []) when is_binary(prompt) do
+  def run(agent, prompt, opts \\ []) when is_binary(prompt) do
+    agent = Clementine.Agent.for_run!(agent, opts[:run], "Clementine.run/3")
     {ref, ctx} = Ephemeral.create()
     run = Run.new(ref: ref, rollout: build_rollout(agent, prompt, opts))
 
@@ -197,8 +206,10 @@ defmodule Clementine do
         _ -> :ok
       end)
   """
-  @spec stream(Clementine.Agent.t(), String.t(), keyword()) :: Enumerable.t()
-  def stream(%Clementine.Agent{} = agent, prompt, opts \\ []) when is_binary(prompt) do
+  @spec stream(Clementine.Agent.t() | module(), String.t(), keyword()) :: Enumerable.t()
+  def stream(agent, prompt, opts \\ []) when is_binary(prompt) do
+    agent = Clementine.Agent.for_run!(agent, opts[:run], "Clementine.stream/3")
+
     Stream.resource(
       fn -> start_stream(agent, prompt, opts) end,
       &next_stream_event/1,
