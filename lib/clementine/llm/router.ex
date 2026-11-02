@@ -49,6 +49,16 @@ defmodule Clementine.LLM.Router do
     end
   end
 
+  @doc false
+  # Boot's credential check: `credential/1` where the app routes its
+  # calls here; under another client (a test's mock), none is needed.
+  @spec check_credential(Clementine.LLM.Policy.t()) :: :ok | {:error, String.t()}
+  def check_credential(policy) do
+    if Application.get_env(:clementine, :llm_client, __MODULE__) == __MODULE__,
+      do: credential(policy),
+      else: :ok
+  end
+
   defp credential_key(:anthropic), do: :anthropic_api_key
   defp credential_key(:openai), do: :openai_api_key
   defp credential_key(platform), do: Clementine.LLM.ChatCompletions.api_key_config(platform)

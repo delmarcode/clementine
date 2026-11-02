@@ -2,6 +2,7 @@ defmodule Clementine.Models.WarningsTest do
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
+  import Mox
 
   alias Clementine.Models
   alias Clementine.Models.Warnings
@@ -74,35 +75,49 @@ defmodule Clementine.Models.WarningsTest do
   end
 
   describe "registry/1" do
-    test "warns once the shipped sheets were read more than 120 days ago" do
-      read = Warnings.registry_read()
-      assert read == ~D[2026-11-01]
+    test "warns for each vendor whose shipped sheets were read more than 120 days ago" do
+      assert Warnings.registry_reads() == %{anthropic: ~D[2026-11-01], openai: ~D[2026-11-01]}
 
-      assert Warnings.registry(Date.add(read, 120)) == nil
+      assert Warnings.registry(~D[2027-03-01]) == []
 
-      assert %Warnings{kind: :stale_registry, date: ^read, message: message} =
-               Warnings.registry(Date.add(read, 121))
+      assert [
+               %Warnings{kind: :stale_registry, vendor: :anthropic, date: ~D[2026-11-01]} =
+                 anthropic,
+               %Warnings{kind: :stale_registry, vendor: :openai}
+             ] = Warnings.registry(~D[2027-03-02])
 
-      assert message =~ "last read on 2026-11-01, more than 120 days ago"
-      assert message =~ "mix clementine.models --check"
+      assert anthropic.message =~
+               "Clementine's Anthropic model sheets were last read on 2026-11-01, more than " <>
+                 "120 days ago"
+
+      assert anthropic.message =~ "mix clementine.models --check"
     end
   end
 
-  describe "at_boot/3 and log/2" do
-    test "every declared agent model and offered id, labeled; a model chosen per run gives none" do
-      warnings = Warnings.at_boot([Judge, Screener, Current, PerRow], ["gpt-4.1"], ~D[2026-11-02])
+  describe "for_model/2 on a retired model" do
+    test "gives none: boot refuses it, and its dates are past" do
+      retired = Models.get!("claude-sonnet-4-20250514")
+      assert retired.lifecycle.status == :retired
+      assert retired.lifecycle.retires_on
+
+      assert [] = Warnings.for_model(retired, ~D[2026-11-02])
+    end
+  end
+
+  describe "for_agents/2 and for_offer/2" do
+    test "every declared agent model, labeled; a model chosen per run gives none" do
+      warnings = Warnings.for_agents([Judge, Screener, Current, PerRow], ~D[2026-11-02])
 
       assert Enum.map(warnings, fn {label, warning} -> {label, warning.kind, warning.model} end) ==
                [
                  {~s(agent "judge"), :not_before_passed, "claude-haiku-4-5"},
-                 {~s(agent "screener"), :deprecated, "gpt-5"},
-                 {"offered", :deprecated, "gpt-4.1"}
+                 {~s(agent "screener"), :deprecated, "gpt-5"}
                ]
     end
 
-    test "adds the stale registry, unlabeled" do
-      assert [{nil, %Warnings{kind: :stale_registry}}] =
-               Warnings.at_boot([Current], [], ~D[2027-06-01])
+    test "every offered id, labeled; an unknown one gives none" do
+      assert [{"offered", %Warnings{kind: :deprecated, model: "gpt-4.1"}}] =
+               Warnings.for_offer(["gpt-4.1", "claude-sonet-5-5"], ~D[2026-11-02])
     end
 
     test "a model declared in config warns from its own dates" do
@@ -114,20 +129,82 @@ defmodule Clementine.Models.WarningsTest do
       })
 
       assert [{"offered", %{kind: :deprecated}}, {"offered", %{kind: :retirement_reached}}] =
-               Warnings.at_boot([], ["claude-sonnet-legacy"], ~D[2026-11-02])
+               Warnings.for_offer(["claude-sonnet-legacy"], ~D[2026-11-02])
+    end
+  end
+
+  describe "logging" do
+    setup :set_mox_global
+
+    setup do
+      offer = Application.get_env(:clementine, :offer)
+
+      on_exit(fn ->
+        if offer,
+          do: Application.put_env(:clementine, :offer, offer),
+          else: Application.delete_env(:clementine, :offer)
+
+        for module <- [Judge, Screener], do: :persistent_term.erase({Warnings, :logged, module})
+      end)
     end
 
-    test "log/2 writes one line per warning and returns :ok" do
-      log =
-        capture_log(fn ->
-          assert :ok = Warnings.log([Judge, Screener], [])
-        end)
+    test "log_start/0 writes the offer's warnings, one line each" do
+      Application.put_env(:clementine, :offer, [{"gpt-5", max_tokens: 16_000}, "gpt-5"])
+
+      log = capture_log(fn -> assert :ok = Warnings.log_start() end)
+
+      assert [_one] = Regex.scan(~r/offered: gpt-5 is deprecated/, log)
+      assert log =~ "See mix clementine.models"
+    end
+
+    test "log_start/0 never raises: an offer it cannot read warns" do
+      Application.put_env(:clementine, :offer, {__MODULE__, :raising_offer, []})
+
+      log = capture_log(fn -> assert :ok = Warnings.log_start() end)
+
+      assert log =~ "Clementine could not read its offer's dates: config :clementine, :offer: "
+      assert log =~ "raised RuntimeError: the offer's table is not there yet"
+    end
+
+    test "log_agents/1 writes each agent's warnings, and its runs then log nothing more" do
+      log = capture_log(fn -> assert :ok = Warnings.log_agents([Judge, Screener]) end)
 
       assert log =~ ~s(agent "judge": claude-haiku-4-5's not-sooner-than date, 2026-10-15)
       assert log =~ ~s(agent "screener": gpt-5 is deprecated)
-      assert log =~ "See mix clementine.models"
+
+      assert capture_log(fn -> Warnings.log_first_run(Judge) end) == ""
+    end
+
+    test "an agent module's first Clementine.run/3 or stream/3 logs its warnings, once" do
+      stub(Clementine.LLM.MockClient, :stream, fn _model, _system, _messages, _tools, _opts ->
+        [
+          {:text_delta, "Done."},
+          {:message_delta, %{"stop_reason" => "end_turn"},
+           %{"input_tokens" => 10, "output_tokens" => 5}}
+        ]
+      end)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _completed} = Clementine.run(Judge, "Hi")
+          assert {:ok, _completed} = Clementine.run(Judge, "Hi")
+        end)
+
+      assert [_once] = Regex.scan(~r/agent "judge": claude-haiku-4-5's not-sooner-than/, log)
+
+      log = capture_log(fn -> Clementine.stream(Screener, "Hi") |> Stream.run() end)
+      assert log =~ ~s(agent "screener": gpt-5 is deprecated)
+    end
+
+    test "log_first_run/1 writes an agent's warnings the first time only" do
+      log = capture_log(fn -> assert :ok = Warnings.log_first_run(Screener) end)
+      assert log =~ ~s(agent "screener": gpt-5 is deprecated)
+
+      assert capture_log(fn -> assert :ok = Warnings.log_first_run(Screener) end) == ""
     end
   end
+
+  def raising_offer, do: raise("the offer's table is not there yet")
 
   defp kinds(warnings), do: Enum.map(warnings, & &1.kind)
 end

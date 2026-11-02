@@ -58,9 +58,10 @@ the drain at shutdown.
   with the vendors' Models APIs; `--json` is for CI
   ([docs/MODELS.md](docs/MODELS.md#adopting-a-new-model)).
 - An agent whose model comes from data (a stored row) names it in
-  `agent/1`. List the ids such agents may pick under `config :clementine,
-  :offer`, as a function reading the app's own offer (`{MyApp.Models,
-  :offered, []}`), so boot checks them and the report shows them.
+  `agent/1`. List the models such agents may pick under `config
+  :clementine, :offer`, as ids or `{id, choices}`, or as a function that
+  reads the app's own offer from config (`{MyApp.Models, :offer, []}`),
+  so boot checks them and the report shows them.
 - To run an agent module in process (an eval, a test), pass the module:
   `Clementine.run(MyApp.Agents.Triage, prompt, run: run)` completes its
   `agent/1` from `use` as the runtime does. A bare `Agent.new/1` with no

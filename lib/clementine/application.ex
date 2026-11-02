@@ -12,6 +12,11 @@ defmodule Clementine.Application do
     # checked when it is built, and again at the child spec's start.
     Clementine.Models.validate_config!()
 
+    # What is ending only warns, and never stops the start: sheets read
+    # long ago, and the dates of the models the app offers. Each agent's
+    # model warns when the runtime starts it, or on its first run.
+    Clementine.Models.Warnings.log_start()
+
     children = [
       # Task supervisor for tool execution
       {Task.Supervisor, name: Clementine.TaskSupervisor},

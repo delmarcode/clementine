@@ -298,44 +298,97 @@ defmodule Clementine.Models do
   end
 
   @doc """
-  The model ids the app offers: the ones a tenant or an eval may pick
-  where the app builds agents from data (stored rows) rather than
-  declaring each one's model on `use Clementine.Agent`. The offer is the
-  app's; `config :clementine, :offer` points Clementine at it, as a list
-  of ids or a `{module, function, args}` that returns one:
+  The models the app offers, each with the choices an agent built on it
+  makes: the ones a tenant or an eval may pick where the app builds
+  agents from data (stored rows) rather than declaring each one's model
+  on `use Clementine.Agent`. The offer is the app's; `config :clementine,
+  :offer` points Clementine at it, as a list or as a
+  `{module, function, args}` that returns one:
 
-      config :clementine, :offer, {MyApp.Models, :offered, []}
+      config :clementine, :offer, [
+        "claude-sonnet-5-5",
+        {"claude-opus-5-5", max_tokens: 64_000}
+      ]
 
-  `{Clementine, ...}` checks each offered id when it starts, as it checks
-  an agent's model with the model's defaults (an unknown or retired id
-  fails boot), and warns for each as for an agent's
-  (`Clementine.Models.Warnings`); `mix clementine.models` reports each
-  beside the agents. Without the config the offer is empty.
+      config :clementine, :offer, {MyApp.Models, :offer, []}
+
+  An entry is a model id, which runs with the model's defaults, or
+  `{id, choices}`, with an agent's choices for it
+  (`Clementine.LLM.Policy.keys/0`). Each comes back as `{id, choices}`,
+  a bare id with `[]`. The function is called with nothing of the app's
+  started (when Clementine starts, and in `mix clementine.models`), so it
+  reads config, not a Repo or a process.
+
+  `{Clementine, ...}` checks each entry when it starts, as it checks an
+  agent's model and choices (an unknown or retired id, a choice the
+  model refuses, or a platform with no credential fails boot);
+  Clementine warns for each when it starts, as for an agent's model
+  (`Clementine.Models.Warnings`); and `mix clementine.models` reports
+  each beside the agents. Without the config the offer is empty.
   """
-  @spec offered() :: [String.t()]
-  def offered do
+  @spec offer() :: [{String.t(), keyword()}]
+  def offer do
     case Application.get_env(:clementine, :offer) do
       nil ->
         []
 
       {module, function, args} = mfa
       when is_atom(module) and is_atom(function) and is_list(args) ->
-        module |> apply(function, args) |> offered!("#{inspect(mfa)} returned")
+        mfa |> call_offer() |> offer!("#{inspect(mfa)} returned")
 
-      ids ->
-        offered!(ids, "config :clementine, :offer is")
+      entries ->
+        offer!(entries, "is")
     end
   end
 
-  defp offered!(ids, what) do
-    if is_list(ids) and Enum.all?(ids, &is_binary/1) do
-      Enum.uniq(ids)
-    else
-      raise ArgumentError,
-            "#{what} #{inspect(ids)}; the offer is a list of model ids " <>
-              ~s|(["claude-sonnet-5-5", ...]), or a {module, function, args} that returns one|
+  defp call_offer({module, function, args} = mfa) do
+    apply(module, function, args)
+  rescue
+    exception ->
+      reraise ArgumentError,
+              [
+                message:
+                  "config :clementine, :offer: #{inspect(mfa)} raised " <>
+                    "#{inspect(exception.__struct__)}: #{Exception.message(exception)}"
+              ],
+              __STACKTRACE__
+  end
+
+  defp offer!(entries, what) when is_list(entries) do
+    entries |> Enum.map(&offer_entry!(&1, what, entries)) |> Enum.uniq()
+  end
+
+  defp offer!(other, what), do: raise(ArgumentError, offer_shape(what, other))
+
+  defp offer_entry!(id, _what, _entries) when is_binary(id), do: {id, []}
+
+  defp offer_entry!({id, choices} = entry, what, entries)
+       when is_binary(id) and is_list(choices) do
+    unless Keyword.keyword?(choices), do: raise(ArgumentError, offer_shape(what, entries))
+
+    case Keyword.keys(choices) -- Clementine.LLM.Policy.keys() do
+      [] ->
+        entry
+
+      unknown ->
+        raise ArgumentError,
+              "config :clementine, :offer: #{inspect(entry)}: #{inspect(unknown)} are not " <>
+                "choices; a choice is one of #{inspect(Clementine.LLM.Policy.keys())}"
     end
   end
+
+  defp offer_entry!(_entry, what, entries), do: raise(ArgumentError, offer_shape(what, entries))
+
+  defp offer_shape(what, got) do
+    "config :clementine, :offer #{what} #{inspect(got)}; the offer is a list whose entries " <>
+      ~s|are model ids or {id, choices} (["claude-sonnet-5-5", {"claude-opus-5-5", | <>
+      ~s|max_tokens: 64_000}]), or a {module, function, args} that returns one|
+  end
+
+  @doc false
+  # The vendors whose sheets this release ships.
+  @spec shipped_vendors() :: [atom()]
+  def shipped_vendors, do: @shipped_reads |> Map.keys() |> Enum.sort()
 
   @doc false
   # The newest `read` date among the sheets this release ships, or

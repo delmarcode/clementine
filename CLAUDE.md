@@ -215,8 +215,9 @@ configures `:clementine` itself. The library reads `:models` (a map
 from model id to facts: overrides of the sheets Clementine ships in
 `lib/clementine/models/`, and declarations of models it does not;
 `docs/MODELS.md` has every key), provider credentials and endpoints
-(`anthropic_api_key: {:system, "..."}`, ...), `:offer` (the model ids an
-app that builds agents from data may pick, which boot checks), `:retry`
+(`anthropic_api_key: {:system, "..."}`, ...), `:offer` (the models, as ids or
+`{id, choices}`, that an app building agents from data may pick, which
+boot checks), `:retry`
 for provider calls, and `:llm_client` (the mock, in tests). An agent
 names its own model by id, with its own choices for it
 (`Clementine.LLM.Policy`). Boot errors come only from the sheets and

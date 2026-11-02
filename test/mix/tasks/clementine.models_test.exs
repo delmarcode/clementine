@@ -73,7 +73,7 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
     assert text =~ ~r/^per_row +\(agent\/1\) +- +- +- +-$/m
 
     assert text =~
-             ~r/^\(offered\) +gpt-5 +openai +deprecated, shuts down 2026-12-11, replaced by gpt-5.6-sol +- +-$/m
+             ~r/^\(offered\) +gpt-5 +openai +deprecated, shuts down 2026-12-11, replaced by gpt-5.6-sol +no line +-$/m
 
     assert text =~ ~r/^\(--model\) +claude-sonnt-5 +- +error/m
     assert text =~ ~s(--model claude-sonnt-5: unknown model "claude-sonnt-5")
@@ -88,12 +88,63 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
     assert Task.status(Task.report(agents: [Judge], today: ~D[2026-11-02])) == 0
   end
 
+  test "an offered entry with its choices, and a retired id, which is compared with nothing" do
+    Application.put_env(:clementine, :offer, [{"claude-opus-5-5", thinking: :off}])
+
+    text =
+      [agents: [], model: "claude-sonnet-4-20250514", today: ~D[2026-11-02]]
+      |> Task.report()
+      |> Task.text()
+
+    assert text =~
+             ~r/^\(offered\) +claude-opus-5-5 +anthropic +active, retires not before \S+, boot refuses it +- +-$/m
+
+    assert text =~ ~s(offered claude-opus-5-5: "claude-opus-5-5": refuses thinking: :off)
+
+    assert text =~
+             ~r/^\(--model\) +claude-sonnet-4-20250514 +anthropic +retired, retired 2026-06-15, replaced by claude-sonnet-5-5, boot refuses it +- +-$/m
+
+    refute text =~ "Warnings"
+  end
+
+  test "per-vendor read dates, and the retired ids Anthropic lists that the sheets never shipped" do
+    report = %{
+      Task.report(agents: [], today: ~D[2026-11-02])
+      | registry: %{
+          reads: %{anthropic: ~D[2026-11-01], openai: ~D[2026-10-20]},
+          stale_after_days: 120,
+          stale: []
+        }
+    }
+
+    checked = %{
+      vendor: :anthropic,
+      status: :checked,
+      reason: nil,
+      listed: 2,
+      findings: [],
+      unshipped: [%{id: "claude-instant-0.9"}]
+    }
+
+    text = Task.text(%{report | check: [checked]})
+
+    assert text =~
+             "Clementine's model sheets were read 2026-11-01 (anthropic), 2026-10-20 (openai)."
+
+    assert text =~
+             "Anthropic's Models API lists 2 models: the sheets agree; 1 retired id the sheets " <>
+               "never shipped (--json lists them)."
+  end
+
   test "--json, for CI" do
     report = Task.report(agents: [Chat], today: ~D[2026-11-02])
 
     assert %{
              "today" => "2026-11-02",
-             "registry" => %{"read" => "2026-11-01", "stale" => false},
+             "registry" => %{
+               "reads" => %{"anthropic" => "2026-11-01", "openai" => "2026-11-01"},
+               "stale" => []
+             },
              "agents" => [
                %{
                  "agent" => "chat",
@@ -133,7 +184,7 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
     assert_received {:mix_shell, :info, [text]}
 
     assert text =~
-             "Anthropic's Models API lists 6 models: 6 differences from the sheets (sheet -> API)"
+             "Anthropic's Models API lists 6 models: 6 differences from the sheets (sheet -> API)."
 
     assert text =~
              ~r/claude-sonnet-6 +not in the sheets \(lifecycle active, line sonnet, released 2026-11-20\)/
@@ -146,6 +197,31 @@ defmodule Mix.Tasks.Clementine.ModelsTest do
 
     assert text =~ "OpenAI's Models API: skipped; config :clementine, openai_api_key: is not set"
     refute text =~ "sk-ant-recorded"
+  end
+
+  test "run/1 with --check exits 1 when it could read no vendor's API" do
+    Application.delete_env(:clementine, :anthropic_api_key)
+    Application.delete_env(:clementine, :openai_api_key)
+
+    assert catch_exit(Task.run(["--check", "--model", "claude-sonnet-5-5"])) == {:shutdown, 1}
+
+    assert_received {:mix_shell, :info, [text]}
+    assert text =~ "Anthropic's Models API: skipped"
+    assert text =~ "--check read no vendor's Models API: configure a key for at least one."
+  end
+
+  test "--check never prints a malformed key, as text or as --json" do
+    Application.put_env(:clementine, :anthropic_api_key, "sk-ant-leak\r\nmore")
+    Application.put_env(:clementine, :openai_api_key, "sk-openai-leak\a")
+
+    for argv <- [["--check"], ["--check", "--json"]] do
+      assert catch_exit(Task.run(argv ++ ["--model", "claude-sonnet-5-5"])) == {:shutdown, 1}
+
+      assert_received {:mix_shell, :info, [out]}
+      assert out =~ "anthropic_api_key: the key has non-printable characters"
+      assert out =~ "openai_api_key: the key has non-printable characters"
+      refute out =~ "leak"
+    end
   end
 
   test "run/1 with --json prints the report and exits 0 when nothing would fail" do

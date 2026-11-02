@@ -27,19 +27,28 @@ defmodule Mix.Tasks.Clementine.Models do
   in each dependency that depends on Clementine: a superset of the
   `agents:` in the child spec, read from the compiled code, so the task
   needs no database and starts nothing. Each agent's model is its
-  `use Clementine.Agent`'s (`__model__/0`), with its choices, resolved as
-  boot resolves them.
+  `use Clementine.Agent`'s (`__model__/0`), with its choices, resolved
+  and checked as boot resolves and checks them. Run it in the app's
+  default (dev) environment: under `MIX_ENV=test` the agents compiled
+  from `test/support` get rows too.
 
   An app that builds agents from data, picking each one's model in
   `agent/1` from a stored row, declares no model on `use`; its row says
   so. Point the task (and boot's checks and warnings) at the models such
-  agents may run with the app's offer, a list of ids or a function that
-  returns one:
+  agents may run with the app's offer: a list whose entries are model
+  ids or `{id, choices}`, or a function that returns one
+  (`Clementine.Models.offer/0`):
 
-      config :clementine, :offer, {MyApp.Models, :offered, []}
+      config :clementine, :offer, {MyApp.Models, :offer, []}
 
-  Each offered id gets a row of its own. `--model ID` adds a row for any
-  other id, once.
+  The task calls that function after loading config, with nothing
+  started, so it reads config rather than a Repo or a process. Each
+  offered entry gets a row of its own, resolved with its choices.
+  `--model ID` adds a row for any other id, once.
+
+  "newest in line" is `-` for a model that is the newest in its line on
+  its platform, and `no line` for a model that names no line. A model
+  an app declares counts as newest only with a `released_on:`.
 
   ## Options
 
@@ -48,13 +57,18 @@ defmodule Mix.Tasks.Clementine.Models do
       where the shipped sheets differ: ids the sheets lack, lifecycle and
       retirement or shutdown date changes, and capability and ceiling
       mismatches. Prices have no API and are not checked. A vendor
-      without a configured key is skipped.
-    * `--json` - print the report as JSON, for CI.
+      without a configured key is skipped; a key is trimmed, and one
+      holding anything but printable ASCII is refused without printing
+      it.
+    * `--json` - print the report as JSON, for CI. Run `mix compile`
+      first, so that compiler output does not precede the JSON on stdout.
     * `--model ID` - add a row for a model id; repeatable.
 
-  The task exits 1 when an agent's or an offered model would fail boot,
-  or when `--check` finds a difference or cannot read an API; warnings
-  never change the exit status.
+  The task exits 1 when boot would refuse an agent's or an offered
+  model (an unknown or retired id, a choice its sheet refuses, a
+  platform with no credential configured), or when `--check` finds a
+  difference, cannot read an API, or reads none for want of a key.
+  Warnings never change the exit status.
   """
 
   use Mix.Task
@@ -99,13 +113,16 @@ defmodule Mix.Tasks.Clementine.Models do
   def report(opts) do
     agents = Keyword.get_lazy(opts, :agents, &agents/0)
     today = Keyword.get_lazy(opts, :today, &Date.utc_today/0)
-    offered = Enum.map(Models.offered(), &{:offer, &1})
+    offered = for {id, choices} <- Models.offer(), do: {:offer, id, choices}
+    offered_ids = for {:offer, id, _choices} <- offered, do: id
 
     named =
-      for id <- Keyword.get_values(opts, :model), {:offer, id} not in offered, do: {:cli, id}
+      for id <- Enum.uniq(Keyword.get_values(opts, :model)),
+          id not in offered_ids,
+          do: {:cli, id, []}
 
     agents
-    |> Report.build(Enum.uniq(offered ++ named), today)
+    |> Report.build(offered ++ named, today)
     |> Map.put(:check, if(opts[:check], do: Check.run()))
   end
 
@@ -119,8 +136,12 @@ defmodule Mix.Tasks.Clementine.Models do
     drifted? =
       Enum.any?(report.check || [], &(&1.status == :failed or &1.findings != []))
 
-    if failing? or drifted?, do: 1, else: 0
+    if failing? or drifted? or unchecked?(report.check), do: 1, else: 0
   end
+
+  # --check that read no vendor's API at all checked nothing.
+  defp unchecked?([_ | _] = results), do: Enum.all?(results, &(&1.status == :skipped))
+  defp unchecked?(_no_check), do: false
 
   @doc false
   # Every module implementing Clementine.Agent in this project's apps
@@ -217,10 +238,17 @@ defmodule Mix.Tasks.Clementine.Models do
       row.model || "(agent/1)",
       (row.platform && Atom.to_string(row.platform)) || "-",
       lifecycle(row, today),
-      row.newest || "-",
+      newest(row),
       differs(row)
     ]
   end
+
+  # "-" is the newest in its line itself, or a row with no model to
+  # compare.
+  defp newest(%{newest: nil, lifecycle: lifecycle, line: nil}) when lifecycle != nil,
+    do: "no line"
+
+  defp newest(%{newest: newest}), do: newest || "-"
 
   defp label(%{source: :agent, agent: key}), do: key
   defp label(%{source: :offer}), do: "(offered)"
@@ -344,13 +372,24 @@ defmodule Mix.Tasks.Clementine.Models do
     Enum.join(["Warnings (dates compared with today, #{today}; never errors):" | lines], "\n")
   end
 
-  defp footer(%{registry: registry, check: check}) do
+  defp footer(%{registry: %{reads: reads}, check: check}) do
     hint =
       if check,
         do: "",
         else: " mix clementine.models --check compares them with the vendors' Models APIs."
 
-    "Clementine's model sheets were read #{registry.read}.#{hint}"
+    read =
+      case reads |> Map.values() |> Enum.uniq() do
+        [date] ->
+          "#{date}"
+
+        _dates ->
+          reads
+          |> Enum.sort()
+          |> Enum.map_join(", ", fn {vendor, date} -> "#{date} (#{vendor})" end)
+      end
+
+    "Clementine's model sheets were read #{read}.#{hint}"
   end
 
   defp subject(%{source: :agent, agent: key}), do: "agent #{inspect(key)}"
@@ -360,7 +399,13 @@ defmodule Mix.Tasks.Clementine.Models do
   ## --check
 
   defp check(nil), do: nil
-  defp check(results), do: Enum.map(results, &vendor_check/1)
+
+  defp check(results) do
+    Enum.map(results, &vendor_check/1) ++
+      if unchecked?(results),
+        do: ["--check read no vendor's Models API: configure a key for at least one."],
+        else: []
+  end
 
   defp vendor_check(%{status: :skipped, vendor: vendor, reason: reason}),
     do: "#{api(vendor)}: skipped; #{reason}."
@@ -376,7 +421,7 @@ defmodule Mix.Tasks.Clementine.Models do
           [_one] -> "1 difference from the sheets (sheet -> API)"
           many -> "#{length(many)} differences from the sheets (sheet -> API)"
         end <>
-        unshipped(unshipped)
+        unshipped(vendor, unshipped)
 
     width = findings |> Enum.map(&String.length(&1.id)) |> Enum.max(fn -> 0 end)
 
@@ -389,10 +434,20 @@ defmodule Mix.Tasks.Clementine.Models do
     )
   end
 
-  defp unshipped([]), do: "."
+  defp unshipped(_vendor, []), do: "."
 
-  defp unshipped(ids),
-    do: "; #{length(ids)} older or non-vendor ids the sheets do not ship (--json lists them)."
+  defp unshipped(vendor, ids) do
+    what =
+      case vendor do
+        :anthropic -> "retired #{ids(ids)} the sheets never shipped"
+        :openai -> "older or non-vendor #{ids(ids)} the sheets do not ship"
+      end
+
+    "; #{length(ids)} #{what} (--json lists them)."
+  end
+
+  defp ids([_one]), do: "id"
+  defp ids(_many), do: "ids"
 
   defp api(:anthropic), do: "Anthropic's Models API"
   defp api(:openai), do: "OpenAI's Models API"

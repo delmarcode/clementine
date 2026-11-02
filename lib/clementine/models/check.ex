@@ -12,7 +12,9 @@ defmodule Clementine.Models.Check do
   # effort levels, structured outputs). It lists active and deprecated
   # models unless `lifecycle` asks for retired ones too, which this does
   # (as `lifecycle[]=`, the official SDKs' array format), so a model the
-  # vendor retired shows as a lifecycle change rather than vanishing.
+  # vendor retired shows as a lifecycle change rather than vanishing. A
+  # retired id the sheets never shipped (claude-1.x, claude-instant-1.x)
+  # is counted as not shipped, not flagged.
   #
   # OpenAI's `GET /v1/models` (read 2026-11-01,
   # https://developers.openai.com/api/reference/resources/models/methods/list)
@@ -22,8 +24,15 @@ defmodule Clementine.Models.Check do
   # audio, images, moderation, the organization's fine-tunes), so an id
   # the sheets lack is a finding only when OpenAI (or `system`) owns it
   # and created it after the sheets were last read; the older ones are
-  # counted as not shipped. Neither API has prices, so prices are never
-  # checked.
+  # counted as not shipped. `created` can precede a model's launch, so a
+  # model OpenAI created before that read and launched after it is
+  # counted, not flagged: a gap docs/MODELS.md names. Neither API has
+  # prices, so prices are never checked.
+  #
+  # Nothing here prints the key. It is trimmed and refused when it holds
+  # anything but printable ASCII, a transport error is reported by its
+  # reason's name only (Mint's `{:invalid_header_value, name, value}`
+  # message quotes the header), and the key is scrubbed from every reason.
 
   alias Clementine.{Model, Models}
 
@@ -66,12 +75,21 @@ defmodule Clementine.Models.Check do
       unshipped: []
     }
 
-    with {:ok, key} <- credential(vendor),
-         {:ok, listed} <- fetch(vendor, key) do
-      Map.merge(%{result | listed: length(listed)}, compare(vendor, listed))
-    else
-      {:skip, reason} -> %{result | status: :skipped, reason: reason}
-      {:error, reason} -> %{result | status: :failed, reason: reason}
+    case credential(vendor) do
+      {:ok, key, raw} ->
+        case fetch(vendor, key) do
+          {:ok, listed} ->
+            Map.merge(%{result | listed: length(listed)}, compare(vendor, listed))
+
+          {:error, reason} ->
+            %{result | status: :failed, reason: scrub(reason, [raw, key])}
+        end
+
+      {:skip, reason} ->
+        %{result | status: :skipped, reason: reason}
+
+      {:error, reason} ->
+        %{result | status: :failed, reason: reason}
     end
   end
 
@@ -82,23 +100,26 @@ defmodule Clementine.Models.Check do
   """
   @spec compare(:anthropic | :openai, [map()]) :: %{findings: [finding()], unshipped: [map()]}
   def compare(:anthropic, listed) do
-    %{findings: Enum.flat_map(listed, &anthropic/1), unshipped: []}
+    partition(listed, &anthropic/1)
   end
 
   def compare(:openai, listed) do
     # When Clementine last read OpenAI's pages; a date an app's own
     # declaration carries never moves it.
     read = Models.shipped_read(:openai)
+    partition(listed, &openai(&1, read))
+  end
 
+  defp partition(listed, compare) do
     {findings, unshipped} =
       Enum.reduce(listed, {[], []}, fn entry, {findings, unshipped} ->
-        case openai(entry, read) do
+        case compare.(entry) do
           {:unshipped, note} -> {findings, [note | unshipped]}
-          more -> {findings ++ more, unshipped}
+          more -> {Enum.reverse(more, findings), unshipped}
         end
       end)
 
-    %{findings: findings, unshipped: Enum.reverse(unshipped)}
+    %{findings: Enum.reverse(findings), unshipped: Enum.reverse(unshipped)}
   end
 
   ## Anthropic
@@ -112,13 +133,17 @@ defmodule Clementine.Models.Check do
           if model.lifecycle.status == :retired, do: [], else: anthropic_facts(model, entry)
 
       {:error, _unknown} ->
-        [
-          finding(id, :unknown, nil, %{
-            lifecycle: entry["lifecycle"],
-            line: entry["line"],
-            released: date(entry["created_at"])
-          })
-        ]
+        note = %{
+          id: id,
+          lifecycle: entry["lifecycle"],
+          line: entry["line"],
+          released: date(entry["created_at"])
+        }
+
+        # One the vendor retired before the sheets would have shipped it.
+        if entry["lifecycle"] == "retired",
+          do: {:unshipped, note},
+          else: [finding(id, :unknown, nil, Map.delete(note, :id))]
     end
   end
 
@@ -261,16 +286,25 @@ defmodule Clementine.Models.Check do
   ## HTTP
 
   # The credentials and endpoints the Messages and Responses clients
-  # use; the Models API is beside each endpoint (`.../v1/models`).
+  # use; the Models API is beside each endpoint (`.../v1/models`). The
+  # key comes back trimmed, with the value as configured for scrubbing.
   defp credential(vendor) do
     config_key = credential_key(vendor)
+    setting = "config :clementine, #{config_key}:"
 
     case resolve(Application.get_env(:clementine, config_key)) do
-      key when is_binary(key) and key != "" ->
-        {:ok, key}
+      {:raised, what} ->
+        {:error, "#{setting} #{what}"}
+
+      raw when is_binary(raw) ->
+        case printable(raw) do
+          {:ok, key} -> {:ok, key, raw}
+          :empty -> {:skip, "#{setting} is empty"}
+          :unprintable -> {:error, "#{setting} the key has non-printable characters"}
+        end
 
       _unset ->
-        {:skip, "config :clementine, #{config_key}: is not set, or names an unset variable"}
+        {:skip, "#{setting} is not set, or names an unset variable"}
     end
   end
 
@@ -278,8 +312,26 @@ defmodule Clementine.Models.Check do
   defp credential_key(:openai), do: :openai_api_key
 
   defp resolve({:system, var}) when is_binary(var), do: System.get_env(var)
-  defp resolve({module, function, args}), do: apply(module, function, args)
+
+  defp resolve({module, function, args} = mfa)
+       when is_atom(module) and is_atom(function) and is_list(args) do
+    apply(module, function, args)
+  rescue
+    # Its message is the app's, and could quote the credential.
+    exception -> {:raised, "#{inspect(mfa)} raised #{inspect(exception.__struct__)}"}
+  end
+
   defp resolve(value), do: value
+
+  # Trimmed, as a secret file's trailing newline is no part of the key;
+  # anything else outside printable ASCII is refused, since an HTTP
+  # header cannot carry it and the transport's error would quote it.
+  defp printable(raw) do
+    case Regex.replace(~r/\A\s+|\s+\z/, raw, "") do
+      "" -> :empty
+      key -> if Regex.match?(~r/\A[\x21-\x7E]+\z/, key), do: {:ok, key}, else: :unprintable
+    end
+  end
 
   @doc false
   # The Models API URL beside a vendor's configured endpoint.
@@ -350,7 +402,7 @@ defmodule Clementine.Models.Check do
         {:error, "#{url} answered #{status}#{error_message(body)}"}
 
       {:error, exception} ->
-        {:error, "#{url}: #{Exception.message(exception)}"}
+        {:error, "#{url}: #{transport_reason(exception)}"}
     end
   end
 
@@ -359,4 +411,27 @@ defmodule Clementine.Models.Check do
     do: ": #{message}"
 
   defp error_message(_body), do: ""
+
+  @transport_errors [Req.TransportError, Req.HTTPError, Mint.TransportError, Mint.HTTPError]
+
+  # Never a transport exception's message: Mint's for an invalid header
+  # quotes the header's value, which can be the key.
+  defp transport_reason(%{__struct__: struct, reason: reason}) when struct in @transport_errors,
+    do: reason_name(reason)
+
+  defp transport_reason(%{__struct__: struct}), do: inspect(struct)
+
+  defp reason_name(reason) when is_atom(reason), do: Atom.to_string(reason)
+
+  defp reason_name(reason) when is_tuple(reason) and is_atom(elem(reason, 0)),
+    do: Atom.to_string(elem(reason, 0))
+
+  defp reason_name(_reason), do: "transport error"
+
+  defp scrub(reason, values) do
+    values
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> Enum.reduce(reason, &String.replace(&2, &1, "**redacted**"))
+  end
 end

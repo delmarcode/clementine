@@ -87,7 +87,7 @@ defmodule Clementine.Models.ReportTest do
 
     test "the newest model has no newest and nothing to differ" do
       assert %{model: "claude-sonnet-5-5", newest: nil, differs: []} =
-               Report.model_row(:cli, "claude-sonnet-5-5", ~D[2026-11-02])
+               Report.model_row(:cli, "claude-sonnet-5-5", [], ~D[2026-11-02])
     end
 
     test "the newest is the newest its platform serves, or none" do
@@ -108,7 +108,7 @@ defmodule Clementine.Models.ReportTest do
       })
 
       assert %{platform: :openrouter, newest: nil, differs: []} =
-               Report.model_row(:cli, "anthropic/claude-sonnet-x", ~D[2026-11-02])
+               Report.model_row(:cli, "anthropic/claude-sonnet-x", [], ~D[2026-11-02])
 
       Application.put_env(:clementine, :models, %{
         "anthropic/claude-sonnet-x" => declared.(~D[2026-01-01]),
@@ -116,7 +116,50 @@ defmodule Clementine.Models.ReportTest do
       })
 
       assert %{platform: :openrouter, newest: "anthropic/claude-sonnet-y"} =
-               Report.model_row(:cli, "anthropic/claude-sonnet-x", ~D[2026-11-02])
+               Report.model_row(:cli, "anthropic/claude-sonnet-x", [], ~D[2026-11-02])
+    end
+
+    test "an offered entry is resolved with the offer's choices for it" do
+      assert %{model: "claude-opus-5-5", error: nil} =
+               Report.model_row(:offer, "claude-opus-5-5", [max_tokens: 64_000], ~D[2026-11-02])
+
+      assert %{model: "claude-opus-5-5", error: error, lifecycle: %{status: :active}} =
+               Report.model_row(:offer, "claude-opus-5-5", [thinking: :off], ~D[2026-11-02])
+
+      assert error =~ "refuses thinking: :off"
+    end
+
+    test "a model whose platform has no credential is one boot refuses" do
+      client = Application.get_env(:clementine, :llm_client)
+      key = Application.get_env(:clementine, :anthropic_api_key)
+
+      on_exit(fn ->
+        Application.put_env(:clementine, :llm_client, client)
+        Application.put_env(:clementine, :anthropic_api_key, key)
+      end)
+
+      # The real router, as the task runs in an app, with no Anthropic key.
+      Application.put_env(:clementine, :llm_client, Clementine.LLM.Router)
+      Application.delete_env(:clementine, :anthropic_api_key)
+
+      assert %{model: "claude-sonnet-5", platform: :anthropic, error: error} =
+               Report.agent_row(Chat, ~D[2026-11-02])
+
+      assert error =~ "anthropic_api_key: is not set"
+    end
+
+    test "a model with no line names no newest" do
+      Application.put_env(:clementine, :models, %{
+        "acme-triage" => [
+          vendor: :acme,
+          context: 32_000,
+          max_output: 4_000,
+          platforms: [openai_compatible: []]
+        ]
+      })
+
+      assert %{line: nil, newest: nil, error: nil} =
+               Report.model_row(:cli, "acme-triage", [], ~D[2026-11-02])
     end
 
     test "an agent that picks its model per run has a row without one" do
@@ -130,8 +173,15 @@ defmodule Clementine.Models.ReportTest do
 
       assert error =~ ~s(unknown model "claude-sonnet-later")
 
-      assert %{model: "claude-sonnet-4-20250514", error: error, lifecycle: %{status: :retired}} =
-               Report.model_row(:offer, "claude-sonnet-4-20250514", ~D[2026-11-02])
+      # Retired: not compared with its line, and no warning beside the error.
+      assert %{
+               model: "claude-sonnet-4-20250514",
+               error: error,
+               lifecycle: %{status: :retired},
+               newest: nil,
+               differs: [],
+               warnings: []
+             } = Report.model_row(:offer, "claude-sonnet-4-20250514", [], ~D[2026-11-02])
 
       assert error =~ "is retired"
 
@@ -148,15 +198,26 @@ defmodule Clementine.Models.ReportTest do
 
     test "the warnings of each row, and the registry's age, collected with their subjects" do
       report =
-        Report.build([Chat], [{:offer, "claude-haiku-4-5"}, {:cli, "gpt-5"}], ~D[2027-04-01])
+        Report.build(
+          [Chat],
+          [{:offer, "claude-haiku-4-5", []}, {:cli, "gpt-5", []}],
+          ~D[2027-04-01]
+        )
 
-      assert %{registry: %{read: ~D[2026-11-01], stale_after_days: 120, stale: true}} = report
+      assert %{
+               registry: %{
+                 reads: %{anthropic: ~D[2026-11-01], openai: ~D[2026-11-01]},
+                 stale_after_days: 120,
+                 stale: [:anthropic, :openai]
+               }
+             } = report
 
-      assert Enum.map(report.warnings, &{&1.subject, &1.kind}) == [
-               {"offered", :not_before_passed},
-               {"--model", :deprecated},
-               {"--model", :retirement_reached},
-               {nil, :stale_registry}
+      assert Enum.map(report.warnings, &{&1.subject, &1.kind, &1[:vendor]}) == [
+               {"offered", :not_before_passed, :anthropic},
+               {"--model", :deprecated, :openai},
+               {"--model", :retirement_reached, :openai},
+               {nil, :stale_registry, :anthropic},
+               {nil, :stale_registry, :openai}
              ]
     end
   end

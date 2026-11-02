@@ -18,15 +18,23 @@ defmodule Clementine.Models.Warnings do
   - `:retirement_reached`: the model's `retires_on` date, a retirement
     or shutdown date the vendor has set, is today or before, so requests
     may now fail with the vendor's error.
-  - `:stale_registry`: the newest `read` date of the sheets Clementine
-    ships is more than 120 days before today, so their facts may have
-    moved on.
+  - `:stale_registry`: the newest `read` date of one vendor's sheets
+    that Clementine ships is more than 120 days before today, so their
+    facts may have moved on.
 
-  `{Clementine, ...}` logs them when it starts, for every agent in its
-  `agents:` that declares a model and every model the app offers
-  (`config :clementine, :offer`, `Clementine.Models.offered/0`). Nothing
-  here reads the network: the vendors' Models APIs are read only by
-  `mix clementine.models --check`.
+  They are logged, never raised:
+
+  - when Clementine starts: the stale registry, and every model the app
+    offers (`config :clementine, :offer`, `Clementine.Models.offer/0`);
+  - when `{Clementine, ...}` starts: every agent in its `agents:` that
+    declares a model;
+  - on an agent module's first `Clementine.run/3` or `Clementine.stream/3`
+    in the node, unless the runtime already logged it: that agent's
+    model. An app that runs agents only in process (an eval, a script)
+    gets each agent's warnings once, on the run that first reaches it.
+
+  Nothing here reads the network: the vendors' Models APIs are read only
+  by `mix clementine.models --check`.
   """
 
   require Logger
@@ -36,18 +44,20 @@ defmodule Clementine.Models.Warnings do
   @stale_after_days 120
 
   @enforce_keys [:kind, :message]
-  defstruct [:kind, :model, :date, :replacement, :message]
+  defstruct [:kind, :model, :vendor, :date, :replacement, :message]
 
   @type kind :: :deprecated | :not_before_passed | :retirement_reached | :stale_registry
 
   @typedoc """
   One warning: its kind, the model it is about (`nil` for the registry),
-  the date it turns on, the vendor's replacement where it names one, and
-  a message that names the model and the date.
+  that model's vendor (or the vendor whose sheets are stale), the date it
+  turns on, the vendor's replacement where it names one, and a message
+  that names the model and the date.
   """
   @type t :: %__MODULE__{
           kind: kind(),
           model: String.t() | nil,
+          vendor: atom() | nil,
           date: Date.t() | nil,
           replacement: String.t() | nil,
           message: String.t()
@@ -59,9 +69,12 @@ defmodule Clementine.Models.Warnings do
 
   @doc """
   The warnings `model`'s lifecycle and dates give on `today`, in the
-  order the moduledoc lists them.
+  order the moduledoc lists them. A retired model gives none: boot
+  refuses it.
   """
   @spec for_model(Model.t(), Date.t()) :: [t()]
+  def for_model(%Model{lifecycle: %{status: :retired}}, %Date{}), do: []
+
   def for_model(%Model{lifecycle: lifecycle} = model, %Date{} = today) do
     [
       deprecated(model, lifecycle),
@@ -72,76 +85,118 @@ defmodule Clementine.Models.Warnings do
   end
 
   @doc """
-  The newest `read` date among the sheets Clementine ships: when this
-  release last read the vendors' pages.
+  The newest `read` date of each vendor's sheets that Clementine ships:
+  when this release last read that vendor's pages.
   """
-  @spec registry_read() :: Date.t()
-  def registry_read, do: Models.shipped_read()
+  @spec registry_reads() :: %{atom() => Date.t()}
+  def registry_reads, do: Map.new(Models.shipped_vendors(), &{&1, Models.shipped_read(&1)})
 
   @doc """
-  The stale-registry warning on `today`, or `nil` while the shipped
-  sheets were read within the last 120 days.
+  The stale-registry warnings on `today`: one for each vendor whose
+  shipped sheets were last read more than 120 days ago.
   """
-  @spec registry(Date.t()) :: t() | nil
+  @spec registry(Date.t()) :: [t()]
   def registry(%Date{} = today) do
-    read = registry_read()
-
-    if Date.diff(today, read) > @stale_after_days do
+    for {vendor, read} <- Enum.sort(registry_reads()),
+        Date.diff(today, read) > @stale_after_days do
       %__MODULE__{
         kind: :stale_registry,
+        vendor: vendor,
         date: read,
         message:
-          "Clementine's model sheets were last read on #{read}, more than " <>
-            "#{@stale_after_days} days ago: their lifecycles, ceilings, and prices may " <>
-            "have changed since. Upgrade Clementine, or run mix clementine.models --check " <>
-            "to compare them with the vendors' Models APIs"
+          "Clementine's #{vendor(vendor)} model sheets were last read on #{read}, more than " <>
+            "#{@stale_after_days} days ago: their lifecycles, ceilings, and prices may have " <>
+            "changed since. Upgrade Clementine, or run mix clementine.models --check to compare " <>
+            "them with the vendors' Models APIs"
       }
     end
   end
 
   @doc """
-  The warnings for what an app runs, on `today`: each agent module's
-  declared model (`__model__/0`), labeled `agent "key"`; each offered
-  id, labeled `offered`; and the registry's age. An id that names no
-  model gives none here, since boot's own check refuses it.
+  The warnings for agent modules on `today`, each labeled `agent "key"`:
+  their declared models' (`__model__/0`). An agent that picks its model
+  in `agent/1` gives none, nor does an id that names no model, since
+  boot refuses it.
   """
-  @spec at_boot([module()], [String.t()], Date.t()) :: [{String.t() | nil, t()}]
-  def at_boot(agents, offered, %Date{} = today) do
-    subjects =
-      for(
-        module <- agents,
+  @spec for_agents([module()], Date.t()) :: [{String.t(), t()}]
+  def for_agents(agents, %Date{} = today) do
+    for module <- agents,
         id = declared_model(module),
-        do: {"agent #{inspect(module.key())}", id}
-      ) ++
-        for id <- offered, do: {"offered", id}
-
-    per_model =
-      for {label, id} <- subjects,
-          {:ok, model} <- [Models.fetch(id)],
-          warning <- for_model(model, today),
-          do: {label, warning}
-
-    case registry(today) do
-      nil -> per_model
-      stale -> per_model ++ [{nil, stale}]
-    end
+        warning <- for_id(id, today),
+        do: {"agent #{inspect(module.key())}", warning}
   end
 
   @doc """
-  Logs `at_boot/3` for today, one warning per line. `{Clementine, ...}`
-  calls it when it starts.
+  The warnings for offered ids on `today`, each labeled `offered`.
   """
-  @spec log([module()], [String.t()]) :: :ok
-  def log(agents, offered) do
-    agents
-    |> at_boot(offered, Date.utc_today())
-    |> Enum.each(fn
+  @spec for_offer([String.t()], Date.t()) :: [{String.t(), t()}]
+  def for_offer(ids, %Date{} = today) do
+    for id <- ids, warning <- for_id(id, today), do: {"offered", warning}
+  end
+
+  @doc false
+  # Clementine.Application's start: the registry's age and the offer.
+  # Never raises: an offer that cannot be read warns here, and boot's
+  # check of it (`{Clementine, ...}`) or the task says why.
+  @spec log_start() :: :ok
+  def log_start do
+    today = Date.utc_today()
+
+    offer =
+      try do
+        Models.offer() |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> for_offer(today)
+      rescue
+        exception ->
+          Logger.warning(
+            "Clementine could not read its offer's dates: #{Exception.message(exception)}"
+          )
+
+          []
+      end
+
+    log(offer ++ Enum.map(registry(today), &{nil, &1}))
+  end
+
+  @doc false
+  # `{Clementine, ...}`'s start: its agents. A module logged here logs
+  # nothing more on its runs.
+  @spec log_agents([module()]) :: :ok
+  def log_agents(agents) do
+    Enum.each(agents, &:persistent_term.put({__MODULE__, :logged, &1}, true))
+    agents |> for_agents(Date.utc_today()) |> log()
+  end
+
+  @doc false
+  # `Clementine.run/3` and `stream/3` with an agent module: its warnings,
+  # the first time the node runs it. (Two first runs at once may both
+  # log; nothing depends on once.)
+  @spec log_first_run(module()) :: :ok
+  def log_first_run(module) when is_atom(module) do
+    key = {__MODULE__, :logged, module}
+
+    if :persistent_term.get(key, false) do
+      :ok
+    else
+      :persistent_term.put(key, true)
+      [module] |> for_agents(Date.utc_today()) |> log()
+    end
+  end
+
+  defp log(warnings) do
+    Enum.each(warnings, fn
       {nil, warning} ->
         Logger.warning(warning.message)
 
       {label, warning} ->
         Logger.warning("#{label}: #{warning.message}. See mix clementine.models")
     end)
+  end
+
+  defp for_id(id, today) do
+    case Models.fetch(id) do
+      {:ok, model} -> for_model(model, today)
+      {:error, _unknown} -> []
+    end
   end
 
   defp declared_model(module) do
@@ -158,6 +213,7 @@ defmodule Clementine.Models.Warnings do
     %__MODULE__{
       kind: :deprecated,
       model: model.id,
+      vendor: model.vendor,
       date: lifecycle.deprecated_on,
       replacement: lifecycle.replacement,
       message: "#{model.id} is deprecated: #{vendor(model)} #{ending}#{replacement(lifecycle)}"
@@ -171,6 +227,7 @@ defmodule Clementine.Models.Warnings do
       %__MODULE__{
         kind: :not_before_passed,
         model: model.id,
+        vendor: model.vendor,
         date: date,
         replacement: lifecycle.replacement,
         message:
@@ -187,6 +244,7 @@ defmodule Clementine.Models.Warnings do
       %__MODULE__{
         kind: :retirement_reached,
         model: model.id,
+        vendor: model.vendor,
         date: date,
         replacement: lifecycle.replacement,
         message:
@@ -202,9 +260,10 @@ defmodule Clementine.Models.Warnings do
   defp replacement(%{replacement: nil}), do: ""
   defp replacement(%{replacement: id}), do: "; its replacement is #{id}"
 
-  defp vendor(%Model{vendor: :anthropic}), do: "Anthropic"
-  defp vendor(%Model{vendor: :openai}), do: "OpenAI"
-  defp vendor(%Model{}), do: "its vendor"
+  defp vendor(%Model{vendor: vendor}), do: vendor(vendor)
+  defp vendor(:anthropic), do: "Anthropic"
+  defp vendor(:openai), do: "OpenAI"
+  defp vendor(_vendor), do: "its vendor"
 
   # OpenAI shuts a model down; Anthropic retires one.
   defp ending_word(%Model{vendor: :openai}), do: "shutdown"

@@ -19,6 +19,7 @@ defmodule Clementine.Models.Report do
           source: :agent | :offer | :cli,
           model: String.t() | nil,
           vendor: atom() | nil,
+          line: atom() | nil,
           platform: atom() | nil,
           lifecycle: map() | nil,
           newest: String.t() | nil,
@@ -29,13 +30,17 @@ defmodule Clementine.Models.Report do
 
   @doc """
   The report on `today` for `agents` (agent modules) and `models`
-  (`{source, id}`, where `source` is `:offer` for the app's offer and
-  `:cli` for an id named on the command line).
+  (`{source, id, choices}`, where `source` is `:offer` for an entry of
+  the app's offer, with its choices, and `:cli` for an id named on the
+  command line).
   """
-  @spec build([module()], [{:offer | :cli, String.t()}], Date.t()) :: map()
+  @spec build([module()], [{:offer | :cli, String.t(), keyword()}], Date.t()) :: map()
   def build(agents, models, %Date{} = today) do
     agent_rows = agents |> Enum.map(&agent_row(&1, today)) |> Enum.sort_by(& &1.agent)
-    model_rows = Enum.map(models, fn {source, id} -> model_row(source, id, today) end)
+
+    model_rows =
+      Enum.map(models, fn {source, id, choices} -> model_row(source, id, choices, today) end)
+
     stale = Warnings.registry(today)
 
     warnings =
@@ -43,15 +48,14 @@ defmodule Clementine.Models.Report do
         row <- agent_rows ++ model_rows,
         warning <- row.warnings,
         do: Map.put(warning, :subject, subject(row))
-      ) ++
-        if(stale, do: [warning(stale) |> Map.put(:subject, nil)], else: [])
+      ) ++ Enum.map(stale, &(&1 |> warning() |> Map.put(:subject, nil)))
 
     %{
       today: today,
       registry: %{
-        read: Warnings.registry_read(),
+        reads: Warnings.registry_reads(),
         stale_after_days: Warnings.stale_after_days(),
-        stale: stale != nil
+        stale: Enum.map(stale, & &1.vendor)
       },
       agents: agent_rows,
       models: model_rows,
@@ -59,31 +63,37 @@ defmodule Clementine.Models.Report do
     }
   end
 
-  @doc "One agent module's row: its declared model, resolved as boot resolves it."
+  @doc """
+  One agent module's row: its declared model, resolved and checked as
+  boot resolves and checks it.
+  """
   @spec agent_row(module(), Date.t()) :: row()
   def agent_row(module, today) do
     base = %{empty() | agent: module.key(), module: inspect(module), source: :agent}
 
     case Agent.resolve_declared(module) do
-      {:ok, nil} ->
-        base
-
-      {:ok, %Policy{model: model, platform: platform}} ->
-        facts(base, model, platform, today)
-
-      {:error, message} ->
-        failed(base, module.__model__(), message, today)
+      {:ok, nil} -> base
+      resolved -> row(base, module.__model__(), resolved, today)
     end
   end
 
-  @doc "An offered or named id's row, resolved with the model's defaults."
-  @spec model_row(:offer | :cli, String.t(), Date.t()) :: row()
-  def model_row(source, id, today) do
-    base = %{empty() | source: source}
+  @doc """
+  An offered or named id's row, resolved with `choices` (the offer's
+  for it, or none) and checked as boot checks an offered id.
+  """
+  @spec model_row(:offer | :cli, String.t(), keyword(), Date.t()) :: row()
+  def model_row(source, id, choices, today) do
+    row(%{empty() | source: source}, id, Policy.resolve(id, choices), today)
+  end
 
-    case Policy.resolve(id, []) do
-      {:ok, %Policy{model: model, platform: platform}} -> facts(base, model, platform, today)
-      {:error, message} -> failed(base, id, message, today)
+  # Boot's checks, in its order: the model and choices against the sheet,
+  # then the credential of the platform they resolve to.
+  defp row(base, id, resolved, today) do
+    with {:ok, %Policy{model: model, platform: platform} = policy} <- resolved,
+         :ok <- Clementine.LLM.Router.check_credential(policy) do
+      facts(base, model, platform, today)
+    else
+      {:error, message} -> failed(base, id, resolved, message, today)
     end
   end
 
@@ -115,6 +125,7 @@ defmodule Clementine.Models.Report do
       source: nil,
       model: nil,
       vendor: nil,
+      line: nil,
       platform: nil,
       lifecycle: nil,
       newest: nil,
@@ -131,6 +142,7 @@ defmodule Clementine.Models.Report do
       row
       | model: model.id,
         vendor: model.vendor,
+        line: model.line,
         platform: platform,
         lifecycle: model.lifecycle,
         newest: newest && newest.id,
@@ -140,13 +152,23 @@ defmodule Clementine.Models.Report do
   end
 
   # A model boot would refuse: the reason, and what is known of the
-  # model if it has a sheet (a retired one, or one whose choices the
-  # sheet refuses).
-  defp failed(row, id, message, today) do
+  # model if it has a sheet (a retired one, one whose choices the sheet
+  # refuses, one whose platform has no credential). A retired model is
+  # not compared with its line: its replacement is in its lifecycle.
+  defp failed(row, id, resolved, message, today) do
     row =
-      case is_binary(id) && Models.fetch(id) do
-        {:ok, model} -> facts(row, model, Models.default_platform(model), today)
-        _unknown -> %{row | model: id}
+      case {resolved, is_binary(id) && Models.fetch(id)} do
+        {{:ok, %Policy{model: model, platform: platform}}, _sheet} ->
+          facts(row, model, platform, today)
+
+        {_refused, {:ok, %Model{lifecycle: %{status: :retired}} = model}} ->
+          %{facts(row, model, Models.default_platform(model), today) | newest: nil, differs: []}
+
+        {_refused, {:ok, model}} ->
+          facts(row, model, Models.default_platform(model), today)
+
+        _unknown ->
+          %{row | model: id}
       end
 
     %{row | error: message}
@@ -189,7 +211,7 @@ defmodule Clementine.Models.Report do
   defp tier(_prices), do: nil
 
   defp warning(%Warnings{} = warning) do
-    Map.take(warning, [:kind, :model, :date, :replacement, :message])
+    Map.take(warning, [:kind, :model, :vendor, :date, :replacement, :message])
   end
 
   defp subject(%{source: :agent, agent: key}), do: "agent #{inspect(key)}"

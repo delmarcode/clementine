@@ -115,6 +115,64 @@ defmodule Clementine.Models.CheckTest do
       refute reason =~ "sk-ant-recorded"
     end
 
+    test "trims a key's trailing newline before it goes", %{bypass: bypass} do
+      # A Kubernetes secret made with --from-file keeps the file's newline.
+      Application.put_env(:clementine, :anthropic_api_key, "sk-ant-recorded\n")
+      test = self()
+
+      Bypass.expect(bypass, "GET", "/v1/models", fn conn ->
+        send(test, {:key, Plug.Conn.get_req_header(conn, "x-api-key")})
+        conn = Plug.Conn.fetch_query_params(conn)
+        page = if conn.query_params["after_id"], do: 2, else: 1
+        respond(conn, "anthropic_page_#{page}.json")
+      end)
+
+      assert %{status: :checked} = Check.check(:anthropic)
+      assert_received {:key, ["sk-ant-recorded"]}
+    end
+
+    test "refuses a key with a non-printable character, never printing it" do
+      for key <- ["sk-ant-rec\norded", "sk-ant-rec\0orded", "sk-ant-récorded"] do
+        Application.put_env(:clementine, :anthropic_api_key, key)
+
+        assert %{status: :failed, reason: reason} = Check.check(:anthropic)
+
+        assert reason ==
+                 "config :clementine, anthropic_api_key: the key has non-printable characters"
+      end
+    end
+
+    test "reports a transport error by its reason's name", %{bypass: bypass} do
+      Bypass.down(bypass)
+
+      assert %{status: :failed, reason: reason} = Check.check(:anthropic)
+      assert reason =~ ~r{^http://localhost:\d+/v1/models: econnrefused$}
+    end
+
+    test "scrubs the key from a vendor's message that echoes it", %{bypass: bypass} do
+      Bypass.expect_once(bypass, "GET", "/v1/models", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(
+          401,
+          ~s({"type":"error","error":{"type":"authentication_error","message":"unknown key sk-ant-recorded"}})
+        )
+      end)
+
+      assert %{status: :failed, reason: reason} = Check.check(:anthropic)
+      assert reason =~ "answered 401: unknown key **redacted**"
+    end
+
+    test "names a credential function that raises, never its message" do
+      Application.put_env(:clementine, :anthropic_api_key, {__MODULE__, :raising_key, []})
+
+      assert %{status: :failed, reason: reason} = Check.check(:anthropic)
+
+      assert reason ==
+               "config :clementine, anthropic_api_key: {Clementine.Models.CheckTest, " <>
+                 ":raising_key, []} raised RuntimeError"
+    end
+
     test "is skipped without a configured key" do
       Application.delete_env(:clementine, :anthropic_api_key)
 
@@ -156,6 +214,17 @@ defmodule Clementine.Models.CheckTest do
                "ft:gpt-6.1-terra:acme::B1x2y3z4"
              ]
     end
+  end
+
+  test "a retired id the sheets lack is counted, not flagged; an active one is flagged" do
+    # Ids no sheet ships, as the API would list an old snapshot.
+    retired = %{"id" => "claude-instant-0.9", "lifecycle" => "retired", "line" => nil}
+    active = %{"id" => "claude-sonnet-6", "lifecycle" => "active", "line" => "sonnet"}
+
+    assert %{
+             findings: [%{id: "claude-sonnet-6", kind: :unknown}],
+             unshipped: [%{id: "claude-instant-0.9", lifecycle: "retired"}]
+           } = Check.compare(:anthropic, [retired, active])
   end
 
   test "a capability the API no longer states as supported is a difference" do
@@ -220,6 +289,8 @@ defmodule Clementine.Models.CheckTest do
            } =
              Check.compare(:anthropic, [entry])
   end
+
+  def raising_key, do: raise("vault said sk-ant-secret is sealed")
 
   defp serve_anthropic(bypass) do
     Bypass.expect(bypass, "GET", "/v1/models", fn conn ->
