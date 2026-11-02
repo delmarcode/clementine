@@ -9,11 +9,13 @@ defmodule Clementine.Cost do
   jsonb, and a host's `bigint` column unchanged; a float would drift as
   costs add up, and `Decimal` comes only with the optional Ecto deps.
 
-  `price/2` is the pure function from `Clementine.Usage` and a model's
-  prices (`Clementine.LLM.Pricing`) to a cost. It charges each part of the
-  usage at its own rate: uncached input (`input_tokens` less the cache
-  reads and writes, which are parts of it), cache reads, cache writes,
-  and output. It sums the parts exactly and rounds once, half up, to the
+  `price/2` is the pure function from one call's `Clementine.Usage` and a
+  model's prices (`Clementine.LLM.Pricing`) to a cost. It picks the rates
+  by the call's prompt: the tier's (`over:`) when the prompt is over the
+  tier's length, else the base rates. It charges each part of the usage
+  at its own rate: uncached input (`input_tokens` less the cache reads
+  and writes, which are parts of it), cache reads, cache writes, and
+  output. It sums the parts exactly and rounds once, half up, to the
   micro-unit, so one call's cost is within half a micro-unit of the exact
   figure.
 
@@ -22,9 +24,10 @@ defmodule Clementine.Cost do
   ## Where costs show
 
   - Each trace `model_call` entry freezes its call's cost under `"cost"`,
-    priced by the call's model at the prices configured when it ran
-    (`Clementine.Trace`), and stored in `agent_run_trace`'s `cost_micros`
-    and `currency` columns. Changing a price never reprices history.
+    priced by the call's model at the prices in force when it ran, in
+    this app (`Clementine.Trace`), and stored in `agent_run_trace`'s
+    `cost_micros` and `currency` columns. Changing a price never reprices
+    history.
   - `Clementine.Runs.cost/2` sums a run's frozen costs (`children: true`
     adds every run it started, down the tree), and
     `Clementine.Runs.subject_cost/1` every run on a subject: `nil` while a
@@ -32,8 +35,10 @@ defmodule Clementine.Cost do
   - `[:clementine, :llm, :stop]` carries a priced call's `cost_micros`,
     and `[:clementine, :llm, :exception]` a call's a provider error ended
     (`Clementine.Telemetry`).
-  - `of/2` prices any usage at today's prices: an in-process run's
-    `result.usage`, or a trace entry's usage to reprice it.
+  - `of/3` prices one call's usage at today's prices: a trace entry's, to
+    reprice it. A tiered model prices each call by its own prompt, so a
+    run's summed usage (an in-process `result.usage`) prices right on an
+    untiered model only; sum the calls' costs instead.
   """
 
   alias Clementine.LLM.Pricing
@@ -47,44 +52,89 @@ defmodule Clementine.Cost do
   @million 1_000_000
 
   @doc """
-  Prices `usage` at `pricing`'s rates, with `cache_write` the single rate
-  for the TTL the call wrote with (`Clementine.LLM.Pricing.of/1` returns
-  prices in that form).
+  Prices one call's `usage` at `pricing`'s rates, with `cache_write` the
+  single rate for the TTL the call wrote with (`Clementine.LLM.Pricing.of/2`
+  returns prices in that form). A call whose prompt, `usage.input_tokens`,
+  is over the tier's `prompt_tokens` pays the tier's rates for all of it.
+
+  Raises `ArgumentError` for prices that still name a write rate per TTL,
+  as a sheet's do (`Clementine.Models.get!(id).prices`): which rate
+  applies depends on the call's TTL, so reduce them with
+  `Clementine.LLM.Pricing.of/2` or `Clementine.LLM.Pricing.at_ttl/2`
+  first.
   """
   @spec price(Usage.t(), Pricing.t()) :: t()
   def price(%Usage{} = usage, %Pricing{cache_write: cache_write} = pricing)
       when is_integer(cache_write) do
+    rates = rates(pricing, usage)
     uncached = max(usage.input_tokens - usage.cache_read_tokens - usage.cache_write_tokens, 0)
 
     # Tokens times micro-units per million tokens: millionths of a
     # micro-unit, exact until the one rounding.
     exact =
-      uncached * pricing.input +
-        usage.cache_read_tokens * pricing.cache_read +
-        usage.cache_write_tokens * cache_write +
-        usage.output_tokens * pricing.output
+      uncached * rates.input +
+        usage.cache_read_tokens * rates.cache_read +
+        usage.cache_write_tokens * rates.cache_write +
+        usage.output_tokens * rates.output
 
     %__MODULE__{currency: pricing.currency, micros: div(exact + div(@million, 2), @million)}
   end
 
-  @doc """
-  Prices `usage` (a `Clementine.Usage` or a usage map) at the prices
-  `model` has now: a model id, as a trace entry records it, at the
-  model's default caching, or a call's resolved model (`%{pricing: ...,
-  cache: ...}`). `nil` for a model without prices, or an id no sheet
-  holds.
-  """
-  @spec of(Usage.t() | map(), String.t() | map() | nil) :: t() | nil
-  def of(_usage, nil), do: nil
+  def price(%Usage{}, %Pricing{cache_write: rates}) when is_map(rates) do
+    raise ArgumentError,
+          "Clementine.Cost.price/2 takes prices with one cache_write rate, and these name one " <>
+            "per TTL (#{inspect(Map.keys(rates))}): reduce them to the call's TTL first, with " <>
+            "Clementine.LLM.Pricing.of(id, cache_ttl: ttl) or " <>
+            "Clementine.LLM.Pricing.at_ttl(prices, ttl)"
+  end
 
-  def of(%Usage{} = usage, model) do
-    case Pricing.of(model) do
+  # The rates a call pays: its tier's once its prompt, every input token
+  # it sent (cache reads and writes are parts of input_tokens), is over the
+  # tier's length, as both vendors count a prompt toward the line.
+  # `Pricing.at_ttl/2` reduces the tier's write rate with the base's.
+  defp rates(%Pricing{over: %{prompt_tokens: line} = tier}, usage)
+       when usage.input_tokens > line,
+       do: tier
+
+  defp rates(%Pricing{} = pricing, _usage), do: pricing
+
+  @doc """
+  Prices one call's `usage` (a `Clementine.Usage`, or a usage map such as
+  a trace entry's `"usage"`) at the prices the model `id` has now. `nil`
+  for a model without prices, an id no sheet holds, or a platform or TTL
+  the model's prices do not cover.
+
+  - `:platform` — where the call ran. Default the model's default
+    platform (`Clementine.Models.default_platform/1`): until
+    `Clementine.Platform` arrives (OPS-195), the only one a request goes
+    to.
+  - `:cache_ttl` — the TTL the call's writes were billed at. Default the
+    model's shortest.
+
+  A trace `:model_call` entry records both, as strings, which these take:
+
+      Clementine.Cost.of(entry.payload["usage"], entry.payload["model"],
+        platform: entry.payload["platform"],
+        cache_ttl: entry.payload["cache_ttl"]
+      )
+  """
+  @spec of(Usage.t() | map(), String.t() | map() | nil, keyword()) :: t() | nil
+  def of(usage, model, opts \\ [])
+
+  def of(%Usage{} = usage, id, opts) when is_binary(id) do
+    case Pricing.of(id, opts) do
       %Pricing{} = pricing -> price(usage, pricing)
       nil -> nil
     end
   end
 
-  def of(usage, model) when is_map(usage), do: of(Usage.new(usage), model)
+  # A call's model as the engine resolved it (`Clementine.Trace`), its
+  # prices already at the call's TTL.
+  def of(%Usage{} = usage, %{pricing: %Pricing{} = pricing}, _opts), do: price(usage, pricing)
+
+  def of(%Usage{}, _model, _opts), do: nil
+
+  def of(usage, model, opts) when is_map(usage), do: of(Usage.new(usage), model, opts)
 
   @doc """
   The total of `costs`: `nil` when any is `nil` (an unpriced call makes the

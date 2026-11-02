@@ -13,11 +13,12 @@ defmodule Clementine.Trace do
 
   - `:execution`, once per execution: when a run starts, and again when it
     resumes after an approval or a delegation.
-    - `"provider"` — the platform the model's request went to
-      (`"anthropic"`, `"openai"`, ...)
+    - `"provider"` — the model's vendor (`"anthropic"`, `"openai"`,
+      `"deepseek"`, ...), `Clementine.Model`'s `vendor`
+    - `"platform"` — where the model's requests went (`"anthropic"`,
+      `"openrouter"`, `"bedrock"`, ...): the model's default platform
+      until an agent can name one (`Clementine.Models.default_platform/1`)
     - `"model"` — the model's id (`Clementine.Model`)
-    - `"alias"` — always `nil` now that models are named by id; the
-      column leaves with trace version 6 (OPS-190)
     - `"agent_fingerprint"` — a sha256 over the model id, the
       instructions, the agent's tool schemas, and, when the agent has
       them, which tools are deferred, the output schema, the skills it
@@ -42,18 +43,25 @@ defmodule Clementine.Trace do
     - `"resumed"` — `true` for an execution that resumed from a checkpoint
   - `:model_call`, once per call to the model.
     - `"iteration"`, `"duration_ms"`
-    - `"provider"`, `"model"` — as in `:execution`, resolved for the call
+    - `"provider"`, `"platform"`, `"model"` — as in `:execution`,
+      resolved for the call
+    - `"cache_ttl"` — the cache TTL the call's writes were priced at
+      (`"five_minutes"`, `"one_hour"`, `"thirty_minutes"`,
+      `"twelve_hours"`): the agent's `cache:` TTL, or with its caching off
+      the model's shortest; `nil` on a model that offers none. With
+      `"platform"` and `"model"`, what `Clementine.Cost.of/3` reprices
+      the call by
     - `"stop_reason"` — the provider's, or `nil` when the call did not
       finish (a cancel, a drain, a lost lease, or a provider error ended
       the execution in the middle of it)
     - `"usage"` — `Clementine.Usage.to_map/1`'s map (`"input_tokens"`,
       `"output_tokens"`, `"cache_read_tokens"`, `"cache_write_tokens"`),
       what the stream reported, so far as it got
-    - `"alias"` — always `nil`, as in `:execution`
     - `"cost"` — what the call cost, frozen when it ended at the prices
-      the model had then: `Clementine.Cost.to_map/1`'s map
-      (`"currency"`, `"micros"`), or `nil` for a model without prices
-      (`Clementine.Runs.cost/2` sums them)
+      the model had then, its tier picked by its own prompt:
+      `Clementine.Cost.to_map/1`'s map (`"currency"`, `"micros"`), or
+      `nil` for a model without prices (`Clementine.Runs.cost/2` sums
+      them)
     - `"content"` — the assistant's blocks, as
       `Clementine.LLM.Message.Content.to_map/1` maps them
   - `:tool_call`, once per tool call started, a call a cancel or a drain
@@ -134,15 +142,15 @@ defmodule Clementine.Trace do
   ## How it is stored
 
   On the durable runtime the trace is `agent_run_trace`
-  (`Clementine.Migration`, version 5), and each entry's facts have
+  (`Clementine.Migration`, version 6), and each entry's facts have
   columns of their own, so a warehouse or a dashboard reads them without
   the content:
 
-  - `:execution`: `provider`, `model`, `alias`, `agent_fingerprint`.
-  - `:model_call`: `iteration`, `provider`, `model`, `alias`, the four
-    counts of `"usage"` (`input_tokens`, `output_tokens`,
-    `cache_read_tokens`, `cache_write_tokens`), `"cost"` as `cost_micros`
-    and `currency`, `duration_ms`, `stop_reason`.
+  - `:execution`: `provider`, `platform`, `model`, `agent_fingerprint`.
+  - `:model_call`: `iteration`, `provider`, `platform`, `model`,
+    `cache_ttl`, the four counts of `"usage"` (`input_tokens`,
+    `output_tokens`, `cache_read_tokens`, `cache_write_tokens`), `"cost"`
+    as `cost_micros` and `currency`, `duration_ms`, `stop_reason`.
   - `:tool_call`: `iteration`, `tool_use_id`, `tool_name` (`"name"`),
     `is_error`, `killed`, `duration_ms`, and `"approval"`'s verdict and
     `"policy"`'s verdict and failure as `approval_verdict`,
@@ -177,6 +185,7 @@ defmodule Clementine.Trace do
   """
 
   alias Clementine.LLM.Message.Content
+  alias Clementine.LLM.Pricing
   alias Clementine.Trace.Entry
 
   @type fidelity :: :content | :facts
@@ -189,13 +198,12 @@ defmodule Clementine.Trace do
   }
 
   # The columns of agent_run_trace that hold an entry's facts
-  # (Clementine.Migration, version 5), in table order.
+  # (Clementine.Migration, version 6), in table order.
   @columns [
     :iteration,
     :tool_use_id,
     :provider,
     :model,
-    :alias,
     :agent_fingerprint,
     :input_tokens,
     :output_tokens,
@@ -212,7 +220,9 @@ defmodule Clementine.Trace do
     :policy_verdict,
     :policy_failed,
     :skill_name,
-    :delegate_key
+    :delegate_key,
+    :platform,
+    :cache_ttl
   ]
 
   @usage_columns [:input_tokens, :output_tokens, :cache_read_tokens, :cache_write_tokens]
@@ -223,15 +233,16 @@ defmodule Clementine.Trace do
   @fact_keys %{
     execution: [
       provider: "provider",
+      platform: "platform",
       model: "model",
-      alias: "alias",
       agent_fingerprint: "agent_fingerprint"
     ],
     model_call: [
       iteration: "iteration",
       provider: "provider",
+      platform: "platform",
       model: "model",
-      alias: "alias",
+      cache_ttl: "cache_ttl",
       duration_ms: "duration_ms",
       stop_reason: "stop_reason"
     ],
@@ -255,17 +266,17 @@ defmodule Clementine.Trace do
 
   @typedoc """
   The model an execution or a call runs on, resolved once
-  (`resolve_model/2`): the platform it goes to (the `provider` a trace
-  entry records), its id, the agent's caching, and the model's prices,
-  or, for an id no sheet holds, the id alone. `alias` is always `nil`:
-  models are named by id, and the column goes in OPS-190's migration.
+  (`resolve_model/2`): its vendor (the `provider` a trace entry records),
+  the platform its requests go to, its id, the cache TTL its writes are
+  billed at, and its prices at that TTL; or, for an id no sheet holds,
+  the id alone.
   """
   @type model :: %{
           required(:provider) => atom() | nil,
+          required(:platform) => atom() | nil,
           required(:id) => String.t() | nil,
-          required(:alias) => nil,
-          required(:pricing) => Clementine.LLM.Pricing.t() | nil,
-          optional(atom()) => term()
+          required(:cache_ttl) => Clementine.Model.ttl() | nil,
+          required(:pricing) => Pricing.t() | nil
         }
 
   @doc "The fidelities an agent may declare."
@@ -285,24 +296,33 @@ defmodule Clementine.Trace do
   # The model `id` names, with the agent's choices `policy` (its
   # `cache:` decides which write rate applies), resolved once for an
   # execution, so its trace entries, its costs, and its telemetry name
-  # the same platform, id, and prices. An id no sheet holds, or choices
-  # its sheet refuses (a test's on a mock client, say), resolve to the id
-  # as written, with no provider and no prices, rather than failing the
-  # run over its record: the request itself fails where it must.
+  # the same vendor, platform, id, and prices. An id no sheet holds, or
+  # choices its sheet refuses (a test's on a mock client, say), resolve
+  # to the id as written, with no provider, platform, or prices, rather
+  # than failing the run over its record: the request itself fails where
+  # it must.
   @spec resolve_model(term(), keyword()) :: model()
   def resolve_model(id, policy \\ []) do
     case Clementine.LLM.Policy.resolve(id, policy) do
       {:ok, resolved} ->
+        ttl = Pricing.billed_ttl(resolved.model, resolved.cache.ttl)
+
         %{
-          provider: resolved.platform,
+          provider: resolved.model.vendor,
+          platform: resolved.platform,
           id: resolved.model.id,
-          alias: nil,
-          pricing: resolved.model.prices,
-          cache: resolved.cache
+          cache_ttl: ttl,
+          pricing: Pricing.at_ttl(resolved.model.prices, ttl)
         }
 
       {:error, _message} ->
-        %{provider: nil, id: if(is_binary(id), do: id), alias: nil, pricing: nil, cache: nil}
+        %{
+          provider: nil,
+          platform: nil,
+          id: if(is_binary(id), do: id),
+          cache_ttl: nil,
+          pricing: nil
+        }
     end
   end
 
@@ -319,8 +339,8 @@ defmodule Clementine.Trace do
 
     %{
       "provider" => model.provider,
+      "platform" => model.platform,
       "model" => model.id,
-      "alias" => model.alias,
       "agent_fingerprint" => fingerprint_of(model, instructions, tools, offer),
       "instructions" => instructions,
       "tools" => Enum.map(offered, &Clementine.Tool.to_schema(&1).name),
@@ -353,8 +373,9 @@ defmodule Clementine.Trace do
       "stop_reason" => stop_reason,
       "usage" => Clementine.Usage.to_map(usage),
       "provider" => model.provider,
+      "platform" => model.platform,
       "model" => model.id,
-      "alias" => model.alias,
+      "cache_ttl" => model.cache_ttl,
       "cost" => Clementine.Cost.to_map(cost),
       "content" => content && Enum.map(content, &content_map/1)
     }

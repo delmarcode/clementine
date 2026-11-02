@@ -86,9 +86,12 @@ other terminal comes back as `{:error, result}` carrying the matching
 `Clementine.Result` variant — a `Failed` with a normalized
 `Clementine.Error` (including whether it is retryable), a `Cancelled`, or
 an `Interrupted`. All variants carry `usage`; tokens burn on failures too.
-`Clementine.Cost.of(result.usage, "claude-sonnet-5-5")` prices it, once
-the model has prices (`prices:` in
-[`docs/MODELS.md`](../docs/MODELS.md#prices)).
+The model's sheet carries its list prices
+([`docs/MODELS.md`](../docs/MODELS.md#prices)), and each model call's
+cost rides `[:clementine, :llm, :usage]`. `Clementine.Cost.of(usage,
+"claude-sonnet-5-5")` prices one call's usage; a tiered model (Claude
+Haiku 5.5, the GPT-6 family) prices each call by its own prompt, so sum
+the calls' costs rather than pricing a run's summed `result.usage`.
 
 Prompt caching is on by default: each step of a run reads the prompt
 the step before it sent from the provider's cache instead of paying for

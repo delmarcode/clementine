@@ -33,8 +33,8 @@ that rolled back.
 sums, and distributions a Prometheus reporter takes as they are. It
 holds the loop metrics (counters labeled `kind`/`outcome`/`reason`/
 `verdict`/`trigger`, step duration and inputs, the inbox distributions)
-beside the engine's, which are labeled by agent, provider, model, and
-alias, and the runs', labeled by agent (`Clementine.Telemetry`, "What is
+beside the engine's, which are labeled by agent, provider, platform,
+and model, and the runs', labeled by agent (`Clementine.Telemetry`, "What is
 exported", lists every series). A PromEx app passes it to one plugin:
 
 <!-- guide-sample: parse-only -->
@@ -50,8 +50,9 @@ end
 ```
 
 Across the fleet, compare by `provider` and `model`: they name what ran,
-in every app alike: `model` is the vendor's id. `alias` is always empty
-now that models are named by id, and leaves with trace version 6. Every metered call counts once in the call,
+in every app alike: `provider` is the model's vendor and `model` its id,
+and `platform` says where it ran (the Claude API, Bedrock, OpenRouter).
+Every metered call counts once in the call,
 token, and cost series, labeled by `outcome`, so a total is one series
 summed, whatever the calls' outcomes. A label nothing filled exports as
 `""` on Core and Peep alike.

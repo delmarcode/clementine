@@ -20,6 +20,15 @@ defmodule Clementine.Models.Anthropic do
     which models bind their thinking and take system messages in place.
   - [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching):
     minimum prefixes and TTLs.
+  - [Pricing](https://platform.claude.com/docs/en/about-claude/pricing):
+    list prices on the Claude API, and the one tier ("Long context
+    pricing": Haiku 5.5 over 100,000 prompt tokens; every other 4.6 and
+    later model bills its whole window at one rate, and the older ones
+    have 200,000-token windows). Bedrock and Google Cloud price
+    themselves, regional endpoints 10% higher; an app on them overrides
+    `prices`. Mythos Preview's input and output rates are on its own
+    page (anthropic.com/glasswing), and its cache rates are this page's
+    multipliers for every model it names no other rate for.
   - [Tool search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
     and [Structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs):
     which models have them.
@@ -58,7 +67,9 @@ defmodule Clementine.Models.Anthropic do
 
   @read ~D[2026-11-01]
   @models "https://platform.claude.com/docs/en/models"
+  @pricing "https://platform.claude.com/docs/en/about-claude/pricing"
   @deprecations "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+  @glasswing "https://anthropic.com/glasswing"
 
   @efforts [:low, :medium, :high, :xhigh, :max]
   @ttls [:five_minutes, :one_hour]
@@ -101,6 +112,16 @@ defmodule Clementine.Models.Anthropic do
     {"claude-2.1", "Claude 2.1", nil, ~D[2025-01-21], ~D[2025-07-21], "claude-opus-4-8"},
     {"claude-2.0", "Claude 2.0", nil, ~D[2025-01-21], ~D[2025-07-21], "claude-opus-4-8"}
   ]
+  # The retired models the pricing page still lists, which Bedrock and
+  # Google Cloud may still serve: input, output, cache hits, and 5-minute
+  # and 1-hour writes. The older ones it no longer prices.
+  @retired_prices %{
+    "claude-opus-4-1-20250805" => {15, 75, 1.50, 18.75, 30},
+    "claude-opus-4-20250514" => {15, 75, 1.50, 18.75, 30},
+    "claude-sonnet-4-20250514" => {3, 15, 0.30, 3.75, 6},
+    "claude-3-5-haiku-20241022" => {0.80, 4, 0.08, 1, 1.60}
+  }
+
   @retired_1 ["claude-1.0", "claude-1.1", "claude-1.2", "claude-1.3"] ++
                ["claude-instant-1.0", "claude-instant-1.1", "claude-instant-1.2"]
 
@@ -108,6 +129,8 @@ defmodule Clementine.Models.Anthropic do
   # The sheets in keyword form, newest first within each line.
   @spec sheets() :: [keyword()]
   def sheets do
+    # Over 100,000 prompt tokens, cache reads and writes counted, the
+    # whole request pays the tier.
     ([
        [
          id: "claude-fable-5-1",
@@ -122,6 +145,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_5_1,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
+         prices: prices(10, 50, 0.25, 12.50, 20),
          platforms: platforms("claude-fable-5-1"),
          source: "#{@models}/fable-5-1/overview"
        ],
@@ -138,6 +162,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_5_1,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
+         prices: prices(10, 50, 0.25, 12.50, 20),
          platforms: verified_platforms("claude-mythos-5-1"),
          source: "#{@models}/mythos-5-1/overview"
        ],
@@ -154,6 +179,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_5_1,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
+         prices: prices(4, 20, 0.20, 5, 8),
          platforms: platforms("claude-opus-5-5"),
          source: "#{@models}/opus-5-5/overview"
        ],
@@ -173,6 +199,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_5_1,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
+         prices: prices(2, 10, 0.10, 2.50, 4),
          platforms: platforms("claude-sonnet-5-5"),
          source: "#{@models}/sonnet-5-5/overview"
        ],
@@ -189,6 +216,16 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_4_7,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
+         prices:
+           prices(0.10, 0.50, 0.01, 0.125, 0.20,
+             over: [
+               prompt_tokens: 100_000,
+               input: 0.50,
+               output: 2.50,
+               cache_read: 0.05,
+               cache_write: [five_minutes: 0.625, one_hour: 1.00]
+             ]
+           ),
          platforms: platforms("claude-haiku-5-5"),
          source: "#{@models}/haiku-5-5/overview"
        ],
@@ -205,6 +242,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_4_7,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
+         prices: prices(5, 25, 0.50, 6.25, 10),
          platforms: platforms("claude-opus-5"),
          source: "#{@models}/opus-5/overview"
        ],
@@ -221,6 +259,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_4_7,
          features: [mid_conversation_system: false] ++ @features,
          cache: [min_prefix: 1024, ttls: @ttls],
+         prices: prices(2, 10, 0.20, 2.50, 4),
          platforms: platforms("claude-sonnet-5"),
          source: "#{@models}/sonnet-5/overview"
        ],
@@ -237,6 +276,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_4_7,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
+         prices: prices(10, 50, 1, 12.50, 20),
          platforms: platforms("claude-fable-5"),
          source: "#{@models}/fable-5/overview"
        ],
@@ -253,6 +293,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_4_7,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 512, ttls: @ttls],
+         prices: prices(10, 50, 1, 12.50, 20),
          platforms: verified_platforms("claude-mythos-5"),
          source: "#{@models}/mythos-5/overview"
        ],
@@ -270,6 +311,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_4_7,
          features: [mid_conversation_system: true] ++ @features,
          cache: [min_prefix: 1024, ttls: @ttls],
+         prices: prices(5, 25, 0.50, 6.25, 10),
          platforms: platforms("claude-opus-4-8"),
          source: "#{@models}/opus-4-8/overview"
        ],
@@ -286,6 +328,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: @rejects_4_7,
          features: [mid_conversation_system: false] ++ @features,
          cache: [min_prefix: 2048, ttls: @ttls],
+         prices: prices(5, 25, 0.50, 6.25, 10),
          platforms: platforms("claude-opus-4-7"),
          source: "#{@models}/opus-4-7/overview"
        ],
@@ -302,6 +345,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: [:prefill],
          features: @features,
          cache: [min_prefix: 4096, ttls: @ttls],
+         prices: prices(5, 25, 0.50, 6.25, 10),
          platforms: [
            anthropic: [],
            vertex: [lifecycle: :partner],
@@ -323,6 +367,7 @@ defmodule Clementine.Models.Anthropic do
          rejects: [:prefill],
          features: @features,
          cache: [min_prefix: 1024, ttls: @ttls],
+         prices: prices(3, 15, 0.30, 3.75, 6),
          platforms: [
            anthropic: [],
            vertex: [lifecycle: :partner],
@@ -345,6 +390,7 @@ defmodule Clementine.Models.Anthropic do
            thinking: thinking_4_5([:low, :medium, :high], :high),
            features: @features,
            cache: [min_prefix: 4096, ttls: @ttls],
+           prices: prices(5, 25, 0.50, 6.25, 10),
            source: "#{@models}/opus-4-5/overview"
          ],
          "20251101"
@@ -367,6 +413,7 @@ defmodule Clementine.Models.Anthropic do
            thinking: thinking_4_5([], nil),
            features: @features,
            cache: [min_prefix: 1024, ttls: @ttls],
+           prices: prices(3, 15, 0.30, 3.75, 6),
            source: "#{@models}/sonnet-4-5/overview"
          ],
          "20250929"
@@ -384,6 +431,7 @@ defmodule Clementine.Models.Anthropic do
            thinking: thinking_4_5([], nil),
            features: @features,
            cache: [min_prefix: 4096, ttls: @ttls],
+           prices: prices(1, 5, 0.10, 1.25, 2),
            source: "#{@models}/haiku-4-5/overview"
          ],
          "20251001",
@@ -417,6 +465,11 @@ defmodule Clementine.Models.Anthropic do
       rejects: [:temperature, :top_p, :top_k, :prefill],
       features: [mid_conversation_system: false] ++ @features,
       cache: [min_prefix: 2048, ttls: @ttls],
+      # Input and output are its own page's, the rates after the research
+      # preview. Its cache rates are the pricing page's multipliers for
+      # "all other models": 1.25x input for a 5-minute write, 2x for an
+      # hour, 0.1x for a hit.
+      prices: Keyword.put(prices(25, 125, 2.50, 31.25, 50), :source, @glasswing),
       platforms: [
         anthropic: [],
         bedrock: [id: "anthropic.claude-mythos-preview", lifecycle: :partner]
@@ -458,7 +511,34 @@ defmodule Clementine.Models.Anthropic do
       ],
       platforms: [anthropic: []],
       source: @deprecations
-    ]
+    ] ++ retired_prices(id)
+  end
+
+  defp retired_prices(id) do
+    case @retired_prices do
+      %{^id => {input, output, cache_read, five_minutes, one_hour}} ->
+        [cache: [ttls: @ttls], prices: prices(input, output, cache_read, five_minutes, one_hour)]
+
+      _unlisted ->
+        []
+    end
+  end
+
+  # List prices in USD per million tokens, as the pricing page states
+  # them: base input, output, cache hits and refreshes, and 5-minute and
+  # 1-hour cache writes. Each model's cache-hit rate is its own (0.025x
+  # input on Fable and Mythos 5.1, 0.05x on Opus and Sonnet 5.5, 0.1x on
+  # the rest), never derived from its input rate.
+  defp prices(input, output, cache_read, five_minutes, one_hour, extra \\ []) do
+    [
+      currency: "USD",
+      input: input,
+      output: output,
+      cache_read: cache_read,
+      cache_write: [five_minutes: five_minutes, one_hour: one_hour],
+      source: @pricing,
+      read: @read
+    ] ++ extra
   end
 
   defp thinking(default, types, opts \\ []) do

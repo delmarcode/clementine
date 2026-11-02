@@ -12,10 +12,12 @@ defmodule Clementine.Models do
   is a model the app declares, and carries what the clients need:
 
       config :clementine, :models, %{
-        # Override: the app's prices for a shipped model.
+        # Override: the app's own prices for a shipped model (a
+        # negotiated rate); the sheet's list prices are replaced whole.
         "claude-opus-5-5" => [
           prices: [currency: "USD", input: 3.60, output: 18.00, cache_read: 0.18,
-                   cache_write: [five_minutes: 4.50, one_hour: 7.20]]
+                   cache_write: [five_minutes: 4.50, one_hour: 7.20],
+                   source: "contract 2026-10", read: ~D[2026-10-15]]
         ],
         # Declaration: an open model on OpenRouter.
         "deepseek/deepseek-v3.2" => [
@@ -29,10 +31,11 @@ defmodule Clementine.Models do
 
   An override merges key by key into `lifecycle`, `thinking`, `features`,
   `cache`, and each entry of `platforms`, and replaces any other fact
-  (`prices` whole). A declaration needs `vendor`, `context`, `max_output`,
-  and `platforms`; the rest default to a model that does not think,
-  binds nothing, has no structured outputs, and caches on its own
-  (`Clementine.Model`). `docs/MODELS.md` has every key.
+  (`prices` whole, so an override of a sheet with a tier restates its
+  `over:` or clears it with `over: nil`). A declaration needs `vendor`,
+  `context`, `max_output`, and `platforms`; the rest default to a model
+  that does not think, binds nothing, has no structured outputs, and
+  caches on its own (`Clementine.Model`). `docs/MODELS.md` has every key.
 
   ## A new model the day it ships
 
@@ -68,6 +71,7 @@ defmodule Clementine.Models do
   id, and builds it again only when that id's config changes.
   """
 
+  alias Clementine.LLM.Pricing
   alias Clementine.Model
   alias Clementine.Models.{Anthropic, OpenAI}
 
@@ -118,7 +122,9 @@ defmodule Clementine.Models do
         {:ok, Map.fetch!(@shipped, id)}
 
       {{:ok, sheet}, {:ok, facts}} ->
-        memo(id, facts, fn -> build(id, &override(sheet, &1), facts) end)
+        memo(id, facts, fn ->
+          with :ok <- tier_restated(id, sheet, facts), do: build(id, &override(sheet, &1), facts)
+        end)
 
       {:error, {:ok, facts}} ->
         memo(id, facts, fn -> declare(id, facts) end)
@@ -218,47 +224,40 @@ defmodule Clementine.Models do
   @doc """
   Checks `config :clementine, :models`: every override and declaration
   builds, every declared model names a platform Clementine can send to,
-  and every priced model names one currency. Raises `ArgumentError`
-  naming the id. `Clementine.Application` calls it at boot.
+  and every priced model, shipped and the app's, names one currency.
+  Raises `ArgumentError` naming the id. `Clementine.Application` calls it
+  at boot.
   """
   @spec validate_config!() :: :ok
   def validate_config! do
     config = config!()
 
-    models =
-      Enum.map(config, fn {id, _facts} ->
-        case fetch(id) do
-          {:ok, model} -> model
-          {:error, message} -> raise ArgumentError, message
-        end
-      end)
+    Enum.each(config, fn {id, facts} ->
+      case fetch(id) do
+        {:ok, model} ->
+          if is_list(facts) and Keyword.has_key?(facts, :prices), do: priced_ttls!(model)
 
-    Enum.each(models, fn model ->
-      priced_ttls!(model)
+          unless default_platform(model) do
+            raise ArgumentError,
+                  "Invalid :clementine, :models entry #{inspect(model.id)}: it is served on " <>
+                    "#{inspect(Keyword.keys(model.platforms))}, and Clementine can send to " <>
+                    "#{inspect(Model.served())}"
+          end
 
-      unless default_platform(model) do
-        raise ArgumentError,
-              "Invalid :clementine, :models entry #{inspect(model.id)}: it is served on " <>
-                "#{inspect(Keyword.keys(model.platforms))}, and Clementine can send to " <>
-                "#{inspect(Model.served())}"
+        {:error, message} ->
+          raise ArgumentError, message
       end
     end)
 
-    case Enum.uniq(for %Model{prices: %{currency: currency}} <- models, do: currency) do
-      [_two, _or_more | _rest] = currencies ->
-        raise ArgumentError,
-              "Invalid :clementine, :models configuration: every priced model names one " <>
-                "currency, so their costs add up; got #{inspect(currencies)}"
-
-      _one_or_none ->
-        :ok
-    end
+    currencies!()
   end
 
-  # A per-TTL price names only TTLs the model offers, so no rate is
-  # written that no agent could write at.
-  defp priced_ttls!(%Model{prices: %{cache_write: rates}} = model) when is_map(rates) do
-    case Map.keys(rates) -- model.cache.ttls do
+  # A per-TTL price the app writes names only TTLs the model offers, so
+  # no rate is written that no agent could write at. (A shipped sheet's
+  # name its own TTLs; an override that narrows them leaves the rates for
+  # the rest unused.)
+  defp priced_ttls!(model) do
+    case Pricing.priced_ttls(model.prices) -- model.cache.ttls do
       [] ->
         :ok
 
@@ -270,7 +269,29 @@ defmodule Clementine.Models do
     end
   end
 
-  defp priced_ttls!(_model), do: :ok
+  # Costs add up only in one currency. Clementine's sheets are in USD, so
+  # an app that pays in another prices every model it runs in it, and
+  # sets `prices: nil` on the rest.
+  defp currencies! do
+    priced = for %Model{prices: %{currency: currency}} = model <- list(), do: {currency, model.id}
+
+    case priced |> Enum.map(&elem(&1, 0)) |> Enum.uniq() do
+      [_two, _or_more | _rest] = currencies ->
+        examples =
+          Enum.map_join(currencies, ", ", fn currency ->
+            "#{inspect(currency)} on #{priced |> List.keyfind(currency, 0) |> elem(1) |> inspect()}"
+          end)
+
+        raise ArgumentError,
+              "Invalid :clementine, :models configuration: every priced model names one " <>
+                "currency, so their costs add up; got #{examples}. Clementine's sheets are " <>
+                "priced in USD: price every model in one currency, or set prices: nil on " <>
+                "those you do not"
+
+      _one_or_none ->
+        :ok
+    end
+  end
 
   @doc false
   # Whether `id` names a shipped sheet or a model the app's config (as
@@ -380,6 +401,27 @@ defmodule Clementine.Models do
     {:error,
      "Invalid :clementine, :models entry #{inspect(id)}: expected a keyword list of facts " <>
        "(and no other id:), got: #{inspect(Model.redact(facts))}"}
+  end
+
+  # An override replaces `prices` whole, so one that leaves out the
+  # sheet's tier would price every long call at the base rates, a 5x
+  # undercount on Haiku 5.5 that nobody sees. It restates the tier, or
+  # clears it with `over: nil`.
+  defp tier_restated(id, sheet, facts) do
+    with true <- Keyword.keyword?(facts),
+         prices when is_list(prices) <- Keyword.get(facts, :prices),
+         true <- Keyword.keyword?(prices),
+         false <- Keyword.has_key?(prices, :over),
+         shipped when is_list(shipped) <- Keyword.get(sheet, :prices),
+         [_ | _] = tier <- Keyword.get(shipped, :over) do
+      {:error,
+       "Invalid :clementine, :models entry #{inspect(id)}: prices: the shipped prices bill a " <>
+         "call over #{tier[:prompt_tokens]} prompt tokens at a higher tier (over:), and an " <>
+         "override replaces prices whole: restate the tier, or write over: nil if your rates " <>
+         "have none"}
+    else
+      _no_tier_dropped -> :ok
+    end
   end
 
   defp override(sheet, facts) do

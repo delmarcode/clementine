@@ -524,11 +524,13 @@ defmodule Clementine.LLM.Policy do
   defp offered(%Model{cache: %{ttls: ttls}, platform: platform}),
     do: "on #{inspect(platform)} it offers #{inspect(ttls)}"
 
-  # A price per cache TTL names the rate for the TTL the agent writes at.
+  # A price per cache TTL names the rate for the TTL the agent's writes
+  # are billed at: its own, or with caching off the shortest the model
+  # offers and its prices name (`Pricing.billed_ttl/2`).
   defp priced(_model, _cache, true = _cache_unset), do: :ok
 
   defp priced(model, cache, false) do
-    case Pricing.validate_for_model(%{pricing: model.prices, cache: cache}) do
+    case Pricing.validate_ttl(model.prices, Pricing.billed_ttl(model, cache.ttl)) do
       :ok -> :ok
       {:error, message} -> {:error, "prices: #{message}"}
     end

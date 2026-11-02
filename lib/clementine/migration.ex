@@ -68,9 +68,9 @@ if Code.ensure_loaded?(Ecto.Migration) do
         iteration: :fact,
         # The provider's id for a tool call; a delegate child's tag_id.
         tool_use_id: :fact,
+        # The model's vendor.
         provider: :fact,
         model: :fact,
-        alias: :fact,
         # A hash, though over content: see "What a warehouse may keep".
         agent_fingerprint: :fact,
         input_tokens: :fact,
@@ -94,7 +94,11 @@ if Code.ensure_loaded?(Ecto.Migration) do
         skill_name: :fact,
         # An agent key the delegate call started, one of the agent's
         # delegates.
-        delegate_key: :fact
+        delegate_key: :fact,
+        # Where the model's requests went: a platform's name, fixed in code.
+        platform: :fact,
+        # The cache TTL a call's writes were priced at, an enum.
+        cache_ttl: :fact
       ]
     ]
 
@@ -127,14 +131,14 @@ if Code.ensure_loaded?(Ecto.Migration) do
         defmodule MyApp.Repo.Migrations.AddClementine do
           use Ecto.Migration
 
-          def up, do: Clementine.Migration.up(version: 5)
-          def down, do: Clementine.Migration.down(version: 5)
+          def up, do: Clementine.Migration.up(version: 6)
+          def down, do: Clementine.Migration.down(version: 6)
         end
 
     Each version's DDL is frozen here: a migration that says `version: 1`
     builds the same table under every later Clementine. A host on an
     earlier version adopts a later one in a new migration with
-    `up(from: 4, version: 5)`.
+    `up(from: 5, version: 6)`.
 
     ## The version stamp
 
@@ -164,9 +168,10 @@ if Code.ensure_loaded?(Ecto.Migration) do
     #{@fact_doc}
 
     A run's tokens are in `agent_runs.usage`; each model call's provider,
-    model, alias, tokens, cost, duration, and stop reason, and each tool
-    call's name, outcome, and duration, are in `agent_run_trace`'s columns
-    (version 5), and a run that was interrupted says why in
+    platform, model, cache TTL, tokens, cost, duration, and stop reason,
+    and each tool call's name, outcome, and duration, are in
+    `agent_run_trace`'s columns (versions 5 and 6), and a run that was
+    interrupted says why in
     `agent_runs.interrupt`, a closed code with Clementine's own text. A
     version that adds a column says here which it is.
 
@@ -190,6 +195,38 @@ if Code.ensure_loaded?(Ecto.Migration) do
       system prompt) makes it a per-person value, which anyone with a
       guess at those instructions can confirm by hashing the guess. Such
       an app leaves it out too.
+
+    ## Version 6
+
+    Models are named by their vendor's id, so the trace records where a
+    call ran and not an alias:
+
+        agent_run_trace
+          alias       dropped
+          provider    text  execution, model_call  now the model's vendor: anthropic,
+                                                   openai, deepseek, ...
+          platform    text  execution, model_call  where the requests went: anthropic,
+                                                   openai, openrouter, bedrock, ...
+          cache_ttl   text  model_call             the cache TTL the call's writes were
+                                                   priced at (five_minutes, one_hour,
+                                                   thirty_minutes, twelve_hours); null on
+                                                   a model that offers none
+
+    `cache_ttl` is what reprices a call at the TTL it wrote with
+    (`Clementine.Cost.of/3`), not the model's default. Like version 5's,
+    no column is `not null`, and an id no sheet holds records none of
+    the three.
+
+    `up(from: 5, version: 6)` drops `alias` with whatever it held and adds
+    the two columns, null on every existing row; nothing is backfilled, and
+    a version 5 row's `provider` keeps what version 5 meant by it, the
+    platform. Version 5 code writes `alias` on every trace row, and
+    version 6 code reads `platform`, so neither runs against the other's
+    table: stop every node on version 5 code, migrate, then start
+    version 6 code (the runtime refuses to start against a version 5
+    table). `down(to: 5, version: 6)` drops `platform` and `cache_ttl`,
+    with their facts, and adds `alias` back, null; roll the code back to
+    version 5 only after it.
 
     ## Version 5
 
@@ -394,7 +431,7 @@ if Code.ensure_loaded?(Ecto.Migration) do
     @table :agent_runs
     @inbox :agent_run_inbox
     @trace :agent_run_trace
-    @current_version 5
+    @current_version 6
 
     @doc "The newest version `up/1` can apply."
     @spec current_version() :: pos_integer()
@@ -719,6 +756,28 @@ if Code.ensure_loaded?(Ecto.Migration) do
           check: "(policy_verdict IS NULL) = (policy_failed IS NULL)"
         )
       )
+
+      stamp(5)
+    end
+
+    # Version 5 code writes alias on every row: no node on it runs against
+    # this table (the moduledoc's Version 6).
+    defp step_up(6) do
+      alter table(@trace) do
+        remove(:alias)
+        add(:platform, :text)
+        add(:cache_ttl, :text)
+      end
+
+      stamp(6)
+    end
+
+    defp step_down(6) do
+      alter table(@trace) do
+        remove(:cache_ttl)
+        remove(:platform)
+        add(:alias, :text)
+      end
 
       stamp(5)
     end

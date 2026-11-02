@@ -2,8 +2,9 @@ defmodule Clementine.CostTest do
   @moduledoc """
   `Clementine.Cost`: the pure function from usage and prices to a cost,
   across each provider's usage shape (cache reads and writes, both of
-  Anthropic's TTLs and both of OpenAI's), `nil` for what is not priced,
-  and sums. The rates are illustrative, not anyone's current prices.
+  Anthropic's TTLs and both of OpenAI's), the tier a call's prompt
+  reaches, `nil` for what is not priced, and sums. The `@card` rates are
+  illustrative; the shipped sheets' are the vendors' list prices.
   """
 
   use ExUnit.Case, async: false
@@ -36,10 +37,8 @@ defmodule Clementine.CostTest do
     validated
   end
 
-  # Prices as `Pricing.of/1` gives them for a resolved model writing with `ttl`.
-  defp at_ttl(pricing, ttl) do
-    Pricing.of(%{pricing: pricing!(pricing), cache: %{ttl: ttl}})
-  end
+  # Prices as a call writing with `ttl` is billed at them.
+  defp at_ttl(pricing, ttl), do: Pricing.at_ttl(pricing!(pricing), ttl)
 
   describe "price/2" do
     test "charges uncached input, cache reads, cache writes, and output each at its rate" do
@@ -98,6 +97,21 @@ defmodule Clementine.CostTest do
       assert %Cost{currency: "USD", micros: 0} =
                Cost.price(%Usage{}, at_ttl(@card, :five_minutes))
     end
+
+    test "prices still per TTL, as a sheet holds them, fail naming the way to reduce them" do
+      put_models(nil)
+      usage = %Usage{input_tokens: 1_000, cache_write_tokens: 500, output_tokens: 100}
+      sheet = Clementine.Models.get!("claude-sonnet-5").prices
+
+      assert_raise ArgumentError,
+                   ~r/per TTL \(\[:five_minutes, :one_hour\]\).*Pricing\.of/s,
+                   fn ->
+                     Cost.price(usage, sheet)
+                   end
+
+      assert Cost.price(usage, Pricing.at_ttl(sheet, :one_hour)) ==
+               Cost.price(usage, Pricing.of("claude-sonnet-5", cache_ttl: :one_hour))
+    end
   end
 
   # Each test starts from the provider's own usage object, normalized as
@@ -136,7 +150,8 @@ defmodule Clementine.CostTest do
         input: 2.0,
         output: 8.0,
         cache_read: 0.2,
-        cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0]
+        cache_write: [thirty_minutes: 2.5, twelve_hours: 5.0],
+        over: nil
       ]
 
       put_models(%{"gpt-5.6-sol" => [prices: card]})
@@ -168,7 +183,8 @@ defmodule Clementine.CostTest do
             input: 1.25,
             output: 10.0,
             cache_read: 0.125,
-            cache_write: 1.25
+            cache_write: 1.25,
+            over: nil
           ]
         ]
       })
@@ -269,17 +285,227 @@ defmodule Clementine.CostTest do
     end
   end
 
+  describe "a tier: the call's prompt picks the rates" do
+    # A Haiku 5.5 call: its prompt is every input token it sent, cache
+    # reads and writes included, as Anthropic counts it toward the line.
+    defp haiku(input, read, write, output) do
+      ProviderUsage.anthropic(%{
+        "input_tokens" => input - read - write,
+        "cache_read_input_tokens" => read,
+        "cache_creation_input_tokens" => write,
+        "output_tokens" => output
+      })
+      |> Usage.new()
+    end
+
+    test "Haiku 5.5 on the shipped sheet: up to 100,000 prompt tokens, then the higher rates" do
+      put_models(nil)
+
+      # 100,000 exactly is "up to": 40,000 uncached × 0.10 + 50,000 read ×
+      # 0.01 + 10,000 written × 0.125 + 2,000 out × 0.50, per million:
+      # 4,000 + 500 + 1,250 + 1,000 = 6,750 micros.
+      at_line = haiku(100_000, 50_000, 10_000, 2_000)
+      assert Cost.of(at_line, "claude-haiku-5-5") == %Cost{currency: "USD", micros: 6_750}
+
+      # One token over, and every token of the call pays the tier: 40,001
+      # × 0.50 + 50,000 × 0.05 + 10,000 × 0.625 + 2,000 × 2.50 =
+      # 20,000.5 + 2,500 + 6,250 + 5,000, rounded once: 33,751.
+      over = haiku(100_001, 50_000, 10_000, 2_000)
+      assert Cost.of(over, "claude-haiku-5-5") == %Cost{currency: "USD", micros: 33_751}
+
+      # Cache reads and writes count toward the line: a prompt that is
+      # mostly a cache hit is still over it.
+      mostly_cached = haiku(150_000, 140_000, 0, 0)
+
+      # 10,000 × 0.50 + 140,000 × 0.05 = 5,000 + 7,000.
+      assert Cost.of(mostly_cached, "claude-haiku-5-5") == %Cost{currency: "USD", micros: 12_000}
+
+      # An hour's writes on each side: 10,000 × 0.20 in place of 0.125
+      # below the line (750 more), × 1.00 in place of 0.625 above (3,750).
+      assert Cost.of(at_line, "claude-haiku-5-5", cache_ttl: :one_hour) ==
+               %Cost{currency: "USD", micros: 7_500}
+
+      assert Cost.of(over, "claude-haiku-5-5", cache_ttl: :one_hour) ==
+               %Cost{currency: "USD", micros: 37_501}
+    end
+
+    test "Haiku 5.5 with an override: the app's own tier, on each side of its line" do
+      put_models(%{
+        "claude-haiku-5-5" => [
+          prices: [
+            currency: "USD",
+            input: 0.08,
+            output: 0.40,
+            cache_read: 0.008,
+            cache_write: [five_minutes: 0.10, one_hour: 0.16],
+            over: [
+              prompt_tokens: 100_000,
+              input: 0.40,
+              output: 2.00,
+              cache_read: 0.04,
+              cache_write: [five_minutes: 0.50, one_hour: 0.80]
+            ],
+            source: "contract 2026-10",
+            read: ~D[2026-10-15]
+          ]
+        ]
+      })
+
+      assert :ok = Clementine.Models.validate_config!()
+
+      # 40,000 × 0.08 + 50,000 × 0.008 + 10,000 × 0.10 + 2,000 × 0.40 =
+      # 3,200 + 400 + 1,000 + 800.
+      assert Cost.of(haiku(100_000, 50_000, 10_000, 2_000), "claude-haiku-5-5") ==
+               %Cost{currency: "USD", micros: 5_400}
+
+      # 40,001 × 0.40 + 50,000 × 0.04 + 10,000 × 0.50 + 2,000 × 2.00 =
+      # 16,000.4 + 2,000 + 5,000 + 4,000.
+      assert Cost.of(haiku(100_001, 50_000, 10_000, 2_000), "claude-haiku-5-5") ==
+               %Cost{currency: "USD", micros: 27_000}
+
+      # An override that clears the tier with over: nil prices every call
+      # at its one set of rates.
+      flat = [
+        currency: "USD",
+        input: 0.08,
+        output: 0.40,
+        cache_read: 0.008,
+        cache_write: [five_minutes: 0.10, one_hour: 0.16]
+      ]
+
+      put_models(%{"claude-haiku-5-5" => [prices: flat ++ [over: nil]]})
+
+      assert :ok = Clementine.Models.validate_config!()
+
+      assert Cost.of(haiku(100_001, 50_000, 10_000, 2_000), "claude-haiku-5-5") ==
+               %Cost{currency: "USD", micros: 5_400}
+    end
+
+    test "an override that leaves out a shipped tier fails, rather than undercount long calls" do
+      flat = [
+        currency: "USD",
+        input: 0.08,
+        output: 0.40,
+        cache_read: 0.008,
+        cache_write: [five_minutes: 0.10, one_hour: 0.16]
+      ]
+
+      # Without over:, a 200,000-token Haiku 5.5 call would pay the base
+      # rates, a fifth of the tier's.
+      put_models(%{"claude-haiku-5-5" => [prices: flat]})
+
+      assert_raise ArgumentError,
+                   ~r/"claude-haiku-5-5".*over 100000 prompt tokens.*restate the tier, or write over: nil/s,
+                   fn -> Clementine.Models.validate_config!() end
+
+      assert {:error, _message} = Clementine.Models.fetch("claude-haiku-5-5")
+      assert Cost.of(haiku(200_000, 0, 0, 1_000), "claude-haiku-5-5") == nil
+
+      assert_raise ArgumentError, ~r/restate the tier/, fn ->
+        Agent.new(model: "claude-haiku-5-5")
+      end
+
+      # The GPT-6 family's 272,000 line holds the same way.
+      gpt = [currency: "USD", input: 9, output: 45, cache_read: 0.9]
+      writes = [cache_write: [thirty_minutes: 11.25, twelve_hours: 22.5]]
+      put_models(%{"gpt-6-astra" => [prices: gpt ++ writes]})
+
+      assert_raise ArgumentError, ~r/"gpt-6-astra".*over 272000 prompt tokens/s, fn ->
+        Clementine.Models.validate_config!()
+      end
+
+      # A sheet with no tier takes an override without over:, and
+      # prices: nil opts out whatever the sheet has.
+      put_models(%{
+        "claude-sonnet-5" => [prices: flat],
+        "claude-haiku-5-5" => [prices: nil]
+      })
+
+      assert :ok = Clementine.Models.validate_config!()
+      assert Cost.of(haiku(200_000, 0, 0, 1_000), "claude-haiku-5-5") == nil
+    end
+
+    test "GPT-6 Astra over 272,000 input tokens, cached ones counted, as OpenAI counts them" do
+      put_models(nil)
+
+      usage = fn input, cached ->
+        ProviderUsage.openai(%{
+          "input_tokens" => input,
+          "input_tokens_details" => %{"cached_tokens" => cached},
+          "output_tokens" => 1_000
+        })
+      end
+
+      # 72,000 × 10 + 200,000 × 1 + 1,000 × 50 = 720,000 + 200,000 + 50,000.
+      assert Cost.of(usage.(272_000, 200_000), "gpt-6-astra") ==
+               %Cost{currency: "USD", micros: 970_000}
+
+      # 72,001 × 20 + 200,000 × 2 + 1,000 × 75.
+      assert Cost.of(usage.(272_001, 200_000), "gpt-6-astra") ==
+               %Cost{currency: "USD", micros: 1_440_020 + 400_000 + 75_000}
+    end
+
+    test "a summed usage picks the tier by its sum: price each call, not a run's total" do
+      put_models(nil)
+      call = haiku(60_000, 0, 0, 0)
+      run = Usage.add(call, call)
+
+      # Two 60,000-token calls each stay under the line; their sum is over.
+      assert Cost.sum([Cost.of(call, "claude-haiku-5-5"), Cost.of(call, "claude-haiku-5-5")]) ==
+               %Cost{currency: "USD", micros: 12_000}
+
+      assert Cost.of(run, "claude-haiku-5-5") == %Cost{currency: "USD", micros: 60_000}
+    end
+  end
+
+  describe "of/3: where the call ran, and the TTL it wrote with" do
+    test "the platform and TTL a trace entry records, as strings or atoms" do
+      put_models(nil)
+      usage = %Usage{input_tokens: 10_000, cache_write_tokens: 10_000}
+
+      # Sonnet 5.5's writes: $2.50 for five minutes, $4 for an hour.
+      assert %Cost{micros: 25_000} = Cost.of(usage, "claude-sonnet-5-5")
+      assert %Cost{micros: 40_000} = Cost.of(usage, "claude-sonnet-5-5", cache_ttl: :one_hour)
+
+      assert %Cost{micros: 40_000} =
+               Cost.of(usage, "claude-sonnet-5-5", platform: "anthropic", cache_ttl: "one_hour")
+
+      # A platform it is not served on, or a TTL it has no rate for, has
+      # no cost to state.
+      assert Cost.of(usage, "claude-sonnet-5-5", platform: :openai) == nil
+      assert Cost.of(usage, "claude-sonnet-5-5", cache_ttl: :thirty_minutes) == nil
+    end
+  end
+
   describe "what is not priced costs nil, never zero" do
-    test "a model without prices, an id no sheet holds, and an alias of old" do
-      put_models(%{"claude-sonnet-5" => [prices: @one_rate]})
+    test "a declared model without prices, an unpriced override, an id no sheet holds, an atom" do
+      put_models(%{
+        "my-qwen" => [
+          vendor: :qwen,
+          context: 32_768,
+          max_output: 8_192,
+          platforms: [openai_compatible: [base_url: "http://localhost:8000/v1"]]
+        ],
+        "claude-sonnet-5" => [prices: nil]
+      })
+
       usage = %Usage{input_tokens: 1_000, output_tokens: 10}
 
-      assert Cost.of(usage, "claude-sonnet-5-5") == nil
-      assert Cost.of(usage, Trace.resolve_model("claude-sonnet-5-5")) == nil
+      assert Cost.of(usage, "my-qwen") == nil
+
+      # Resolved for a call: its vendor and the platform it is served on.
+      assert %{provider: :qwen, platform: :openai_compatible, cache_ttl: nil, pricing: nil} =
+               Trace.resolve_model("my-qwen")
+
+      assert Cost.of(usage, Trace.resolve_model("my-qwen")) == nil
+      assert Cost.of(usage, "claude-sonnet-5") == nil
       assert Cost.of(usage, "not-a-model") == nil
       assert Cost.of(usage, Trace.resolve_model("not-a-model")) == nil
       assert Cost.of(usage, :claude_sonnet) == nil
       assert Cost.of(usage, nil) == nil
+
+      # A shipped sheet is priced without any config.
+      assert %Cost{currency: "USD"} = Cost.of(usage, "claude-sonnet-5-5")
     end
 
     test "no usage on a priced model is zero" do
@@ -308,13 +534,11 @@ defmodule Clementine.CostTest do
     end
 
     test "nothing is zero in the models' currency, or nil when no model has prices" do
-      # An override that sets no prices leaves its model unpriced.
-      plain = [display_name: "Haiku, as the app calls it"]
-      put_models(%{"claude-haiku-5-5" => plain, "claude-sonnet-5" => [prices: @card]})
-
+      put_models(nil)
       assert Cost.sum([]) == %Cost{currency: "USD", micros: 0}
 
-      put_models(%{"claude-haiku-5-5" => plain})
+      # An app that unprices every model has no currency to state zero in.
+      put_models(Map.new(Clementine.Models.list(), &{&1.id, [prices: nil]}))
       assert Cost.sum([]) == nil
     end
   end

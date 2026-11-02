@@ -581,6 +581,78 @@ defmodule Clementine.LLM.OpenAITest do
     Agent.stop(counter)
   end
 
+  test "a clamped usage names the model's vendor and the platform, in calls and streams", %{
+    bypass: bypass
+  } do
+    # A model an app declares on :openai need not be OpenAI's.
+    Application.put_env(:clementine, :models, %{
+      "acme-reasoner" => [
+        vendor: :acme,
+        context: 200_000,
+        max_output: 8_000,
+        platforms: [openai: []]
+      ]
+    })
+
+    test = self()
+    ref = make_ref()
+
+    :telemetry.attach(
+      "openai-clamped-#{inspect(ref)}",
+      [:clementine, :llm, :usage_clamped],
+      fn _event, _measurements, metadata, _config -> send(test, {:clamped, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach("openai-clamped-#{inspect(ref)}") end)
+
+    # More cached tokens than input: the normalizer raises the total and
+    # says so.
+    usage = %{
+      "input_tokens" => 10,
+      "input_tokens_details" => %{"cached_tokens" => 50},
+      "output_tokens" => 3
+    }
+
+    Bypass.expect(bypass, "POST", "/v1/responses", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      if Jason.decode!(body)["stream"] do
+        completed =
+          sse("response.completed", %{
+            "type" => "response.completed",
+            "response" => %{
+              "id" => "resp_1",
+              "status" => "completed",
+              "output" => [],
+              "usage" => usage
+            }
+          })
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.resp(200, completed <> "\n\n")
+      else
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(
+          200,
+          Jason.encode!(%{"id" => "resp_1", "output" => [], "usage" => usage})
+        )
+      end
+    end)
+
+    meta = %{provider: :acme, platform: :openai, model: "acme-reasoner"}
+
+    assert {:ok, %Response{}} =
+             OpenAI.call("acme-reasoner", "system", [UserMessage.new("Hi")], [])
+
+    assert_received {:clamped, ^meta}
+
+    OpenAI.stream("acme-reasoner", "system", [UserMessage.new("Hi")], []) |> Enum.to_list()
+    assert_received {:clamped, ^meta}
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:clementine, key)
   defp restore_env(key, value), do: Application.put_env(:clementine, key, value)
 

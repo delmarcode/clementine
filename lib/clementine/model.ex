@@ -58,8 +58,10 @@ defmodule Clementine.Model do
     `cache_control` markers, `:thirty_minutes` and `:twelve_hours` are
     OpenAI's `prompt_cache_options`, and none means the provider caches
     on its own, if at all.
-  - `prices`: the app's prices for the model (`Clementine.LLM.Pricing`),
-    or `nil`. Clementine ships none yet.
+  - `prices`: the model's list prices, per million tokens, with their
+    `source` and `read` date, and a tier (`over:`) where the vendor
+    bills more above a prompt length (`Clementine.LLM.Pricing`). An app
+    overrides them where it pays something else; `nil` costs `nil`.
   - `platforms`: where the model is served, each with the id it goes by
     there and how its facts differ there: `[anthropic: [id: ...],
     bedrock: [id: "anthropic.claude-...", lifecycle: :partner], ...]`.
@@ -297,6 +299,10 @@ defmodule Clementine.Model do
   @doc "The thinking settings a sheet or an agent may name."
   @spec thinking_types() :: [thinking_type()]
   def thinking_types, do: @thinking_types
+
+  @doc "The cache TTLs a sheet may offer and a price may be keyed by."
+  @spec ttls() :: [ttl()]
+  def ttls, do: @ttls
 
   @doc false
   # The platforms a request can reach today, in the order a model's

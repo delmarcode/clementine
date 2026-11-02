@@ -20,6 +20,14 @@ defmodule Clementine.Models.OpenAI do
   - [Using GPT-6](https://developers.openai.com/api/docs/guides/latest-model)
     and the [Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create):
     rejected sampling parameters, `reasoning.summary`.
+  - [Pricing](https://developers.openai.com/api/docs/pricing): Standard
+    list prices, short and long context. Every model the page lists long
+    rates for (GPT-6, GPT-6.1, GPT-5.6, GPT-5.5, and GPT-5.4, with their
+    Pro models) bills a request over 272,000 input tokens at them, cached
+    tokens counted (the Responses API's `input_tokens` holds them): 2x
+    input and cache, 1.5x output (each model's page). Batch, Flex, fast
+    mode, and regional processing price otherwise; an app on them
+    overrides `prices`.
 
   A model the deprecations page lists as shut down keeps a stub sheet
   (`lifecycle: [status: :retired]`), so naming it fails with the
@@ -36,6 +44,11 @@ defmodule Clementine.Models.OpenAI do
 
   @read ~D[2026-11-01]
   @models "https://developers.openai.com/api/docs/models"
+  @pricing "https://developers.openai.com/api/docs/pricing"
+  # "Long context: >272K input tokens", priced at the long rates for the
+  # whole request. K is a thousand: GPT-5's 400,000-token window is
+  # 272,000 of input and 128,000 of output.
+  @long_context 272_000
 
   @gpt_6_efforts [:low, :medium, :high, :xhigh, :max]
   @gpt_5_4_efforts [:none, :low, :medium, :high, :xhigh]
@@ -69,6 +82,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:none | @gpt_6_efforts], :medium),
+        prices: prices({1, 5, 0.05, {1.25, 2.50}}, {2, 7.50, 0.10, {2.50, 5}}),
         rejects: @sampling,
         cache: @cache
       ],
@@ -80,6 +94,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning(@gpt_6_efforts, :medium),
+        prices: prices({2, 10, 0.10, {2.50, 5}}, {4, 15, 0.20, {5, 10}}),
         rejects: @sampling,
         cache: @cache
       ],
@@ -91,6 +106,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:none | @gpt_6_efforts], :medium),
+        prices: prices({2, 10, 0.20, {2.50, 5}}, {4, 15, 0.40, {5, 10}}),
         rejects: @sampling,
         cache: @cache
       ],
@@ -102,6 +118,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:none | @gpt_6_efforts], :medium),
+        prices: prices({0.10, 0.50, 0.01, {0.125, 0.25}}, {0.20, 0.75, 0.02, {0.25, 0.50}}),
         rejects: @sampling,
         cache: @cache
       ],
@@ -114,6 +131,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning(@gpt_6_efforts, nil),
+        prices: prices({10, 50, 1, {12.50, 25}}, {20, 75, 2, {25, 50}}),
         rejects: @sampling,
         cache: @cache
       ],
@@ -125,6 +143,10 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:none | @gpt_6_efforts], :medium),
+        # Promotional: the pricing page holds these rates "at least through
+        # November 21, 2026" and gives no regular price; GPT-5.5 lists
+        # $5/$30. Re-read the page after that date.
+        prices: prices({4, 20, 0.40, {5, 10}}, {8, 30, 0.80, {10, 20}}),
         cache: @cache
       ],
       [
@@ -135,6 +157,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:none | @gpt_6_efforts], :medium),
+        prices: prices({2, 12, 0.20, {2.50, 5}}, {4, 18, 0.40, {5, 10}}),
         cache: @cache
       ],
       [
@@ -145,6 +168,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:none | @gpt_6_efforts], :medium),
+        prices: prices({0.20, 1.20, 0.02, {0.25, 0.50}}, {0.40, 1.80, 0.04, {0.50, 1}}),
         cache: @cache
       ],
       [
@@ -153,7 +177,8 @@ defmodule Clementine.Models.OpenAI do
         released_on: ~D[2026-04-24],
         context: 1_050_000,
         max_output: 128_000,
-        thinking: reasoning([:none, :low, :medium, :high, :xhigh], :medium)
+        thinking: reasoning([:none, :low, :medium, :high, :xhigh], :medium),
+        prices: prices({5, 30, 0.50, 5}, {10, 45, 1, 10})
       ],
       [
         # Its page lists streaming as not supported, and an agent's runs
@@ -164,6 +189,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:medium, :high, :xhigh], :high),
+        prices: prices({30, 180, 30, 30}, {60, 270, 60, 60}),
         features: [structured_outputs: true, streaming: false]
       ],
       [
@@ -172,7 +198,8 @@ defmodule Clementine.Models.OpenAI do
         released_on: ~D[2026-03-05],
         context: 1_050_000,
         max_output: 128_000,
-        thinking: reasoning(@gpt_5_4_efforts, :none)
+        thinking: reasoning(@gpt_5_4_efforts, :none),
+        prices: prices({2.50, 15, 0.25, 2.50}, {5, 22.50, 0.50, 5})
       ],
       [
         id: "gpt-5.4-pro",
@@ -181,6 +208,7 @@ defmodule Clementine.Models.OpenAI do
         context: 1_050_000,
         max_output: 128_000,
         thinking: reasoning([:medium, :high, :xhigh], :medium),
+        prices: prices({30, 180, 30, 30}, {60, 270, 60, 60}),
         features: [structured_outputs: false]
       ],
       [
@@ -189,7 +217,8 @@ defmodule Clementine.Models.OpenAI do
         released_on: ~D[2026-03-17],
         context: 400_000,
         max_output: 128_000,
-        thinking: reasoning(@gpt_5_4_efforts, :none)
+        thinking: reasoning(@gpt_5_4_efforts, :none),
+        prices: prices({0.75, 4.50, 0.075, 0.75})
       ],
       [
         id: "gpt-5.4-nano",
@@ -198,7 +227,8 @@ defmodule Clementine.Models.OpenAI do
         lifecycle: deprecated(~D[2026-10-01], ~D[2027-04-01], "gpt-6-luna"),
         context: 400_000,
         max_output: 128_000,
-        thinking: reasoning(@gpt_5_4_efforts, :none)
+        thinking: reasoning(@gpt_5_4_efforts, :none),
+        prices: prices({0.20, 1.25, 0.02, 0.20})
       ],
       [
         id: "gpt-5.2",
@@ -206,7 +236,8 @@ defmodule Clementine.Models.OpenAI do
         released_on: ~D[2025-12-11],
         context: 400_000,
         max_output: 128_000,
-        thinking: reasoning(@gpt_5_4_efforts, :none)
+        thinking: reasoning(@gpt_5_4_efforts, :none),
+        prices: prices({1.75, 14, 0.175, 1.75})
       ],
       [
         # The changelog gives no release date, nor the page a default
@@ -216,6 +247,7 @@ defmodule Clementine.Models.OpenAI do
         context: 400_000,
         max_output: 128_000,
         thinking: reasoning([:medium, :high, :xhigh], nil),
+        prices: prices({21, 168, 21, 21}),
         features: [structured_outputs: false]
       ],
       [
@@ -225,7 +257,8 @@ defmodule Clementine.Models.OpenAI do
         lifecycle: deprecated(~D[2026-10-01], ~D[2027-04-01], "gpt-6-sol"),
         context: 400_000,
         max_output: 128_000,
-        thinking: reasoning([:none, :low, :medium, :high], :none)
+        thinking: reasoning([:none, :low, :medium, :high], :none),
+        prices: prices({1.25, 10, 0.125, 1.25})
       ],
       [
         # The deprecations page names GPT-5.6 Sol as the replacement; the
@@ -238,6 +271,7 @@ defmodule Clementine.Models.OpenAI do
         context: 400_000,
         max_output: 128_000,
         thinking: reasoning(@gpt_5_efforts, nil),
+        prices: prices({1.25, 10, 0.125, 1.25}),
         rejects: @gpt_5_rejects
       ],
       [
@@ -248,6 +282,7 @@ defmodule Clementine.Models.OpenAI do
         context: 400_000,
         max_output: 128_000,
         thinking: reasoning(@gpt_5_efforts, nil),
+        prices: prices({0.25, 2, 0.025, 0.25}),
         rejects: @gpt_5_rejects
       ],
       [
@@ -258,6 +293,7 @@ defmodule Clementine.Models.OpenAI do
         context: 400_000,
         max_output: 128_000,
         thinking: reasoning(@gpt_5_efforts, nil),
+        prices: prices({0.05, 0.40, 0.005, 0.05}),
         rejects: @gpt_5_rejects
       ],
       [
@@ -269,6 +305,7 @@ defmodule Clementine.Models.OpenAI do
         context: 400_000,
         max_output: 272_000,
         thinking: reasoning([:high], :high),
+        prices: prices({15, 120, 15, 15}),
         rejects: @gpt_5_rejects
       ],
       [
@@ -278,7 +315,8 @@ defmodule Clementine.Models.OpenAI do
         lifecycle: deprecated(~D[2026-10-14], ~D[2027-01-14], "gpt-6-luna"),
         context: 1_047_576,
         max_output: 32_768,
-        thinking: [default: :off, types: [:off]]
+        thinking: [default: :off, types: [:off]],
+        prices: prices({2, 8, 0.50, 2})
       ],
       [
         id: "gpt-4.1-mini",
@@ -287,10 +325,13 @@ defmodule Clementine.Models.OpenAI do
         lifecycle: deprecated(~D[2026-10-14], ~D[2027-01-14], "gpt-6-luna"),
         context: 1_047_576,
         max_output: 32_768,
-        thinking: [default: :off, types: [:off]]
+        thinking: [default: :off, types: [:off]],
+        prices: prices({0.40, 1.60, 0.10, 0.40})
       ],
-      shut_down("o4-mini", "o4-mini", ~D[2026-04-22], ~D[2026-10-23], "gpt-5.6-terra"),
-      shut_down("gpt-4.1-nano", "GPT-4.1 nano", ~D[2026-04-22], ~D[2026-10-23], "gpt-5.6-luna")
+      shut_down("o4-mini", "o4-mini", ~D[2026-04-22], ~D[2026-10-23], "gpt-5.6-terra") ++
+        [prices: prices({1.10, 4.40, 0.275, 1.10})],
+      shut_down("gpt-4.1-nano", "GPT-4.1 nano", ~D[2026-04-22], ~D[2026-10-23], "gpt-5.6-luna") ++
+        [prices: prices({0.10, 0.40, 0.025, 0.10})]
     ]
     |> Enum.map(fn sheet ->
       id = Keyword.fetch!(sheet, :id)
@@ -324,6 +365,29 @@ defmodule Clementine.Models.OpenAI do
       replacement: replacement
     ]
   end
+
+  # Standard-tier list prices in USD per million tokens, as the pricing
+  # page states them: `{input, output, cached input, cache write}`, the
+  # write a `{30-minute, 12-hour}` pair on GPT-5.6 and later, and the long
+  # context rates where the page lists them. Before GPT-5.6 a cache write
+  # is billed as plain input (the page lists none), so its rate is the
+  # input rate; the Pro models list no cached input, so a read is too.
+  defp prices(rates, long \\ nil) do
+    base = [currency: "USD"] ++ rates(rates) ++ [source: @pricing, read: @read]
+
+    if long,
+      do: base ++ [over: [prompt_tokens: @long_context] ++ rates(long)],
+      else: base
+  end
+
+  defp rates({input, output, cache_read, cache_write}) do
+    [input: input, output: output, cache_read: cache_read, cache_write: writes(cache_write)]
+  end
+
+  defp writes({thirty_minutes, twelve_hours}),
+    do: [thirty_minutes: thirty_minutes, twelve_hours: twelve_hours]
+
+  defp writes(rate), do: rate
 
   defp reasoning(efforts, default_effort) do
     [

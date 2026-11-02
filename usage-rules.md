@@ -9,10 +9,12 @@ the drain at shutdown.
 
 - One child after Oban, whose `repo` is Oban's repo:
   `{Clementine, repo: MyApp.Repo, oban: Oban, queue: :agents, agents: [MyApp.Agents.Triage], host: MyApp.Agents.Host}`.
-- One migration calling `Clementine.Migration.up(version: 5)`. Each
+- One migration calling `Clementine.Migration.up(version: 6)`. Each
   version stamps the table, and the runtime refuses to start against a
   table behind the code's version, naming the migration to write
-  (`Clementine.Migration.up(from: 4, version: 5)`).
+  (`Clementine.Migration.up(from: 5, version: 6)`). Stop every node on
+  version 5 before migrating to 6: v5 code starts against a v6 table and
+  then fails every trace insert on the dropped `alias` column.
 - Agent modules, each listed in `agents:`:
   `use Clementine.Agent, key: "triage", model: "claude-sonnet-5-5", instructions: "...", tools: [...]`.
   Every run row stores the key, so never rename a key that has runs. An
@@ -33,6 +35,11 @@ the drain at shutdown.
 - A model Clementine does not ship, or a fact the app knows better (its
   prices), goes under `config :clementine, :models`, keyed by id
   (`docs/MODELS.md`). Never infer a fact from an id.
+- The sheets carry the vendors' list prices, tiers included (Haiku 5.5
+  over 100,000 prompt tokens, the GPT-6 family over 272,000). Override
+  `prices:` only where the app pays something else, and then whole:
+  every rate, its own `over:` or none, and a `source` and `read` date.
+  Never derive a cache read price from the input price.
 - An `agent/1` that picks a model per run (an eval's `--model`) passes
   `model: run.metadata["model"] || __model__()`. `use`'s choices are for
   `use`'s model: the runtime fills them in when `agent/1` leaves the
@@ -55,9 +62,10 @@ lifecycle, or a reaper into the app.
 Metrics are `Clementine.Telemetry.metrics/0`: pass it whole to the
 app's reporter (a PromEx plugin's `Event.build/2`, or
 `TelemetryMetricsPrometheus`), and never hand-copy Clementine's metric
-definitions into the app. Its series are labeled by agent key, provider,
-model (and `alias`, empty since models are named by id), and keep the
-bare `clementine_` names every app exports.
+definitions into the app. Its series are labeled by agent key, provider
+(the model's vendor), platform (where it ran), and model, and keep the
+bare `clementine_` names every app exports. Compare models across apps
+and platforms by `provider` and `model`.
 
 ## Subject, actor, turn, lane
 
@@ -124,9 +132,10 @@ bare `clementine_` names every app exports.
   Clementine writes it.
 - `trace/1` returns the run's trace, oldest first: a
   `Clementine.Trace.Entry` for each execution (`:execution`: the
-  provider and model, the tools offered, the agent's fingerprint,
-  the system prompt), each model call (`:model_call`: the provider and
-  model, usage, its cost, timing, what it said), each tool
+  provider, platform, and model, the tools offered, the agent's
+  fingerprint, the system prompt), each model call (`:model_call`: the
+  provider, platform, and model, usage, the cache TTL it was priced at,
+  its cost, timing, what it said), each tool
   call (`:tool_call`: name, arguments, result, timing, the approval it
   waited on, and the tool policy's verdict), each answer of the tool
   policy (`:policy`), each skill loaded (`:skill_load`: its name, the
@@ -141,8 +150,10 @@ bare `clementine_` names every app exports.
   (integer `micros` of the models' currency), frozen on each call at
   the prices of the moment; `children: true` adds every run below it
   (delegates, a loop's turns), and `subject_cost(subject)` totals a
-  subject. Prices are your config, the `pricing:` key in
-  `docs/MODELS.md`; without them a cost is `nil`, never zero. A cost
+  subject. Prices are the model's sheet's, or your override's
+  (`docs/MODELS.md#prices`); a model without them costs `nil`, never
+  zero. A tiered model prices each call by its own prompt, so never
+  price a run's summed `usage` as one call: sum the calls' costs. A cost
   goes with its trace on `purge/1`: copy `cost(run.id)` into your own
   table from `run_finished/2` if spend must outlive it.
 - The queries: `active?(agent, subject)` is a task's lane (does the agent
@@ -725,8 +736,8 @@ use Clementine.Agent, key: "grader", model: "claude-sonnet-5-5", instructions: "
 - Never copy `Clementine.Migration.content_columns/0` to a warehouse:
   they hold prompts, replies, tool arguments and results, and your
   `metadata`. Exclude them, and keep the facts (`fact_columns/0`): the
-  trace's columns hold each model call's provider, model, tokens,
-  and cost, and each tool call's name and outcome. Keep `subject_id`,
+  trace's columns hold each model call's provider, platform, model,
+  cache TTL, tokens, and cost, and each tool call's name and outcome. Keep `subject_id`,
   `actor_id`, and `tag_id` ids (never an email address or a Message-ID),
   or exclude them too, and exclude `agent_fingerprint` if your
   instructions differ by person.

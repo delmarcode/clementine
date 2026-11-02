@@ -175,7 +175,7 @@ defmodule Clementine.TelemetryTest do
                          agent_key: "telemetry_test",
                          provider: :anthropic,
                          model: "claude-sonnet-5",
-                         alias: nil,
+                         platform: :anthropic,
                          max_iterations: 10,
                          tool_count: 0
                        }}
@@ -279,7 +279,7 @@ defmodule Clementine.TelemetryTest do
                          agent_key: "telemetry_test",
                          provider: :anthropic,
                          model: "claude-sonnet-5",
-                         alias: nil,
+                         platform: :anthropic,
                          iteration: 1,
                          message_count: 1,
                          tool_count: 0,
@@ -354,12 +354,18 @@ defmodule Clementine.TelemetryTest do
                        %{input_tokens: 900, cost_micros: 630},
                        %{
                          model: "claude-sonnet-5",
-                         alias: nil,
+                         platform: :anthropic,
                          provider: :anthropic,
                          currency: "USD"
                        }}
 
-      Application.put_env(:clementine, :models, previous)
+      # The model unpriced: the app sets prices: nil over the sheet's.
+      Application.put_env(
+        :clementine,
+        :models,
+        Map.put(previous || %{}, "claude-sonnet-5", prices: nil)
+      )
+
       unpriced = make_ref()
       MemoryLifecycle.seed_queued(store, unpriced)
 
@@ -455,10 +461,12 @@ defmodule Clementine.TelemetryTest do
       assert [{first, %{outcome: :stop, stop_reason: "tool_use", iteration: 1}}, {_, second}] =
                usages
 
-      assert %{outcome: :stop, stop_reason: "end_turn", iteration: 2, currency: nil} = second
+      # Each call priced at Claude Sonnet 5's list prices, in USD.
+      assert %{outcome: :stop, stop_reason: "end_turn", iteration: 2, currency: "USD"} = second
 
-      assert %{alias: nil, model: "claude-sonnet-5", provider: :anthropic} = second
-      refute Map.has_key?(first, :cost_micros)
+      assert %{platform: :anthropic, model: "claude-sonnet-5", provider: :anthropic} = second
+      refute Map.has_key?(second, :alias)
+      assert is_integer(first.cost_micros)
     end
 
     test "a raise in the stream meters nothing", %{store: store, ref: ref} do

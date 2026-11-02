@@ -17,9 +17,13 @@ defmodule Clementine.Telemetry do
   >   now names the loop layer's events.
   > - On rollout and llm events, `model` is the model's id
   >   (`"claude-sonnet-5"`), as the agent names it.
-  > - Rollout, llm, and tool events gain `agent_key`, `provider`, and
-  >   `alias` ("What a run names"). Models are named by id, so `alias`
-  >   is always `nil`; it leaves with OPS-190.
+  > - Rollout, llm, and tool events carry `agent_key`, `provider`,
+  >   `platform`, and `model` ("What a run names"), and so does every
+  >   engine series in `metrics/0`. `alias` is gone, from the events and
+  >   every series' labels: models are named by id. `provider` is now the
+  >   model's vendor, and `platform` where its requests went, so a model
+  >   on OpenRouter is `provider="deepseek", platform="openrouter"`, where
+  >   it was `provider="openrouter"`.
 
   ## What a run names
 
@@ -31,16 +35,17 @@ defmodule Clementine.Telemetry do
     (`Clementine.run(agent, prompt, context: %{agent_key: "triage"})`);
     otherwise `nil`. Never the agent's `id`, which an app may set to
     anything, a per-workspace id say
-  - `provider` — the platform the model's request goes to
-    (`:anthropic`, `:openai`, ...)
+  - `provider` — the model's vendor (`:anthropic`, `:openai`,
+    `:deepseek`, ...), `Clementine.Model`'s `vendor`
+  - `platform` — where the model's requests go (`:anthropic`, `:openai`,
+    `:openrouter`, `:bedrock`, ...): the model's default platform
+    (`Clementine.Models.default_platform/1`) until an agent can name one
   - `model` — the model's id (`"claude-sonnet-5"`, `Clementine.Model`)
-  - `alias` — always `nil` now that models are named by id; it leaves
-    with OPS-190
 
   An id no sheet holds, or choices its sheet refuses (a test's, on a
-  mock client), has `provider: nil` and keeps the id as `model`. Each is
-  fixed in code, so a metric may label by it, and a nil one exports as
-  `""`.
+  mock client), has `provider: nil` and `platform: nil`, and keeps the id
+  as `model`. Each is fixed in code, so a metric may label by it, and a
+  nil one exports as `""`.
 
   A tool batch run outside a rollout, through
   `Clementine.ToolRunner.execute/4` or `run_batch/4`, names no execution:
@@ -63,7 +68,7 @@ defmodule Clementine.Telemetry do
   Emitted when the Gather → Act engine begins animating a rollout.
 
   - Measurements: `%{system_time: integer}`
-  - Metadata: `%{agent_key, provider, model, alias, max_iterations: integer, tool_count: integer}`
+  - Metadata: `%{agent_key, provider, platform, model, max_iterations: integer, tool_count: integer}`
 
   ### `[:clementine, :rollout, :stop]`
 
@@ -73,7 +78,7 @@ defmodule Clementine.Telemetry do
   nothing and called no tools (`:empty`), never a success.
 
   - Measurements: `%{duration: native_time, iterations: integer}`
-  - Metadata: `%{agent_key, provider, model, alias, status: :success | :suspended | :cancelled | :drained | :lost_lease}`
+  - Metadata: `%{agent_key, provider, platform, model, status: :success | :suspended | :cancelled | :drained | :lost_lease}`
 
   ### `[:clementine, :rollout, :exception]`
 
@@ -84,7 +89,7 @@ defmodule Clementine.Telemetry do
 
   - Measurements: `%{duration: native_time, iterations: integer}` —
     `iterations` is absent on a genuine raise
-  - Metadata: `%{agent_key, provider, model, alias, kind: atom, reason: term, error_kind: Clementine.Error.kind(), error_code: atom}` —
+  - Metadata: `%{agent_key, provider, platform, model, kind: atom, reason: term, error_kind: Clementine.Error.kind(), error_code: atom}` —
     a returned error carries `kind: :error, reason: %Clementine.Error{}`,
     and its `kind` and `code` as `error_kind` and `error_code` (`:refused`
     and `:truncated` for a final turn the provider refused or cut off,
@@ -323,7 +328,7 @@ defmodule Clementine.Telemetry do
   Emitted before calling the LLM API.
 
   - Measurements: `%{system_time: integer}`
-  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, message_count: integer, tool_count: integer, streaming: boolean}`
+  - Metadata: `%{agent_key, provider, platform, model, iteration: integer, message_count: integer, tool_count: integer, streaming: boolean}`
 
   ### `[:clementine, :llm, :stop]`
 
@@ -338,7 +343,7 @@ defmodule Clementine.Telemetry do
     (`Clementine.Cost`), at the prices the model has now, the same cost
     the call's trace entry freezes; a call on a model without prices
     leaves it out, never reports zero.
-  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, stop_reason: String.t() | nil, currency: String.t() | nil, streaming: boolean}`
+  - Metadata: `%{agent_key, provider, platform, model, iteration: integer, stop_reason: String.t() | nil, currency: String.t() | nil, streaming: boolean}`
     — `currency` is `nil` for an unpriced call
 
   ### `[:clementine, :llm, :exception]`
@@ -349,7 +354,7 @@ defmodule Clementine.Telemetry do
     stream also carries what the call reported before it, as stop does:
     the four token counts and, priced, `cost_micros`. A raise carries
     `duration` alone.
-  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, kind: atom, reason: term, error_code: atom, currency: String.t() | nil, streaming: boolean}`
+  - Metadata: `%{agent_key, provider, platform, model, iteration: integer, kind: atom, reason: term, error_code: atom, currency: String.t() | nil, streaming: boolean}`
     — `error_code` is the code `Clementine.Error.normalize/2` gives the
     provider's error (`:rate_limited`, `:overloaded`, `:network`, ...),
     `:exception` for a raise; `currency` is `nil` but on a priced
@@ -366,7 +371,7 @@ defmodule Clementine.Telemetry do
   - Measurements: `%{input_tokens: integer, output_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer, cost_micros: integer}`
     — `:stop`'s counts and cost; `cost_micros` is left out for an
     unpriced call
-  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, outcome: :stop | :aborted | :error, stop_reason: String.t() | nil, currency: String.t() | nil, ...}`
+  - Metadata: `%{agent_key, provider, platform, model, iteration: integer, outcome: :stop | :aborted | :error, stop_reason: String.t() | nil, currency: String.t() | nil, ...}`
     — `stop_reason` is the provider's, for `outcome: :stop` only
 
   Spend is the `cost_micros` of `:usage`; the trace prices the same
@@ -380,7 +385,9 @@ defmodule Clementine.Telemetry do
   client assumes, which would otherwise undercount quietly.
 
   - Measurements: `%{input_tokens: integer, cache_read_tokens: integer, cache_write_tokens: integer}` (as reported)
-  - Metadata: `%{provider: atom, model: String.t() | nil}`
+  - Metadata: `%{provider: atom | nil, platform: atom, model: String.t() | nil}`
+    — `platform` is the wire whose convention differs, `provider` the
+    model's vendor where the client knows it
 
   ### `[:clementine, :llm, :thinking_dropped]`
 
@@ -399,7 +406,7 @@ defmodule Clementine.Telemetry do
 
   - Measurements: `%{turns: integer, blocks: integer}` — the turns sent
     without their thinking, and the thinking blocks left out
-  - Metadata: `%{agent_key, provider, model, alias, iteration: integer, first_index: integer}`
+  - Metadata: `%{agent_key, provider, platform, model, iteration: integer, first_index: integer}`
     — `first_index` is the first such turn's place in the request's
     messages (the history, then the prompt). Never content.
 
@@ -410,7 +417,7 @@ defmodule Clementine.Telemetry do
   Emitted before executing a single tool.
 
   - Measurements: `%{system_time: integer}`
-  - Metadata: `%{agent_key, provider, model, alias, tool: String.t(), tool_call_id: String.t(), iteration: integer}`
+  - Metadata: `%{agent_key, provider, platform, model, tool: String.t(), tool_call_id: String.t(), iteration: integer}`
 
   A tool event fires only for a tool the agent offers, so `tool` is a
   name fixed in code.
@@ -420,14 +427,14 @@ defmodule Clementine.Telemetry do
   Emitted when a tool completes execution.
 
   - Measurements: `%{duration: native_time}`
-  - Metadata: `%{agent_key, provider, model, alias, tool: String.t(), tool_call_id: String.t(), iteration: integer, result: :ok | :error}`
+  - Metadata: `%{agent_key, provider, platform, model, tool: String.t(), tool_call_id: String.t(), iteration: integer, result: :ok | :error}`
 
   ### `[:clementine, :tool, :exception]`
 
   Emitted when a tool crashes.
 
   - Measurements: `%{duration: native_time}`
-  - Metadata: `%{agent_key, provider, model, alias, tool: String.t(), tool_call_id: String.t(), iteration: integer, kind: atom, reason: term}`
+  - Metadata: `%{agent_key, provider, platform, model, tool: String.t(), tool_call_id: String.t(), iteration: integer, kind: atom, reason: term}`
 
   ### `[:clementine, :tool, :input_repaired]`
 
@@ -436,7 +443,7 @@ defmodule Clementine.Telemetry do
   recovered them before the call was gated or executed.
 
   - Measurements: `%{count: integer}` (parameters touched)
-  - Metadata: `%{agent_key, provider, model, alias, tool: String.t(), tool_call_id: String.t(), iteration: integer, fields: [atom]}`
+  - Metadata: `%{agent_key, provider, platform, model, tool: String.t(), tool_call_id: String.t(), iteration: integer, fields: [atom]}`
 
   ## Logging
 
@@ -457,8 +464,8 @@ defmodule Clementine.Telemetry do
 
   ### What is exported
 
-  The engine's metrics are labeled `agent_key`, `provider`, `model`, and
-  `alias` ("What a run names"), plus the labels shown:
+  The engine's metrics are labeled `agent_key`, `provider`, `platform`,
+  and `model` ("What a run names"), plus the labels shown:
 
   | Series | Kind | From | Labels |
   |--------|------|------|--------|
@@ -520,19 +527,22 @@ defmodule Clementine.Telemetry do
   distributions `clementine_loop_inbox_depth` and
   `clementine_loop_inbox_oldest_age_milliseconds`, which need the
   poller (`Clementine.Runs.emit_inbox_depths/0`). The usage-clamped
-  counter, `clementine_llm_usage_clamped_total`, is labeled `provider`.
+  counter, `clementine_llm_usage_clamped_total`, is labeled `provider`
+  and `platform`.
 
   ### Labels across apps and reporters
 
   A label a writer could not fill (an `agent_key` no run named, the
-  `alias` no model has now) exports as `""`, which
+  `platform` of an id no sheet holds) exports as `""`, which
   Prometheus reads as the label absent, on every reporter: left to
   themselves, `TelemetryMetricsPrometheus.Core` writes `""` and Peep
   writes `"nil"`.
 
   Compare the fleet by `provider` and `model`: they name what ran, and
-  a model's prices attach to its id. `alias` is always `""` until
-  OPS-190 drops the label.
+  a model's prices attach to its id, so "every Claude call, wherever it
+  ran" is `sum by (model)`. `platform` separates the same model on two
+  platforms (the Claude API and Bedrock) where their prices or behavior
+  differ.
 
   Distributions carry Prometheus buckets in `reporter_options`.
   `TelemetryMetricsPrometheus.Core`, PromEx's default store, uses them
@@ -577,7 +587,7 @@ defmodule Clementine.Telemetry do
 
   # What every rollout, llm, and tool event names: fixed in code, so
   # bounded label sets.
-  @identity [:agent_key, :provider, :model, :alias]
+  @identity [:agent_key, :provider, :platform, :model]
 
   @tokens [:input_tokens, :output_tokens, :cache_read_tokens, :cache_write_tokens]
 
@@ -625,8 +635,8 @@ defmodule Clementine.Telemetry do
   Names carry a bare `clementine_` prefix in Prometheus
   (`clementine_llm_calls_total`), so every app exports the same series
   and a fleet query aggregates across them. Labels are bounded: the
-  agent's key, the provider, the model's id, and `alias` (always empty
-  now) on the engine's metrics, the agent's key on the run metrics, and
+  agent's key, the provider (the model's vendor), the platform, and the
+  model's id on the engine's metrics, the agent's key on the run metrics, and
   the event's own closed sets (outcome, stop reason, error code, status,
   terminal, tool, ...); never a run, a subject, or a loop. A label with
   no value exports as `""`. "What is exported" in the moduledoc lists
@@ -718,7 +728,7 @@ defmodule Clementine.Telemetry do
             event_name: [:clementine, :llm, :usage_clamped],
             measurement: &one/1,
             description: "Provider usage reports whose input total was raised to its cache parts."
-          ] ++ labels([:provider])
+          ] ++ labels([:provider, :platform])
         )
       ]
   end
