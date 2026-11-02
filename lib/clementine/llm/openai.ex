@@ -210,7 +210,8 @@ defmodule Clementine.LLM.OpenAI do
   end
 
   defp build_body(model, system, messages, tools, opts, checks) do
-    policy = Policy.resolve!(model, opts, checks)
+    schema? = Keyword.get(opts, :output_schema) != nil
+    policy = Policy.resolve!(model, opts, [output_schema: schema?] ++ checks)
 
     if policy.platform != :openai do
       raise ArgumentError, "#{inspect(model)} goes to #{inspect(policy.platform)}, not :openai"

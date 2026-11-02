@@ -424,6 +424,7 @@ defmodule Clementine.Agent do
       @clementine_agent_description description
       @clementine_agent_model Keyword.get(fields, :model)
       @clementine_agent_policy Keyword.take(fields, Clementine.LLM.Policy.keys())
+      @clementine_agent_output_schema? Keyword.get(fields, :output_schema) != nil
 
       if @clementine_agent_model == nil and @clementine_agent_policy != [] do
         raise ArgumentError,
@@ -438,6 +439,10 @@ defmodule Clementine.Agent do
       @doc false
       # The policy this agent declares on `use`.
       def __policy__, do: @clementine_agent_policy
+
+      @doc false
+      # Whether this agent's `use` gives an output schema.
+      def __output_schema__?, do: @clementine_agent_output_schema?
 
       @impl Clementine.Agent
       def key, do: @clementine_agent_key
@@ -592,7 +597,9 @@ defmodule Clementine.Agent do
         check!(filled, fn message ->
           own = policy(agent)
 
-          if own != [] and match?({:error, _}, Clementine.LLM.Policy.resolve(model, own)),
+          alone = Clementine.LLM.Policy.resolve(model, own, schema(agent))
+
+          if (own != [] or agent.output_schema != nil) and match?({:error, _}, alone),
             do: "#{inspect(module)}.agent/1's Clementine.Agent.new/1 choices: #{message}",
             else:
               "#{inspect(module)}'s use Clementine.Agent choices #{inspect(declared)}" <>
@@ -658,7 +665,7 @@ defmodule Clementine.Agent do
   end
 
   defp check!(agent, describe) do
-    case Clementine.LLM.Policy.resolve(agent.model, policy(agent)) do
+    case Clementine.LLM.Policy.resolve(agent.model, policy(agent), schema(agent)) do
       {:ok, _policy} -> agent
       {:error, message} -> raise ArgumentError, describe.(message)
     end
@@ -683,7 +690,11 @@ defmodule Clementine.Agent do
         {:ok, nil}
 
       {model, policy} ->
-        with {:error, message} <- Clementine.LLM.Policy.resolve(model, policy),
+        schema? =
+          function_exported?(module, :__output_schema__?, 0) and module.__output_schema__?()
+
+        with {:error, message} <-
+               Clementine.LLM.Policy.resolve(model, policy, output_schema: schema?),
              do: {:error, "its use Clementine.Agent declares #{inspect(policy)}: #{message}"}
     end
   end
@@ -702,11 +713,13 @@ defmodule Clementine.Agent do
   defp check_model!(%__MODULE__{model: nil} = agent, _source, _checks), do: agent
 
   defp check_model!(%__MODULE__{model: model} = agent, source, checks) do
-    case Clementine.LLM.Policy.resolve(model, policy(agent), checks) do
+    case Clementine.LLM.Policy.resolve(model, policy(agent), checks ++ schema(agent)) do
       {:ok, _policy} -> agent
       {:error, message} -> raise ArgumentError, "#{source}: #{message}"
     end
   end
+
+  defp schema(agent), do: [output_schema: agent.output_schema != nil]
 
   # Delegates are agent modules, kept as given, and checked as far as a
   # build may (Clementine.Delegation.check/2): their keys are read when a

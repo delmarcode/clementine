@@ -334,6 +334,11 @@ calls are unaffected):
 | OpenAI | `text.format`: `{"type": "json_schema", "name": "output", "schema": ..., "strict": true}` |
 | Chat Completions | `response_format`: `{"type": "json_schema", "json_schema": {"name": "output", "schema": ..., "strict": true}}`, only where the sheet says `features.structured_outputs` |
 
+The Anthropic and OpenAI clients send the schema as given, so an agent
+with an `output_schema:` on a model whose sheet has no structured
+outputs there (gpt-5.4-pro, gpt-5.2-pro) fails at build, at boot, and at
+the run's start, naming the fix, rather than with a 400 mid-run.
+
 The engine checks the answer either way (`Clementine.OutputSchema`), so
 a declared model without structured outputs still answers in shape when
 its instructions describe the answer (one markdown fence around the

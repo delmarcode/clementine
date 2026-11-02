@@ -312,4 +312,86 @@ defmodule Clementine.AgentPolicyTest do
       assert :ok = Agent.check_declared(module)
     end
   end
+
+  describe "an output schema on a model without structured outputs" do
+    @schema %{
+      "type" => "object",
+      "properties" => %{"verdict" => %{"type" => "string"}},
+      "required" => ["verdict"],
+      "additionalProperties" => false
+    }
+
+    test "is refused at build, at boot, and at the run's start, naming the fix" do
+      for id <- ["gpt-5.4-pro", "gpt-5.2-pro"] do
+        message =
+          assert_raise ArgumentError, fn -> Agent.new(model: id, output_schema: @schema) end
+
+        assert message.message =~ ~s(Clementine.Agent.new/1: "#{id}": has no structured outputs)
+        assert message.message =~ "pick a model whose sheet has them"
+        assert message.message =~ "or leave output_schema: out"
+
+        # The same model without a schema, and a sibling with structured
+        # outputs, build.
+        assert %Agent{} = Agent.new(model: id)
+      end
+
+      assert %Agent{} = Agent.new(model: "gpt-5.4", output_schema: @schema)
+
+      # use, at compile time.
+      message =
+        assert_raise ArgumentError, fn ->
+          Code.compile_string("""
+          defmodule Clementine.AgentPolicyTest.ProSchema do
+            use Clementine.Agent,
+              key: "pro_schema",
+              model: "gpt-5.4-pro",
+              output_schema: %{"type" => "object", "properties" => %{}}
+          end
+          """)
+        end
+
+      assert message.message =~ "use Clementine.Agent (Clementine.AgentPolicyTest.ProSchema)"
+      assert message.message =~ "has no structured outputs"
+
+      # Boot re-checks under runtime config: an override that takes
+      # structured outputs away from a model the build accepted.
+      [{module, _binary}] =
+        Code.compile_string("""
+        defmodule Clementine.AgentPolicyTest.Schema54 do
+          use Clementine.Agent,
+            key: "schema_54",
+            model: "gpt-5.4",
+            output_schema: %{"type" => "object", "properties" => %{}}
+        end
+        """)
+
+      assert :ok = Agent.check_declared(module)
+
+      Application.put_env(:clementine, :models, %{
+        "gpt-5.4" => [features: [structured_outputs: false]]
+      })
+
+      assert {:error, message} = Agent.check_declared(module)
+      assert message =~ "has no structured outputs"
+
+      # The run's start, for an agent built without new/1.
+      agent = %Agent{model: "gpt-5.4-pro", output_schema: @schema}
+      message = assert_raise ArgumentError, fn -> Clementine.run(agent, "Grade it.") end
+      assert message.message =~ ~s(Clementine.run/3: "gpt-5.4-pro": has no structured outputs)
+    end
+
+    test "a declared Chat Completions model keeps it: the client withholds response_format" do
+      Application.put_env(:clementine, :models, %{
+        "qwen3" => [
+          vendor: :qwen,
+          context: 32_000,
+          max_output: 8_000,
+          platforms: [openai_compatible: [base_url: "http://localhost:1/v1"]]
+        ]
+      })
+
+      refute Clementine.Models.get!("qwen3").features.structured_outputs
+      assert %Agent{} = Agent.new(model: "qwen3", output_schema: @schema)
+    end
+  end
 end
