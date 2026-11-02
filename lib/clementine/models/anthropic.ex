@@ -56,14 +56,14 @@ defmodule Clementine.Models.Anthropic do
     only (`Clementine.Platform`).
   - `vertex:` takes the dateless id from the 4.6 generation on and
     `<alias>@<date>` before it.
-  - `foundry:` takes the id as its default deployment name, and has no
-    mid-conversation system messages (the page lists the Claude API,
-    Bedrock, Google managed, and Claude Platform on AWS).
-  - `bedrock:` and `vertex:` take mid-conversation system messages but
-    not a tool defined inside one (`features: [inline_tools: false]`):
-    the page documents `inline-tools-2026-09-15` on the Claude API
-    only, and the by-reference tool changes on Bedrock and Google
-    Cloud.
+  - `foundry:` takes the id as its default deployment name.
+
+  What a platform never takes on any model is the platform's
+  (`Clementine.Platform.withheld/1`), not a sheet's: Foundry has no
+  mid-conversation system messages (the page lists the Claude API,
+  Bedrock, Google managed, and Claude Platform on AWS), and Bedrock,
+  Vertex, and Foundry take no tool defined inside one (the page
+  documents `inline-tools-2026-09-15` on the Claude API only).
   - `claude_on_aws:` takes the Claude API's id.
 
   A retired id keeps a stub sheet (`lifecycle: [status: :retired]`) so
@@ -91,15 +91,6 @@ defmodule Clementine.Models.Anthropic do
   # Mid-conversation system messages, and the tools a skill's load adds
   # defined inside one (`inline-tools-2026-09-15`).
   @mid_conversation [mid_conversation_system: true, inline_tools: true]
-
-  # Foundry has no mid-conversation system messages, on any model.
-  @foundry [features: [mid_conversation_system: false]]
-
-  # Bedrock and Google Cloud take mid-conversation system messages, but
-  # the mid-conversation system messages page documents a tool defined
-  # inside one (`inline-tools-2026-09-15`) on the Claude API only, so a
-  # skill's tools join `tools` there.
-  @partner_features [features: [inline_tools: false]]
 
   # Anthropic's retired ids, with the dates and replacement the
   # deprecations page gives.
@@ -364,7 +355,7 @@ defmodule Clementine.Models.Anthropic do
          platforms: [
            anthropic: [],
            vertex: [lifecycle: :partner],
-           foundry: @foundry,
+           foundry: [],
            claude_on_aws: []
          ],
          source: "#{@models}/opus-4-6/overview"
@@ -386,7 +377,7 @@ defmodule Clementine.Models.Anthropic do
          platforms: [
            anthropic: [],
            vertex: [lifecycle: :partner],
-           foundry: @foundry,
+           foundry: [],
            claude_on_aws: []
          ],
          source: "#{@models}/sonnet-4-6/overview"
@@ -502,9 +493,9 @@ defmodule Clementine.Models.Anthropic do
   defp platforms(id) do
     [
       anthropic: [],
-      bedrock: [id: "anthropic." <> id, lifecycle: :partner] ++ @partner_features,
-      vertex: [lifecycle: :partner] ++ @partner_features,
-      foundry: @foundry,
+      bedrock: [id: "anthropic." <> id, lifecycle: :partner],
+      vertex: [lifecycle: :partner],
+      foundry: [],
       claude_on_aws: []
     ]
   end
@@ -605,7 +596,7 @@ defmodule Clementine.Models.Anthropic do
     platforms = [
       anthropic: [],
       vertex: [id: "#{alias_id}@#{date}", lifecycle: :partner],
-      foundry: [id: alias_id] ++ @foundry,
+      foundry: [id: alias_id],
       claude_on_aws: [id: alias_id]
     ]
 

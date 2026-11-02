@@ -180,8 +180,10 @@ defmodule Clementine.Models do
 
   @doc """
   `model` (or the model `id` names) on `platform`: its facts with the
-  platform's deltas merged in, and `platform` set, so
-  `Clementine.Model.platform_id/1` gives the id it goes by there.
+  platform's deltas merged in, then what the platform never takes
+  (`Clementine.Platform.withheld/1`) set off whatever the sheet says,
+  and `platform` set, so `Clementine.Model.platform_id/1` gives the id it
+  goes by there.
   """
   @spec for_platform(Model.t() | String.t(), atom()) :: {:ok, Model.t()} | {:error, String.t()}
   def for_platform(id, platform) when is_binary(id) do
@@ -200,7 +202,10 @@ defmodule Clementine.Models do
          %{
            model
            | platform: platform,
-             features: Map.merge(model.features, entry.features),
+             features:
+               model.features
+               |> Map.merge(entry.features)
+               |> Map.merge(Platform.withheld(platform)),
              cache: Map.merge(model.cache, entry.cache)
          }}
     end

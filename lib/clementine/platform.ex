@@ -55,10 +55,13 @@ defmodule Clementine.Platform do
   Mantle host both wires share (`https://bedrock-mantle.us-east-1.api.aws`).
   This is the convention Anthropic's SDKs follow, with one exception:
   Anthropic's Bedrock page sets an SDK's base URL to `.../anthropic`,
-  which Clementine appends itself. A `base_url:` that ends in the path
-  Clementine appends (`/v1/messages`, `/v1`, `/responses`,
-  `/chat/completions`, and on Bedrock `/anthropic`) is refused, rather
-  than sent to a doubled path. Foundry takes `resource:` or `base_url:`
+  which Clementine appends itself. A `base_url:` that ends in a path
+  Clementine appends is refused rather than sent to a doubled path: on
+  Messages `/v1/messages`, `/messages`, or `/v1`; on Responses
+  `/responses`; on Chat Completions `/chat/completions` (a `.../v1` base
+  is right there, as in the `tinker` entry above); and on Bedrock the
+  Messages and Chat Completions ones, `/anthropic`, or `/openai/v1`.
+  Foundry takes `resource:` or `base_url:`
   (`https://myapp-prod.services.ai.azure.com/anthropic`), and Bedrock
   `region:` or `base_url:`. Vertex takes `project:` and `region:`, or
   `base_url:`.
@@ -99,11 +102,13 @@ defmodule Clementine.Platform do
   ## What a platform withholds
 
   A model's facts on a platform are its sheet with that platform's
-  entry merged in (`Clementine.Models.for_platform/2`), and the clients
-  read only those: Foundry takes no mid-conversation system messages, so
-  a skill's load folds into the system prompt and `tools` there, and
-  Bedrock takes no tool defined inside one (`inline_tools: false`), so a
-  skill's tools join `tools` there.
+  entry merged in, and then what the platform never takes on any model
+  (`withheld/1`) set off, whatever the sheet or an app's declaration
+  says (`Clementine.Models.for_platform/2`). The clients read only
+  those: Foundry takes no mid-conversation system messages, so a skill's
+  load folds into the system prompt and `tools` there, and Bedrock and
+  Vertex take no tool defined inside one (`inline_tools`), so a skill's
+  tools join `tools` there.
 
   ## Prices
 
@@ -146,6 +151,8 @@ defmodule Clementine.Platform do
   @credential {:custom, __MODULE__, :validate_credential, []}
   @string {:custom, __MODULE__, :validate_string, []}
   @credential_keys [:api_key, :access_token]
+  # The same keys as a string-keyed map or list (decoded JSON) holds them.
+  @secret_keys @credential_keys ++ Enum.map(@credential_keys, &Atom.to_string/1)
 
   @schemas %{
     anthropic: [api_key: [type: @credential], base_url: [type: @string]],
@@ -243,6 +250,26 @@ defmodule Clementine.Platform do
            ":platforms names none by that name"}
     end
   end
+
+  @doc """
+  The features the platform `name` never takes, on any model, whatever a
+  model's sheet or an app's declaration says. `Clementine.Models.for_platform/2`
+  applies them over the model's facts there.
+
+  - `:foundry` takes no mid-conversation system messages (Anthropic's
+    platform table), and so no tool defined inside one.
+  - `:bedrock` and `:vertex` take mid-conversation system messages but
+    no tool defined inside one: Anthropic's mid-conversation system
+    messages page documents `inline-tools-2026-09-15` on the Claude API
+    only. A skill's tools join `tools` there.
+
+  An app-named platform withholds nothing: its models' declarations
+  say what the server takes.
+  """
+  @spec withheld(name()) :: %{atom() => false}
+  def withheld(:foundry), do: %{mid_conversation_system: false, inline_tools: false}
+  def withheld(name) when name in [:bedrock, :vertex], do: %{inline_tools: false}
+  def withheld(_name), do: %{}
 
   @doc """
   Whether `name` is a platform the app names itself under
@@ -550,12 +577,19 @@ defmodule Clementine.Platform do
   end
 
   defp validate(name, entry, schema) when is_list(entry) do
-    case NimbleOptions.validate(entry, schema) do
-      {:ok, opts} ->
-        {:ok, opts}
+    # NimbleOptions raises on a list that is not a keyword list, quoting
+    # it, and the list may hold the credential (`[{"api_key", key}]`
+    # from decoded JSON, `[key]`).
+    if Keyword.keyword?(entry) do
+      case NimbleOptions.validate(entry, schema) do
+        {:ok, opts} ->
+          {:ok, opts}
 
-      {:error, %NimbleOptions.ValidationError{} = error} ->
-        {:error, "#{name}: " <> scrub(Exception.message(error), entry)}
+        {:error, %NimbleOptions.ValidationError{} = error} ->
+          {:error, "#{name}: " <> scrub(Exception.message(error), entry)}
+      end
+    else
+      {:error, "#{name}: #{not_keyword()}"}
     end
   end
 
@@ -564,6 +598,15 @@ defmodule Clementine.Platform do
   # shape is named.
   defp validate(name, other, _schema) do
     {:error, "#{name}: expected a keyword list (api_key: ...), got #{shape(other)}"}
+  end
+
+  @doc false
+  # What is wrong with a list that is not a keyword list, without its
+  # contents.
+  @spec not_keyword() :: String.t()
+  def not_keyword do
+    "expected a keyword list (api_key: ...), got a list that is not one: each entry is an " <>
+      "{atom, value} pair, and a string key such as {\"api_key\", ...} (decoded JSON's) is not"
   end
 
   # The keys a platform needs to know where to send.
@@ -712,7 +755,7 @@ defmodule Clementine.Platform do
   # `term` with every value under `api_key:` or `access_token:` redacted,
   # whatever its shape, for an error message.
   @spec redact(term()) :: term()
-  def redact({key, value}) when key in @credential_keys, do: {key, redact_credential(value)}
+  def redact({key, value}) when key in @secret_keys, do: {key, redact_credential(value)}
   def redact(list) when is_list(list), do: Enum.map(list, &redact/1)
   def redact(%{__struct__: _} = struct), do: struct
   def redact(map) when is_map(map), do: Map.new(map, &redact/1)
@@ -746,7 +789,7 @@ defmodule Clementine.Platform do
     |> Enum.reduce(message, &String.replace(&2, &1, "**redacted**"))
   end
 
-  defp secrets({key, value}) when key in @credential_keys, do: secret_strings(value)
+  defp secrets({key, value}) when key in @secret_keys, do: secret_strings(value)
   defp secrets(list) when is_list(list), do: Enum.flat_map(list, &secrets/1)
   defp secrets(%{__struct__: _}), do: []
   defp secrets(map) when is_map(map), do: Enum.flat_map(map, &secrets/1)

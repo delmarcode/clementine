@@ -48,7 +48,9 @@ defmodule Clementine.AgentServer do
   - `:platform`, `:max_tokens`, `:effort`, `:thinking`, `:display`,
     `:cache`, `:provider_options` - the agent's choices for its model, as
     `use Clementine.Agent` takes them; `platform: :bedrock` runs it on
-    Bedrock (`Clementine.Platform`)
+    Bedrock (`Clementine.Platform`). They are for `use`'s model: a
+    `start_link/1` that names another model takes none of them but
+    `platform:`, and that only for a model of the same vendor
   - `:tools` - List of tool modules (default: [])
   - `:system` - System prompt (default: "")
   - `:max_iterations` - Maximum loop iterations (default: 10)
@@ -149,7 +151,21 @@ defmodule Clementine.AgentServer do
                   "Clementine.AgentServer or to start_link/1 (model: \"claude-sonnet-5-5\")"
         end
 
-        policy = Keyword.merge(@agent_policy, Keyword.take(opts, Clementine.LLM.Policy.keys()))
+        # use's choices are for use's model, as Clementine.Agent's are:
+        # start_link/1's model of another vendor takes none of them, and
+        # one of the same vendor only its platform:. A use that names no
+        # model gives its choices for whichever start_link/1 names.
+        declared =
+          if @agent_model,
+            do: Clementine.Agent.carried(model, @agent_model, @agent_policy),
+            else: @agent_policy
+
+        policy =
+          declared
+          |> Keyword.merge(Keyword.take(opts, Clementine.LLM.Policy.keys()), fn
+            :provider_options, declared, own -> Keyword.merge(declared, own)
+            _key, _declared, own -> own
+          end)
 
         # The model and its choices, checked whole once, as a run's start
         # checks them.

@@ -52,7 +52,9 @@ defmodule Clementine.Model do
     and `tools`), `inline_tools` (with `mid_conversation_system`, the
     tools a skill's load adds go inline in that message, as
     `tool_addition` definitions under the `inline-tools-2026-09-15`
-    beta, rather than joining `tools`), and `streaming` (default
+    beta, rather than joining `tools`; a platform that never takes one
+    withholds it whatever the sheet says, `Clementine.Platform.withheld/1`),
+    and `streaming` (default
     `true`; an agent's runs always stream, so one on a model that does
     not is refused).
   - `cache`: `min_prefix`, the fewest tokens a cached prefix holds
@@ -320,7 +322,8 @@ defmodule Clementine.Model do
   """
   @spec new(keyword()) :: {:ok, t()} | {:error, String.t()}
   def new(sheet) when is_list(sheet) do
-    with {:ok, opts} <- validate(sheet, @schema),
+    with :ok <- keyword_shapes(sheet),
+         {:ok, opts} <- validate(sheet, @schema),
          {:ok, platforms} <- platforms_of(opts),
          model = build(opts, platforms),
          :ok <- consistent(model) do
@@ -333,6 +336,28 @@ defmodule Clementine.Model do
 
   def new(other),
     do: {:error, "expected a keyword list of facts, got: #{inspect(redact(other))}"}
+
+  # NimbleOptions raises on a sheet that is not a keyword list, and
+  # quotes a `platforms:` that is not one; either may hold a key an app
+  # left there. Both are named by their shape only.
+  defp keyword_shapes(sheet) do
+    cond do
+      not Keyword.keyword?(sheet) ->
+        {:error, "expected a keyword list of facts, got a list that is not one"}
+
+      (platforms = Keyword.get(sheet, :platforms)) != nil and
+          not (is_list(platforms) and Keyword.keyword?(platforms)) ->
+        {:error,
+         "platforms: expected a keyword list from platform to its entry (anthropic: []), got " <>
+           if(is_list(platforms),
+             do: "a list that is not one",
+             else: Clementine.Platform.shape(platforms)
+           )}
+
+      true ->
+        :ok
+    end
+  end
 
   @doc "As `new/1`, raising `ArgumentError`."
   @spec new!(keyword()) :: t()
@@ -436,7 +461,8 @@ defmodule Clementine.Model do
   defp known_platform?(name), do: name in @platforms or Clementine.Platform.app_named?(name)
 
   defp platform_entry(name, entry) when is_list(entry) do
-    with :ok <- no_platform_config(name, entry),
+    with :ok <- keyword_entry(entry),
+         :ok <- no_platform_config(name, entry),
          {:ok, validated} <- validate(entry, @platform_schema) do
       {:ok,
        validated
@@ -451,6 +477,15 @@ defmodule Clementine.Model do
       {:error,
        "expected a keyword list (id:, lifecycle:, features:, cache:), got " <>
          Clementine.Platform.shape(other)}
+
+  defp keyword_entry(entry) do
+    if Keyword.keyword?(entry),
+      do: :ok,
+      else:
+        {:error,
+         "expected a keyword list (id:, lifecycle:, features:, cache:), got a list that is " <>
+           "not one"}
+  end
 
   # Where a model's platform entry once took an endpoint or a credential
   # (`base_url:`, `api_key:`), the platform's own config now holds it.

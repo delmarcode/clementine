@@ -90,6 +90,39 @@ defmodule Clementine.AgentServerTest do
       GenServer.stop(agent)
     end
 
+    test "use's choices are for use's model: another model takes only its vendor's platform" do
+      test = self()
+
+      expect(Clementine.LLM.MockClient, :stream, 3, fn model, _system, _messages, _tools, opts ->
+        send(test, {:opts, model, opts})
+        text_events("ok")
+      end)
+
+      # Another Claude model keeps use's platform, but not its effort.
+      {:ok, agent} = BedrockAgent.start_link(model: "claude-opus-5-5")
+      assert {:ok, _completed} = Clementine.AgentServer.run(agent, "Hi")
+      assert_received {:opts, "claude-opus-5-5", opts}
+      assert opts[:platform] == :bedrock
+      assert opts[:effort] == nil
+      GenServer.stop(agent)
+
+      # Another vendor's model takes neither, and goes to its own platform.
+      {:ok, agent} = BedrockAgent.start_link(model: "gpt-6.1-sol")
+      assert {:ok, _completed} = Clementine.AgentServer.run(agent, "Hi")
+      assert_received {:opts, "gpt-6.1-sol", opts}
+      assert opts[:platform] == nil
+      assert opts[:effort] == nil
+      GenServer.stop(agent)
+
+      # start_link/1's own choices apply to the model it names.
+      {:ok, agent} = BedrockAgent.start_link(model: "claude-opus-5-5", effort: :high)
+      assert {:ok, _completed} = Clementine.AgentServer.run(agent, "Hi")
+      assert_received {:opts, "claude-opus-5-5", opts}
+      assert opts[:platform] == :bedrock
+      assert opts[:effort] == :high
+      GenServer.stop(agent)
+    end
+
     test "a choice the model cannot take there fails start" do
       Process.flag(:trap_exit, true)
 

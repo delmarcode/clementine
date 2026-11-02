@@ -199,7 +199,16 @@ defmodule Clementine.PlatformTest do
              "a list"},
             # The entry itself in the wrong shape.
             {[anthropic: {:ok, key}], :anthropic, "an {:ok, value} tuple"},
-            {[anthropic: key], :anthropic, "a string"}
+            {[anthropic: key], :anthropic, "a string"},
+            # A list that is not a keyword list, which NimbleOptions would
+            # quote: string keys from decoded JSON, a bare key, a mix.
+            {[anthropic: [{"api_key", key}]], :anthropic, "a list that is not one"},
+            {[anthropic: [key]], :anthropic, "a list that is not one"},
+            {[anthropic: [{:api_key, key}, key]], :anthropic, "a list that is not one"},
+            {[tinker: [{"protocol", "messages"}, {"api_key", key}]], :tinker,
+             "a list that is not one"},
+            {[tinker: [protocol: :messages, base_url: "https://p", api_key: "k", other: key]],
+             :tinker, "unknown options [:other]"}
           ] do
         put(platforms)
 

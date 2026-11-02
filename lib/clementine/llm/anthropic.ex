@@ -377,7 +377,10 @@ defmodule Clementine.LLM.Anthropic do
 
     {encoded_messages, binding, dropped} =
       if binds? do
-        Binding.encode(messages, Binding.start(system, encoded_tools), replay)
+        {encoded, binding, dropped} =
+          Binding.encode(messages, Binding.start(system, encoded_tools), replay)
+
+        {encoded, binding, with_cause(dropped, placement, messages)}
       else
         {Enum.flat_map(messages, replay), nil, nil}
       end
@@ -444,6 +447,32 @@ defmodule Clementine.LLM.Anthropic do
     |> Enum.reject(&(&1["name"] in names))
     |> Enum.uniq_by(& &1["name"])
   end
+
+  # Why a request sends earlier turns without their thinking: `:fold`
+  # when a system message after every one of them changed the prefix
+  # because the platform takes it no other way (its tools joined `tools`,
+  # or its text joined `system`), which would have dropped them whatever
+  # else changed; `:history` otherwise.
+  defp with_cause(nil, _placement, _messages), do: nil
+
+  defp with_cause(%{last_index: last} = dropped, placement, messages) do
+    folded? =
+      messages
+      |> Enum.with_index()
+      |> Enum.any?(fn {message, index} -> index > last and folds?(placement, message) end)
+
+    Map.put(dropped, :cause, if(folded?, do: :fold, else: :history))
+  end
+
+  defp folds?(:inline, _message), do: false
+
+  defp folds?(:text, %SystemMessage{} = message),
+    do: SystemMessage.tool_definitions(message) != []
+
+  defp folds?(:fold, %SystemMessage{} = message),
+    do: SystemMessage.tool_definitions(message) != [] or SystemMessage.get_text(message) != ""
+
+  defp folds?(_placement, _message), do: false
 
   # A system message without the tools it adds, or nothing when it
   # added tools and said nothing.

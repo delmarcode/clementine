@@ -400,14 +400,21 @@ defmodule Clementine.Telemetry do
   The request goes through; the model loses that reasoning, and the
   prompt cache restarts there. A change reports once: a turn already
   sent without its thinking when a later turn of the history was
-  produced is not counted again. An app whose every turn reports one
-  replays its threads in another order than the model saw them (the
-  runtime guide's "Models that bind their thinking"). Clementine also
-  logs it as a warning.
+  produced is not counted again. `cause` says what changed:
+
+  - `:history`: the app's history. An app whose every turn reports one
+    replays its threads in another order than the model saw them (the
+    runtime guide's "Models that bind their thinking"). Clementine logs
+    it as a warning.
+  - `:fold`: the model's platform. A skill's load joined the tools (or,
+    where the platform takes no mid-conversation system message, the
+    system prompt) because the platform takes no tool defined inside
+    one: Bedrock, Vertex, and Foundry (`Clementine.Platform.withheld/1`).
+    It happens once per skill load there, and is logged at info.
 
   - Measurements: `%{turns: integer, blocks: integer}` — the turns sent
     without their thinking, and the thinking blocks left out
-  - Metadata: `%{agent_key, provider, platform, model, iteration: integer, first_index: integer}`
+  - Metadata: `%{agent_key, provider, platform, model, iteration: integer, first_index: integer, cause: :history | :fold}`
     — `first_index` is the first such turn's place in the request's
     messages (the history, then the prompt). Never content.
 
@@ -475,7 +482,7 @@ defmodule Clementine.Telemetry do
   | `clementine_llm_cost_micros_total` | sum | `:llm :usage` | + `outcome`, `currency` |
   | `clementine_llm_duration_milliseconds` | distribution | `:llm :stop` | |
   | `clementine_llm_exceptions_total` | counter | `:llm :exception` | + `error_code` |
-  | `clementine_llm_thinking_dropped_total` | counter | `:llm :thinking_dropped` | |
+  | `clementine_llm_thinking_dropped_total` | counter | `:llm :thinking_dropped` | + `cause` (`history`, `fold`) |
   | `clementine_tool_calls_total` | counter | `:tool :stop` | + `tool`, `result` |
   | `clementine_tool_duration_milliseconds` | distribution | `:tool :stop` | + `tool` |
   | `clementine_tool_exceptions_total`, `clementine_tool_input_repaired_total` | counter | `:tool :exception`, `:tool :input_repaired` | + `tool` |
@@ -602,6 +609,9 @@ defmodule Clementine.Telemetry do
   # :exception for a raise, and the codes of the errors the engine itself
   # returns. Error's `code` is any atom (a passthrough error keeps an
   # app's own), so anything else is labeled "other".
+  # Why a call sent earlier turns without their thinking.
+  @causes [:history, :fold]
+
   @error_codes [
     :auth,
     :not_found,
@@ -720,8 +730,9 @@ defmodule Clementine.Telemetry do
             measurement: &one/1,
             description:
               "Model calls that sent earlier turns without their thinking, because the " <>
-                "history before them changed since they were produced."
-          ] ++ labels(@identity)
+                "history before them changed since they were produced: by the app's " <>
+                "history, or by the platform folding a skill's load into the prefix."
+          ] ++ labels(@identity ++ [:cause], &cause_labels/1)
         ),
         counter(
           [:clementine, :llm, :usage_clamped, :total],
@@ -1016,6 +1027,8 @@ defmodule Clementine.Telemetry do
 
   defp stop_reason(reason) when reason in @stop_reasons, do: reason
   defp stop_reason(_other), do: "other"
+
+  defp cause_labels(metadata), do: Map.update(metadata, :cause, nil, &bounded(&1, @causes))
 
   defp error_code_labels(metadata) do
     Map.update(metadata, :error_code, nil, &bounded(&1, @error_codes))

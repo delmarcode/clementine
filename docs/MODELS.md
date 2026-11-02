@@ -234,11 +234,14 @@ whose clients send the schema as given, an agent with an
   [:adaptive], efforts: [...]]`, and `default_effort:` if it has one.
 - A Claude model Clementine lacks (5.1 or later):
   `thinking: [binding: :prefix]`, and
-  `features: [mid_conversation_system: true, inline_tools: true]` where
-  its platform takes them (`inline_tools` only on the Claude API), and
+  `features: [mid_conversation_system: true, inline_tools: true]`, and
   `features: [structured_outputs: true]`, or an agent with an
   `output_schema:` is refused on `:anthropic`. Better, declare it
   `based_on:` the sheet it succeeds (below), which carries all of these.
+  What a platform never takes stays off there whatever a declaration
+  says (`Clementine.Platform.withheld/1`): the same declaration sends
+  inline tools on `:anthropic`, a skill's tools in `tools` on Bedrock,
+  and folds the load into the system prompt on Foundry.
 - An OpenAI model Clementine lacks, on `:openai`: its efforts and
   default, `cache: [min_prefix: 1024, ttls: [:thirty_minutes,
   :twelve_hours]]` from GPT-5.6 on, and `features: [structured_outputs:
@@ -370,18 +373,24 @@ later, and Haiku 4.5). Claude on Vertex and Claude Platform on AWS
 arrive with OPS-199.
 
 **What a platform withholds** is in the model's facts on it
-(`Clementine.Models.for_platform/2`), which the clients read:
+(`Clementine.Models.for_platform/2`), which the clients read. What a
+platform never takes, on any model, is the platform's
+(`Clementine.Platform.withheld/1`), set off over any sheet or
+declaration; what one model lacks on one platform is its sheet's entry
+for that platform.
 
 - Foundry has no mid-conversation system messages (Anthropic's platform
   table, read 2026-11-01), so a skill's load folds into the system
   prompt and `tools` there.
-- Bedrock takes mid-conversation system messages, but Anthropic's
-  mid-conversation system messages page documents a tool defined inside
-  one (the `inline-tools-2026-09-15` beta) on the Claude API only. A
-  skill's tools therefore join `tools` on Bedrock
-  (`features: [inline_tools: false]`), which costs the cache and, on a
-  model that binds its thinking, the earlier turns' thinking at the
-  load, as on Foundry. Bedrock documents tool changes by reference
+- Bedrock and Vertex take mid-conversation system messages, but
+  Anthropic's mid-conversation system messages page documents a tool
+  defined inside one (the `inline-tools-2026-09-15` beta) on the Claude
+  API only. A skill's tools therefore join `tools` there
+  (`inline_tools: false`), which costs the cache and, on a model that
+  binds its thinking, the earlier turns' thinking at the load, as on
+  Foundry. `[:clementine, :llm, :thinking_dropped]` reports that drop
+  with `cause: :fold`, and Clementine logs it at info rather than as a
+  warning. Bedrock documents tool changes by reference
   (`mid-conversation-tool-changes-2026-07-01`), which Clementine does
   not send.
 - Neither Bedrock nor Foundry has server-side `fallbacks`, the Models

@@ -625,19 +625,31 @@ defmodule Clementine.Agent do
         end)
 
       true ->
-        # use's platform: says where the app sends that vendor's models,
-        # so it carries to another model of the same vendor; a model of
-        # another vendor (an eval's cross-vendor --model) takes its own
-        # vendor's default platform unless agent/1 names one.
-        carried = if same_vendor?(agent.model, model), do: Keyword.take(declared, [:platform])
+        carried = carried(agent.model, model, declared)
 
         agent
-        |> fill(carried || [])
+        |> fill(carried)
         |> check!(fn message ->
           "#{inspect(module)}.agent/1 picked #{inspect(agent.model)} for this run, not the " <>
             "#{inspect(model)} its use Clementine.Agent declares, so only agent/1's own " <>
-            "choices apply#{if carried not in [nil, []], do: ", and use's platform"}: #{message}"
+            "choices apply#{if carried != [], do: ", and use's platform"}: #{message}"
         end)
+    end
+  end
+
+  @doc false
+  # The `use` choices (`declared`, for `use_model`) that apply to a run on
+  # `model`: all of them on `use`'s own model; on another model of the
+  # same vendor only `platform:`, which says where the app sends that
+  # vendor's models (an eval's `--model`); on another vendor's, none, so
+  # it goes to its own vendor's default platform unless the run names
+  # one. `Clementine.AgentServer` applies the same rule.
+  @spec carried(String.t() | nil, String.t() | nil, keyword()) :: keyword()
+  def carried(model, use_model, declared) do
+    cond do
+      model in [nil, use_model] -> declared
+      same_vendor?(model, use_model) -> Keyword.take(declared, [:platform])
+      true -> []
     end
   end
 

@@ -93,7 +93,8 @@ defmodule Clementine.LLM.Anthropic.Binding do
     %{
       turns: length(dropped),
       blocks: Enum.sum_by(dropped, &elem(&1, 1)),
-      first_index: first
+      first_index: first,
+      last_index: dropped |> List.last() |> elem(0)
     }
   end
 
@@ -108,11 +109,25 @@ defmodule Clementine.LLM.Anthropic.Binding do
   end
 
   @doc """
-  Warns that a request sent earlier turns without their thinking: their
-  conversation changed since they were produced. Counts and the first
-  turn's index only, never content.
+  Says that a request sent earlier turns without their thinking: their
+  conversation changed since they were produced. A change the history
+  made (`cause: :history`) is a warning, since the app replays its
+  thread in another order than the model saw it. One the model's
+  platform made (`cause: :fold`: a skill's load joined the system prompt
+  or the tools there, as on Bedrock and Foundry) is expected, and only
+  noted. Counts and the first turn's index only, never content.
   """
   def log_dropped(nil, _who), do: :ok
+
+  def log_dropped(%{cause: :fold, turns: turns, blocks: blocks, first_index: index}, who) do
+    Logger.info(
+      "#{who}: sent #{turns} earlier turn(s) without their thinking (#{blocks} block(s), " <>
+        "first at messages.#{index}): on this platform the model takes no tool defined " <>
+        "inside a mid-conversation system message, so a skill's load joined the system prompt or " <>
+        "tools those turns were produced after. Expected there; nothing to replay " <>
+        "differently (the runtime guide's \"Models that bind their thinking\")."
+    )
+  end
 
   def log_dropped(%{turns: turns, blocks: blocks, first_index: index}, who) do
     Logger.warning(
