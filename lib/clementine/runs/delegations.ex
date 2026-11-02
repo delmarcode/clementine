@@ -22,8 +22,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     #     the flag, so it ends after them and a cascade finishes bottom up;
     #   * the parent's end while it waits (the reaper's wait ceiling, a
     #     cancel of a park that started no child): its live children are
-    #     cancelled in the same transaction, and the end carries their
-    #     effects in its fence.
+    #     cancelled in the same transaction, and the end is fenced when
+    #     one of them acted or still can.
     #
     # reconcile/1 resumes a parent whose children have all ended and that
     # still waits: after a park that started none (the worker calls it
@@ -280,7 +280,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # or resumed by an earlier end) hears nothing.
     @spec child_ended(AgentRun.t(), AgentRun.t()) :: :ok
     def child_ended(%AgentRun{} = parent, %AgentRun{} = child) do
-      if child.effects and not AgentRun.terminal?(parent), do: raise_fence(parent.id)
+      if child.effects, do: raise_fence(parent.id)
 
       case Codec.to_facts(parent, @fields) do
         %Facts{
@@ -413,8 +413,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     # descendants locked deepest first, then the run's own row, compared
     # with what the write expects, then the write, then each live child
     # cancelled (a waiting one cascades the same way). An end raises the
-    # run's fence first when a child or a live descendant had effects: a
-    # live one acted, or may have, before the cancel reaches it. A run
+    # run's fence first when a child or a live descendant had effects, or
+    # a live descendant is running: the cancel only flags a running one,
+    # which can still act (and raise its own fence) until it honors the
+    # flag, after this end is written. A queued or waiting one ends, or
+    # cascades, in this transaction and runs nothing more. A run
     # that moved meanwhile (its last child's end resumed it) is
     # `{:error, :stale}`, returned as a value with nothing written, so a
     # cancel inside an enclosing unit (a loop's step) fetches again and
@@ -460,7 +463,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     defp inherit_effects(repo, run_id, live) do
       if repo.exists?(
            from(r in AgentRun,
-             where: (r.parent_id == ^run_id or r.id in ^live) and r.effects
+             where: (r.parent_id == ^run_id and r.effects) or r.id in ^live,
+             where: r.effects or r.status == "running"
            )
          ),
          do: raise_fence(run_id)

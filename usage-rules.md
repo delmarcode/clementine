@@ -220,8 +220,10 @@ end
   turn. A thread's `"retry"` runs a failed turn again with the same
   prompt, so store the user's message when it arrives, or insert the
   prompt keyed on the turn (`run.tag_id`, the same for the retry) and
-  skip one already stored. Never append `[input_message | messages]` at
-  every end: a retried turn's prompt is stored twice. Store them as
+  skip one already stored; either way, `history/1` leaves out the
+  turn's own rows, from its prompt on. Never append `[input_message |
+  messages]` at every end: a retried turn's prompt is stored twice.
+  Store them as
   `jsonb` through `Clementine.LLM.Message.to_map/1`, and read them back
   with `from_map/1`.
 - One turn is one run with subject `{"conversation", id}`, so a second

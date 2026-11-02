@@ -2,9 +2,9 @@ defmodule ClementineSmoke.Agents.ChatTest do
   use ClementineSmoke.AgentsCase
 
   alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
-  alias Clementine.Result
-  alias Clementine.Runs.AgentRun
-  alias ClementineSmoke.Agents.{Chat, Host}
+  alias Clementine.Runs
+  alias Clementine.Runs.{StepWorker, TimerWorker, Worker}
+  alias ClementineSmoke.Agents.Chat
   alias ClementineSmoke.Agents.LLMMock
   alias ClementineSmoke.Conversations
 
@@ -25,7 +25,7 @@ defmodule ClementineSmoke.Agents.ChatTest do
       text_events("Hello, Ada.")
     end)
 
-    assert :ok = perform_job(Clementine.Runs.Worker, %{"run_id" => first.id})
+    assert :ok = perform_job(Worker, %{"run_id" => first.id})
 
     id = first.id
 
@@ -49,32 +49,46 @@ defmodule ClementineSmoke.Agents.ChatTest do
       text_events("Your name is Ada.")
     end)
 
-    assert :ok = perform_job(Clementine.Runs.Worker, %{"run_id" => second.id})
+    assert :ok = perform_job(Worker, %{"run_id" => second.id})
 
     id = second.id
     assert {:chat_text, id, "Your name is Ada."} in broadcasts()
     assert length(Conversations.messages(conversation)) == 4
   end
 
-  test "a turn's prompt is stored once, when a retry of the turn ends too", %{
-    conversation: conversation
-  } do
-    # A thread's turn that failed with nothing done, and its retry.
-    run = %AgentRun{agent_key: "chat", subject_id: conversation, tag_kind: "turn", tag_id: "m1"}
-    prompt = UserMessage.new("Hello?")
-    overloaded = %Clementine.Error{code: :overloaded, retryable?: true}
-
-    :ok =
-      Host.run_finished(
-        %{run | id: Ecto.UUID.generate()},
-        %Result.Failed{error: overloaded, input_message: prompt, effects?: false}
+  test "a thread retries a turn that failed with nothing done: the model reads the prompt " <>
+         "once, and the conversation stores it once",
+       %{conversation: conversation} do
+    {:ok, loop} =
+      Runs.start_loop(
+        Clementine.Thread,
+        %{"agent" => "chat", "on_failure" => "retry", "retry_after_ms" => 1_000},
+        subject: {"conversation", conversation}
       )
 
-    :ok =
-      Host.run_finished(
-        %{run | id: Ecto.UUID.generate()},
-        Result.completed(input_message: prompt, messages: [AssistantMessage.text("Hi.")])
-      )
+    {:ok, :appended} = Runs.send(loop.id, %{"prompt" => "Hello?", "id" => "m1"})
+    assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+    {:ok, first} = Runs.child(loop.id, {:turn, "m1"})
+
+    # The provider is overloaded: a failure the same request may get past.
+    expect_turn([{:error, %{"type" => "overloaded_error", "message" => "Overloaded"}}])
+    assert :ok = perform_job(Worker, %{"run_id" => first.id})
+
+    # The thread hears it, and runs the turn again after the delay: its
+    # timer job, as Oban would run it.
+    assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+    [timer] = all_enqueued(worker: TimerWorker)
+    assert :ok = perform_job(%{timer | attempt: 1, attempted_at: DateTime.utc_now()})
+    assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+    {:ok, retry} = Runs.child(loop.id, {:turn, "m1"})
+    assert retry.id != first.id
+
+    expect(LLMMock, :stream, fn _model, _system, messages, _tools, _opts ->
+      assert messages == [UserMessage.new("Hello?")]
+      text_events("Hi.")
+    end)
+
+    assert :ok = perform_job(Worker, %{"run_id" => retry.id})
 
     assert [%UserMessage{content: "Hello?"}, %AssistantMessage{} = reply] =
              Conversations.messages(conversation)
@@ -88,7 +102,7 @@ defmodule ClementineSmoke.Agents.ChatTest do
   end
 
   defp start_turn(conversation, text) do
-    Clementine.Runs.start(Chat, text, subject: {"conversation", conversation})
+    Runs.start(Chat, text, subject: {"conversation", conversation})
   end
 
   # What the conversation's topic carried, in order.

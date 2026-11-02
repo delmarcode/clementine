@@ -26,13 +26,12 @@ defmodule ClementineSmoke.Agents.Host do
 
   def run_transition(_run, _transition), do: :ok
 
-  # The prompt is stored once per turn, keyed on the turn's tag: a
-  # thread's retry runs a failed turn again under the same tag, with the
-  # same prompt. A run with no tag is never retried; its id keys it.
+  # The prompt is stored once per turn: a thread's retry runs a failed
+  # turn again under the same key, with the same prompt.
   @impl true
   def run_finished(%{agent_key: "chat"} = run, %ended{} = result)
       when ended in [Result.Completed, Result.Failed] do
-    Conversations.put_prompt!(run.subject_id, run.tag_id || run.id, result.input_message)
+    Conversations.put_prompt!(run.subject_id, Conversations.turn_key(run), result.input_message)
     Conversations.append!(run.subject_id, result.messages)
   end
 

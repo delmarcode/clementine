@@ -38,8 +38,9 @@ defmodule Clementine.Delegation do
 
   A child's effects are its parent's. A child that ran a tool not
   declared `retry: :safe` raises its parent's effect fence when it
-  ends, and a parent ended while it waits takes its live children's, so
-  a `Clementine.Thread` never retries a turn whose delegate acted.
+  ends, and a parent ended while it waits is fenced when a child acted
+  or one still running can, so a `Clementine.Thread` never retries a
+  turn whose delegate acted.
 
   Calls in one batch run side by side, and their answers return to the
   model together, with the batch's other results. A batch that also

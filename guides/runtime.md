@@ -268,10 +268,13 @@ says so; a run that did nothing at all fails:
 - Store a turn's prompt once per turn, not once per run. A thread's
   `"retry"` runs a failed turn again under the same tag, with the same
   prompt, so appending `[input_message | messages]` at every end stores
-  the prompt twice. Store the user's message when it arrives (and leave
-  it out of that turn's `history/1`), or insert `input_message` keyed on
-  the turn, `run.tag_id` (the message's id, the same for the retry),
-  skipping one already stored; then append only `messages`.
+  the prompt twice. Store the user's message when it arrives, or insert
+  `input_message` keyed on the turn, `run.tag_id` (the message's id, the
+  same for the retry), skipping one already stored; then append only
+  `messages`. Either way the prompt can be stored before the turn runs
+  (again), so `history/1` leaves out the turn's own rows, from its
+  prompt on: the run adds the prompt itself, and a model that read it
+  twice would answer it twice.
 - A refusal is usually not the last word. Anthropic's advice is to send
   the same request to another Claude model, which usually answers it.
   Its server-side fallback (`fallbacks: "default"`, a beta) does that

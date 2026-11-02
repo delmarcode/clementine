@@ -761,15 +761,13 @@ defmodule Clementine.Runs.DelegationTest do
       assert %{status: :queued, resume: %{payload: {:delegated, %{}}}} = facts(parent.id)
     end
 
-    test "ending a waiting parent at its wait ceiling carries the fence of a live child that " <>
-           "acted, so nothing runs its work again" do
+    test "ending a waiting parent at its wait ceiling fences it while a child runs: the " <>
+           "cancel only flags the child, which can still act" do
       parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
       [echo] = children(parent_id)
 
-      # The child is running, and has raised its fence: it may have acted.
+      # The child is running, its fence still down.
       {:ok, lease} = Protocol.claim(Lifecycle, echo.id, executor: "test")
-      :ok = Protocol.mark_effects(lease)
-      assert %AgentRun{effects: false} = Runs.get(parent_id)
 
       reason = Clementine.InterruptReason.new(:suspension_expired)
       assert {:ok, _facts} = Protocol.interrupt(Lifecycle, facts(parent_id), reason, nil)
@@ -779,7 +777,23 @@ defmodule Clementine.Runs.DelegationTest do
       assert_received {:run_finished, %AgentRun{id: ^parent_id},
                        %Result.Interrupted{effects?: true}}
 
+      # The cancel reaches the child too late: it acts, then ends.
       assert %{status: :running, cancel: %{}} = facts(echo.id)
+      :ok = Protocol.mark_effects(lease)
+      {:ok, _} = Protocol.finish(lease, Result.completed(output: "Said."))
+      assert %AgentRun{status: "interrupted", effects: true} = Runs.get(parent_id)
+    end
+
+    test "ending a waiting parent whose children never started leaves it unfenced: they end " <>
+           "with it" do
+      parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
+      [echo] = children(parent_id)
+
+      reason = Clementine.InterruptReason.new(:suspension_expired)
+      assert {:ok, _facts} = Protocol.interrupt(Lifecycle, facts(parent_id), reason, nil)
+
+      assert %AgentRun{status: "interrupted", effects: false} = Runs.get(parent_id)
+      assert %AgentRun{status: "cancelled"} = Runs.get(echo.id)
     end
 
     test "leaves the waiting parent alone" do
@@ -821,21 +835,6 @@ defmodule Clementine.Runs.DelegationTest do
 
       assert_received {:run_finished, %AgentRun{id: ^parent_id},
                        %Result.Failed{error: %Error{code: :overloaded}, effects?: true}}
-    end
-
-    test "leaves a parent that has ended as it ended" do
-      parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
-      [echo] = children(parent_id)
-      {:ok, lease} = Protocol.claim(Lifecycle, echo.id, executor: "test")
-
-      reason = Clementine.InterruptReason.new(:suspension_expired)
-      assert {:ok, _facts} = Protocol.interrupt(Lifecycle, facts(parent_id), reason, nil)
-
-      # The cancel reaches the child too late: it acts, then ends.
-      :ok = Protocol.mark_effects(lease)
-      {:ok, _} = Protocol.finish(lease, Result.completed(output: "Said."))
-
-      assert %AgentRun{status: "interrupted", effects: false} = Runs.get(parent_id)
     end
   end
 
