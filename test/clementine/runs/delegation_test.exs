@@ -761,10 +761,80 @@ defmodule Clementine.Runs.DelegationTest do
       assert %{status: :queued, resume: %{payload: {:delegated, %{}}}} = facts(parent.id)
     end
 
+    test "ending a waiting parent at its wait ceiling fences it while a child runs: the " <>
+           "cancel only flags the child, which can still act" do
+      parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
+      [echo] = children(parent_id)
+
+      # The child is running, its fence still down.
+      {:ok, lease} = Protocol.claim(Lifecycle, echo.id, executor: "test")
+
+      reason = Clementine.InterruptReason.new(:suspension_expired)
+      assert {:ok, _facts} = Protocol.interrupt(Lifecycle, facts(parent_id), reason, nil)
+
+      assert %AgentRun{status: "interrupted", effects: true} = Runs.get(parent_id)
+
+      assert_received {:run_finished, %AgentRun{id: ^parent_id},
+                       %Result.Interrupted{effects?: true}}
+
+      # The cancel reaches the child too late: it acts, then ends.
+      assert %{status: :running, cancel: %{}} = facts(echo.id)
+      :ok = Protocol.mark_effects(lease)
+      {:ok, _} = Protocol.finish(lease, Result.completed(output: "Said."))
+      assert %AgentRun{status: "interrupted", effects: true} = Runs.get(parent_id)
+    end
+
+    test "ending a waiting parent whose children never started leaves it unfenced: they end " <>
+           "with it" do
+      parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
+      [echo] = children(parent_id)
+
+      reason = Clementine.InterruptReason.new(:suspension_expired)
+      assert {:ok, _facts} = Protocol.interrupt(Lifecycle, facts(parent_id), reason, nil)
+
+      assert %AgentRun{status: "interrupted", effects: false} = Runs.get(parent_id)
+      assert %AgentRun{status: "cancelled"} = Runs.get(echo.id)
+    end
+
     test "leaves the waiting parent alone" do
       parent_id = park!([ask("tu_1", "test_echo", "Say it.")])
       assert %{interrupted: 0} = Reaper.sweep()
       assert %AgentRun{status: "waiting"} = Runs.get(parent_id)
+    end
+  end
+
+  describe "a child that acted" do
+    test "raises its parent's fence as it ends, so a parent that then fails says it had " <>
+           "effects, and the model reads that the child acted" do
+      parent_id =
+        park!([ask("tu_1", "test_echo", "Say it."), ask("tu_2", "test_lookup", "Look.")])
+
+      [echo, lookup] = children(parent_id)
+
+      # The first child had effects and failed; the parent still waits
+      # on the second, and its fence is up already.
+      {:ok, lease} = Protocol.claim(Lifecycle, echo.id, executor: "test")
+      :ok = Protocol.mark_effects(lease)
+      {:ok, _} = Protocol.finish(lease, Result.failed(%Error{message: "overloaded"}))
+      assert %AgentRun{status: "waiting", effects: true} = Runs.get(parent_id)
+
+      # A child with no effects leaves it as it is.
+      {:ok, lease} = Protocol.claim(Lifecycle, lookup.id, executor: "test")
+      {:ok, _} = Protocol.finish(lease, Result.completed(output: "Found."))
+
+      assert %{status: :queued, effects?: true, resume: %{payload: {:delegated, outcomes}}} =
+               facts(parent_id)
+
+      assert outcomes["tu_1"]["content"] =~ "failed: overloaded It had already acted:"
+      assert outcomes["tu_2"]["content"] == "Found."
+
+      # The resumed parent fails without a tool of its own: its end says
+      # it had effects, the ones its child had.
+      expect_turn([{:error, %{"type" => "overloaded_error", "message" => "Overloaded"}}])
+      assert :ok = perform!(parent_id)
+
+      assert_received {:run_finished, %AgentRun{id: ^parent_id},
+                       %Result.Failed{error: %Error{code: :overloaded}, effects?: true}}
     end
   end
 

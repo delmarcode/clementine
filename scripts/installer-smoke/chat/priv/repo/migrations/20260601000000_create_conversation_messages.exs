@@ -4,6 +4,7 @@ defmodule ClementineSmoke.Repo.Migrations.CreateConversationMessages do
   def change do
     create table(:conversation_messages) do
       add(:conversation_id, :string, null: false)
+      add(:reply_to, :bigint)
       add(:message, :map, null: false)
 
       timestamps(type: :utc_datetime_usec, updated_at: false)

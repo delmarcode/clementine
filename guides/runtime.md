@@ -110,13 +110,17 @@ defmodule MyApp.Agents.Chat do
     model: "claude-sonnet-5-5",
     instructions: "You are a helpful assistant. Be brief."
 
+  # The thread before this turn's message, which the app stored when it
+  # arrived: the run adds the message itself, as its prompt.
   @impl true
-  def history(run), do: MyApp.Chat.messages(run.subject_id)
+  def history(run), do: MyApp.Chat.messages(run.subject_id, before: run.metadata["message_id"])
 end
 ```
 
-A turn is a run on a thread: its subject is the thread, and the host's
-`run_finished/2` appends what it said (below). A turn agent without
+A turn is a run on a thread: its subject is the thread. The app stores
+each user message when it arrives and names it in the turn's metadata
+(`"message_id"`, as a thread's message does), and the host's
+`run_finished/2` appends what the turn said after it (below). A turn agent without
 `history/1` fails the build; any other agent is a task, and may define
 one too.
 
@@ -250,10 +254,28 @@ says so; a run that did nothing at all fails:
   requires. No provider is sent it as an empty message, and no history
   sends a text block that is empty or only whitespace, which the API
   refuses on every later turn.
-- A failed turn returns no messages, so a host that stores a thread's
-  turns from `Result.Completed` stores nothing of it. Keep the user's
-  message that drew a refusal in the thread: it is what the user said,
-  and two user messages in a row are valid on every provider.
+- A failed run keeps the steps it completed. `Result.Failed`'s
+  `messages` are each model turn whose tool calls all settled, their
+  results, and the system messages a skill load added, closed by an
+  assistant message of no content; the step that failed is not in them
+  (the refused or cut-off turn, an answer that did not decode, calls
+  that did not run). They are `[]` when no step completed. Store them
+  in `run_finished/2` as you store a completed turn's: they are the
+  record of what the run's tools did (a sent email, a flagged
+  emergency), so the next turn does not do it again. The closing turn
+  ends the exchange, as an empty final turn does: `History.window/2`
+  and an app's trim keep it, the next prompt replays valid on every
+  provider, and no provider is sent it as an empty message.
+- Keep the user's message that drew a refusal in the thread too: it is
+  what the user said, and two user messages in a row are valid on
+  every provider.
+- Store the user's message when it arrives, and from `run_finished/2`
+  only the turn's `messages` (a completed turn's, and a failed turn's
+  kept steps); `history/1` reads what came before the turn's message.
+  Storing the prompt at the turn's end (`[input_message | messages]`)
+  stores a retried turn's prompt twice, since a thread's `"retry"` ends
+  the same turn again, and never stores an interrupted or cancelled
+  turn's, since neither result carries `input_message`.
 - A refusal is usually not the last word. Anthropic's advice is to send
   the same request to another Claude model, which usually answers it.
   Its server-side fallback (`fallbacks: "default"`, a beta) does that
@@ -299,9 +321,12 @@ What each kind of agent does with it:
   a way to ask again), never silence, and store the turn's messages as
   usual: the empty turn is what closes its tool calls (a sent email, a
   flagged emergency). `:empty` (a turn that did nothing) shows the same.
-  `"on_failure": "retry"` runs a refused or cut-off turn again, which
-  is likely refused or cut off again, and repeats what its tools did (a
-  sent email): keep it for turns whose tools are safe to repeat.
+  A thread never retries a refused, cut-off, or empty turn, or one
+  whose tools had effects: `"on_failure": "retry"` runs a failed turn
+  again only when its error is retryable (an overloaded provider, an
+  outage) and its run had no effects (`Result.Failed`'s `effects?`), so
+  a retry never sends an email twice. The effects of a delegate the turn
+  asked count as the turn's.
 
 In tests, script the stop through the Anthropic fake
 (`expect_claude_turn/2`):
@@ -480,7 +505,7 @@ What the app does:
 @impl true
 def history(run) do
   run.subject_id
-  |> MyApp.Chat.messages()
+  |> MyApp.Chat.messages(before: run.metadata["message_id"])
   |> Clementine.History.window(max: 100)
 end
 ```
@@ -707,10 +732,14 @@ defmodule MyApp.Agents.Host do
 
   # What must happen when a run ends. Inside the transaction that ends
   # it: these writes, and the mail job, commit with the run's end or not
-  # at all. A chat turn stores its messages here.
+  # at all. A chat turn stores its messages here, and a failed one the
+  # steps it completed (its tool calls and their results), after the
+  # user's message, which the app stored when it arrived: a retry never
+  # stores it twice, and an interrupted or cancelled turn never loses it.
   @impl true
-  def run_finished(%{agent_key: "chat"} = run, %Result.Completed{} = result) do
-    MyApp.Chat.append!(run.subject_id, [result.input_message | result.messages])
+  def run_finished(%{agent_key: "chat"} = run, %ended{} = result)
+      when ended in [Result.Completed, Result.Failed] do
+    MyApp.Chat.append_reply!(run.subject_id, run.metadata["message_id"], result.messages)
   end
 
   def run_finished(run, %Result.Completed{output: output}) do

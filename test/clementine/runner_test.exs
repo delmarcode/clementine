@@ -428,7 +428,11 @@ defmodule Clementine.RunnerTest do
 
       assert {:finished, %Facts{status: :failed} = facts} = execute(build_run(ref), store)
       assert %Error{kind: :runtime, code: :exception} = facts.error
-      assert [{^ref, %Result.Failed{}}] = MemoryLifecycle.projections(store)
+
+      # What the rollout held went with the raise; the prompt is the
+      # run's own, so a host folds the failure as any other.
+      assert [{^ref, %Result.Failed{input_message: %UserMessage{}, messages: []}}] =
+               MemoryLifecycle.projections(store)
     end
   end
 

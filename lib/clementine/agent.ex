@@ -188,8 +188,11 @@ defmodule Clementine.Agent do
           model: "claude-sonnet-5-5",
           instructions: "You are a helpful assistant."
 
+        # The thread before this turn's message, which the app stored
+        # when it arrived; the run adds the message as its prompt.
         @impl true
-        def history(run), do: MyApp.Chat.messages(run.subject_id)
+        def history(run),
+          do: MyApp.Chat.messages(run.subject_id, before: run.metadata["message_id"])
       end
 
   Which a run is decides its **lane**, the key under which active runs are
@@ -370,12 +373,14 @@ defmodule Clementine.Agent do
   a reordered or freshly trimmed history costs the earlier turns'
   reasoning.
 
-  The messages are the app's data: store what a run said in
-  `c:Clementine.Host.run_finished/2` (`Result.Completed` carries the
-  prompt as `input_message` and the run's own turns as `messages`;
-  `Clementine.LLM.Message.to_map/1` and `from_map/1` round-trip them
-  through a `jsonb` column), and read them back here. Where the cutoff
-  falls (messages that arrived after the prompt, say) is the app's rule.
+  The messages are the app's data: store the user's message when it
+  arrives, and what a run said (its `messages`, a failed run's kept
+  steps too) in `c:Clementine.Host.run_finished/2`, never the prompt
+  again there: a thread's retry ends the same turn twice
+  (`Clementine.LLM.Message.to_map/1` and `from_map/1` round-trip them
+  through a `jsonb` column). Read back here what came before the turn's
+  message; where the cutoff falls (messages that arrived after the
+  prompt, say) is the app's rule.
 
   It is called when a run starts from its prompt, after the subject and
   actor resolve, so `run.subject` and `run.actor` are set. A run that

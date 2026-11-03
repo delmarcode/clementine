@@ -337,7 +337,25 @@ defmodule Clementine.Lifecycle.EctoAdapterTest do
 
       assert facts.status == :failed
       assert facts.error == error
-      assert_received {:projected, %Result.Failed{}, _row}
+      assert_received {:projected, %Result.Failed{effects?: false}, _row}
+    end
+
+    test "a failed or interrupted end reaches the projection with the fence the row holds, " <>
+           "whatever the result said" do
+      run = insert_run!()
+      lease = claim!(run)
+      :ok = Protocol.mark_effects(lease)
+
+      {:ok, _facts} = Protocol.finish(lease, Result.failed(%Clementine.Error{message: "cut"}))
+      assert_received {:projected, %Result.Failed{effects?: true}, _row}
+
+      run = insert_run!()
+      claim!(run)
+
+      {:ok, _facts} =
+        Protocol.interrupt(Lifecycle, fetch!(run.id), InterruptReason.new(:lease_expired), self())
+
+      assert_received {:projected, %Result.Interrupted{effects?: false}, _row}
     end
   end
 

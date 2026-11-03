@@ -115,6 +115,30 @@ defmodule Clementine.LLM.ProviderStreamTest do
     assert_receive {:DOWN, ^monitor_ref, :process, ^worker, _reason}, 500
   end
 
+  test "a provider that sends nothing for the idle timeout ends the stream with a stall the " <>
+         "same request may get past" do
+    test = self()
+
+    stream =
+      ProviderStream.new(
+        TestParser,
+        fn _consumer, _ref ->
+          send(test, {:worker, self()})
+          Process.sleep(:infinity)
+        end,
+        20
+      )
+
+    assert [{:error, {:stream_timeout, 20} = reason}] = Enum.to_list(stream)
+
+    assert %Clementine.Error{code: :timeout, retryable?: true} =
+             Clementine.Error.normalize(reason)
+
+    assert_receive {:worker, worker}
+    monitor_ref = Process.monitor(worker)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, _reason}, 500
+  end
+
   test "three-element signals (lease lost) surface the same way" do
     stream =
       ProviderStream.new(TestParser, fn _consumer, _ref ->

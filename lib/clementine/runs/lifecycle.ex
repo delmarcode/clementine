@@ -114,6 +114,9 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       :ok
     end
 
+    # A failed or interrupted end arrives with the run's effect fence
+    # (`effects?`), stamped by the adapter from the row this write
+    # committed, and the loop's own end by its step.
     @impl Clementine.Lifecycle.Ecto
     def project(result, %AgentRun{} = run, _ctx) do
       %Config{repo: repo, host: host} = Config.fetch!()
@@ -228,12 +231,21 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
     @doc false
     # The Result a terminal row records: the output a completed run
     # stored and its final turn's stop reason, the error, the cancel reason, the interrupt reason, and the
-    # usage. Reads of a child's end that did not carry its Result (the
-    # loop sweep's synthesized completion, a delegating parent's resume)
-    # rebuild it here.
+    # usage, with the effect fence on a failed or interrupted end. Reads
+    # of a child's end that did not carry its Result (the loop sweep's
+    # synthesized completion, a delegating parent's resume) rebuild it
+    # here. A failed run's messages are not on the row: the host stored
+    # them in run_finished/2.
     @spec terminal_result(AgentRun.t()) :: Result.t()
     def terminal_result(%AgentRun{} = row) do
       facts = Codec.to_facts(row, @fields)
+
+      facts
+      |> recorded_result(row)
+      |> Result.with_effects(facts.effects?)
+    end
+
+    defp recorded_result(facts, row) do
       usage = facts.usage || %Clementine.Usage{}
 
       case facts.status do

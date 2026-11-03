@@ -61,7 +61,8 @@ defmodule Clementine.Loop.InboxCodec do
   projection glue's door, where only the child row's `tag_key` exists.
 
   A completed child's result travels as its `output`, `stop_reason`, and
-  `usage` only:
+  `usage` only, and a failed one's as its `error`, `effects?`, and
+  `usage`, without the steps it kept:
   every path into an inbox (the child's own terminal, the reaper's
   synthesized completion, the in-memory loop) comes through here, so a
   controller sees one shape whichever delivered it, and an inbox row
@@ -75,6 +76,9 @@ defmodule Clementine.Loop.InboxCodec do
 
   defp summary(%Result.Completed{output: output, stop_reason: reason, usage: usage}),
     do: Result.completed(output: output, stop_reason: reason, usage: usage)
+
+  defp summary(%Result.Failed{error: error, effects?: effects?, usage: usage}),
+    do: %Result.Failed{error: error, effects?: effects?, usage: usage}
 
   defp summary(result), do: result
 

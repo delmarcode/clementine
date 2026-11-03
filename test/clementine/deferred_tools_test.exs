@@ -250,7 +250,7 @@ defmodule Clementine.DeferredToolsTest do
       expect_turn(paused)
       expect_turn(paused)
 
-      assert {:error, %Clementine.Error{code: :max_iterations}} =
+      assert {:error, %Result.Failed{error: %Clementine.Error{code: :max_iterations}}} =
                Rollout.execute(
                  rollout(tools: [Echo], deferred: [GatedDeploy], limits: [max_iterations: 2])
                )

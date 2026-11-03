@@ -203,8 +203,9 @@ runtime sends them to the model, then the prompt.
 defmodule MyApp.Agents.Chat do
   use Clementine.Agent, key: "chat", turn: true, model: "claude-sonnet-5-5", instructions: "Be brief."
 
+  # The thread before this turn's message, stored when it arrived.
   @impl true
-  def history(run), do: MyApp.Chat.messages(run.subject_id)
+  def history(run), do: MyApp.Chat.messages(run.subject_id, before: run.metadata["message_id"])
 end
 ```
 
@@ -224,11 +225,19 @@ end
   whose conversation changed, so an edit is never refused; it costs
   reasoning, and emits `[:clementine, :llm, :thinking_dropped]` (guide:
   "Models that bind their thinking").
-- The conversation is the app's data, in its own table. Store each
-  finished turn in `run_finished/2`: `result.input_message` (unless the
-  app stored the user's message when it arrived) and `result.messages`,
-  as `jsonb` through `Clementine.LLM.Message.to_map/1`. Read them back with
-  `from_map/1`.
+- The conversation is the app's data, in its own table. Store the
+  user's message when it arrives, and name it in the turn's metadata
+  (`"message_id"`): `history/1` reads what came before it. Store what
+  each turn said in `run_finished/2`, for a `Result.Failed` as for a
+  `Result.Completed`: `result.messages` alone (a failed turn's are the
+  steps it completed, its tool calls and a sent email, and the next
+  turn must see them), after the message it answers. Never append
+  `[input_message | messages]` at the end: a thread's `"retry"` ends
+  the same turn twice, so the prompt is stored twice, and an
+  interrupted or cancelled turn carries no `input_message`, so its
+  prompt is lost. Store them as
+  `jsonb` through `Clementine.LLM.Message.to_map/1`, and read them back
+  with `from_map/1`.
 - One turn is one run with subject `{"conversation", id}`, so a second
   turn while one is in flight, of this agent or another, returns
   `{:error, :active_run_exists}`.
@@ -369,8 +378,13 @@ the message.
   while a turn runs; `"on_failure"`, `"surface"` (the default) or
   `"retry"` after `"retry_after_ms"` (five minutes); `"retry_interrupted"`
   (`true`), one immediate retry of a turn whose node died. A turn is
-  retried at most once, under the same tag. Bad args end the loop
-  `failed` in its first step.
+  retried at most once, under the same tag, and only when its run had no
+  effects (`effects?: false` on the result: it called no tool that is
+  not `retry: :safe`, no delegate it asked did, and none was still
+  running when the turn ended waiting on it); a failed one only
+  on a retryable error (an overloaded provider, an outage, a stalled
+  stream), never a refusal, a cut, or `:empty`.
+  Bad args end the loop `failed` in its first step.
 - `send/3` appends the message, wakes the loop, and enqueues its step in
   one transaction. Inside the caller's transaction they commit with it
   and the job steps the loop at the commit; outside one the step runs at
@@ -698,9 +712,14 @@ use Clementine.Agent, key: "grader", model: "claude-sonnet-5-5", instructions: "
   of no content at the end of `messages`. Store it like any turn: it
   closes the exchange, so the next turn does not repeat its calls. A
   chat shows that the assistant did not reply, never silence.
-- A thread's `"on_failure": "retry"` repeats a refused turn and its
-  tools' effects. Keep `"surface"` for turns whose tools are not safe
-  to repeat.
+- A failed run keeps the steps it completed: `Result.Failed`'s
+  `messages` are its finished tool calls and their results, closed by
+  an assistant message of no content, without the turn that failed
+  (`[]` when no step finished). Store them like a completed turn's, or
+  the next turn repeats what the tools did; the user's message was
+  stored when it arrived, so a retry never stores it twice.
+- A thread retries neither a refused, cut-off, or empty turn nor one
+  whose tools had effects, whatever `"on_failure"` says.
 
 ## Prompt caching
 

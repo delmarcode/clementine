@@ -33,7 +33,16 @@ defmodule Clementine.Delegation do
   - a completed child's output, as is when it is text, and JSON-encoded
     when it is anything else (a map from `output_schema:`);
   - a child that failed, was cancelled, or was interrupted, as an error
-    result naming what happened.
+    result naming what happened, which for a failed or interrupted
+    child whose tools had effects says it had already acted.
+
+  A child's effects are its parent's. A child that ran a tool not
+  declared `retry: :safe` raises its parent's effect fence when it
+  ends, and a parent ended while it waits is fenced when a child acted
+  or one still running can, so a `Clementine.Thread` never retries a
+  turn whose delegate acted. The fence is cumulative, as for the
+  parent's own calls before it parked: a drain interrupts a resumed
+  parent whose child had effects rather than requeue it.
 
   Calls in one batch run side by side, and their answers return to the
   model together, with the batch's other results. A batch that also
@@ -312,7 +321,9 @@ defmodule Clementine.Delegation do
   child's output (as is when it is text, JSON-encoded when it is anything
   else, such as a map from `output_schema:`), a sentence saying so when
   it completed without writing anything (`stop_reason: "empty"`), or an
-  error result naming how it ended otherwise. The runtime builds the
+  error result naming how it ended otherwise, which also says so when a
+  failed or interrupted child had already acted (`effects?: true`), so
+  the model checks before it asks again. The runtime builds the
   `{:delegated, %{tool_use_id => outcome}}` resume payload from these.
   """
   @spec outcome(String.t(), Result.t()) :: outcome()
@@ -328,10 +339,10 @@ defmodule Clementine.Delegation do
     %{"status" => "completed", "content" => render(output), "is_error" => false}
   end
 
-  def outcome(agent, %Result.Failed{error: error}) do
+  def outcome(agent, %Result.Failed{error: error} = result) do
     %{
       "status" => "failed",
-      "content" => "The #{agent} run failed: #{error_message(error)}",
+      "content" => "The #{agent} run failed: #{error_message(error)}" <> acted(result),
       "is_error" => true
     }
   end
@@ -344,14 +355,25 @@ defmodule Clementine.Delegation do
     }
   end
 
-  def outcome(agent, %Result.Interrupted{reason: reason}) do
+  def outcome(agent, %Result.Interrupted{reason: reason} = result) do
     %{
       "status" => "interrupted",
       "content" =>
-        "The #{agent} run was interrupted (#{interrupt_code(reason)}) before it answered.",
+        "The #{agent} run was interrupted (#{interrupt_code(reason)}) before it answered." <>
+          acted(result),
       "is_error" => true
     }
   end
+
+  # A child that ended without answering may still have acted: its tools
+  # had effects (`effects?`, its fence) before it stopped, so asking it
+  # again could do the same thing twice.
+  defp acted(%{effects?: true}) do
+    " It had already acted: tools it called had effects before it stopped, so check what " <>
+      "it did before you ask again."
+  end
+
+  defp acted(_result), do: ""
 
   defp render(output) when is_binary(output), do: output
   defp render(nil), do: ""

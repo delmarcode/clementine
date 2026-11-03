@@ -4,7 +4,7 @@ defmodule Clementine.AgentServerTest do
   import Mox
 
   alias Clementine.{Error, Event, Result}
-  alias Clementine.LLM.Message.{AssistantMessage, UserMessage}
+  alias Clementine.LLM.Message.{AssistantMessage, ToolResultMessage, UserMessage}
 
   setup :set_mox_global
   setup :verify_on_exit!
@@ -16,6 +16,14 @@ defmodule Clementine.AgentServerTest do
       model: "claude-sonnet-5",
       tools: [],
       system: "You are a test assistant."
+  end
+
+  defmodule EchoAgent do
+    use Clementine.AgentServer,
+      name: "echo_agent",
+      model: "claude-sonnet-5",
+      tools: [Clementine.Test.Tools.Echo],
+      system: "Echo what you are asked to."
   end
 
   # An agent off its vendor's own platform, with a choice for its model.
@@ -172,7 +180,7 @@ defmodule Clementine.AgentServerTest do
       GenServer.stop(agent)
     end
 
-    test "a failed turn returns the terminal result and leaves history alone" do
+    test "a failed turn that completed no step returns the terminal result and leaves history alone" do
       expect_stream([{:error, {:api_error, 500, "boom"}}])
 
       {:ok, agent} = TestAgent.start_link()
@@ -181,6 +189,36 @@ defmodule Clementine.AgentServerTest do
                Clementine.AgentServer.run(agent, "Hi")
 
       assert Clementine.AgentServer.get_history(agent) == []
+
+      GenServer.stop(agent)
+    end
+
+    test "a failed turn folds the steps it completed into history, so the next turn knows them" do
+      expect_stream([
+        {:tool_use_start, "tu_1", "echo"},
+        {:input_json_delta, "tu_1", ~s({"message": "hi"})},
+        {:content_block_stop, 0},
+        {:message_delta, %{"stop_reason" => "tool_use"},
+         %{"input_tokens" => 5, "output_tokens" => 2}}
+      ])
+
+      expect_stream([
+        {:text_delta, "I echoed and"},
+        {:message_delta, %{"stop_reason" => "max_tokens"},
+         %{"input_tokens" => 7, "output_tokens" => 3}}
+      ])
+
+      {:ok, agent} = EchoAgent.start_link()
+
+      assert {:error, %Result.Failed{error: %Error{code: :truncated}}} =
+               Clementine.AgentServer.run(agent, "Echo hi, then say so.")
+
+      assert [
+               %UserMessage{},
+               %AssistantMessage{},
+               %ToolResultMessage{},
+               %AssistantMessage{content: []}
+             ] = Clementine.AgentServer.get_history(agent)
 
       GenServer.stop(agent)
     end

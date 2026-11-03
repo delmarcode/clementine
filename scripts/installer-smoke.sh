@@ -68,7 +68,7 @@ mix clementine.gen.agent Weather --yes
 assert_unchanged "a second clementine.gen.agent"
 
 cp -R "$clementine/scripts/installer-smoke/chat/." .
-perl -0pi -e 's/agents: \[ClementineSmoke\.Agents\.Weather\]/agents: [ClementineSmoke.Agents.Weather, ClementineSmoke.Agents.Chat],\n     host: ClementineSmoke.Agents.Host/' "lib/$app/application.ex"
+perl -0pi -e 's/agents: \[ClementineSmoke\.Agents\.Weather\]/agents: [ClementineSmoke.Agents.Weather, ClementineSmoke.Agents.Chat, Clementine.Thread],\n     host: ClementineSmoke.Agents.Host/' "lib/$app/application.ex"
 grep -q 'host: ClementineSmoke.Agents.Host' "lib/$app/application.ex" ||
   { echo "FAIL: could not add the chat agent and host to the child spec" >&2; exit 1; }
 mix format "lib/$app/application.ex"

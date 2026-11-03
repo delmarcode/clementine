@@ -68,7 +68,11 @@ defmodule Clementine.Loop do
   integer id. One live child per tag; the tag re-arms once the child is
   terminal. `child` is a JSON map: `"agent"` (an agent key from the child
   spec), `"prompt"`, and optionally `"subject"` and `"actor"` as
-  `[type, id]` (both default to the loop's own) and `"metadata"`.
+  `[type, id]` (both default to the loop's own) and `"metadata"`. A
+  child's `{:completed, tag, result}` carries no transcript: a
+  `Completed`'s output, stop reason, and usage, a `Failed`'s error and
+  usage, and on a `Failed` or `Interrupted` the run's effect fence
+  (`effects?`), which a controller reads before it runs the work again.
   `{:cancel, tag}` flags the live child under the tag, and its
   `Clementine.Result.Cancelled` completion arrives like any other; a tag
   with no live child is a no-op. A child spawned earlier in the same

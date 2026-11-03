@@ -3,20 +3,67 @@ defmodule Clementine.Runs.ThreadTest do
   `Clementine.Thread` on the durable runtime, and the step `send/3` runs
   inline: a thread end to end on Postgres (two messages, two turns in
   order, the first cancelled mid-run, the second answered; the same with
-  an interrupt), then the inline step against its backstop job, the send
-  inside a caller's transaction, a task that dies mid-step, and Oban's
-  `:manual` mode, where nothing steps inline.
+  an interrupt), a failed turn's retry (never one whose tool, or whose
+  delegate's tool, had effects, nor a refusal; a retryable failure with
+  none, yes) and the steps it kept, then the inline step against its
+  backstop job, the send inside a caller's transaction, a task that dies
+  mid-step, and Oban's `:manual` mode, where nothing steps inline.
   """
 
   use Clementine.RunsCase
 
   import Ecto.Query, only: [from: 2]
 
+  alias Clementine.LLM.Anthropic.Fake
+  alias Clementine.LLM.Message
+  alias Clementine.LLM.Message.{AssistantMessage, Content, ToolResultMessage, UserMessage}
   alias Clementine.LLM.ProviderStream
   alias Clementine.LoopCase.Battery.Passthrough
+  alias Clementine.Lifecycle.Protocol
   alias Clementine.Loop.Codec
-  alias Clementine.Runs.{Config, Reaper, StepSupervisor, StepWorker}
-  alias Clementine.{Result, Thread}
+  alias Clementine.Runs.{Config, Reaper, StepSupervisor, StepWorker, TimerWorker}
+  alias Clementine.{Error, Result, Thread}
+
+  defmodule Mailer do
+    @moduledoc false
+    # A turn agent whose one tool has effects and needs no approval, as
+    # Meli's email reply does. Its history is the turn's metadata
+    # "history", which the test fills from what run_finished/2 heard, as
+    # a host stores it.
+    use Clementine.Agent,
+      key: "test_thread_mailer",
+      turn: true,
+      model: "claude-sonnet-5-5",
+      instructions: "Reply by email.",
+      tools: [Clementine.Test.Tools.Echo]
+
+    @impl true
+    def history(run), do: Enum.map(Map.get(run.metadata, "history", []), &Message.from_map/1)
+  end
+
+  defmodule Sender do
+    @moduledoc false
+    # A task whose one tool has effects: what a turn asks to send.
+    use Clementine.Agent,
+      key: "test_thread_sender",
+      model: "claude-sonnet-5-5",
+      instructions: "Send what you are asked to.",
+      tools: [Clementine.Test.Tools.Echo]
+  end
+
+  defmodule Delegator do
+    @moduledoc false
+    # A turn agent with no tool of its own, which asks Sender.
+    use Clementine.Agent,
+      key: "test_thread_delegator",
+      turn: true,
+      model: "claude-sonnet-5-5",
+      instructions: "Have replies sent.",
+      delegates: [Clementine.Runs.ThreadTest.Sender]
+
+    @impl true
+    def history(_run), do: []
+  end
 
   defmodule Blocking do
     @moduledoc false
@@ -191,6 +238,163 @@ defmodule Clementine.Runs.ThreadTest do
     end
   end
 
+  describe "a failed turn on the runtime" do
+    @describetag runtime: false
+
+    setup do
+      start_supervised!(
+        {Clementine,
+         repo: TestRepo,
+         agents: [Mailer, Sender, Delegator, Thread],
+         host: Clementine.RunsCase.Host}
+      )
+
+      :ok
+    end
+
+    test "a turn that sent its reply and was then cut off keeps the send, is not retried, and replays valid" do
+      loop = retrying_thread(21)
+      turn = start_turn(loop, "m1", "Reply to the customer.")
+
+      claude_turn(
+        [
+          {:thinking, "I should reply."},
+          {:tool_use, "toolu_1", "echo", %{"message" => "Your order shipped."}}
+        ],
+        []
+      )
+
+      claude_turn([{:text, "I replied, and"}], stop_reason: "max_tokens")
+      assert :ok = perform_job(Worker, %{"run_id" => turn.id})
+
+      # The host hears the steps the turn completed: the send and its
+      # result, closed by an empty turn in place of the cut one.
+      turn_id = turn.id
+
+      assert_received {:run_finished, %AgentRun{id: ^turn_id, effects: true},
+                       %Result.Failed{error: %Error{code: :truncated}, effects?: true} = failed}
+
+      assert [
+               %AssistantMessage{content: [%Content.Thinking{}, %Content.ToolUse{id: "toolu_1"}]},
+               %ToolResultMessage{},
+               %AssistantMessage{content: []}
+             ] = failed.messages
+
+      # The thread hears the failure and the fence, never the transcript;
+      # the row reads back the same way (a lost completion's stand-in).
+      assert [%{input: %{kind: :completed, result: %Result.Failed{} = heard}}] =
+               Runs.pending(loop.id)
+
+      assert %Result.Failed{effects?: true, messages: [], input_message: nil} = heard
+
+      assert %Result.Failed{effects?: true, messages: []} =
+               Clementine.Runs.Lifecycle.terminal_result(Runs.get(turn.id))
+
+      # The thread moves on: a retry would send the reply again.
+      assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+      assert state(loop)["turn"] == nil
+      refute_enqueued(worker: TimerWorker)
+      assert Runs.turns(loop.id) |> Enum.map(&{&1.tag_id, &1.status}) == [{"m1", "failed"}]
+
+      # The next turn reads what the host stored, through JSON, and the
+      # strict fake passes it: the kept turn's thinking still holds.
+      stored = Enum.map([UserMessage.new("Reply to the customer.") | failed.messages], &stored/1)
+      second = start_turn(loop, "m2", "Did it go?", %{"history" => stored})
+
+      claude_turn([{:text, "It went."}], [])
+      assert :ok = perform_job(Worker, %{"run_id" => second.id})
+
+      assert %AgentRun{status: "completed", result: %{"output" => "It went."}} =
+               Runs.get(second.id)
+    end
+
+    test "a refused turn with no effects is not retried: the same request is refused again" do
+      loop = retrying_thread(22)
+      turn = start_turn(loop, "m1", "Something it will not do.")
+
+      claude_turn([{:text, "I can't"}], stop_reason: "refusal")
+      assert :ok = perform_job(Worker, %{"run_id" => turn.id})
+
+      turn_id = turn.id
+
+      assert_received {:run_finished, %AgentRun{id: ^turn_id},
+                       %Result.Failed{
+                         error: %Error{code: :refused},
+                         effects?: false,
+                         messages: []
+                       }}
+
+      assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+      assert state(loop)["turn"] == nil
+      refute_enqueued(worker: TimerWorker)
+    end
+
+    test "a retryable failure with no effects is still retried, under the same tag, after the delay" do
+      loop = retrying_thread(23)
+      turn = start_turn(loop, "m1", "Reply to the customer.")
+
+      claude_turn([{:error, "overloaded_error"}], [])
+      assert :ok = perform_job(Worker, %{"run_id" => turn.id})
+      assert %AgentRun{status: "failed", effects: false} = Runs.get(turn.id)
+
+      assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+      assert state(loop)["turn"]["phase"] == "retry_wait"
+
+      [timer] = all_enqueued(worker: TimerWorker, args: %{"run_id" => loop.id})
+      assert :ok = perform(timer)
+      assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+
+      assert {:ok, %AgentRun{status: "queued"} = retry} = Runs.child(loop.id, {:turn, "m1"})
+      assert retry.id != turn.id
+
+      claude_turn([{:text, "Replied."}], [])
+      assert :ok = perform_job(Worker, %{"run_id" => retry.id})
+      assert %AgentRun{status: "completed"} = Runs.get(retry.id)
+    end
+
+    test "a turn whose delegate sent the reply is not retried when it then fails: the " <>
+           "child's effects are the turn's" do
+      loop = retrying_thread(24, "test_thread_delegator")
+      turn = delegated_send!(loop)
+
+      # The resumed turn's provider is overloaded: retryable, but the
+      # turn's delegate already sent.
+      claude_turn([{:error, "overloaded_error"}], [])
+      assert :ok = perform_job(Worker, %{"run_id" => turn.id})
+
+      turn_id = turn.id
+
+      assert_received {:run_finished, %AgentRun{id: ^turn_id},
+                       %Result.Failed{error: %Error{code: :overloaded}, effects?: true}}
+
+      assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+      assert state(loop)["turn"] == nil
+      refute_enqueued(worker: TimerWorker)
+      assert [%AgentRun{agent_key: "test_thread_sender"}] = Runs.list(parent: turn.id)
+    end
+
+    test "nor is one whose node died after its delegate sent the reply" do
+      loop = retrying_thread(25, "test_thread_delegator")
+      turn = delegated_send!(loop)
+
+      # The resumed turn's node dies as it runs, and the reaper ends it.
+      {:ok, _lease} = Protocol.claim(Clementine.Runs.Lifecycle, turn.id, executor: "dead")
+      {:ok, facts} = Clementine.Runs.Lifecycle.fetch(turn.id, nil)
+      reason = Clementine.InterruptReason.new(:lease_expired)
+      {:ok, _facts} = Protocol.interrupt(Clementine.Runs.Lifecycle, facts, reason, nil)
+
+      turn_id = turn.id
+
+      assert_received {:run_finished, %AgentRun{id: ^turn_id},
+                       %Result.Interrupted{effects?: true}}
+
+      # retry_interrupted is on, and the thread moves on all the same.
+      assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+      assert state(loop)["turn"] == nil
+      assert Runs.turns(loop.id) |> Enum.map(&{&1.tag_id, &1.status}) == [{"m1", "interrupted"}]
+    end
+  end
+
   describe "the inline step" do
     # Oban's testing mode disabled, as in production: the runtime steps
     # inline (and would sweep). With no queues configured, the jobs the
@@ -356,6 +560,54 @@ defmodule Clementine.Runs.ThreadTest do
       repo: TestRepo
     )
   end
+
+  # An email thread: a failed turn is retried, when a retry may be.
+  defp retrying_thread(conversation, agent \\ "test_thread_mailer") do
+    {:ok, loop} =
+      Runs.start_loop(Thread, %{"agent" => agent, "on_failure" => "retry"},
+        subject: {"conversation", conversation}
+      )
+
+    loop
+  end
+
+  # A Delegator turn that asks Sender, whose run sends and answers: the
+  # turn, resumed and queued again.
+  defp delegated_send!(loop) do
+    turn = start_turn(loop, "m1", "Have the reply sent.")
+    ask = %{"agent" => "test_thread_sender", "prompt" => "Send: your order shipped."}
+    claude_turn([{:tool_use, "toolu_1", "delegate", ask}], [])
+    assert :ok = perform_job(Worker, %{"run_id" => turn.id})
+    assert %AgentRun{status: "waiting", effects: false} = Runs.get(turn.id)
+    [sender] = Runs.list(parent: turn.id)
+
+    claude_turn([{:tool_use, "toolu_2", "echo", %{"message" => "Your order shipped."}}], [])
+    claude_turn([{:text, "Sent."}], [])
+    assert :ok = perform_job(Worker, %{"run_id" => sender.id})
+    assert %AgentRun{status: "completed", effects: true} = Runs.get(sender.id)
+
+    # The child's end raised the turn's fence, as it resumed it.
+    assert %AgentRun{status: "queued", effects: true} = Runs.get(turn.id)
+    turn
+  end
+
+  # Sends a message and steps the thread: its turn, queued.
+  defp start_turn(loop, id, prompt, metadata \\ %{}) do
+    message = %{"prompt" => prompt, "id" => id, "metadata" => metadata}
+    {:ok, :appended} = Runs.send(loop.id, message)
+    assert :ok = perform_job(StepWorker, %{"run_id" => loop.id})
+    {:ok, %AgentRun{} = turn} = Runs.child(loop.id, {:turn, id})
+    turn
+  end
+
+  defp claude_turn(script, fake_opts) do
+    expect(Clementine.LLM.MockClient, :stream, fn model, system, messages, tools, opts ->
+      Fake.stream(model, system, messages, tools, opts, script, fake_opts)
+    end)
+  end
+
+  # A message as a host's jsonb column gives it back.
+  defp stored(message), do: message |> Message.to_map() |> Jason.encode!() |> Jason.decode!()
 
   # The thread's committed state.
   defp state(%AgentRun{id: id}, vocabulary \\ Thread.__loop__(:vocabulary)) do

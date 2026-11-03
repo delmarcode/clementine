@@ -3,12 +3,14 @@ defmodule Clementine.LLM.ProviderStream do
 
   alias Clementine.LLM.Error
 
-  @receive_timeout 300_000
+  @idle_timeout 300_000
 
   # `parser` is a parser module, which starts from its `new/0`, or
   # `{module, state}` for a parser that needs more than that to start. A
-  # retried request starts it over from the same state.
-  def new(parser, request_fun) when is_function(request_fun, 2) do
+  # retried request starts it over from the same state. `idle_timeout` is
+  # how long the stream waits for the provider's next chunk.
+  def new(parser, request_fun, idle_timeout \\ @idle_timeout)
+      when is_function(request_fun, 2) do
     {parser_module, initial} =
       case parser do
         {module, state} when is_atom(module) -> {module, state}
@@ -17,7 +19,7 @@ defmodule Clementine.LLM.ProviderStream do
 
     Stream.resource(
       fn -> start(initial, request_fun) end,
-      &receive_chunk(&1, parser_module, initial),
+      &receive_chunk(&1, parser_module, initial, idle_timeout),
       &cleanup/1
     )
   end
@@ -44,7 +46,7 @@ defmodule Clementine.LLM.ProviderStream do
       send(parent, {ref, {:error, Error.normalize_exception(kind, reason)}})
   end
 
-  defp receive_chunk({ref, pid, parser}, parser_module, initial) do
+  defp receive_chunk({ref, pid, parser}, parser_module, initial, idle_timeout) do
     receive do
       {^ref, {:data, data}} ->
         {events, new_parser} = parser_module.parse(parser, data)
@@ -68,12 +70,14 @@ defmodule Clementine.LLM.ProviderStream do
       {:clementine, _, _} = signal ->
         {[{:signal, signal}], {:halting, pid}}
     after
-      @receive_timeout ->
-        {[{:error, :timeout}], {:halting, pid}}
+      # A provider that stalls is a timeout the same request may get
+      # past (Clementine.Error), as an HTTP 408 or a timeout_error is.
+      idle_timeout ->
+        {[{:error, {:stream_timeout, idle_timeout}}], {:halting, pid}}
     end
   end
 
-  defp receive_chunk({:halting, pid}, _parser_module, _initial) do
+  defp receive_chunk({:halting, pid}, _parser_module, _initial, _idle_timeout) do
     {:halt, {:halting, pid}}
   end
 

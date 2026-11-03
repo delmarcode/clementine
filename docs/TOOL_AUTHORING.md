@@ -115,7 +115,9 @@ The declaration has two consequences:
 - The **effect fence** (`Facts.effects?`) rises only before the first
   batch containing a non-`:safe` tool. A run that only ever called
   `:safe` tools stays eligible for same-run requeue — it survives a
-  graceful drain invisibly and can be retried by reaper policy.
+  graceful drain invisibly and can be retried by reaper policy — and a
+  `Clementine.Thread` may retry its turn; one that called any other
+  tool is never run again.
 - On cooperative **cancellation** mid-batch, `:safe` tools are killed
   immediately; non-`:safe` tools run out their own timeout, because
   killing an effectful tool mid-flight creates unknowable external state.

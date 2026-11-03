@@ -120,6 +120,31 @@ defmodule Clementine.DelegationTest do
                  Result.interrupted(InterruptReason.new({:app, :reconciled}))
                )
     end
+
+    test "says a failed or interrupted child whose tools had effects already acted, so the " <>
+           "model checks before it asks again" do
+      failed = %{Result.failed(%Error{message: "overloaded"}) | effects?: true}
+
+      assert %{"status" => "failed", "is_error" => true, "content" => content} =
+               Delegation.outcome("sender", failed)
+
+      assert content ==
+               "The sender run failed: overloaded It had already acted: tools it called had " <>
+                 "effects before it stopped, so check what it did before you ask again."
+
+      interrupted = %{Result.interrupted(:lease_expired) | effects?: true}
+
+      assert %{"status" => "interrupted", "content" => content} =
+               Delegation.outcome("sender", interrupted)
+
+      assert content =~ "before it answered. It had already acted:"
+
+      # No effects, or a lifecycle that did not say: nothing to check.
+      for effects? <- [false, nil] do
+        assert %{"content" => "The sender run failed: overloaded"} =
+                 Delegation.outcome("sender", %{failed | effects?: effects?})
+      end
+    end
   end
 
   defp skill do

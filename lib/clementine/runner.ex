@@ -56,6 +56,7 @@ defmodule Clementine.Runner do
   }
 
   alias Clementine.Events.Stamper
+  alias Clementine.LLM.Message.UserMessage
   alias Clementine.Trace.Recorder
   alias Clementine.Lifecycle.{Facts, Protocol}
 
@@ -140,7 +141,7 @@ defmodule Clementine.Runner do
 
       # Heartbeat still live: the terminal/suspend write retries transient
       # storage errors without racing the reaper.
-      settle(rollout_result, lease, stamper, recorder)
+      settle(rollout_result, run, lease, stamper, recorder)
     after
       Recorder.close(recorder)
       if heartbeat, do: Heartbeat.stop(heartbeat)
@@ -193,9 +194,11 @@ defmodule Clementine.Runner do
   # finish(failed), never a CaseClauseError that turns into a two-minute
   # reaped mystery. Results the rollout could not carry usage on (cancel,
   # error, drain-interrupt) get the stamper's accumulated approximation.
-  # Every write that ends or parks the run carries the trace entries the
+  # A raise arrives as a bare error (the rescue in run_leased/3), its
+  # completed steps gone with the process state that held them. Every
+  # write that ends or parks the run carries the trace entries the
   # rollout recorded and has not written.
-  defp settle(rollout_result, lease, stamper, recorder) do
+  defp settle(rollout_result, run, lease, stamper, recorder) do
     case rollout_result do
       {:ok, %Result.Completed{} = result} ->
         finish(lease, result, recorder)
@@ -209,19 +212,31 @@ defmodule Clementine.Runner do
       :drained ->
         requeue(lease, stamper, recorder)
 
+      # Usage as for any failure, the stamper's: it counts from a resumed
+      # run's checkpoint even when the failure was restoring it.
+      {:error, %Result.Failed{error: %Error{}} = result} ->
+        finish(lease, %{result | usage: Stamper.usage(stamper)}, recorder)
+
       {:error, %Error{} = error} ->
-        finish(lease, Result.failed(error, Stamper.usage(stamper)), recorder)
+        finish(lease, failed(run, error, stamper), recorder)
 
       :lost_lease ->
         {:discard, :lost_lease}
 
       other ->
-        finish(
-          lease,
-          Result.failed(Error.invalid_return(other), Stamper.usage(stamper)),
-          recorder
-        )
+        finish(lease, failed(run, Error.invalid_return(other), stamper), recorder)
     end
+  end
+
+  # A failure the rollout did not end itself (a raise, a value outside
+  # its contract) is the run's prompt and no steps: whatever it had
+  # completed went with it.
+  defp failed(%Run{rollout: %Rollout{input: input}}, error, stamper) do
+    %Result.Failed{
+      error: error,
+      input_message: if(is_binary(input), do: UserMessage.new(input)),
+      usage: Stamper.usage(stamper)
+    }
   end
 
   defp suspend(lease, request, stamper, recorder) do

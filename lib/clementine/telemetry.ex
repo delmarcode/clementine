@@ -83,7 +83,7 @@ defmodule Clementine.Telemetry do
 
   ### `[:clementine, :rollout, :exception]`
 
-  Emitted when the engine returns `{:error, %Clementine.Error{}}` — the
+  Emitted when the engine returns `{:error, %Clementine.Result.Failed{}}` — the
   legacy `:loop` reading of "exception", kept across the rename (note that
   hitting `max_iterations` is now a normalized error, no longer a `:stop`
   status) — and when a raise escapes toward the runner's rescue tier.

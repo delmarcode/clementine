@@ -347,11 +347,11 @@ defmodule Clementine.RolloutStopsTest do
     test "refused leaves nothing to store, and the next turn replays valid" do
       script([{[], stop_reason: "refusal"}])
 
-      assert {:error, %Result.Failed{error: %Error{code: :refused}}} =
+      assert {:error, %Result.Failed{error: %Error{code: :refused}, messages: []}} =
                Clementine.run(agent(), "Something it will not do.")
 
-      # A host stores turns from Completed, so the refused prompt is all
-      # the thread may hold of it. Two user messages in a row are valid.
+      # No step completed, so the refused prompt is all the thread may
+      # hold of it. Two user messages in a row are valid.
       thread = [UserMessage.new("Something it will not do.")]
       script([{[{:text, "Sure."}], []}])
 
@@ -431,6 +431,151 @@ defmodule Clementine.RolloutStopsTest do
 
       assert {:error, %Result.Failed{error: %Error{code: :empty}}} =
                Clementine.run(agent(), "Say something.")
+    end
+  end
+
+  describe "a failed run's completed steps" do
+    test "a tool that had effects, then a cut: the step is kept and closed, and the next turn replays it" do
+      script([
+        {[{:thinking, "I should send it."}, {:tool_use, "toolu_1", "echo", %{"message" => "hi"}}],
+         []},
+        {[{:text, "I sent the"}], stop_reason: "max_tokens"}
+      ])
+
+      assert {:error, %Result.Failed{error: %Error{code: :truncated}} = failed} =
+               Clementine.run(agent(), "Send it, then say so.")
+
+      # The call that ran and its result, then a turn of no content in
+      # place of the cut one. The cut turn's text is not kept.
+      assert [
+               %AssistantMessage{content: [%Content.Thinking{}, %Content.ToolUse{id: "toolu_1"}]},
+               %ToolResultMessage{content: [%Content.ToolResult{tool_use_id: "toolu_1"}]},
+               %AssistantMessage{content: [], binding: nil}
+             ] = failed.messages
+
+      assert failed.input_message == UserMessage.new("Send it, then say so.")
+      assert failed.effects? == true
+
+      # The exchange is closed: a window (and an app's trim) keeps the
+      # call, so the next turn knows the email went.
+      thread = [failed.input_message | failed.messages]
+      assert History.window(thread, max: 100) == thread
+
+      # Strict: the kept turn's thinking replays, and nothing the API
+      # refuses is sent.
+      script([{[{:text, "It went."}], []}])
+
+      assert {:ok, %Result.Completed{output: "It went."}} =
+               Clementine.run(agent(), "Did it go?", messages: thread)
+    end
+
+    test "after a skill loads, then a refusal: the closing turn is what the skill's system message needs" do
+      script([
+        {[{:tool_use, "toolu_1", "use_skill", %{"name" => "notes"}}], []},
+        {[], stop_reason: "refusal"}
+      ])
+
+      agent = agent(skills: [Notes])
+
+      assert {:error, %Result.Failed{error: %Error{code: :refused}} = failed} =
+               Clementine.run(agent, "Load your notes.")
+
+      assert [
+               %AssistantMessage{},
+               %ToolResultMessage{},
+               %SystemMessage{skill: "notes"},
+               %AssistantMessage{content: []}
+             ] = failed.messages
+
+      # A skill load has no effects.
+      assert failed.effects? == false
+
+      thread = [failed.input_message | failed.messages]
+      assert History.window(thread, max: 100) == thread
+
+      # Ending on the tool result instead, the API refuses the next prompt.
+      next = UserMessage.new("Take a note.")
+
+      assert {:error, {:api_error, 400, body}} =
+               Fake.check("claude-sonnet-5-5", nil, Enum.drop(thread, -1) ++ [next], [], [],
+                 strict: false
+               )
+
+      assert body["error"]["message"] =~ "a system message must follow a user message"
+
+      # The skill stays loaded: the next turn is offered its tool.
+      test = self()
+
+      expect(Clementine.LLM.MockClient, :stream, fn model, system, messages, tools, opts ->
+        send(test, {:offered, Enum.map(tools, &Clementine.Tool.to_schema(&1).name)})
+        Fake.stream(model, system, messages, tools, opts, [{:text, "Noted."}], [])
+      end)
+
+      assert {:ok, %Result.Completed{output: "Noted."}} =
+               Clementine.run(agent, "Take a note.", messages: thread)
+
+      assert_received {:offered, offered}
+      assert "safe_echo" in offered
+    end
+
+    test "out of iterations after tool batches keeps every batch" do
+      script([
+        {[{:tool_use, "toolu_1", "echo", %{"message" => "one"}}], []},
+        {[{:tool_use, "toolu_2", "echo", %{"message" => "two"}}], []}
+      ])
+
+      assert {:error, %Result.Failed{error: %Error{code: :max_iterations}} = failed} =
+               Clementine.run(agent(defaults: [max_iterations: 2]), "Echo twice.")
+
+      assert [
+               %AssistantMessage{content: [%Content.ToolUse{id: "toolu_1"}]},
+               %ToolResultMessage{},
+               %AssistantMessage{content: [%Content.ToolUse{id: "toolu_2"}]},
+               %ToolResultMessage{},
+               %AssistantMessage{content: []}
+             ] = failed.messages
+    end
+
+    test "a provider error after a batch keeps the batch; a safe tool leaves the fence down" do
+      script([
+        {[{:tool_use, "toolu_1", "safe_echo", %{"message" => "hi"}}], []},
+        {[{:error, "overloaded_error"}], []}
+      ])
+
+      agent = agent(tools: [Clementine.Test.Tools.SafeEcho])
+
+      assert {:error, %Result.Failed{error: %Error{code: :overloaded}} = failed} =
+               Clementine.run(agent, "Look it up.")
+
+      assert [%AssistantMessage{}, %ToolResultMessage{}, %AssistantMessage{content: []}] =
+               failed.messages
+
+      assert failed.effects? == false
+    end
+
+    test "a cut inside a later turn's call keeps the earlier batch, and none of the cut turn" do
+      script([
+        {[{:tool_use, "toolu_1", "echo", %{"message" => "one"}}], []},
+        {[
+           {:tool_use, "toolu_2", "echo", %{"message" => "two"}},
+           {:unfinished_tool_use, "toolu_3", "echo", ~s({"message": "thr)}
+         ], []}
+      ])
+
+      events = Clementine.stream(agent(), "Echo three times.") |> Enum.to_list()
+
+      assert {:result, %Result.Failed{error: %Error{code: :truncated}} = failed} =
+               List.last(events)
+
+      assert [
+               %AssistantMessage{content: [%Content.ToolUse{id: "toolu_1"}]},
+               %ToolResultMessage{},
+               %AssistantMessage{content: []}
+             ] = failed.messages
+
+      # The cut turn ran none of its calls, the whole one included.
+      results = for %Clementine.Event{type: :tool_result, payload: p} <- events, do: p.tool_use_id
+      assert results == ["toolu_1"]
     end
   end
 end

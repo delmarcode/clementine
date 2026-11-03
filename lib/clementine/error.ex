@@ -145,9 +145,11 @@ defmodule Clementine.Error do
   Normalizes any error reason the engine can produce.
 
   Accepts the provider-boundary shapes (`{:api_error, status, body}`,
-  `{:request_failed, reason}`, `{:llm_exception, info}`), the error event
-  Anthropic's stream sends mid-turn (`%{"type" => "overloaded_error",
-  "message" => ...}`), engine atoms (`:max_iterations_reached`), and
+  `{:request_failed, reason}`, `{:llm_exception, info}`, and
+  `{:stream_timeout, ms}` for a stream that stalled, a retryable
+  `:timeout`), the error event Anthropic's stream sends mid-turn
+  (`%{"type" => "overloaded_error", "message" => ...}`), engine atoms
+  (`:max_iterations_reached`), and
   passes an existing `%Clementine.Error{}` through unchanged. Anything
   unrecognized becomes a non-retryable `:unknown` — never a crash.
   """
@@ -201,6 +203,17 @@ defmodule Clementine.Error do
       message: stream_error_message(event),
       retryable?: retryable?,
       raw: event
+    }
+  end
+
+  def normalize({:stream_timeout, ms}, provider) when is_integer(ms) do
+    %__MODULE__{
+      kind: :provider,
+      code: :timeout,
+      provider: provider,
+      message: "The provider's stream sent nothing for #{ms} ms.",
+      retryable?: true,
+      raw: {:stream_timeout, ms}
     }
   end
 

@@ -150,7 +150,7 @@ defmodule Clementine.OutputSchemaTest do
     test "a final answer that does not match fails the run with :invalid_output" do
       expect_turn(text_events(~s({"verdict": "maybe", "score": "high"})))
 
-      assert {:error, %Clementine.Error{} = error} =
+      assert {:error, %Result.Failed{error: %Clementine.Error{} = error}} =
                Rollout.execute(rollout(tools: [], output_schema: @verdict))
 
       assert %Clementine.Error{kind: :rollout, code: :invalid_output, retryable?: false} = error
@@ -167,7 +167,8 @@ defmodule Clementine.OutputSchemaTest do
          %{"input_tokens" => 7, "output_tokens" => 3}}
       ])
 
-      assert {:error, %Clementine.Error{kind: :rollout, code: :truncated} = error} =
+      assert {:error,
+              %Result.Failed{error: %Clementine.Error{kind: :rollout, code: :truncated} = error}} =
                Rollout.execute(rollout(tools: [], output_schema: @verdict))
 
       assert error.message =~ "cut off at max_tokens"
@@ -207,7 +208,7 @@ defmodule Clementine.OutputSchemaTest do
     test "a mismatch after a search fails, and raw keeps all of the turn's text" do
       expect_turn(searched_turn("Let me find the rubric.", ~s({"verdict": "pass"}), "end_turn"))
 
-      assert {:error, %Clementine.Error{code: :invalid_output} = error} =
+      assert {:error, %Result.Failed{error: %Clementine.Error{code: :invalid_output} = error}} =
                Rollout.execute(rollout(tools: [Echo], output_schema: @verdict))
 
       assert error.message =~ ~s(/: missing required property "score")
@@ -250,7 +251,8 @@ defmodule Clementine.OutputSchemaTest do
         text_events(~s({"b": 1}))
       end)
 
-      assert {:error, %Clementine.Error{code: :invalid_output, message: message}} =
+      assert {:error,
+              %Result.Failed{error: %Clementine.Error{code: :invalid_output, message: message}}} =
                Rollout.execute(Rollout.new(agent: agent, input: "go"))
 
       assert message =~ ~s(/: missing required property "a")
@@ -261,7 +263,10 @@ defmodule Clementine.OutputSchemaTest do
       for schema <- [%{"type" => "string"}, %{"type" => "object", "properties" => []}, "verdict"] do
         agent = %{Clementine.Agent.new(model: "claude-sonnet-5") | output_schema: schema}
 
-        assert {:error, %Clementine.Error{kind: :rollout, code: :invalid_output_schema} = error} =
+        assert {:error,
+                %Result.Failed{
+                  error: %Clementine.Error{kind: :rollout, code: :invalid_output_schema} = error
+                }} =
                  Rollout.execute(Rollout.new(agent: agent, input: "go"))
 
         assert error.message =~ "output_schema:"
@@ -287,7 +292,8 @@ defmodule Clementine.OutputSchemaTest do
 
       expect_turn(events)
 
-      assert {:error, %Clementine.Error{kind: :rollout, code: :refused} = error} =
+      assert {:error,
+              %Result.Failed{error: %Clementine.Error{kind: :rollout, code: :refused} = error}} =
                Rollout.execute(rollout(tools: [], output_schema: @verdict))
 
       assert error.message =~ "refused"

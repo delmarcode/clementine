@@ -320,7 +320,11 @@ defmodule Clementine.Loop.Local do
                facts.epoch == transition.expect.epoch do
             new_facts = apply_set(facts, transition.set, stamp_clock(facts, state))
             state = put_in(state.runs[transition.run_ref], new_facts)
-            state = record_result(state, transition.run_ref, transition.result)
+
+            result =
+              transition.result && Result.with_effects(transition.result, new_facts.effects?)
+
+            state = record_result(state, transition.run_ref, result)
             {{:ok, new_facts}, state}
           else
             {{:error, :stale}, state}

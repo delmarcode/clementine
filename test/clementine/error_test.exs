@@ -61,6 +61,15 @@ defmodule Clementine.ErrorTest do
     assert error.retryable?
   end
 
+  test "normalize/2 for a stream that stalled is a retryable provider timeout" do
+    error = Error.normalize({:stream_timeout, 300_000})
+
+    assert error.kind == :provider
+    assert error.code == :timeout
+    assert error.message == "The provider's stream sent nothing for 300000 ms."
+    assert error.retryable?
+  end
+
   test "normalize/2 for llm exceptions carries the message" do
     error = Error.normalize({:llm_exception, %{kind: :error, message: "boom"}})
 

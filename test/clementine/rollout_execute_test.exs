@@ -243,7 +243,10 @@ defmodule Clementine.RolloutExecuteTest do
     test "max_iterations returns a normalized error, never a bare atom" do
       expect_stream(tool_events("tu_1", "echo", %{"message" => "loop"}))
 
-      assert {:error, %Error{kind: :rollout, code: :max_iterations, retryable?: false}} =
+      assert {:error,
+              %Result.Failed{
+                error: %Error{kind: :rollout, code: :max_iterations, retryable?: false}
+              }} =
                Rollout.execute(rollout(tools: [Echo], limits: [max_iterations: 1]))
     end
 
@@ -255,7 +258,8 @@ defmodule Clementine.RolloutExecuteTest do
         tool_events("tu_1", "echo", %{"message" => "loop"})
       end)
 
-      assert {:error, %Error{code: :max_iterations}} = Rollout.execute(rollout(tools: [Echo]))
+      assert {:error, %Result.Failed{error: %Error{code: :max_iterations}}} =
+               Rollout.execute(rollout(tools: [Echo]))
 
       assert count_received(:gather) == 10
     end
@@ -263,7 +267,10 @@ defmodule Clementine.RolloutExecuteTest do
     test "an expired deadline fails at the boundary before any provider call" do
       deadline = DateTime.add(DateTime.utc_now(), -1, :second)
 
-      assert {:error, %Error{kind: :rollout, code: :deadline_exceeded, retryable?: false}} =
+      assert {:error,
+              %Result.Failed{
+                error: %Error{kind: :rollout, code: :deadline_exceeded, retryable?: false}
+              }} =
                Rollout.execute(rollout(), deadline: deadline)
     end
   end
@@ -449,7 +456,7 @@ defmodule Clementine.RolloutExecuteTest do
     test "preserves the iteration counter across the suspension" do
       checkpoint = %Checkpoint{rollout_id: "r1", iteration: 3, messages: []}
 
-      assert {:error, %Error{code: :max_iterations}} =
+      assert {:error, %Result.Failed{error: %Error{code: :max_iterations}}} =
                Rollout.execute(rollout(limits: [max_iterations: 3]),
                  resume: {checkpoint, :elapsed}
                )
@@ -458,17 +465,18 @@ defmodule Clementine.RolloutExecuteTest do
     test "matrix row 8: a checkpoint struct from another version is incompatible" do
       checkpoint = %Checkpoint{version: 3, rollout_id: "r1"}
 
-      assert {:error, %Error{code: :incompatible_checkpoint, retryable?: false}} =
+      assert {:error,
+              %Result.Failed{error: %Error{code: :incompatible_checkpoint, retryable?: false}}} =
                Rollout.execute(rollout(), resume: {checkpoint, :elapsed})
     end
 
     test "matrix row 8: an encoded envelope with an unknown version is incompatible" do
-      assert {:error, %Error{code: :incompatible_checkpoint}} =
+      assert {:error, %Result.Failed{error: %Error{code: :incompatible_checkpoint}}} =
                Rollout.execute(rollout(), resume: {%{"version" => 42}, :elapsed})
     end
 
     test "matrix row 8: checkpoint garbage decodes to the same clean error" do
-      assert {:error, %Error{code: :incompatible_checkpoint}} =
+      assert {:error, %Result.Failed{error: %Error{code: :incompatible_checkpoint}}} =
                Rollout.execute(rollout(), resume: {:corrupted, :elapsed})
     end
   end
@@ -515,7 +523,7 @@ defmodule Clementine.RolloutExecuteTest do
     test "a fence write that fails transiently fails the run closed" do
       expect_stream(tool_events("tu_1", "echo", %{"message" => "never"}))
 
-      assert {:error, %Error{}} =
+      assert {:error, %Result.Failed{error: %Error{}}} =
                Rollout.execute(rollout(tools: [Echo]),
                  mark_effects: fn -> {:error, :db_down} end
                )
@@ -974,7 +982,8 @@ defmodule Clementine.RolloutExecuteTest do
     test "matrix row 8: a pending tool absent from this rollout's toolset is incompatible" do
       checkpoint = approval_checkpoint()
 
-      assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+      assert {:error,
+              %Result.Failed{error: %Error{code: :incompatible_checkpoint, message: message}}} =
                Rollout.execute(rollout(tools: []), resume: {checkpoint, {:approved, %{}}})
 
       assert message =~ "does not resolve"
@@ -984,7 +993,8 @@ defmodule Clementine.RolloutExecuteTest do
       for args <- [nil, ["env", "prod"], "prod"] do
         checkpoint = approval_checkpoint(pending: {"tu_1", "gated_deploy", args})
 
-        assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+        assert {:error,
+                %Result.Failed{error: %Error{code: :incompatible_checkpoint, message: message}}} =
                  Rollout.execute(
                    rollout(tools: [GatedDeploy], context: %{notify: self()}),
                    resume: {checkpoint, {:approved, %{}}}
@@ -999,7 +1009,8 @@ defmodule Clementine.RolloutExecuteTest do
     test "a checkpoint that cannot support its own pending call is incompatible" do
       checkpoint = %Checkpoint{approval_checkpoint() | messages: [UserMessage.new("go")]}
 
-      assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+      assert {:error,
+              %Result.Failed{error: %Error{code: :incompatible_checkpoint, message: message}}} =
                Rollout.execute(
                  rollout(tools: [GatedDeploy]),
                  resume: {checkpoint, {:approved, %{}}}
@@ -1011,7 +1022,8 @@ defmodule Clementine.RolloutExecuteTest do
     test "an unrecognized payload for a pending approval fails cleanly, never crashes" do
       checkpoint = approval_checkpoint()
 
-      assert {:error, %Error{code: :invalid_resume_payload, retryable?: false}} =
+      assert {:error,
+              %Result.Failed{error: %Error{code: :invalid_resume_payload, retryable?: false}}} =
                Rollout.execute(
                  rollout(tools: [GatedDeploy], context: %{notify: self()}),
                  resume: {checkpoint, :elapsed}
@@ -1076,7 +1088,7 @@ defmodule Clementine.RolloutExecuteTest do
       checkpoint = approval_checkpoint()
       deadline = DateTime.add(DateTime.utc_now(), -1, :second)
 
-      assert {:error, %Error{code: :deadline_exceeded, retryable?: false}} =
+      assert {:error, %Result.Failed{error: %Error{code: :deadline_exceeded, retryable?: false}}} =
                Rollout.execute(
                  rollout(tools: [GatedDeploy], context: %{notify: self()}),
                  resume: {checkpoint, {:approved, %{}}},
@@ -1092,7 +1104,8 @@ defmodule Clementine.RolloutExecuteTest do
       # the same doctrine road.
       checkpoint = %Checkpoint{approval_checkpoint() | pending: {:external_wait, "webhook_123"}}
 
-      assert {:error, %Error{code: :incompatible_checkpoint, message: message}} =
+      assert {:error,
+              %Result.Failed{error: %Error{code: :incompatible_checkpoint, message: message}}} =
                Rollout.execute(
                  rollout(tools: [GatedDeploy]),
                  resume: {checkpoint, {:approved, %{}}}
@@ -1156,7 +1169,7 @@ defmodule Clementine.RolloutExecuteTest do
       # The capped tool times out around the deadline instant; the next
       # boundary converts that into the deadline failure — total run time
       # is bounded by the budget, not by the tool's own duration.
-      assert {:error, %Error{code: :deadline_exceeded, retryable?: false}} =
+      assert {:error, %Result.Failed{error: %Error{code: :deadline_exceeded, retryable?: false}}} =
                Rollout.execute(rollout(tools: [Slow]), deadline: deadline)
 
       assert System.monotonic_time(:millisecond) - started < 2_000
@@ -1194,7 +1207,8 @@ defmodule Clementine.RolloutExecuteTest do
     test "a failing gather emits a normalized error event last" do
       expect_stream([{:error, {:api_error, 500, "boom"}}])
 
-      assert {:error, %Error{code: :provider_unavailable, retryable?: true} = error} =
+      assert {:error,
+              %Result.Failed{error: %Error{code: :provider_unavailable, retryable?: true} = error}} =
                Rollout.execute(rollout(), emit: stamper())
 
       assert List.last(collect_events()) == %Event{

@@ -106,8 +106,12 @@ defmodule Clementine.Runs.ThreadWaitingTest do
     {:ok, state, [_spawn]} = Thread.handle({:message, %{"prompt" => "a", "id" => "m1"}}, state)
     {:ok, state, []} = Thread.handle({:message, %{"prompt" => "b", "id" => "m2"}}, state)
 
+    # A provider that was overloaded, on a run that had no effects: the
+    # one kind of failure the thread retries.
+    overloaded = %{Result.failed({:api_error, 529, ""}) | effects?: false}
+
     {:ok, state, [{:timer, {:retry, "m1"}, _ms}]} =
-      Thread.handle({:completed, {:turn, "m1"}, Result.failed(:boom)}, state)
+      Thread.handle({:completed, {:turn, "m1"}, overloaded}, state)
 
     assert state["turn"]["phase"] == "retry_wait"
     assert Thread.queued_ids(state) == ["m2"]

@@ -77,7 +77,9 @@ policies as creation args: `"busy"` (`"queue"`, the default, or
 place once the cancel completes), `"on_failure"` (`"surface"`, the
 default, or `"retry"` after `"retry_after_ms"`), and
 `"retry_interrupted"` (one immediate retry of a turn whose node died).
-Start it, feed it, and read its turns back:
+A retry runs only a turn whose run had no effects, and a failed one
+only on an error a retry gets past, so it never repeats a sent email
+or a refusal. Start it, feed it, and read its turns back:
 
 <!-- guide-sample: parse-only -->
 ```elixir
@@ -148,8 +150,9 @@ defmodule MyApp.ThreadLoop do
   end
 
   # Pod death mid-turn: the reaper interrupted the child and its end
-  # reached here like any other completion. Retry it once, after a pause.
-  def handle({:completed, {:turn, id}, %Result.Interrupted{}}, state) do
+  # reached here like any other completion. Retry it once, after a pause,
+  # unless its tools had effects: running it again would repeat them.
+  def handle({:completed, {:turn, id}, %Result.Interrupted{effects?: false}}, state) do
     {:ok, state, [{:timer, {:retry, id}, :timer.seconds(30)}]}
   end
 
@@ -157,7 +160,8 @@ defmodule MyApp.ThreadLoop do
     {:ok, state, [turn(state, message)]}
   end
 
-  # A failed or cancelled turn: the host saw the result; move on.
+  # A failed or cancelled turn, or an interrupted one that had effects:
+  # the host saw the result; move on.
   def handle({:completed, {:turn, _id}, _failed_or_cancelled}, state) do
     next(state)
   end
@@ -268,9 +272,13 @@ defmodule MyApp.Chat.Threads do
       message = MyApp.Chat.insert_message!(conversation, content)
       loop = Runs.active({"conversation", conversation.id}, kind: :loop)
 
-      case Runs.send(loop.id, %{"id" => message.id, "prompt" => content},
-             dedup_key: "message:#{message.id}"
-           ) do
+      message_args = %{
+        "id" => message.id,
+        "prompt" => content,
+        "metadata" => %{"message_id" => message.id}
+      }
+
+      case Runs.send(loop.id, message_args, dedup_key: "message:#{message.id}") do
         {:ok, :appended} -> message
         {:ok, :duplicate} -> message
         {:ok, :dead_lettered} -> MyApp.Repo.rollback(:conversation_closed)
