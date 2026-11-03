@@ -368,6 +368,13 @@ defmodule Clementine.Platform do
   def url(%__MODULE__{} = platform, :responses), do: base(platform) <> "/responses"
   def url(%__MODULE__{} = platform, :chat_completions), do: base(platform) <> "/chat/completions"
 
+  @doc false
+  # The part before the wire's path, on a platform with a default
+  # endpoint (`:anthropic`, `:openai`, `:openrouter`) or a `base_url:`:
+  # `mix clementine.models --check` puts the Models API under it.
+  @spec base_url(t()) :: String.t()
+  def base_url(%__MODULE__{} = platform), do: base(platform)
+
   @doc """
   The headers that carry `platform`'s credential on `protocol`, the
   credential resolved now. Raises naming the config key (never the
@@ -631,7 +638,21 @@ defmodule Clementine.Platform do
   # doubled path (`/anthropic/anthropic/v1/messages`).
   defp base_url_path(%__MODULE__{base_url: nil}), do: :ok
 
-  defp base_url_path(%__MODULE__{base_url: base_url} = platform) do
+  # Not echoed: a URL can carry userinfo.
+  defp base_url_path(%__MODULE__{base_url: base_url} = platform) when is_binary(base_url) do
+    case URI.parse(base_url) do
+      %URI{scheme: scheme, host: host}
+      when scheme in ["http", "https"] and host not in [nil, ""] ->
+        base_url_tail(platform)
+
+      _no_scheme_or_host ->
+        {:error,
+         "#{platform.name}: base_url: needs an http or https scheme and a host " <>
+           "(https://api.anthropic.com)"}
+    end
+  end
+
+  defp base_url_tail(%__MODULE__{base_url: base_url} = platform) do
     {tails, convention} = base_url_convention(platform)
     trimmed = String.trim_trailing(base_url, "/")
 
@@ -710,6 +731,30 @@ defmodule Clementine.Platform do
   defp unresolved(platform, key, why),
     do: "config :clementine, :platforms, #{platform.name}: [#{key}: ...] #{why}"
 
+  @doc false
+  # A credential's value now, as a request resolves it: `{:ok, value}`,
+  # `{:none, why}` when it has none, or `{:error, why}`. An
+  # {m, f, a} that raises, throws, or exits is an error too, named by
+  # `Mod.fun/arity` and the exception's module or what it did: never its
+  # arguments, its message, or the term it threw, any of which can hold
+  # the key (`mix clementine.models --check`).
+  @spec resolve_credential(credential() | nil) ::
+          {:ok, String.t()} | {:none, String.t()} | {:error, String.t()}
+  def resolve_credential({module, function, args} = credential)
+      when is_atom(module) and is_atom(function) and is_list(args) do
+    resolve(credential)
+  rescue
+    exception ->
+      {:error, "#{call(module, function, args)} raised #{inspect(exception.__struct__)}"}
+  catch
+    :throw, _value -> {:error, "#{call(module, function, args)} threw"}
+    :exit, _reason -> {:error, "#{call(module, function, args)} exited"}
+  end
+
+  def resolve_credential(credential), do: resolve(credential)
+
+  defp call(module, function, args), do: "#{inspect(module)}.#{function}/#{length(args)}"
+
   # A credential's value now, `{:none, why}` when it has none, or
   # `{:error, why}` when an {m, f, a} returned something other than a
   # string. Never a value in `why`.
@@ -723,7 +768,7 @@ defmodule Clementine.Platform do
   end
 
   defp resolve({module, function, args}) do
-    call = "#{inspect(module)}.#{function}/#{length(args)}"
+    call = call(module, function, args)
 
     case apply(module, function, args) do
       value when is_binary(value) and value != "" ->

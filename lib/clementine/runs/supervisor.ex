@@ -23,6 +23,11 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       # migration to write.
       :ok = Clementine.Migration.check!(config.repo)
 
+      # What is ending only warns: a deprecated model, a date passed.
+      # Boot's errors come from the sheets and config. (The offer and the
+      # registry's age warn when Clementine itself starts.)
+      :ok = Clementine.Models.Warnings.log_agents(Map.values(config.agents))
+
       # Oban's own plugins do not run in a testing mode; neither does the
       # reaper, which would sweep from outside the test's sandbox, nor the
       # step send/3 runs inline, which would step from outside it too:

@@ -59,7 +59,19 @@ the drain at shutdown.
   :models` with `based_on:` a shipped sheet (`docs/MODELS.md`), rather
   than as a bare declaration that knows none of the base's facts.
 - A boot error naming a model says what it takes instead; change the
-  agent, not Clementine.
+  agent, not Clementine. A boot warning (a deprecated model, a date
+  passed, sheets more than 120 days old) never fails boot: plan the move
+  before the vendor's date.
+- Before moving an agent to another model, and after upgrading
+  Clementine, run `mix clementine.models`: each agent's model, the
+  newest in its line, and what differs. `--check` compares the sheets
+  with the vendors' Models APIs; `--json` is for CI
+  ([docs/MODELS.md](docs/MODELS.md#adopting-a-new-model)).
+- An agent whose model comes from data (a stored row) names it in
+  `agent/1`. List the models such agents may pick under `config
+  :clementine, :offer`, as ids or `{id, choices}`, or as a function that
+  reads the app's own offer from config (`{MyApp.Models, :offer, []}`),
+  so boot checks them and the report shows them.
 - To run an agent module in process (an eval, a test), pass the module:
   `Clementine.run(MyApp.Agents.Triage, prompt, run: run)` completes its
   `agent/1` from `use` as the runtime does. A bare `Agent.new/1` with no

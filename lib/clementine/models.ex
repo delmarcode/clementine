@@ -80,6 +80,9 @@ defmodule Clementine.Models do
   # Built at compile time, so a malformed shipped sheet fails the build.
   @shipped Map.new(@shipped_sheets, &{Keyword.fetch!(&1, :id), Model.new!(&1)})
   @order Enum.map(@shipped_sheets, &Keyword.fetch!(&1, :id))
+  @shipped_reads @shipped_sheets
+                 |> Enum.group_by(&Keyword.fetch!(&1, :vendor), &Keyword.fetch!(&1, :read))
+                 |> Map.new(fn {vendor, reads} -> {vendor, Enum.max(reads, Date)} end)
 
   # Facts an override merges into key by key; every other fact it
   # replaces.
@@ -159,11 +162,12 @@ defmodule Clementine.Models do
   @doc """
   The active model in `line` released last, or `nil`. A model with no
   release date counts as older than any with one; two on the same day
-  go by the order their vendor module lists them.
+  go by the order their vendor module lists them. `platform:` counts
+  only the models served there.
   """
-  @spec newest(atom()) :: Model.t() | nil
-  def newest(line) do
-    [line: line, lifecycle: :active]
+  @spec newest(atom(), keyword()) :: Model.t() | nil
+  def newest(line, opts \\ []) do
+    ([line: line, lifecycle: :active] ++ Keyword.take(opts, [:platform]))
     |> list()
     |> Enum.with_index()
     |> Enum.max_by(
@@ -297,6 +301,112 @@ defmodule Clementine.Models do
         :ok
     end
   end
+
+  @doc """
+  The models the app offers, each with the choices an agent built on it
+  makes: the ones a tenant or an eval may pick where the app builds
+  agents from data (stored rows) rather than declaring each one's model
+  on `use Clementine.Agent`. The offer is the app's; `config :clementine,
+  :offer` points Clementine at it, as a list or as a
+  `{module, function, args}` that returns one:
+
+      config :clementine, :offer, [
+        "claude-sonnet-5-5",
+        {"claude-opus-5-5", max_tokens: 64_000, platform: :bedrock}
+      ]
+
+      config :clementine, :offer, {MyApp.Models, :offer, []}
+
+  An entry is a model id, which runs with the model's defaults on its
+  default platform, or `{id, choices}`, with an agent's choices for it
+  (`Clementine.LLM.Policy.keys/0`, `platform:` among them). Each comes back as `{id, choices}`,
+  a bare id with `[]`. The function is called with nothing of the app's
+  started (when Clementine starts, and in `mix clementine.models`), so it
+  reads config, not a Repo or a process.
+
+  `{Clementine, ...}` checks each entry when it starts, as it checks an
+  agent's model and choices (an unknown or retired id, a choice the
+  model refuses, or no credential on the platform it resolves to fails
+  boot);
+  Clementine warns for each when it starts, as for an agent's model
+  (`Clementine.Models.Warnings`); and `mix clementine.models` reports
+  each beside the agents. Without the config the offer is empty.
+  """
+  @spec offer() :: [{String.t(), keyword()}]
+  def offer do
+    case Application.get_env(:clementine, :offer) do
+      nil ->
+        []
+
+      {module, function, args} = mfa
+      when is_atom(module) and is_atom(function) and is_list(args) ->
+        mfa |> call_offer() |> offer!("#{inspect(mfa)} returned")
+
+      entries ->
+        offer!(entries, "is")
+    end
+  end
+
+  defp call_offer({module, function, args} = mfa) do
+    apply(module, function, args)
+  rescue
+    exception ->
+      reraise ArgumentError,
+              [
+                message:
+                  "config :clementine, :offer: #{inspect(mfa)} raised " <>
+                    "#{inspect(exception.__struct__)}: #{Exception.message(exception)}"
+              ],
+              __STACKTRACE__
+  catch
+    # What it threw or exited with is not shown: it is the app's term.
+    :throw, _value -> raise ArgumentError, "config :clementine, :offer: #{inspect(mfa)} threw"
+    :exit, _reason -> raise ArgumentError, "config :clementine, :offer: #{inspect(mfa)} exited"
+  end
+
+  defp offer!(entries, what) when is_list(entries) do
+    entries |> Enum.map(&offer_entry!(&1, what, entries)) |> Enum.uniq()
+  end
+
+  defp offer!(other, what), do: raise(ArgumentError, offer_shape(what, other))
+
+  defp offer_entry!(id, _what, _entries) when is_binary(id), do: {id, []}
+
+  defp offer_entry!({id, choices} = entry, what, entries)
+       when is_binary(id) and is_list(choices) do
+    unless Keyword.keyword?(choices), do: raise(ArgumentError, offer_shape(what, entries))
+
+    case Keyword.keys(choices) -- Clementine.LLM.Policy.keys() do
+      [] ->
+        entry
+
+      unknown ->
+        raise ArgumentError,
+              "config :clementine, :offer: #{inspect(entry)}: #{inspect(unknown)} are not " <>
+                "choices; a choice is one of #{inspect(Clementine.LLM.Policy.keys())}"
+    end
+  end
+
+  defp offer_entry!(_entry, what, entries), do: raise(ArgumentError, offer_shape(what, entries))
+
+  defp offer_shape(what, got) do
+    "config :clementine, :offer #{what} #{inspect(got)}; the offer is a list whose entries " <>
+      ~s|are model ids or {id, choices} (["claude-sonnet-5-5", {"claude-opus-5-5", | <>
+      ~s|max_tokens: 64_000}]), or a {module, function, args} that returns one|
+  end
+
+  @doc false
+  # The vendors whose sheets this release ships.
+  @spec shipped_vendors() :: [atom()]
+  def shipped_vendors, do: @shipped_reads |> Map.keys() |> Enum.sort()
+
+  @doc false
+  # The newest `read` date among the sheets this release ships, or
+  # among one vendor's. An app's declarations never move it.
+  @spec shipped_read(atom() | nil) :: Date.t()
+  def shipped_read(vendor \\ nil)
+  def shipped_read(nil), do: @shipped_reads |> Map.values() |> Enum.max(Date)
+  def shipped_read(vendor), do: Map.fetch!(@shipped_reads, vendor)
 
   @doc false
   # Whether `id` names a shipped sheet or a model the app's config (as

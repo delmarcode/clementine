@@ -38,6 +38,16 @@ defmodule Clementine.LLM.Router do
   @spec credential(Policy.t()) :: :ok | {:error, String.t()}
   def credential(%Policy{platform: platform, model: model}), do: Platform.check(platform, model)
 
+  @doc false
+  # Boot's credential check: `credential/1` where the app routes its
+  # calls here; under another client (a test's mock), none is needed.
+  @spec check_credential(Policy.t()) :: :ok | {:error, String.t()}
+  def check_credential(policy) do
+    if Application.get_env(:clementine, :llm_client, __MODULE__) == __MODULE__,
+      do: credential(policy),
+      else: :ok
+  end
+
   # `:llm_provider_clients` (tests) sends one platform's requests to
   # another client.
   defp client(id, opts) do

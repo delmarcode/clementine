@@ -176,7 +176,7 @@ defmodule Clementine do
           {:ok, Result.Completed.t()}
           | {:error, Result.Failed.t() | Result.Cancelled.t() | Result.Interrupted.t()}
   def run(agent, prompt, opts \\ []) when is_binary(prompt) do
-    agent = Clementine.Agent.for_run!(agent, opts[:run], "Clementine.run/3")
+    agent = for_run!(agent, opts, "Clementine.run/3")
     {ref, ctx} = Ephemeral.create()
     run = Run.new(ref: ref, rollout: build_rollout(agent, prompt, opts))
 
@@ -213,13 +213,21 @@ defmodule Clementine do
   """
   @spec stream(Clementine.Agent.t() | module(), String.t(), keyword()) :: Enumerable.t()
   def stream(agent, prompt, opts \\ []) when is_binary(prompt) do
-    agent = Clementine.Agent.for_run!(agent, opts[:run], "Clementine.stream/3")
+    agent = for_run!(agent, opts, "Clementine.stream/3")
 
     Stream.resource(
       fn -> start_stream(agent, prompt, opts) end,
       &next_stream_event/1,
       &cleanup_stream/1
     )
+  end
+
+  # An agent module's model warns once in the node, on its first run
+  # (Clementine.Models.Warnings), as the runtime's agents do at its start.
+  defp for_run!(agent, opts, caller) do
+    built = Clementine.Agent.for_run!(agent, opts[:run], caller)
+    if is_atom(agent), do: Clementine.Models.Warnings.log_first_run(agent)
+    built
   end
 
   defp build_rollout(agent, prompt, opts) do

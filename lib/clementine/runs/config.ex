@@ -25,7 +25,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
 
     @key {__MODULE__, :config}
 
-    defstruct [:repo, :oban, :queue, :agents, :host, :lifecycle, inline_steps: false]
+    defstruct [:repo, :oban, :queue, :agents, :host, :lifecycle, offer: [], inline_steps: false]
 
     @type t :: %__MODULE__{
             repo: module(),
@@ -34,6 +34,7 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
             agents: %{String.t() => module()},
             host: module() | nil,
             lifecycle: map(),
+            offer: [{String.t(), keyword()}],
             inline_steps: boolean()
           }
 
@@ -51,7 +52,8 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
         queue: opts[:queue],
         agents: agents!(opts[:agents]),
         host: host!(opts[:host]),
-        lifecycle: EctoLifecycle.config(repo, AgentRun, [])
+        lifecycle: EctoLifecycle.config(repo, AgentRun, []),
+        offer: offer!()
       }
     end
 
@@ -123,17 +125,30 @@ if Code.ensure_loaded?(Oban) and Code.ensure_loaded?(Ecto.Query) do
       end
     end
 
+    # The app may build an agent on any model it offers, so each is
+    # checked as an agent's model is, with the offer's choices for it,
+    # its credential on the platform those choices resolve to.
+    defp offer! do
+      offer = Clementine.Models.offer()
+
+      Enum.each(offer, fn {id, choices} ->
+        with {:ok, policy} <- Clementine.LLM.Policy.resolve(id, choices),
+             :ok <- credentials(policy) do
+          :ok
+        else
+          {:error, message} ->
+            raise ArgumentError, "offered model (config :clementine, :offer): #{message}"
+        end
+      end)
+
+      offer
+    end
+
     # The platform the agent's model goes to, with the agent's own
     # choices, has a credential configured. Only for the provider clients
     # Clementine routes to; a test's mock client needs no key.
     defp credentials(nil), do: :ok
-
-    defp credentials(policy) do
-      if Application.get_env(:clementine, :llm_client, Clementine.LLM.Router) ==
-           Clementine.LLM.Router,
-         do: Clementine.LLM.Router.credential(policy),
-         else: :ok
-    end
+    defp credentials(policy), do: Clementine.LLM.Router.check_credential(policy)
 
     @doc "True for a `use Clementine.Agent` module."
     @spec agent?(module()) :: boolean()

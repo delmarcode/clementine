@@ -13,9 +13,10 @@ side, and the merge of an app's config), `Clementine.Models.Anthropic`
 and `Clementine.Models.OpenAI` (the sheets), `Clementine.Platform` (where
 a model is served: endpoints and credentials), `Clementine.LLM.Policy` (an
 agent's choices checked against a sheet), `Clementine.LLM.Reasoning`
-(the choices on each wire), `Clementine.LLM.Router`, and the three
-clients: `Clementine.LLM.Anthropic`, `Clementine.LLM.OpenAI`,
-`Clementine.LLM.ChatCompletions`.
+(the choices on each wire), `Clementine.LLM.Router`, the three
+clients (`Clementine.LLM.Anthropic`, `Clementine.LLM.OpenAI`,
+`Clementine.LLM.ChatCompletions`), `Clementine.Models.Warnings` (what
+boot warns about), and `mix clementine.models` (the adoption report).
 
 ## The agent names its model and its policy
 
@@ -133,8 +134,9 @@ The read side:
   override merged in.
 - `list/1`: every model, filtered by `line:`, `vendor:`, `lifecycle:`
   (a status), or `platform:`.
-- `newest/1`: the active model in a line released last
-  (`Clementine.Models.newest(:sonnet)`).
+- `newest/2`: the active model in a line released last
+  (`Clementine.Models.newest(:sonnet)`), or the last one a platform
+  serves (`newest(:sonnet, platform: :bedrock)`).
 - `for_platform/2`: a model's facts on one platform, with that
   platform's id (`Clementine.Model.platform_id/1`) and deltas.
 
@@ -155,7 +157,8 @@ id, both facts no request reaches until OPS-199.
 `Clementine.Agent.new/1` checks an agent's model and choices against
 the sheet, so `use Clementine.Agent` with a typo fails the build. Boot
 checks them again for every agent in the child spec's `agents:`, since
-config can change after a build, and checks
+config can change after a build, checks every model the app offers
+(below) as an agent's model with the model's own defaults, and checks
 `config :clementine, :models` when Clementine starts.
 
 | Finding | Outcome |
@@ -168,18 +171,84 @@ config can change after a build, and checks
 | a cache TTL the model does not offer on its platform, or a per-TTL price without the agent's TTL | error, naming the TTLs |
 | a price list partial, finer than six decimals, or in a second currency | error |
 | a sheet whose status is `:retired` in this Clementine release | error, naming the replacement |
-| a deprecated model, or a date that has passed (a retire-not-before date, a shutdown date) | never an error |
+| a deprecated model, a date that has passed (a not-sooner-than date, a shutdown date), or sheets read more than 120 days ago | a warning, never an error (below) |
 
 **Boot is clock-independent.** Every error comes from the sheets and the
 app's config, never from the date. A node that restarts after a
 vendor's shutdown date still boots, its non-AI parts included; the
 vendor's own error ends the run that reaches the model, and the next
-Clementine release marks it retired. Warnings for deprecated models and
-passed dates come with `mix clementine.models`.
+Clementine release marks it retired.
+
+What compares a date with today only warns, and is logged, never
+raised (`Clementine.Models.Warnings`); `mix clementine.models` prints
+the same:
+
+- when Clementine starts: the stale sheets, and every model the app
+  offers (below);
+- when `{Clementine, ...}` starts: every agent in its `agents:` that
+  declares a model;
+- on an agent module's first `Clementine.run/3` or `Clementine.stream/3`
+  in the node, unless the runtime logged it already: that agent's model.
+  An app that runs agents only in process (evals, scripts) gets each
+  one's warnings once, on its first run. The flag is per node, so a test
+  that asserts such a warning calls `Clementine.Models.Warnings.reset/0`
+  in its `setup`, or it passes or fails by which test ran the agent
+  first.
+
+| Warning | When |
+|---|---|
+| deprecated | the sheet's status is `:deprecated`; it names the vendor's retirement or shutdown date and replacement (gpt-5, Sonnet 4.5) |
+| not-sooner-than date passed | the day after `retires_not_before`, the date the vendor promised the model until: it may now retire it with notice (Haiku 4.5, from 2026-10-16) |
+| shutdown date reached | from the day of `retires_on`, a retirement or shutdown date the vendor set: its own error ends the runs that reach the model (gpt-5, from 2026-12-11) |
+| stale sheets | the newest `read` date among one vendor's sheets that Clementine ships is more than 120 days old (this release's, 2026-11-01 for both, from 2027-03-02): upgrade Clementine, or run `mix clementine.models --check` |
+
+A retired model gives none of these: boot refuses it.
+
+Boot reads no network. The vendors' Models APIs are read only by
+`mix clementine.models --check`.
 
 At request time a provider error the facts did not predict ends the run
 as `invalid_request`, as before: a sheet is a best effort, and the API
 stays the judge.
+
+## An offer: models an app picks per run
+
+An app that builds agents from data, where a tenant picks the model for
+its agent and a stored row holds the id, declares no model on `use
+Clementine.Agent`; `agent/1` names the row's. The app's offer, the ids a
+row may hold, stays the app's (it validates rows against it). Point
+Clementine at it, as a list or a function that returns one. An entry is
+a model id, which runs on the model's defaults, or `{id, choices}`, with
+the choices its agents make for that model (`Clementine.LLM.Policy`),
+`platform:` among them:
+
+```elixir
+# config/config.exs
+config :my_app, :models,
+  offered: [
+    {"claude-opus-5-5", max_tokens: 64_000, platform: :bedrock},
+    {"claude-sonnet-5-5", max_tokens: 64_000},
+    "gpt-6-astra"
+  ]
+
+config :clementine, :offer, {MyApp.Models, :offer, []}
+```
+
+`MyApp.Models.offer/0` returns that list as it stands. Clementine calls
+it when it starts, before the app's own processes, and
+`mix clementine.models` calls it with nothing started, so it reads
+config, not a Repo or a process; an error it raises names
+`config :clementine, :offer`.
+
+Boot (`{Clementine, ...}`) then checks each entry as an agent's model
+and choices: an unknown or retired id, a choice the model refuses, or a
+platform with no credential fails boot. The credential checked is the
+one of the platform the entry resolves to, so an app that reaches
+Claude only through Bedrock or Foundry offers Claude ids with
+`platform:` and configures no Claude API key. Clementine warns for each
+offered model when it starts, as for an agent's, and
+`mix clementine.models` reports each entry beside the agents
+(`Clementine.Models.offer/0`).
 
 ## Overrides and declarations
 
@@ -282,7 +351,10 @@ config :clementine, :models, %{
 ```
 
 What names the base model stays behind: its `display_name`,
-`released_on`, `lifecycle`, `prices`, `source`, and `read`. It keeps the
+`released_on`, `lifecycle`, `prices`, `source`, and `read`. Give the
+declaration its own `released_on:`, as above: without one it counts as
+older than every dated model in its line, so `Clementine.Models.newest/2`
+and `mix clementine.models` never name it the newest. It keeps the
 base's platforms, each under the new id as that platform's scheme gives
 it: `anthropic.claude-sonnet-6` on Bedrock's Messages endpoint, and
 `claude-sonnet-6` itself elsewhere (a new Claude model is dateless on
@@ -408,12 +480,95 @@ two prices is not modeled.
 
 ## Adopting a new model
 
-1. Clementine releases the sheet, or the app declares the model the
-   same day under `config :clementine, :models`, keyed by id, with the
-   facts it needs.
-2. Compare it with the agent's model: `Clementine.Models.newest(line)`
-   and the two sheets (`mix clementine.models` will show this per
-   agent).
+`mix clementine.models` is the adoption report. For every agent the app
+runs, it shows the agent's model, the platform its requests go to, the
+model's lifecycle, the newest active model in its line that platform
+serves, and the facts that differ between the two. For the installer's sample app:
+
+```
+$ mix clementine.models
+agent    model              platform   lifecycle                              newest in line     differs on the newest
+chat     claude-sonnet-5    anthropic  active, retires not before 2027-06-30  claude-sonnet-5-5  binding none->prefix; thinking +between_tools -off; cache read 0.1x->0.05x; min prefix 1024->512
+weather  claude-sonnet-5-5  anthropic  active, retires not before 2027-09-28  -                  -
+
+Clementine's model sheets were read 2026-11-01. mix clementine.models --check compares them with the vendors' Models APIs.
+```
+
+- **Which agents.** Every module that implements `Clementine.Agent` in
+  the project and in each dependency that depends on Clementine, read
+  from the compiled code: a superset of the child spec's `agents:`, with
+  no database and nothing started. Run it in dev: under `MIX_ENV=test`
+  the agents in `test/support` get rows too. Each agent's model is its
+  `use`'s (`__model__/0`), with its choices, resolved and checked as
+  boot resolves and checks them. An agent that picks its model in
+  `agent/1` gets a row saying so; the models it may pick come from the
+  offer (above), one row per entry, resolved with its choices.
+  `--model ID` adds a row for any other id.
+- **Newest in line.** The active model in the line released last that
+  the row's platform serves; `-` when the row's model is that one, `no
+  line` when it names no line. A model the app declares counts only with
+  a `released_on:` (a `based_on:` declaration leaves the base's date
+  behind), so give a declared successor one to see it here.
+- **What differs.** Whether the model binds its thinking, the thinking
+  types it takes, the cache read multiplier, the minimum cached prefix,
+  the context window, the input and output prices (the app's override,
+  where it has one), and the price tier. A retired model is compared
+  with nothing; its lifecycle names its replacement.
+- **Warnings** follow the table: the ones boot logs (above).
+- **`--json`** prints the same as JSON, for CI. Run `mix compile` first,
+  so compiler output does not precede the JSON on stdout. The task
+  exits 1 when boot would refuse an agent's or an offered model (an
+  unknown or retired id, a choice the sheet refuses, a platform with no
+  credential configured), or when `--check` finds a difference or
+  cannot read a vendor's API, an `api_key:` that gives no usable key
+  included. Warnings never change the exit status.
+
+`--check` reads Anthropic's and OpenAI's Models APIs with the
+credentials of the `anthropic:` and `openai:` platforms
+([Platforms and credentials](#platforms-and-credentials)), resolved as
+a request resolves them, at each platform's `base_url` (or default):
+`<base_url>/v1/models` on Anthropic's (`https://api.anthropic.com/v1/models`)
+and `<base_url>/models` on OpenAI's (`https://api.openai.com/v1/models`).
+It reports where the sheets differ, sheet then API. A vendor whose
+platform has no `api_key:` is skipped: Bedrock, Vertex, Foundry, and
+the Chat Completions platforms have no Models API it reads, so an app
+that reaches Claude only through one of them gets a note that nothing
+was compared, and exit 0. An `api_key:` that gives no usable key (an
+unset variable, a function that raises, throws, or returns no string)
+fails its vendor, as a request would. A key is trimmed (a secret file's
+trailing newline), and one that still holds anything but printable
+ASCII is refused as "the key has non-printable characters". No output,
+text or JSON, carries a key, a credential function's arguments, or what
+it raised, and no redirect is followed.
+
+| | Anthropic | OpenAI |
+|---|---|---|
+| ids the sheets lack | every active or deprecated id it lists; a retired one the sheets never shipped is counted, not flagged | ids OpenAI (or `system`) owns that it created after the sheets were read; older ids (embeddings, audio, images) and the organization's fine-tunes are counted, not flagged |
+| lifecycle | `lifecycle`, `deprecated_at`, `retires_at` | `shutdown_date` |
+| capabilities | thinking types, effort levels, structured outputs | none in the API |
+| ceilings | `max_input_tokens` (context), `max_tokens` (max output) | none in the API |
+| prices | none in the API | none in the API |
+
+A model the app declares is compared by its declared facts, so
+`--check` also says where a `based_on:` declaration differs from what
+the vendor lists.
+
+OpenAI's `created` is when OpenAI made the model, which can be weeks
+before it launched. A model OpenAI created before the sheets were read
+and launched after is counted among the ids not shipped, not flagged:
+`--check` misses it, and `--json` lists it under `unshipped`. The fix
+is a list of the ids OpenAI listed when the sheets were read, which
+needs a live read Clementine's releases have not yet made.
+
+### A new model ships: what an app does
+
+1. Learn of it: a Clementine release ships its sheet, or `mix
+   clementine.models --check` (in CI, with `--json`) reports an id the
+   sheets lack. Until the release, declare it the same day under
+   `config :clementine, :models`, `based_on:` the sheet it succeeds
+   ([A new model the day it ships](#a-new-model-the-day-it-ships)).
+2. Run `mix clementine.models`: it shows which agents could move, to
+   which model, and what moving changes.
 3. Change `model:` on one agent. The build and boot say if its
    `thinking`, `effort`, `max_tokens`, or TTL no longer fit, and name
    the fix.
@@ -426,6 +581,12 @@ two prices is not modeled.
    [Models that bind their thinking](../guides/runtime.md#models-that-bind-their-thinking)).
 6. A tenant-facing app adds the id to its offer, and moves its rows when
    it chooses: ids are pinned snapshots that never rename.
+
+When the vendor deprecates the old model, boot warns, and warns again
+once its dates pass; the agent keeps running until the vendor's own
+error says otherwise. The Clementine release that marks the model
+`:retired` fails boot for any agent or offer still naming it, naming the
+replacement.
 
 ## Structured output
 
